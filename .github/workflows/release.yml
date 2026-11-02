@@ -1,0 +1,139 @@
+# Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            platform: darwin
+            arch: arm64
+            runner: macos-14
+            wheel: macosx_11_0_arm64
+          - target: x86_64-apple-darwin
+            platform: darwin
+            arch: x64
+            runner: macos-14
+            wheel: macosx_10_12_x86_64
+          # Linux binaries link musl statically, so they run on any distribution.
+          - target: x86_64-unknown-linux-musl
+            platform: linux
+            arch: x64
+            runner: ubuntu-24.04
+            wheel: manylinux_2_17_x86_64.musllinux_1_2_x86_64
+          - target: aarch64-unknown-linux-musl
+            platform: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            wheel: manylinux_2_17_aarch64.musllinux_1_2_aarch64
+          - target: x86_64-pc-windows-msvc
+            platform: win32
+            arch: x64
+            runner: windows-latest
+            wheel: win_amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install the musl compiler
+        if: matrix.platform == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release -p lockyard --target "${{ matrix.target }}"
+      - name: Stage binary
+        shell: bash
+        run: |
+          name=lockyard
+          if [[ "${{ matrix.platform }}" == "win32" ]]; then name=lockyard.exe; fi
+          stage="$PWD/stage/${{ matrix.platform }}-${{ matrix.arch }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/$name" "$stage/$name"
+          echo "LOCKYARD_BINARY=$stage/$name" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build platform wheel
+        shell: bash
+        working-directory: packages/pypi
+        env:
+          LOCKYARD_PLATFORM_TAG: ${{ matrix.wheel }}
+        run: |
+          cp ../../LICENSE ../../README.md .
+          python -m pip install build
+          python -m build --wheel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.platform }}-${{ matrix.arch }}
+          path: stage/${{ matrix.platform }}-${{ matrix.arch }}
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}-${{ matrix.arch }}
+          path: packages/pypi/dist/*.whl
+          if-no-files-found: error
+
+  publish-crates:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish -p lockyard-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - run: cargo publish -p lockyard
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-npm:
+    needs: publish-crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: packages/npm/binaries
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: cp ../../LICENSE ../../README.md .
+        working-directory: packages/npm
+      - run: node scripts/build-platform-packages.js binaries
+        working-directory: packages/npm
+      # The ./ matters: without it npm reads dist/x as a GitHub repository.
+      - run: for package in ./dist/*; do npm publish "$package" --access public; done
+        working-directory: packages/npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm publish --access public
+        working-directory: packages/npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-pypi:
+    needs: publish-npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
+          packages-dir: dist

@@ -1,0 +1,9 @@
+target/
+dist/
+node_modules/
+__pycache__/
+*.tgz
+packages/npm/LICENSE
+packages/npm/README.md
+packages/pypi/LICENSE
+packages/pypi/README.md
