@@ -8,9 +8,76 @@
 
 use crate::zones::Conflict;
 use crate::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::fmt;
+
+/// Reads a JSON null as an empty list: the server stores absent labels as null.
+fn null_is_empty<'de, D: Deserializer<'de>>(
+    reader: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    Ok(Option::<Vec<String>>::deserialize(reader)?.unwrap_or_default())
+}
+
+/// Days from 1970-01-01 to a civil date.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let of_era = year.rem_euclid(400);
+    let shifted = (month + 9) % 12;
+    let of_year = (153 * shifted + 2) / 5 + day - 1;
+    let of_cycle = of_era * 365 + of_era / 4 - of_era / 100 + of_year;
+    era * 146_097 + of_cycle - 719_468
+}
+
+/// Milliseconds since the epoch as the UTC text the server stores.
+pub fn rfc3339(millis: i64) -> String {
+    let days = millis.div_euclid(86_400_000);
+    let rest = millis.rem_euclid(86_400_000);
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let of_era = shifted.rem_euclid(146_097);
+    let of_cycle = (of_era - of_era / 1460 + of_era / 36_524 - of_era / 146_096) / 365;
+    let of_year = of_era - (365 * of_cycle + of_cycle / 4 - of_cycle / 100);
+    let shifted_month = (5 * of_year + 2) / 153;
+    let day = of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = of_cycle + era * 400 + i64::from(month <= 2);
+    let (hour, minute) = (rest / 3_600_000, rest / 60_000 % 60);
+    let (second, milli) = (rest / 1000 % 60, rest % 1000);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{milli:03}Z")
+}
+
+/// Reads RFC 3339 text as milliseconds since the epoch.
+pub fn parse_rfc3339(text: &str) -> Option<i64> {
+    let digits = |from: usize, to: usize| text.get(from..to)?.parse::<i64>().ok();
+    let bytes = text.as_bytes();
+    if bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') || bytes.get(13) != Some(&b':') {
+        return None;
+    }
+    let days = days_from_civil(digits(0, 4)?, digits(5, 7)?, digits(8, 10)?);
+    let seconds = digits(11, 13)? * 3600 + digits(14, 16)? * 60 + digits(17, 19)?;
+    let tail = text.get(19..)?;
+    let zone_at = tail.find(['Z', 'z', '+', '-'])?;
+    let (fraction, zone) = tail.split_at(zone_at);
+    let millis = match fraction.strip_prefix('.') {
+        Some(found) => format!("{found:0<3}").get(..3)?.parse::<i64>().ok()?,
+        None => 0,
+    };
+    let offset = match zone.as_bytes().first()? {
+        b'Z' | b'z' => 0,
+        sign => {
+            let minutes =
+                zone.get(1..3)?.parse::<i64>().ok()? * 60 + zone.get(4..6)?.parse::<i64>().ok()?;
+            if *sign == b'-' { -minutes } else { minutes }
+        }
+    };
+    Some((days * 86_400 + seconds - offset * 60) * 1000 + millis)
+}
 
 /// A moment as the server spells it. Local mode uses milliseconds since the epoch, and the protocol
 /// leaves the format open, so numbers and text both read. Clients show it and never compare it.
@@ -24,6 +91,16 @@ pub enum Stamp {
 impl Default for Stamp {
     fn default() -> Self {
         Self::Millis(0)
+    }
+}
+
+impl Stamp {
+    /// The spelling the server accepts: it reads timestamps as text only.
+    pub fn on_the_wire(&self) -> Self {
+        match self {
+            Self::Millis(value) => Self::Text(rfc3339(*value)),
+            Self::Text(text) => Self::Text(text.clone()),
+        }
     }
 }
 
@@ -104,6 +181,12 @@ pub struct Claim {
     pub meta: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<i64>,
+    /// False when the holder is unavailable: such a claim stops blocking and may be taken by anyone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_available: Option<bool>,
+    /// Dirty paths of other sessions inside this claim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub foreign_dirty_paths: Vec<DirtyPath>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -200,10 +283,17 @@ pub struct QueueEntry {
     pub mode: ClaimMode,
     #[serde(default)]
     pub purpose: Purpose,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "null_is_empty",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub zones: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<i64>,
+    /// The paths were free, so the entry turned into a claim at once.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub granted: bool,
     #[serde(default)]
     pub created_at: Stamp,
     #[serde(default)]
@@ -365,7 +455,7 @@ pub struct InboxPage {
 pub struct Undelivered {
     #[serde(alias = "message_id")]
     pub id: i64,
-    #[serde(default)]
+    #[serde(default, alias = "addressee")]
     pub to: String,
     #[serde(default)]
     pub age_seconds: i64,
@@ -415,7 +505,6 @@ pub enum WorkStatus {
     Failed,
     Expired,
     Cancelled,
-    Declined,
 }
 
 /// A task offer between agents.
@@ -451,6 +540,11 @@ pub struct WorkTask {
     pub executor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// A declined task ends as `cancelled` and carries this moment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declined_at: Option<Stamp>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -605,7 +699,8 @@ pub struct EventQuery {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub seq: i64,
-    #[serde(rename = "type", default)]
+    /// `op` on the registry stream, `type` on the coordination stream.
+    #[serde(rename = "type", alias = "op", default)]
     pub kind: String,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub payload: Value,
@@ -635,6 +730,14 @@ impl EventPage {
             .map(|event| event.seq)
             .fold(after, i64::max)
     }
+}
+
+/// A new service token.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct TokenRequest {
+    pub name: String,
+    pub role: String,
+    pub expires_at: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -759,6 +862,37 @@ mod tests {
             ..WorkStep::default()
         };
         assert_eq!(serde_json::to_value(&step).unwrap(), json!({"report": "r"}));
+    }
+
+    #[test]
+    fn utc_text_and_milliseconds_convert_both_ways() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(rfc3339(1_793_620_800_123), "2026-11-02T12:00:00.123Z");
+        for millis in [0, 951_782_400_000, 1_793_620_800_123, 4_107_542_399_999] {
+            assert_eq!(parse_rfc3339(&rfc3339(millis)), Some(millis));
+        }
+        assert_eq!(
+            parse_rfc3339("2026-11-02T14:30:00.1234567+02:30"),
+            Some(1_793_620_800_123)
+        );
+        assert_eq!(parse_rfc3339("yesterday"), None);
+        assert_eq!(
+            Stamp::Millis(0).on_the_wire(),
+            Stamp::Text("1970-01-01T00:00:00.000Z".into())
+        );
+    }
+
+    #[test]
+    fn a_queue_entry_reads_a_null_zone_list() {
+        let entry: QueueEntry =
+            serde_json::from_value(json!({"id": 1, "session": "s", "zones": null})).unwrap();
+        assert!(entry.zones.is_empty());
+    }
+
+    #[test]
+    fn a_registry_event_names_its_operation() {
+        let event: Event = serde_json::from_value(json!({"seq": 1, "op": "created"})).unwrap();
+        assert_eq!(event.kind, "created");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 //! Picks the one backend of a project from `.lockyard/config.toml`.
 
-use lockyard_cloud_client::{Client, CloudBackend};
+use lockyard_cloud_client::{Client, CloudBackend, token_id};
 use lockyard_core::config::{Config, Mode};
 use lockyard_core::paths::find_root;
 use lockyard_core::{Backend, Error, Result, Store, ZonePath};
@@ -65,9 +65,18 @@ fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
     /// Long enough for a long poll passed through the agent.
     const CLI_TIMEOUT: Duration = Duration::from_secs(40);
     let (url, workspace) = endpoint(config)?;
-    match AgentSocket::connect(&crate::agent::socket_path(), &url, &workspace, CLI_TIMEOUT) {
-        Some(socket) => Ok(Box::new(CloudBackend::new(socket, session))),
-        None => direct(&url, session),
+    let socket = AgentSocket::connect(&crate::agent::socket_path(), &url, &workspace, CLI_TIMEOUT);
+    let token = Config::token().ok();
+    match socket {
+        // An agent running under another token would act with that token's role.
+        Some(socket)
+            if token
+                .as_deref()
+                .is_none_or(|token| socket.token_id().is_ok_and(|id| id == token_id(token))) =>
+        {
+            Ok(Box::new(CloudBackend::new(socket, session)))
+        }
+        _ => direct(&url, session),
     }
 }
 

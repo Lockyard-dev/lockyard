@@ -75,7 +75,7 @@ on stderr.
 
 Local mode has zones, mail, tasks, the board and presence. Everything else needs cloud mode, and says so when asked for
 in local mode: `zone wait`, `queue`, `unwait`, `request`, `answer`, `handover`, `accept`, `narrow`, `add-path`,
-`takeover`, `dirty`, `msg ack`, `msg thread`, `events` and `work`.
+`takeover`, `dirty`, `msg ack`, `msg thread`, `events`, `work`, `task plan` and `cloud`.
 
 Create `.lockyard/config.toml`:
 
@@ -86,8 +86,37 @@ workspace = "your-team"
 ```
 
 The workspace is a label: the server takes the real one from the token. The token comes from `LOCKYARD_TOKEN` or from
-the file named by `LOCKYARD_TOKEN_FILE`, and never from the config file. In cloud mode the `task` commands are not
-available; agent work goes through `lockyard work`.
+the file named by `LOCKYARD_TOKEN_FILE`, and never from the config file. A session can be addressed once it has sent a
+heartbeat: `lockyard presence beat`, or any hook through the agent process.
+
+### Tokens
+
+The server starts with one owner token, set by `LOCKYARD_BOOTSTRAP_TOKEN`. Use it to make the others, then keep it safe.
+
+```sh
+LOCKYARD_TOKEN=$OWNER lockyard cloud token create alice --role agent --days 90   # the raw token prints once
+LOCKYARD_TOKEN=$OWNER lockyard cloud token list
+LOCKYARD_TOKEN=$OWNER lockyard cloud token revoke <id>
+```
+
+Roles are `agent`, `lead`, `owner`, `exporter`, `importer` and `dispatcher`.
+
+### Tasks in cloud mode
+
+`lockyard task` works on the server's backlog, and the agent that writes an item sets its urgency itself. An item is
+ready at once, without triage. It needs an area, and the first area of the workspace is used unless you pass `--area`. A
+lead or an owner creates the first one on their first `task add`.
+
+```sh
+lockyard task add "Rate limit the login route" --priority P1 --type code --target code_accepted
+lockyard task add "Checkout is down" --priority P0 --p0-category prod_outage --evidence "probe 12:04"
+lockyard task plan D-14 --priority P2 --due 2026-12-01T00:00:00Z
+```
+
+`T-14` and `D-14` name the same item. A lease lasts two hours whatever `--ttl` says. Only a lead or an owner accepts,
+rejects or cancels, and an item can be cancelled only while nobody holds it. `task submit` records its evidence as a commit, or
+as a CI run for the target `ci_passed`. A target that needs a deploy probe cannot be closed from here. Task offers between
+agents stay in `lockyard work`.
 
 ### The agent process
 
@@ -107,7 +136,14 @@ lockyard agent uninstall
   `~/.local/state/lockyard`, so they survive an outage and arrive in order. Claims never wait in it: during an outage
   they fail, because a claim that lands minutes late is worse than one that was refused.
 - One agent serves one workspace, the one its token belongs to. A hook in any other workspace allows and says why.
+- One agent serves one token. A command run with another token goes straight to the server, so it keeps its own role.
 - With no agent running, the command line calls the server itself, and hooks allow and say so.
+
+## Testing against a real server
+
+`crates/lockyard/tests/e2e.rs` drives the real binary as several agents. It needs `LOCKYARD_E2E_URL`, `LOCKYARD_E2E_OWNER_TOKEN`
+and `LOCKYARD_E2E_SERVER`, a shell command that runs the server in the foreground on a database that survives a restart.
+The suite starts and stops that server itself. Without the URL it skips, and with `CI=true` it fails instead.
 
 ## Limits
 

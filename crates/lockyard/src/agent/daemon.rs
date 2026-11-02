@@ -15,6 +15,7 @@ use lockyard_cloud_client::{Call, ClientError, CloudBackend, Transport, ulid};
 use lockyard_core::proto::{
     ActivityRequest, BoardEntry, CheckStatus, Claim, ClaimMode, ClaimQuery, EventPage, EventQuery,
     InboxQuery, Message, PathCheck, PresenceBeat, SessionActivity, SessionState, Stamp, Stream,
+    rfc3339,
 };
 use lockyard_core::zones::Conflict;
 use lockyard_core::{Backend, Error, ZonePath};
@@ -37,6 +38,9 @@ const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const IDLE_CONNECTION: Duration = Duration::from_secs(60);
 /// A server's `Retry-After` delays the outbox by at most this long.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Longest pause of a failed event poll. A refresh can make the view look fresh again while the poll
+/// still sleeps, and until it wakes the view does not hear about new claims.
+const MAX_POLL_PAUSE: Duration = Duration::from_secs(2);
 
 /// Every interval of the process. Tests shorten them.
 #[derive(Debug, Clone)]
@@ -85,6 +89,7 @@ impl Default for Timing {
 pub struct AgentConfig {
     pub url: String,
     pub workspace: String,
+    pub token_id: String,
     pub socket: PathBuf,
     pub state_root: PathBuf,
     pub timing: Timing,
@@ -148,7 +153,9 @@ impl View {
 
     fn check_path(&self, session: &str, raw: &str) -> PathCheck {
         let path = ZonePath::stored(raw.to_string());
-        let covering = |claim: &&Claim| covers(claim, &path);
+        // A claim of an unavailable session stops blocking, as it does on the server.
+        let covering =
+            |claim: &&Claim| claim.holder_available != Some(false) && covers(claim, &path);
         let mine: Vec<&Claim> = self
             .claims
             .iter()
@@ -505,7 +512,7 @@ impl<T: Transport + 'static> Shared<T> {
                 version: Some(lockyard_core::VERSION.to_string()),
                 activity: Some(SessionActivity {
                     tool_running: running,
-                    tool_started_at: running.then(|| Stamp::Millis(now_ms())),
+                    tool_started_at: running.then(|| Stamp::Text(rfc3339(now_ms()))),
                     state: Some(state),
                     meta: None,
                 }),
@@ -671,6 +678,7 @@ impl<T: Transport + 'static> Shared<T> {
         AgentStatus {
             url: self.config.url.clone(),
             workspace: self.config.workspace.clone(),
+            token_id: self.config.token_id.clone(),
             pid: std::process::id(),
             view_fresh: view.fresh(self.timing().fresh),
             view_age_ms: view
@@ -785,7 +793,7 @@ impl<T: Transport + 'static> Shared<T> {
                         eprintln!("lockyard agent: {name} events: {error}");
                     }
                     self.pause(pause);
-                    pause = (pause * 2).min(self.timing().retry_max);
+                    pause = (pause * 2).min(self.timing().retry_max.min(MAX_POLL_PAUSE));
                 }
             }
         }
@@ -1221,6 +1229,7 @@ mod tests {
         AgentConfig {
             url: "https://example.test".into(),
             workspace: "team".into(),
+            token_id: "t".into(),
             socket: dir.join("run/agent.sock"),
             state_root: dir.join("state"),
             timing,
@@ -1355,6 +1364,26 @@ mod tests {
             CheckStatus::Held,
             "no shared claim of mine covers it"
         );
+    }
+
+    #[test]
+    fn a_claim_of_an_unavailable_holder_stops_blocking_in_the_view() {
+        let view = View {
+            claims: vec![
+                serde_json::from_value(
+                    json!({"id": 1, "session": "bob", "paths": ["src"], "holder_available": false}),
+                )
+                .unwrap(),
+                serde_json::from_value(
+                    json!({"id": 2, "session": "bob", "paths": ["docs"], "holder_available": true}),
+                )
+                .unwrap(),
+            ],
+            ..View::default()
+        };
+        let status = |path: &str| view.check("me", &[path.to_string()]).remove(0).status;
+        assert_eq!(status("src/a"), CheckStatus::Free);
+        assert_eq!(status("docs/a"), CheckStatus::Held);
     }
 
     #[test]

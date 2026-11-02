@@ -11,7 +11,7 @@ use lockyard_core::proto::{
     ReleaseRequest, RenewRequest, SendRequest, SessionActivity, SessionState, Stamp, Stream,
     WorkAction, WorkOffer, WorkStep, expand_zones,
 };
-use lockyard_core::tasks::Status;
+use lockyard_core::tasks::{Status, TaskPlan, TaskSpec};
 use lockyard_core::zones::DEFAULT_TTL_MINUTES;
 use lockyard_core::{Error, Result};
 use serde::Serialize;
@@ -284,9 +284,18 @@ fn tools() -> Vec<Value> {
         ),
         tool_def(
             "task_add",
-            "Add a task",
-            json!({"title": text, "body": text}),
+            "Add a task. In cloud mode the writer sets its urgency",
+            json!({
+                "title": text, "body": text, "acceptance": text, "priority": text, "p0_category": text,
+                "type": text, "target": text, "verification": text, "area": text, "due": text, "evidence": text
+            }),
             &["title"],
+        ),
+        tool_def(
+            "task_plan",
+            "Change the urgency of a task",
+            json!({"id": int, "priority": text, "p0_category": text, "due": text}),
+            &["id"],
         ),
         tool_def(
             "task_list",
@@ -900,12 +909,28 @@ fn run_tool(
                 .undelivered(me()?, args.some_int("older_than")?.unwrap_or(0))?,
         ),
         "task_add" => {
-            let body = args.optional_text("body")?;
-            encode(
-                &opened
-                    .backend
-                    .add_task(me()?, args.text("title")?, body, now)?,
-            )
+            let spec = TaskSpec {
+                title: args.text("title")?.to_string(),
+                body: args.optional_text("body")?.to_string(),
+                acceptance: args.some_text("acceptance")?,
+                priority: args.some_text("priority")?,
+                p0_category: args.some_text("p0_category")?,
+                kind: args.some_text("type")?,
+                target: args.some_text("target")?,
+                verification: args.some_text("verification")?,
+                area: args.some_text("area")?,
+                due_at: args.some_text("due")?,
+                evidence: args.some_text("evidence")?,
+            };
+            encode(&opened.backend.add_task(me()?, &spec, now)?)
+        }
+        "task_plan" => {
+            let plan = TaskPlan {
+                priority: args.some_text("priority")?,
+                p0_category: args.some_text("p0_category")?,
+                due_at: args.some_text("due")?,
+            };
+            encode(&opened.backend.plan_task(me()?, args.id()?, &plan)?)
         }
         "task_list" => {
             let status = args

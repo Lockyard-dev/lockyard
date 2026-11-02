@@ -9,8 +9,8 @@ use crate::proto::{
     AccessAnswer, AccessRecord, AccessRequest, ActivityRequest, AgentSeen, BoardEntry, BoardWrite,
     CheckStatus, Claim, ClaimMode, ClaimQuery, ClaimRequest, DirtyPath, EventPage, EventQuery,
     Freeze, InboxPage, InboxQuery, LostClaim, Message, PathCheck, Presence, PresenceBeat, Purpose,
-    QueueEntry, QueueRequest, ReleaseRequest, RenewRequest, SendRequest, Stamp, Undelivered,
-    WorkAction, WorkOffer, WorkStep, WorkTask,
+    QueueEntry, QueueRequest, ReleaseRequest, RenewRequest, SendRequest, Stamp, TokenRequest,
+    Undelivered, WorkAction, WorkOffer, WorkStep, WorkTask,
 };
 use crate::{Error, Result, Store, ZonePath, bus, coordination, tasks, zones};
 use serde_json::Value;
@@ -159,7 +159,16 @@ pub trait Backend {
     -> Result<Vec<tasks::Task>>;
     fn task(&self, id: i64) -> Result<tasks::Task>;
     fn task_history(&self, id: i64) -> Result<Vec<tasks::TaskEvent>>;
-    fn add_task(&mut self, author: &str, title: &str, body: &str, now: i64) -> Result<tasks::Task>;
+    fn add_task(&mut self, author: &str, spec: &tasks::TaskSpec, now: i64) -> Result<tasks::Task>;
+    /// Changes the urgency of a task.
+    fn plan_task(
+        &mut self,
+        _agent: &str,
+        _id: i64,
+        _plan: &tasks::TaskPlan,
+    ) -> Result<tasks::Task> {
+        cloud("task plan")
+    }
     fn claim_task(&mut self, agent: &str, id: i64, ttl: i64, now: i64) -> Result<tasks::Task>;
     fn renew_task(&mut self, agent: &str, id: i64, ttl: i64, now: i64) -> Result<tasks::Task>;
     fn release_task(&mut self, agent: &str, id: i64, note: &str, now: i64) -> Result<tasks::Task>;
@@ -216,6 +225,15 @@ pub trait Backend {
     fn import_bus(&mut self, _agent: &str, _dump: &Value) -> Result<Value> {
         cloud("import")
     }
+    fn tokens(&self) -> Result<Value> {
+        cloud("cloud token")
+    }
+    fn token_create(&mut self, _agent: &str, _request: &TokenRequest) -> Result<Value> {
+        cloud("cloud token")
+    }
+    fn token_revoke(&mut self, _agent: &str, _id: &str) -> Result<Value> {
+        cloud("cloud token")
+    }
 }
 
 fn claim_record(claim: zones::Claim) -> Claim {
@@ -241,6 +259,8 @@ fn claim_record(claim: zones::Claim) -> Claim {
         last_write_at: None,
         meta: None,
         version: None,
+        holder_available: None,
+        foreign_dirty_paths: Vec::new(),
     }
 }
 
@@ -475,8 +495,11 @@ impl Backend for Store {
         Store::task_history(self, id)
     }
 
-    fn add_task(&mut self, author: &str, title: &str, body: &str, now: i64) -> Result<tasks::Task> {
-        Store::add_task(self, author, title, body, now)
+    fn add_task(&mut self, author: &str, spec: &tasks::TaskSpec, now: i64) -> Result<tasks::Task> {
+        if spec.uses_registry_fields() {
+            return cloud("task priority, type, target, area and evidence");
+        }
+        Store::add_task(self, author, &spec.title, &spec.body, now)
     }
 
     fn claim_task(&mut self, agent: &str, id: i64, ttl: i64, now: i64) -> Result<tasks::Task> {
@@ -638,6 +661,25 @@ mod tests {
             backend.freeze("a", &Freeze::default()).map(|_| ()),
             backend.import_zones("a", &json!({})).map(|_| ()),
             backend.import_bus("a", &json!({})).map(|_| ()),
+            backend.tokens().map(|_| ()),
+            backend
+                .token_create("a", &TokenRequest::default())
+                .map(|_| ()),
+            backend.token_revoke("a", "x").map(|_| ()),
+            backend
+                .plan_task("a", 1, &tasks::TaskPlan::default())
+                .map(|_| ()),
+            backend
+                .add_task(
+                    "a",
+                    &tasks::TaskSpec {
+                        title: "t".into(),
+                        priority: Some("P1".into()),
+                        ..tasks::TaskSpec::default()
+                    },
+                    0,
+                )
+                .map(|_| ()),
         ];
         for refusal in refusals {
             let error = refusal.unwrap_err();

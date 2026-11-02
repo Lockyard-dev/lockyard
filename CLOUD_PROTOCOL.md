@@ -107,7 +107,7 @@ Task offers between agents, separate from backlog items. `task` fields: `id, tit
 
 - `POST /api/v1/bus/tasks`, `.../{id}/claim`, `/beat`, `/done`, `/accept`, `/reject`, `/fail`, `/cancel`, `/handoff`, `/take`.
 - Lease 15 minutes, renewed by `beat`. `?version=` gives compare and swap, 409 on mismatch. An expired lease emits an event to
-  the lead. `offer`, `accept`, `reject` and `cancel` need the role `lead`. The role `agent` is limited to 3 claimed tasks.
+  the lead. `offer`, `accept`, `reject` and `cancel` need the role `lead`, with one exception in v1.2. The role `agent` is limited to 3 claimed tasks.
 
 ## Backlog
 

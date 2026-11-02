@@ -817,9 +817,9 @@ mod tests {
 
     #[test]
     fn shortening_never_splits_a_character() {
-        let long = "ж".repeat(MAIL_BODY_CHARS + 1);
+        let long = "é".repeat(MAIL_BODY_CHARS + 1);
         let short = shorten(&long);
-        assert_eq!(short.matches('ж').count(), MAIL_BODY_CHARS);
+        assert_eq!(short.matches('é').count(), MAIL_BODY_CHARS);
         assert_eq!(shorten("short"), "short");
     }
 

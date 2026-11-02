@@ -18,6 +18,10 @@ pub struct Reply {
 
 impl Reply {
     pub fn json(status: u16, body: Value) -> Self {
+        Self::text(status, &body.to_string()).header("Content-Type", "application/json")
+    }
+
+    pub fn text(status: u16, body: &str) -> Self {
         Self {
             status,
             body: body.to_string(),
@@ -126,7 +130,7 @@ fn answer(mut stream: TcpStream, log: &Mutex<Vec<Seen>>, script: &Mutex<VecDeque
         headers: Vec::new(),
     });
     let mut response = format!(
-        "HTTP/1.1 {} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "HTTP/1.1 {} Status\r\nContent-Length: {}\r\nConnection: close\r\n",
         reply.status,
         reply.body.len()
     );

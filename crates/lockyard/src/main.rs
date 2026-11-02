@@ -11,10 +11,10 @@ use lockyard_core::proto::{
     AccessAnswer, AccessRequest, ActivityRequest, BoardEntry, BoardWrite, CheckStatus, Claim,
     ClaimMode, ClaimQuery, ClaimRequest, DirtyPath, EventQuery, Freeze, InboxPage, InboxQuery,
     Message, PresenceBeat, Purpose, QueueRequest, ReleaseRequest, RenewRequest, SendRequest,
-    SessionActivity, SessionState, Stamp, Stream, WorkAction, WorkOffer, WorkStep, WorkTask,
-    expand_zones,
+    SessionActivity, SessionState, Stamp, Stream, TokenRequest, WorkAction, WorkOffer, WorkStep,
+    WorkTask, expand_zones, rfc3339,
 };
-use lockyard_core::tasks::{Status, Task};
+use lockyard_core::tasks::{Status, Task, TaskPlan, TaskSpec};
 use lockyard_core::zones::DEFAULT_TTL_MINUTES;
 use lockyard_core::{Backend, Error, Result, Store};
 use open::Opened;
@@ -35,6 +35,10 @@ const INBOX_LIMIT: usize = 200;
 /// The server keeps a place in line for this long.
 const MAX_SHORT_WAIT_SECONDS: u64 = 120;
 const WAIT_RETRY: Duration = Duration::from_secs(2);
+/// One try of a short wait. Longer than this, the answer could outlast the read limit of a long poll.
+const WAIT_SLICE_SECONDS: u64 = 25;
+const DEFAULT_TOKEN_DAYS: i64 = 90;
+const DAY_MS: i64 = 86_400_000;
 /// Lease of a queued claim unless the caller asks for another one.
 const DEFAULT_QUEUE_MINUTES: i64 = 60;
 
@@ -400,6 +404,44 @@ enum TaskCommand {
         title: String,
         #[arg(long, default_value = "")]
         body: String,
+        /// What closes the task. Cloud mode; the title by default.
+        #[arg(long)]
+        acceptance: Option<String>,
+        /// P0, P1, P2 or P3. Cloud mode; P2 by default.
+        #[arg(long)]
+        priority: Option<String>,
+        /// Required with P0: player_money, security_breach, prod_outage or cert_slip.
+        #[arg(long)]
+        p0_category: Option<String>,
+        /// Item type, such as code, ops or finding. Cloud mode.
+        #[arg(long = "type")]
+        kind: Option<String>,
+        /// What done means, such as code_accepted or ci_passed. Cloud mode.
+        #[arg(long)]
+        target: Option<String>,
+        /// auto, owner or none. Cloud mode.
+        #[arg(long)]
+        verification: Option<String>,
+        /// Key of the area. Cloud mode; the first area by default.
+        #[arg(long)]
+        area: Option<String>,
+        /// Due date as RFC 3339 text. Cloud mode.
+        #[arg(long)]
+        due: Option<String>,
+        /// Evidence stored at once. P0 needs it. Cloud mode.
+        #[arg(long)]
+        evidence: Option<String>,
+    },
+    /// Change the urgency of a task. Needs cloud mode.
+    Plan {
+        #[arg(value_parser = parse_id)]
+        id: i64,
+        #[arg(long)]
+        priority: Option<String>,
+        #[arg(long)]
+        p0_category: Option<String>,
+        #[arg(long)]
+        due: Option<String>,
     },
     /// List unfinished tasks.
     List {
@@ -684,6 +726,27 @@ enum CloudCommand {
     ImportZones { file: PathBuf },
     /// Import threads, the board and tasks from a JSON file. Needs the importer role.
     ImportBus { file: PathBuf },
+    /// Service tokens of the workspace. Needs the owner role.
+    #[command(subcommand)]
+    Token(TokenCommand),
+}
+
+#[derive(Subcommand)]
+enum TokenCommand {
+    /// Create a token. The raw token prints once and cannot be read again.
+    Create {
+        name: String,
+        /// agent, lead, owner, exporter, importer or dispatcher.
+        #[arg(long)]
+        role: String,
+        /// Days until it expires, at most 366.
+        #[arg(long, default_value_t = DEFAULT_TOKEN_DAYS)]
+        days: i64,
+    },
+    /// List tokens, never their raw value.
+    List,
+    /// Revoke a token.
+    Revoke { id: String },
 }
 
 #[derive(Subcommand)]
@@ -696,10 +759,10 @@ enum HookCommand {
     Cursor,
 }
 
-/// Accepts `12`, `T-12`, `Z-12`, `M-12`, `W-12` and `Q-12`.
+/// Accepts `12`, `T-12`, `D-12`, `Z-12`, `M-12`, `W-12` and `Q-12`.
 fn parse_id(text: &str) -> std::result::Result<i64, String> {
     let digits = text
-        .strip_prefix(['T', 'Z', 'M', 'W', 'Q', 't', 'z', 'm', 'w', 'q'])
+        .strip_prefix(['T', 'D', 'Z', 'M', 'W', 'Q', 't', 'd', 'z', 'm', 'w', 'q'])
         .and_then(|rest| rest.strip_prefix('-'))
         .unwrap_or(text);
     digits
@@ -909,7 +972,8 @@ pub(crate) fn wait_for_claim(
     let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        request.queue_wait_seconds = Some(i64::try_from(left.as_secs()).unwrap_or(0));
+        let slice = left.as_secs().min(WAIT_SLICE_SECONDS);
+        request.queue_wait_seconds = Some(i64::try_from(slice).unwrap_or(0));
         match backend.claim(agent, &request, now_ms()) {
             Err(Error::Conflict(_) | Error::Contended(_)) if !left.is_zero() => {
                 std::thread::sleep(WAIT_RETRY.min(left));
@@ -984,7 +1048,8 @@ fn run_zone(
                 zones: style.zones.clone(),
             };
             let entry = opened.backend.queue_add(&agent, &request)?;
-            output(&entry, format!("queued Q-{}", entry.id))
+            let verb = if entry.granted { "granted" } else { "queued" };
+            output(&entry, format!("{verb} Q-{}", entry.id))
         }
         ZoneCommand::Unwait { id } => {
             opened.backend.queue_cancel(&resolve_agent(agent)?, id)?;
@@ -1332,9 +1397,49 @@ fn run_task(mut opened: Opened, command: TaskCommand, agent: Option<&String>) ->
             let data = json!({ "task": task, "history": history });
             return output(&data, lines.join("\n"));
         }
-        TaskCommand::Add { title, body } => {
-            store.add_task(&resolve_agent(agent)?, &title, &body, now)?
-        }
+        TaskCommand::Add {
+            title,
+            body,
+            acceptance,
+            priority,
+            p0_category,
+            kind,
+            target,
+            verification,
+            area,
+            due,
+            evidence,
+        } => store.add_task(
+            &resolve_agent(agent)?,
+            &TaskSpec {
+                title,
+                body,
+                acceptance,
+                priority,
+                p0_category,
+                kind,
+                target,
+                verification,
+                area,
+                due_at: due,
+                evidence,
+            },
+            now,
+        )?,
+        TaskCommand::Plan {
+            id,
+            priority,
+            p0_category,
+            due,
+        } => store.plan_task(
+            &resolve_agent(agent)?,
+            id,
+            &TaskPlan {
+                priority,
+                p0_category,
+                due_at: due,
+            },
+        )?,
         TaskCommand::Claim { id, ttl } => {
             store.claim_task(&resolve_agent(agent)?, id, ttl.ttl, now)?
         }
@@ -1603,9 +1708,55 @@ fn run_cloud(mut opened: Opened, command: CloudCommand, agent: Option<&String>) 
         }
         CloudCommand::ImportZones { file } => backend.import_zones(&agent, &read_json(&file)?)?,
         CloudCommand::ImportBus { file } => backend.import_bus(&agent, &read_json(&file)?)?,
+        CloudCommand::Token(command) => return run_token(backend, command, &agent),
     };
     let text = answer.to_string();
     output(&answer, text)
+}
+
+fn run_token(backend: &mut dyn Backend, command: TokenCommand, agent: &str) -> Result<Output> {
+    let line = |token: &Value| {
+        let field = |name: &str| token[name].as_str().unwrap_or("-").to_string();
+        let revoked = if token["revoked_at"].is_string() {
+            "  revoked"
+        } else {
+            ""
+        };
+        format!(
+            "{}  {}  {}  until {}{revoked}",
+            field("id"),
+            field("role"),
+            field("name"),
+            field("expires_at")
+        )
+    };
+    match command {
+        TokenCommand::Create { name, role, days } => {
+            let request = TokenRequest {
+                name,
+                role,
+                expires_at: rfc3339(now_ms().saturating_add(days.saturating_mul(DAY_MS))),
+            };
+            let answer = backend.token_create(agent, &request)?;
+            let raw = answer["raw"].as_str().unwrap_or_default();
+            let text = format!(
+                "{}\nThis token is shown once:\n{raw}",
+                line(&answer["token"])
+            );
+            output(&answer, text)
+        }
+        TokenCommand::List => {
+            let answer = backend.tokens()?;
+            let rows = answer.as_array().map_or(&[][..], Vec::as_slice);
+            let text = join(rows, line, "no tokens");
+            output(&answer, text)
+        }
+        TokenCommand::Revoke { id } => {
+            let answer = backend.token_revoke(agent, &id)?;
+            let text = line(&answer);
+            output(&answer, text)
+        }
+    }
 }
 
 fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
@@ -1631,7 +1782,9 @@ fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
         let session = agent.as_deref().unwrap_or("lockyard-cli");
         let work = backend.work_list(session)?;
         lines.push(join(&work, work_line, "no work tasks"));
-        let data = json!({ "unread": unread, "claims": claims, "work": work });
+        let tasks = backend.tasks(None, false)?;
+        lines.push(join(&tasks, task_line, "no tasks"));
+        let data = json!({ "unread": unread, "claims": claims, "work": work, "tasks": tasks });
         return output(&data, lines.join("\n"));
     }
     let tasks = backend.tasks(None, false)?;
@@ -1711,10 +1864,13 @@ fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
         None => {
             let (_, config) = project()?;
             let (url, workspace) = open::endpoint(&config)?;
-            let client = Client::new(&url, Config::token()?)?;
+            let token = Config::token()?;
+            let token_id = lockyard_cloud_client::token_id(&token);
+            let client = Client::new(&url, token)?;
             let settings = AgentConfig {
                 url,
                 workspace,
+                token_id,
                 socket: agent::socket_path(),
                 state_root: agent::state_root()?,
                 timing: Default::default(),
@@ -1999,7 +2155,7 @@ mod tests {
         fn task_history(&self, _: i64) -> Result<Vec<lockyard_core::tasks::TaskEvent>> {
             unreachable!()
         }
-        fn add_task(&mut self, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
+        fn add_task(&mut self, _: &str, _: &TaskSpec, _: i64) -> Result<Task> {
             unreachable!()
         }
         fn claim_task(&mut self, _: &str, _: i64, _: i64, _: i64) -> Result<Task> {

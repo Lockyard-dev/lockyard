@@ -72,6 +72,9 @@ pub enum Source {
 pub struct AgentStatus {
     pub url: String,
     pub workspace: String,
+    /// Which token the process runs under. See `lockyard_cloud_client::token_id`.
+    #[serde(default)]
+    pub token_id: String,
     pub pid: u32,
     pub view_fresh: bool,
     pub view_age_ms: Option<u64>,

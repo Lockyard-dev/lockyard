@@ -5,13 +5,13 @@
 //! The protocol names the fields of a record but not the envelope of a response, so a list reads
 //! either as a bare array or under its plural name, and a record either bare or under its singular name.
 
-use crate::{Call, ClientError, MAX_POLL_WAIT_SECONDS, Transport, encode};
+use crate::{Call, ClientError, MAX_POLL_WAIT_SECONDS, Transport, encode, ulid};
 use lockyard_core::proto::{
     AccessAnswer, AccessRecord, AccessRequest, ActivityRequest, AgentSeen, BoardEntry, BoardWrite,
     CheckStatus, Claim, ClaimQuery, ClaimRequest, DirtyPath, EventPage, EventQuery, Freeze,
     InboxPage, InboxQuery, LostClaim, Message, PathCheck, Presence, PresenceBeat, QueueEntry,
-    QueueRequest, ReleaseRequest, RenewRequest, SendRequest, Stream, Undelivered, WorkAction,
-    WorkOffer, WorkStep, WorkTask,
+    QueueRequest, ReleaseRequest, RenewRequest, SendRequest, Stream, TokenRequest, Undelivered,
+    WorkAction, WorkOffer, WorkStep, WorkTask, parse_rfc3339, rfc3339,
 };
 use lockyard_core::zones::Conflict;
 use lockyard_core::{Backend, Error, Result, tasks};
@@ -19,7 +19,20 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-const TASKS_IN_CLOUD: &str = "the task commands: cloud work goes through `lockyard work`, and";
+const ITEMS: &str = "/api/v1/registry/items";
+const TOKENS: &str = "/api/v1/registry/tokens";
+const AREAS: &str = "/api/v1/registry/areas";
+const ITEM_PAGE: usize = 200;
+const DEFAULT_PRIORITY: &str = "P2";
+const DEFAULT_TARGET: &str = "code_accepted";
+/// The area a workspace gets when the first item needs one.
+const DEFAULT_AREA: &str = "general";
+/// The server keeps at most this many unread messages per addressee and refuses a larger page.
+const INBOX_PAGE: usize = 50;
+/// The protocol requires a lifetime on every board value.
+const DEFAULT_BOARD_MINUTES: i64 = 24 * 60;
+/// The kind of a message that names none: mail stays seven days, as it does in local mode.
+const DEFAULT_KIND: &str = "ask";
 /// `who` lists sessions seen in this window, the time mail is kept.
 const WHO_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 
@@ -81,12 +94,16 @@ fn check_item(item: Value) -> std::result::Result<PathCheck, ClientError> {
             Some(conflict)
         }
     };
+    // An answer this client cannot read must never count as free.
     let status = match item.get("status").and_then(Value::as_str) {
         Some("own") => CheckStatus::Own,
-        Some("held") | Some("holder") => CheckStatus::Held,
+        Some("held") => CheckStatus::Held,
         Some("free") => CheckStatus::Free,
-        _ if holder.is_some() => CheckStatus::Held,
-        _ => CheckStatus::Free,
+        other => {
+            return Err(ClientError::Decode(format!(
+                "a zone check for {path} has status {other:?}"
+            )));
+        }
     };
     Ok(PathCheck {
         path,
@@ -116,6 +133,42 @@ impl<T: Transport> CloudBackend<T> {
 
     fn post(&self, session: &str, path: String, body: &impl Serialize) -> Result<Value> {
         self.write(session, "POST", path, body)
+    }
+
+    fn item(&self, session: &str, id: i64) -> Result<Value> {
+        self.get(session, format!("{ITEMS}/{}", item_id(id)))
+    }
+
+    /// One registry operation on an item, at the version the caller read.
+    fn item_step(
+        &self,
+        agent: &str,
+        id: i64,
+        operation: &str,
+        mut body: Value,
+        item: &Value,
+    ) -> Result<tasks::Task> {
+        body["expected_version"] = item["version"].clone();
+        let route = format!("{ITEMS}/{}/{operation}", item_id(id));
+        task_from(&self.post(agent, route, &body)?)
+    }
+
+    /// The area named by key. Without a key, the first one, created on first use where the role allows.
+    fn area_id(&self, agent: &str, wanted: Option<&str>) -> Result<String> {
+        let value = self.get(agent, AREAS.into())?;
+        let areas: Vec<Value> = list(value, &["areas", "items"])?;
+        let found = match wanted {
+            Some(key) => areas.iter().find(|area| text(area, "key") == key),
+            None => areas.first(),
+        };
+        match (found, wanted) {
+            (Some(area), _) => Ok(text(area, "id").to_string()),
+            (None, Some(key)) => Err(Error::NotFound(format!("no area {key:?}"))),
+            (None, None) => {
+                let body = json!({"key": DEFAULT_AREA, "name": "General"});
+                Ok(text(&self.post(agent, AREAS.into(), &body)?, "id").to_string())
+            }
+        }
     }
 
     fn write(
@@ -192,8 +245,87 @@ fn message(value: Value) -> Result<Message> {
     Ok(one(value, "message")?)
 }
 
-fn no_tasks<T>() -> Result<T> {
-    Err(Error::NeedsLocal(TASKS_IN_CLOUD.into()))
+fn item_id(id: i64) -> String {
+    format!("D-{id}")
+}
+
+fn text<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
+fn millis(value: &Value, key: &str) -> Option<i64> {
+    parse_rfc3339(value.get(key)?.as_str()?)
+}
+
+/// The session inside an identity `token:<id>:<session>`.
+fn session_of(identity: &str) -> String {
+    identity
+        .splitn(3, ':')
+        .nth(2)
+        .unwrap_or(identity)
+        .to_string()
+}
+
+fn reason_or<'a>(reason: &'a str, fallback: &'a str) -> &'a str {
+    if reason.trim().is_empty() {
+        fallback
+    } else {
+        reason
+    }
+}
+
+/// Evidence for a code or CI target. A deploy target also needs a probe, which `task` does not record.
+fn evidence_body(agent: &str, target: &str, value: &str, now: i64) -> Value {
+    json!({
+        "kind": if target == "ci_passed" { "ci_run" } else { "commit" },
+        "environment": "local",
+        "value": value,
+        "observed_at": rfc3339(now),
+        "verifier": agent,
+    })
+}
+
+fn task_status(status: &str) -> tasks::Status {
+    match status {
+        "active" => tasks::Status::Claimed,
+        "review" => tasks::Status::Review,
+        "done" => tasks::Status::Accepted,
+        "cancelled" => tasks::Status::Cancelled,
+        _ => tasks::Status::Open,
+    }
+}
+
+/// A backlog item in the shape of a task. Open covers `ready`, `blocked` and `intake`.
+fn task_from(item: &Value) -> Result<tasks::Task> {
+    let id = text(item, "id");
+    let number = id
+        .strip_prefix("D-")
+        .and_then(|digits| digits.parse().ok())
+        .ok_or_else(|| Error::Protocol(format!("{id:?} is not a backlog id")))?;
+    let assignment = item.get("assignment").filter(|found| found.is_object());
+    let evidence: Vec<&str> = item
+        .get("evidence")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|entry| text(entry, "value"))
+        .collect();
+    Ok(tasks::Task {
+        id: number,
+        title: text(item, "title").to_string(),
+        body: text(item, "body").to_string(),
+        status: task_status(text(item, "status")),
+        author: session_of(text(item, "created_by")),
+        assignee: assignment.map(|found| session_of(text(found, "executor"))),
+        lease_until: assignment.and_then(|found| millis(found, "lease_expires_at")),
+        evidence: (!evidence.is_empty()).then(|| evidence.join(", ")),
+        created_at: millis(item, "created_at").unwrap_or(0),
+        updated_at: millis(item, "updated_at").unwrap_or(0),
+        priority: item
+            .get("priority")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
 }
 
 impl<T: Transport> Backend for CloudBackend<T> {
@@ -219,8 +351,14 @@ impl<T: Transport> Backend for CloudBackend<T> {
     }
 
     fn claim(&mut self, agent: &str, request: &ClaimRequest, _now: i64) -> Result<Claim> {
-        let value = self.post(agent, "/api/v1/zones/claims".into(), request)?;
-        Ok(one(value, "claim")?)
+        let body =
+            serde_json::to_value(request).map_err(|error| Error::Invalid(error.to_string()))?;
+        let mut call = Call::write(agent, "POST", "/api/v1/zones/claims".into(), body);
+        // With a short wait the server holds the answer until the zone frees up.
+        call.long_poll = request
+            .queue_wait_seconds
+            .is_some_and(|seconds| seconds > 0);
+        Ok(one(self.transport.call(&call)?, "claim")?)
     }
 
     fn renew(
@@ -447,7 +585,9 @@ impl<T: Transport> Backend for CloudBackend<T> {
     }
 
     fn send(&mut self, agent: &str, request: &SendRequest, _now: i64) -> Result<Message> {
-        message(self.post(agent, "/api/v1/bus/messages".into(), request)?)
+        let mut request = request.clone();
+        request.kind.get_or_insert_with(|| DEFAULT_KIND.to_string());
+        message(self.post(agent, "/api/v1/bus/messages".into(), &request)?)
     }
 
     fn reply(&mut self, agent: &str, id: i64, body: &str, _now: i64) -> Result<Message> {
@@ -468,7 +608,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
             ("all", filter.all.then(|| "true".to_string())),
             (
                 "limit",
-                (filter.limit > 0).then(|| filter.limit.to_string()),
+                (filter.limit > 0).then(|| filter.limit.min(INBOX_PAGE).to_string()),
             ),
         ]);
         Ok(inbox_page(
@@ -523,80 +663,162 @@ impl<T: Transport> Backend for CloudBackend<T> {
 
     fn tasks(
         &self,
-        _status: Option<tasks::Status>,
-        _include_final: bool,
+        status: Option<tasks::Status>,
+        include_final: bool,
     ) -> Result<Vec<tasks::Task>> {
-        no_tasks()
+        let mut found = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let tail = query(&[
+                ("limit", Some(ITEM_PAGE.to_string())),
+                ("cursor", cursor.clone()),
+            ]);
+            let page = self.get(&self.session, format!("{ITEMS}{tail}"))?;
+            let items = page.get("items").and_then(Value::as_array);
+            for item in items.into_iter().flatten() {
+                found.push(task_from(item)?);
+            }
+            match page.get("cursor").and_then(Value::as_str) {
+                Some(next) => cursor = Some(next.to_string()),
+                None => break,
+            }
+        }
+        found.retain(|task| match status {
+            Some(wanted) => task.status == wanted,
+            None => include_final || !task.status.is_final(),
+        });
+        Ok(found)
     }
-    fn task(&self, _id: i64) -> Result<tasks::Task> {
-        no_tasks()
+
+    fn task(&self, id: i64) -> Result<tasks::Task> {
+        task_from(&self.item(&self.session, id)?)
     }
-    fn task_history(&self, _id: i64) -> Result<Vec<tasks::TaskEvent>> {
-        no_tasks()
+
+    fn task_history(&self, id: i64) -> Result<Vec<tasks::TaskEvent>> {
+        let value = self.get(&self.session, format!("{ITEMS}/{}/history", item_id(id)))?;
+        let rows: Vec<Value> = list(value, &["events", "items"])?;
+        Ok(rows
+            .iter()
+            .map(|row| tasks::TaskEvent {
+                agent: session_of(text(row, "actor")),
+                action: text(row, "op").to_string(),
+                note: text(row, "reason").to_string(),
+                at: millis(row, "at").unwrap_or(0),
+            })
+            .collect())
     }
-    fn add_task(
-        &mut self,
-        _author: &str,
-        _title: &str,
-        _body: &str,
-        _now: i64,
-    ) -> Result<tasks::Task> {
-        no_tasks()
+
+    fn add_task(&mut self, author: &str, spec: &tasks::TaskSpec, now: i64) -> Result<tasks::Task> {
+        let target = spec.target.as_deref().unwrap_or(DEFAULT_TARGET);
+        let evidence: Vec<Value> = spec
+            .evidence
+            .iter()
+            .map(|value| evidence_body(author, target, value, now))
+            .collect();
+        let body = json!({
+            "client_key": ulid(),
+            "title": spec.title,
+            "body": spec.body,
+            "acceptance": spec.acceptance.as_deref().unwrap_or(&spec.title),
+            "type": spec.kind.as_deref().unwrap_or("code"),
+            "actor": "agent",
+            "area_id": self.area_id(author, spec.area.as_deref())?,
+            "priority": spec.priority.as_deref().unwrap_or(DEFAULT_PRIORITY),
+            "p0_category": spec.p0_category,
+            "due_at": spec.due_at,
+            "target": target,
+            "verification": spec.verification.as_deref().unwrap_or("auto"),
+            "audience": [],
+            "evidence": evidence,
+        });
+        task_from(&self.post(author, ITEMS.into(), &body)?)
     }
-    fn claim_task(&mut self, _agent: &str, _id: i64, _ttl: i64, _now: i64) -> Result<tasks::Task> {
-        no_tasks()
+
+    fn plan_task(&mut self, agent: &str, id: i64, plan: &tasks::TaskPlan) -> Result<tasks::Task> {
+        let item = self.item(agent, id)?;
+        let body = json!({
+            "priority": plan.priority.as_deref().map_or(item["priority"].clone(), |p| json!(p)),
+            "p0_category": plan.p0_category.as_deref().map_or(item["p0_category"].clone(), |p| json!(p)),
+            "due_at": plan.due_at.as_deref().map_or(item["due_at"].clone(), |p| json!(p)),
+            "revisit_after": item["revisit_after"],
+            "revisit_on": item["revisit_on"],
+            "expected_version": item["version"],
+        });
+        task_from(&self.post(agent, format!("{ITEMS}/{}/plan", item_id(id)), &body)?)
     }
-    fn renew_task(&mut self, _agent: &str, _id: i64, _ttl: i64, _now: i64) -> Result<tasks::Task> {
-        no_tasks()
+
+    /// The registry leases an item for two hours, so `ttl` has no meaning here.
+    fn claim_task(&mut self, agent: &str, id: i64, _ttl: i64, _now: i64) -> Result<tasks::Task> {
+        let item = self.item(agent, id)?;
+        self.item_step(agent, id, "claim", json!({"session": agent}), &item)
     }
+
+    fn renew_task(&mut self, agent: &str, id: i64, _ttl: i64, _now: i64) -> Result<tasks::Task> {
+        let item = self.item(agent, id)?;
+        self.item_step(agent, id, "heartbeat", json!({}), &item)
+    }
+
     fn release_task(
         &mut self,
-        _agent: &str,
-        _id: i64,
+        agent: &str,
+        id: i64,
         _note: &str,
         _now: i64,
     ) -> Result<tasks::Task> {
-        no_tasks()
+        let item = self.item(agent, id)?;
+        self.item_step(agent, id, "release", json!({}), &item)
     }
+
     fn submit_task(
         &mut self,
-        _agent: &str,
-        _id: i64,
-        _evidence: &str,
-        _now: i64,
+        agent: &str,
+        id: i64,
+        evidence: &str,
+        now: i64,
     ) -> Result<tasks::Task> {
-        no_tasks()
+        let item = self.item(agent, id)?;
+        let target = item["target"].as_str().unwrap_or(DEFAULT_TARGET);
+        let body = evidence_body(agent, target, evidence, now);
+        let proved = self.item_step(agent, id, "evidence", body, &item);
+        proved?;
+        let item = self.item(agent, id)?;
+        let body = json!({"to": "review", "reason": "submitted for review"});
+        self.item_step(agent, id, "transition", body, &item)
     }
-    fn accept_task(
-        &mut self,
-        _agent: &str,
-        _id: i64,
-        _note: &str,
-        _now: i64,
-    ) -> Result<tasks::Task> {
-        no_tasks()
+
+    fn accept_task(&mut self, agent: &str, id: i64, note: &str, _now: i64) -> Result<tasks::Task> {
+        let item = self.item(agent, id)?;
+        let body =
+            json!({"to": "done", "resolution": "completed", "reason": reason_or(note, "accepted")});
+        self.item_step(agent, id, "transition", body, &item)
     }
+
     fn reject_task(
         &mut self,
-        _agent: &str,
-        _id: i64,
-        _reason: &str,
+        agent: &str,
+        id: i64,
+        reason: &str,
         _now: i64,
     ) -> Result<tasks::Task> {
-        no_tasks()
+        let item = self.item(agent, id)?;
+        let body = json!({"to": "ready", "reason": reason_or(reason, "rejected")});
+        self.item_step(agent, id, "transition", body, &item)
     }
-    fn cancel_task(
-        &mut self,
-        _agent: &str,
-        _id: i64,
-        _note: &str,
-        _now: i64,
-    ) -> Result<tasks::Task> {
-        no_tasks()
+
+    fn cancel_task(&mut self, agent: &str, id: i64, note: &str, _now: i64) -> Result<tasks::Task> {
+        let item = self.item(agent, id)?;
+        let body = json!({
+            "to": "cancelled",
+            "resolution": "wont_do",
+            "reason": reason_or(note, "cancelled"),
+        });
+        self.item_step(agent, id, "transition", body, &item)
     }
 
     fn board_set(&mut self, agent: &str, write: &BoardWrite, _now: i64) -> Result<BoardEntry> {
-        let value = self.post(agent, "/api/v1/bus/board".into(), write)?;
+        let mut write = write.clone();
+        write.ttl_minutes.get_or_insert(DEFAULT_BOARD_MINUTES);
+        let value = self.post(agent, "/api/v1/bus/board".into(), &write)?;
         Ok(one(value, "entry")?)
     }
 
@@ -661,7 +883,15 @@ impl<T: Transport> Backend for CloudBackend<T> {
     }
 
     fn heartbeat(&mut self, agent: &str, beat: &PresenceBeat, _now: i64) -> Result<()> {
-        self.post(agent, "/api/v1/presence".into(), beat)?;
+        let mut beat = beat.clone();
+        beat.dnd_until = beat.dnd_until.map(|stamp| stamp.on_the_wire());
+        if let Some(activity) = beat.activity.as_mut() {
+            activity.tool_started_at = activity
+                .tool_started_at
+                .take()
+                .map(|stamp| stamp.on_the_wire());
+        }
+        self.post(agent, "/api/v1/presence".into(), &beat)?;
         Ok(())
     }
 
@@ -703,6 +933,18 @@ impl<T: Transport> Backend for CloudBackend<T> {
 
     fn import_bus(&mut self, agent: &str, dump: &Value) -> Result<Value> {
         self.post(agent, "/api/v1/import/bus".into(), dump)
+    }
+
+    fn tokens(&self) -> Result<Value> {
+        self.get(&self.session, TOKENS.into())
+    }
+
+    fn token_create(&mut self, agent: &str, request: &TokenRequest) -> Result<Value> {
+        self.post(agent, TOKENS.into(), request)
+    }
+
+    fn token_revoke(&mut self, agent: &str, id: &str) -> Result<Value> {
+        self.post(agent, format!("{TOKENS}/{}/revoke", encode(id)), &json!({}))
     }
 }
 
@@ -930,7 +1172,7 @@ mod tests {
                 {"path": "a", "status": "free"},
                 {"path": "b", "status": "own"},
                 {"path": "c", "status": "held", "holder": {"session": "bob", "claim_id": 9, "note": "n"}},
-                {"path": "d", "holder": "carol"}
+                {"path": "d", "status": "held", "holder": "carol"}
             ]}),
         ]);
         let filter = ClaimQuery {
@@ -1442,17 +1684,235 @@ mod tests {
         assert_eq!(seen[2].body["catalog"], json!({"zones": {}}));
     }
 
+    fn item(status: &str, version: i64) -> Value {
+        json!({
+            "id": "D-7", "title": "t", "body": "b", "status": status, "priority": "P1", "version": version,
+            "target": "ci_passed", "created_by": "token:ab:writer",
+            "created_at": "2026-11-02T10:00:00+00:00", "updated_at": "2026-11-02T10:00:00+00:00",
+            "assignment": {"executor": "token:ab:s:1", "lease_expires_at": "2026-11-02T12:00:00+00:00"},
+            "evidence": [{"value": "run 5"}],
+        })
+    }
+
     #[test]
-    fn the_task_commands_say_they_are_local() {
-        let (_server, mut cloud) = backend(vec![]);
+    fn a_new_item_sets_its_urgency_and_finds_an_area() {
+        let (server, mut cloud) = backend(vec![
+            json!([{"id": "a1", "key": "api"}, {"id": "a2", "key": "web"}]),
+            item("ready", 1),
+        ]);
+        let spec = tasks::TaskSpec {
+            title: "t".into(),
+            priority: Some("P1".into()),
+            area: Some("web".into()),
+            ..tasks::TaskSpec::default()
+        };
+        let task = cloud.add_task("me", &spec, 0).unwrap();
+        assert_eq!((task.id, task.priority.as_deref()), (7, Some("P1")));
+        assert_eq!(task.status, tasks::Status::Open);
+        assert_eq!(task.author, "writer");
+        assert_eq!(task.assignee.as_deref(), Some("s:1"));
+        assert_eq!(task.evidence.as_deref(), Some("run 5"));
+        let seen = sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/areas"),
+                ("POST", "/api/v1/registry/items"),
+            ],
+        );
+        let body = &seen[1].body;
+        assert_eq!(body["area_id"], "a2");
+        assert_eq!(body["priority"], "P1");
+        assert_eq!(body["type"], "code");
+        assert_eq!(body["target"], "code_accepted");
+        assert_eq!(body["client_key"].as_str().unwrap().len(), 26);
+    }
+
+    #[test]
+    fn an_unknown_area_is_refused_and_a_workspace_without_one_gets_the_default() {
+        let (_server, mut cloud) = backend(vec![json!([])]);
+        let named = tasks::TaskSpec {
+            title: "t".into(),
+            area: Some("nope".into()),
+            ..tasks::TaskSpec::default()
+        };
         assert!(matches!(
-            cloud.add_task("me", "t", "", 0),
-            Err(Error::NeedsLocal(_))
+            cloud.add_task("me", &named, 0),
+            Err(Error::NotFound(_))
         ));
-        assert!(matches!(
-            cloud.tasks(None, false),
-            Err(Error::NeedsLocal(_))
-        ));
+        let (server, mut cloud) = backend(vec![json!([]), json!({"id": "new"}), item("ready", 1)]);
+        let plain = tasks::TaskSpec {
+            title: "t".into(),
+            ..tasks::TaskSpec::default()
+        };
+        cloud.add_task("me", &plain, 0).unwrap();
+        let seen = server.requests();
+        assert_eq!(seen[1].body["key"], "general");
+        assert_eq!(seen[2].body["area_id"], "new");
+    }
+
+    #[test]
+    fn a_submission_proves_first_and_each_step_carries_the_version_it_read() {
+        let (server, mut cloud) = backend(vec![
+            item("active", 3),
+            item("active", 4),
+            item("active", 4),
+            item("review", 5),
+        ]);
+        cloud.submit_task("me", 7, "run 5", 0).unwrap();
+        let seen = sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/items/D-7"),
+                ("POST", "/api/v1/registry/items/D-7/evidence"),
+                ("GET", "/api/v1/registry/items/D-7"),
+                ("POST", "/api/v1/registry/items/D-7/transition"),
+            ],
+        );
+        assert_eq!(seen[1].body["expected_version"], 3);
+        assert_eq!(seen[1].body["kind"], "ci_run");
+        assert_eq!(
+            seen[3].body,
+            json!({"to": "review", "reason": "submitted for review", "expected_version": 4})
+        );
+    }
+
+    #[test]
+    fn listing_walks_every_page_and_hides_final_items() {
+        let (server, cloud) = backend(vec![
+            json!({"items": [item("ready", 1)], "cursor": "7"}),
+            json!({"items": [item("done", 1)], "cursor": null}),
+        ]);
+        assert_eq!(cloud.tasks(None, false).unwrap().len(), 1);
+        let seen = server.requests();
+        assert_eq!(seen[1].path, "/api/v1/registry/items?limit=200&cursor=7");
+    }
+
+    #[test]
+    fn history_reads_the_session_out_of_the_identity() {
+        let (_server, cloud) = backend(vec![json!([
+            {"actor": "token:ab:bob", "op": "claimed", "reason": null, "at": "2026-11-02T10:00:00+00:00"}
+        ])]);
+        let history = cloud.task_history(7).unwrap();
+        assert_eq!(
+            (history[0].agent.as_str(), history[0].action.as_str()),
+            ("bob", "claimed")
+        );
+    }
+
+    #[test]
+    fn tokens_use_the_registry_routes() {
+        let (server, mut cloud) = backend(vec![json!([]), json!({"raw": "x"}), json!({})]);
+        cloud.tokens().unwrap();
+        let request = TokenRequest {
+            name: "n".into(),
+            role: "agent".into(),
+            expires_at: "2027-01-01T00:00:00.000Z".into(),
+        };
+        assert_eq!(cloud.token_create("me", &request).unwrap()["raw"], "x");
+        cloud.token_revoke("me", "abc").unwrap();
+        let seen = sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/tokens"),
+                ("POST", "/api/v1/registry/tokens"),
+                ("POST", "/api/v1/registry/tokens/abc/revoke"),
+            ],
+        );
+        assert_eq!(seen[1].body["role"], "agent");
+    }
+
+    /// Keeps the calls it is given, for what HTTP does not show.
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<Call>>);
+
+    impl Transport for Recorder {
+        fn call(&self, call: &Call) -> std::result::Result<Value, ClientError> {
+            self.0.lock().unwrap().push(call.clone());
+            Ok(claim_json(1))
+        }
+    }
+
+    #[test]
+    fn a_claim_that_waits_uses_the_long_read_limit() {
+        let recorder = std::sync::Arc::new(Recorder::default());
+        let mut cloud = CloudBackend::new(std::sync::Arc::clone(&recorder), "me");
+        let waiting = ClaimRequest {
+            queue_wait_seconds: Some(25),
+            ..ClaimRequest::default()
+        };
+        cloud.claim("me", &ClaimRequest::default(), 0).unwrap();
+        cloud.claim("me", &waiting, 0).unwrap();
+        let calls = recorder.0.lock().unwrap();
+        assert!(!calls[0].long_poll);
+        assert!(calls[1].long_poll);
+    }
+
+    #[test]
+    fn undelivered_mail_names_its_addressee() {
+        let (_server, cloud) = backend(vec![
+            json!([{"id": 3, "addressee": "bob", "age_seconds": 7}]),
+        ]);
+        assert_eq!(cloud.undelivered("me", 0).unwrap()[0].to, "bob");
+    }
+
+    #[test]
+    fn a_check_without_a_status_is_refused_and_never_reads_as_free() {
+        assert!(checks(json!([{"path": "a", "state": "held"}])).is_err());
+    }
+
+    #[test]
+    fn a_large_inbox_page_is_cut_to_what_the_server_takes() {
+        let (server, mut cloud) = backend(vec![json!({"messages": []})]);
+        let filter = InboxQuery {
+            all: false,
+            limit: 200,
+        };
+        cloud.inbox("me", filter, 0).unwrap();
+        assert_eq!(server.requests()[0].path, "/api/v1/bus/inbox?limit=50");
+    }
+
+    #[test]
+    fn plain_mail_names_a_kind_and_a_plain_board_value_a_lifetime() {
+        let (server, mut cloud) =
+            backend(vec![json!({"id": 1}), json!({"key": "k", "value": "v"})]);
+        let send = SendRequest {
+            to: "bob".into(),
+            body: "x".into(),
+            ..SendRequest::default()
+        };
+        cloud.send("me", &send, 0).unwrap();
+        let write = BoardWrite {
+            key: "k".into(),
+            value: "v".into(),
+            ..BoardWrite::default()
+        };
+        cloud.board_set("me", &write, 0).unwrap();
+        let seen = server.requests();
+        assert_eq!(seen[0].body["kind"], "ask");
+        assert_eq!(seen[1].body["ttl_minutes"], 1440);
+    }
+
+    #[test]
+    fn a_heartbeat_writes_its_times_as_text() {
+        let (server, mut cloud) = backend(vec![json!({})]);
+        let beat = PresenceBeat {
+            client: "cli".into(),
+            dnd_until: Some(lockyard_core::proto::Stamp::Millis(0)),
+            activity: Some(SessionActivity {
+                tool_running: true,
+                tool_started_at: Some(lockyard_core::proto::Stamp::Millis(0)),
+                state: None,
+                meta: None,
+            }),
+            ..PresenceBeat::default()
+        };
+        cloud.heartbeat("me", &beat, 0).unwrap();
+        let body = &server.requests()[0].body;
+        assert_eq!(body["dnd_until"], "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            body["activity"]["tool_started_at"],
+            "1970-01-01T00:00:00.000Z"
+        );
     }
 
     #[test]

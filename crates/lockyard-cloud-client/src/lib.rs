@@ -53,7 +53,13 @@ impl ApiError {
                 .unwrap_or_default()
                 .to_string()
         };
-        let message = text("message");
+        // A registry 422 from model binding is `{message}` with no envelope around it.
+        let bare = parsed
+            .as_ref()
+            .and_then(|value| value.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let message = bare.unwrap_or_else(|| text("message"));
         Self {
             status,
             code: text("code"),
@@ -442,12 +448,34 @@ fn allowed_url(url: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1")
 }
 
+/// A short name for a token, so that a client can tell whether the agent process runs under the same one.
+/// It identifies, it does not protect: the socket is private to this user already.
+pub fn token_id(token: &str) -> String {
+    let hash = token.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{hash:016x}")
+}
+
 fn decode(response: ureq::Response) -> Result<Value, ClientError> {
+    let lines = response
+        .content_type()
+        .eq_ignore_ascii_case("application/x-ndjson");
     let text = response
         .into_string()
         .map_err(|error| ClientError::Transport(error.to_string()))?;
     if text.is_empty() {
         return Ok(Value::Null);
+    }
+    if lines {
+        // The registry event stream is one JSON record per line.
+        return text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<Value>, _>>()
+            .map(Value::Array)
+            .map_err(|error| ClientError::Decode(error.to_string()));
     }
     serde_json::from_str(&text).map_err(|error| ClientError::Decode(error.to_string()))
 }
@@ -676,6 +704,31 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_digit() || (c.is_ascii_uppercase() && !"ILOU".contains(c)))
         );
+    }
+
+    #[test]
+    fn a_bare_message_from_the_registry_is_read() {
+        let error = ApiError::parse(422, r#"{"message":"bad request"}"#, None);
+        assert_eq!(error.message, "bad request");
+    }
+
+    #[test]
+    fn the_registry_stream_reads_one_record_per_line() {
+        let body = "{\"seq\":1,\"op\":\"created\"}\n{\"seq\":2,\"op\":\"claimed\"}\n";
+        let server = FakeServer::start(vec![
+            Reply::text(200, body).header("Content-Type", "application/x-ndjson; charset=utf-8"),
+        ]);
+        let client = Client::new(&server.url(), "secret".into()).unwrap();
+        let value = client
+            .call(&Call::get("a", "/api/v1/registry/events".into()))
+            .unwrap();
+        assert_eq!(value[1]["seq"], 2);
+    }
+
+    #[test]
+    fn a_token_id_is_stable_and_tells_tokens_apart() {
+        assert_eq!(token_id("a"), token_id("a"));
+        assert_ne!(token_id("a"), token_id("b"));
     }
 
     #[test]

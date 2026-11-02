@@ -49,7 +49,8 @@ impl Status {
         .find(|status| status.as_str() == text)
     }
 
-    fn is_final(self) -> bool {
+    /// True when a task in this status will not change again.
+    pub fn is_final(self) -> bool {
         matches!(self, Self::Accepted | Self::Cancelled)
     }
 }
@@ -73,6 +74,53 @@ pub struct Task {
     pub evidence: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Urgency of a backlog item. Local tasks have none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+}
+
+/// A new task. Everything past `body` belongs to the cloud backlog, where the agent that writes an
+/// item also sets its urgency.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskSpec {
+    pub title: String,
+    pub body: String,
+    pub acceptance: Option<String>,
+    pub priority: Option<String>,
+    pub p0_category: Option<String>,
+    pub kind: Option<String>,
+    pub target: Option<String>,
+    pub verification: Option<String>,
+    pub area: Option<String>,
+    pub due_at: Option<String>,
+    pub evidence: Option<String>,
+}
+
+impl TaskSpec {
+    /// True when local mode would have to drop part of this request.
+    pub fn uses_registry_fields(&self) -> bool {
+        [
+            &self.acceptance,
+            &self.priority,
+            &self.p0_category,
+            &self.kind,
+            &self.target,
+            &self.verification,
+            &self.area,
+            &self.due_at,
+            &self.evidence,
+        ]
+        .iter()
+        .any(|field| field.is_some())
+    }
+}
+
+/// A change of urgency.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskPlan {
+    pub priority: Option<String>,
+    pub p0_category: Option<String>,
+    pub due_at: Option<String>,
 }
 
 impl Task {
@@ -322,6 +370,7 @@ fn read_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         evidence: row.get(7)?,
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
+        priority: None,
     })
 }
 

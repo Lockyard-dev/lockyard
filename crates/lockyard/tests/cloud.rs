@@ -370,13 +370,19 @@ fn the_new_commands_reach_their_routes() {
 }
 
 #[test]
-fn the_task_commands_point_at_work_in_cloud_mode() {
+fn the_task_commands_read_the_registry_in_cloud_mode() {
     let server = Server::start();
     let dir = cloud_project(&server);
     let runtime = tempfile::tempdir().unwrap();
-    let refused = cli(dir.path(), runtime.path(), &["task", "list"]);
-    assert_eq!(refused.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("lockyard work"));
+    let listed = cli(dir.path(), runtime.path(), &["task", "list"]);
+    assert_eq!(listed.status.code(), Some(0), "{listed:?}");
+    let state = server.state.lock().unwrap();
+    assert!(
+        state
+            .seen
+            .iter()
+            .any(|seen| seen.path.starts_with("/api/v1/registry/items"))
+    );
 }
 
 fn hook(dir: &Path, runtime: &Path, event: &Value) -> Output {

@@ -34,6 +34,11 @@ impl AgentSocket {
             .then_some(socket)
     }
 
+    /// The token this process runs under. Calls through it carry that token's role, not the caller's.
+    pub fn token_id(&self) -> io::Result<String> {
+        self.ping().map(|status| status.token_id)
+    }
+
     /// Asks the process at `path` how it is, whichever workspace it serves.
     pub fn status(path: &Path, timeout: Duration) -> io::Result<AgentStatus> {
         Self {
