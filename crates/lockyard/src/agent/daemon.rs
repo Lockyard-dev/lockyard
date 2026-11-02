@@ -13,9 +13,9 @@ use super::private_dir;
 use super::wire::{AgentStatus, Envelope, Phase, Reply, Request, Source};
 use lockyard_cloud_client::{Call, ClientError, CloudBackend, Transport, ulid};
 use lockyard_core::proto::{
-    ActivityRequest, BoardEntry, CheckStatus, Claim, ClaimMode, ClaimQuery, DirtyPath, EventPage,
-    EventQuery, InboxQuery, Message, PathCheck, PresenceBeat, SessionActivity, SessionState, Stamp,
-    Stream, rfc3339,
+    AccessRecord, ActivityRequest, BoardEntry, CheckStatus, Claim, ClaimMode, ClaimQuery,
+    DirtyPath, EventPage, EventQuery, InboxQuery, LostClaim, Message, PathCheck, PresenceBeat,
+    QueueEntry, SessionActivity, SessionState, Stamp, Stream, rfc3339,
 };
 use lockyard_core::zones::Conflict;
 use lockyard_core::{Backend, Error, ZonePath};
@@ -42,6 +42,8 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Longest pause of a failed event poll. A refresh can make the view look fresh again while the poll
 /// still sleeps, and until it wakes the view does not hear about new claims.
 const MAX_POLL_PAUSE: Duration = Duration::from_secs(2);
+const MAIL_BUFFER_LIMIT: usize = 10;
+const MAIL_DELIVERY_LEASE: Duration = Duration::from_secs(60);
 
 /// Every interval of the process. Tests shorten them.
 #[derive(Debug, Clone)]
@@ -116,8 +118,36 @@ impl UnreadCount {
 }
 
 #[derive(Default)]
+struct LostMarks {
+    marks: Vec<LostClaim>,
+    generation: u64,
+    clean: u64,
+    at: Option<Instant>,
+    wall_at: Option<SystemTime>,
+}
+
+struct MailBuffer {
+    messages: VecDeque<Message>,
+    reserved_at: Instant,
+    lease_expires_at: Instant,
+}
+
+impl LostMarks {
+    fn fresh(&self, limit: Duration) -> bool {
+        self.generation == self.clean
+            && self.at.is_some_and(|at| at.elapsed() < limit)
+            && self
+                .wall_at
+                .is_some_and(|at| SystemTime::now().duration_since(at).unwrap_or_default() < limit)
+    }
+}
+
+#[derive(Default)]
 struct View {
     claims: Vec<Claim>,
+    extras_stale: bool,
+    queue: Vec<QueueEntry>,
+    requests: Vec<AccessRecord>,
     board: Vec<BoardEntry>,
     zones_generation: u64,
     zones_clean: u64,
@@ -128,6 +158,8 @@ struct View {
     board_at: Option<Instant>,
     board_wall_at: Option<SystemTime>,
     unread: HashMap<String, UnreadCount>,
+    mail: HashMap<String, MailBuffer>,
+    lost: HashMap<String, LostMarks>,
 }
 
 impl View {
@@ -436,8 +468,9 @@ impl<T: Transport + 'static> Shared<T> {
     fn unread(&self, session: &str) -> Reply {
         let limit = self.timing().fresh;
         self.hear(session);
-        let generation = {
+        let registered = {
             let mut view = self.write_view();
+            let registered = !view.unread.contains_key(session);
             let entry = view.unread.entry(session.to_string()).or_default();
             if entry.fresh(limit) {
                 return Reply {
@@ -446,23 +479,41 @@ impl<T: Transport + 'static> Shared<T> {
                     ..Reply::default()
                 };
             }
-            entry.generation
+            registered
         };
-        let asked = session.to_string();
-        let answer = self.within_deadline(move |backend| backend.unread(&asked), session);
-        match answer {
-            Some(Ok(count)) => {
-                self.store_unread(session, generation, count);
-                Reply {
-                    unread: Some(count),
-                    source: Some(Source::Server),
-                    ..Reply::default()
-                }
-            }
-            _ => Reply {
-                source: Some(Source::None),
-                ..Reply::default()
-            },
+        if registered {
+            self.nudge();
+        }
+        Reply {
+            unread: None,
+            source: Some(Source::None),
+            ..Reply::default()
+        }
+    }
+
+    fn zone_snapshot(&self, session: &str) -> Reply {
+        self.hear(session);
+        let mut view = self.write_view();
+        let age_ms = view
+            .zones_at
+            .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
+        let claims = view.claims.clone();
+        let queue = view.queue.clone();
+        let requests = view.requests.clone();
+        let lost = view.lost.entry(session.to_string()).or_default();
+        let lost = lost.at.map(|_| lost.marks.clone());
+        Reply {
+            claims: Some(claims),
+            queue: Some(queue),
+            requests: Some(requests),
+            lost,
+            source: Some(if age_ms.is_some() {
+                Source::View
+            } else {
+                Source::None
+            }),
+            age_ms,
+            ..Reply::default()
         }
     }
 
@@ -475,34 +526,54 @@ impl<T: Transport + 'static> Shared<T> {
         entry.wall_at = Some(SystemTime::now());
     }
 
-    fn take_mail(&self, session: &str, limit: usize, lease_seconds: i64) -> Reply {
-        let asked = session.to_string();
-        let answer = self.within_deadline(
-            move |mut backend| -> Result<Vec<Message>, Error> {
-                let page = backend.inbox(&asked, InboxQuery { all: false, limit }, 0)?;
-                if page.messages.is_empty() {
-                    return Ok(Vec::new());
-                }
-                let ids: Vec<i64> = page.messages.iter().map(|message| message.id).collect();
-                let granted = backend.inbox_claim(&asked, "agent", &ids, lease_seconds, 0)?;
-                Ok(page
-                    .messages
-                    .into_iter()
-                    .filter(|message| granted.contains(&message.id))
-                    .collect())
-            },
-            session,
-        );
-        match answer {
-            Some(Ok(messages)) => Reply {
-                messages: Some(messages),
-                source: Some(Source::Server),
-                ..Reply::default()
-            },
-            _ => Reply {
+    fn take_mail(&self, session: &str, limit: usize, _lease_seconds: i64) -> Reply {
+        let mut view = self.write_view();
+        let fresh = self.timing().fresh;
+        // Reserved mail is good for its lease, whatever the age of the count.
+        if !view.mail.contains_key(session)
+            && !view
+                .unread
+                .get(session)
+                .is_some_and(|entry| entry.fresh(fresh))
+        {
+            if !view.unread.contains_key(session) {
+                view.unread.entry(session.to_string()).or_default();
+                drop(view);
+                self.nudge();
+            }
+            return Reply {
                 source: Some(Source::None),
                 ..Reply::default()
-            },
+            };
+        }
+        let now = Instant::now();
+        if view.mail.get(session).is_some_and(|buffer| {
+            debug_assert!(buffer.lease_expires_at >= buffer.reserved_at);
+            buffer.lease_expires_at.saturating_duration_since(now) < Duration::from_secs(10)
+        }) {
+            view.mail.remove(session);
+        }
+        let mut messages = Vec::new();
+        if let Some(buffer) = view.mail.get_mut(session) {
+            for _ in 0..limit {
+                let Some(message) = buffer.messages.pop_front() else {
+                    break;
+                };
+                messages.push(message);
+            }
+            if buffer.messages.is_empty() {
+                view.mail.remove(session);
+            }
+        }
+        if let Some(count) = view.unread.get_mut(session) {
+            count.count = count.count.saturating_sub(messages.len() as i64).max(0);
+            count.at = Some(now);
+            count.wall_at = Some(SystemTime::now());
+        }
+        Reply {
+            messages: Some(messages),
+            source: Some(Source::View),
+            ..Reply::default()
         }
     }
 
@@ -648,16 +719,22 @@ impl<T: Transport + 'static> Shared<T> {
     }
 
     fn hear(&self, session: &str) {
-        self.sessions()
-            .entry(session.to_string())
-            .or_default()
-            .heard = Some(Instant::now());
+        let registered = {
+            let mut sessions = self.sessions();
+            let registered = !sessions.contains_key(session);
+            sessions.entry(session.to_string()).or_default().heard = Some(Instant::now());
+            registered
+        };
+        if registered {
+            self.nudge();
+        }
     }
 
     fn touch(&self, session: &str, client: &str, phase: Phase, write_paths: Vec<String>) -> Reply {
         let running = phase == Phase::Pre;
-        let beat = {
+        let (beat, registered) = {
             let mut sessions = self.sessions();
+            let registered = !sessions.contains_key(session);
             let track = sessions.entry(session.to_string()).or_default();
             track.heard = Some(Instant::now());
             track.client = client.to_string();
@@ -670,8 +747,11 @@ impl<T: Transport + 'static> Shared<T> {
                 track.beat = Some(Instant::now());
                 track.tool_running = running;
             }
-            send
+            (send, registered)
         };
+        if registered {
+            self.nudge();
+        }
         if beat {
             let state = if phase == Phase::End {
                 SessionState::Ended
@@ -831,7 +911,11 @@ impl<T: Transport + 'static> Shared<T> {
             return match self.transport.call(&call) {
                 Ok(value) => {
                     if writes {
-                        self.write_view().zones_generation += 1;
+                        let mut view = self.write_view();
+                        view.zones_generation += 1;
+                        for marks in view.lost.values_mut() {
+                            marks.generation += 1;
+                        }
                         self.nudge();
                     }
                     Reply {
@@ -919,6 +1003,7 @@ impl<T: Transport + 'static> Shared<T> {
             },
             Request::Check { session, paths } => self.check(&session, paths),
             Request::Unread { session } => self.unread(&session),
+            Request::ZoneSnapshot { session } => self.zone_snapshot(&session),
             Request::TakeMail {
                 session,
                 limit,
@@ -942,6 +1027,9 @@ impl<T: Transport + 'static> Shared<T> {
         for event in &page.events {
             if event.kind.starts_with("zone.") {
                 view.zones_generation += 1;
+                for marks in view.lost.values_mut() {
+                    marks.generation += 1;
+                }
                 touched = true;
             } else if event.kind == "board.changed" {
                 view.board_generation += 1;
@@ -1016,11 +1104,20 @@ impl<T: Transport + 'static> Shared<T> {
 
     fn refresh_zones(&self) {
         let (generation, started) = (self.read_view().zones_generation, Instant::now());
-        if let Ok(claims) = self
-            .backend(&self.session)
-            .claims(&ClaimQuery::default(), 0)
-        {
-            let mut view = self.write_view();
+        let backend = self.backend(&self.session);
+        let claims = backend.claims(&ClaimQuery::default(), 0);
+        let queue = backend.queue_list(&self.session);
+        let requests = backend.zone_requests(&self.session);
+        let mut view = self.write_view();
+        // Only claims decide a path check, so a failed queue or request read must not stale it.
+        view.extras_stale = queue.is_err() || requests.is_err();
+        if let Ok(queue) = queue {
+            view.queue = queue;
+        }
+        if let Ok(requests) = requests {
+            view.requests = requests;
+        }
+        if let Ok(claims) = claims {
             view.claims = claims;
             view.zones_clean = generation;
             view.zones_at = Some(started);
@@ -1050,6 +1147,7 @@ impl<T: Transport + 'static> Shared<T> {
         let wanted: Vec<(String, u64)> = {
             let mut view = self.write_view();
             view.unread.retain(|session, _| live.contains(session));
+            view.mail.retain(|session, _| live.contains(session));
             let stale = view.unread.iter().filter(|(_, entry)| !entry.fresh(limit));
             stale
                 .map(|(session, entry)| (session.clone(), entry.generation))
@@ -1062,6 +1160,104 @@ impl<T: Transport + 'static> Shared<T> {
         }
     }
 
+    fn refresh_mail(&self) {
+        let now = Instant::now();
+        let window = self.timing().active_window;
+        let live: HashSet<String> = {
+            let mut sessions = self.sessions();
+            sessions.retain(|_, track| track.heard.is_some_and(|at| at.elapsed() < window));
+            sessions.keys().cloned().collect()
+        };
+        let wanted: Vec<String> = {
+            let mut view = self.write_view();
+            view.mail.retain(|_, buffer| buffer.lease_expires_at > now);
+            view.unread
+                .iter()
+                .filter(|(session, entry)| {
+                    entry.count > 0 && live.contains(*session) && !view.mail.contains_key(*session)
+                })
+                .map(|(session, _)| session.clone())
+                .collect()
+        };
+        for session in wanted {
+            let mut backend = self.backend(&session);
+            let page = match backend.inbox(
+                &session,
+                InboxQuery {
+                    all: false,
+                    limit: MAIL_BUFFER_LIMIT,
+                },
+                0,
+            ) {
+                Ok(page) => page,
+                Err(_) => continue,
+            };
+            if page.messages.is_empty() {
+                continue;
+            }
+            let ids: Vec<i64> = page.messages.iter().map(|message| message.id).collect();
+            let reserved_at = Instant::now();
+            let granted = match backend.inbox_claim(
+                &session,
+                "agent",
+                &ids,
+                i64::try_from(MAIL_DELIVERY_LEASE.as_secs()).unwrap_or(i64::MAX),
+                0,
+            ) {
+                Ok(granted) => granted,
+                Err(_) => continue,
+            };
+            let messages: VecDeque<Message> = page
+                .messages
+                .into_iter()
+                .filter(|message| granted.contains(&message.id))
+                .collect();
+            if messages.is_empty() {
+                continue;
+            }
+            // A claim is only a lease: if the agent dies before marking mail seen, the server
+            // releases it at expiry and a later upkeep pass can deliver it again.
+            let mut view = self.write_view();
+            view.mail.entry(session).or_insert(MailBuffer {
+                messages,
+                reserved_at,
+                lease_expires_at: reserved_at + MAIL_DELIVERY_LEASE,
+            });
+        }
+    }
+
+    fn refresh_lost(&self) {
+        let window = self.timing().active_window;
+        let live: HashSet<String> = {
+            let mut sessions = self.sessions();
+            sessions.retain(|_, track| track.heard.is_some_and(|at| at.elapsed() < window));
+            sessions.keys().cloned().collect()
+        };
+        let limit = self.timing().fresh / 2;
+        let wanted: Vec<(String, u64)> = {
+            let mut view = self.write_view();
+            view.lost.retain(|session, _| live.contains(session));
+            for session in &live {
+                view.lost.entry(session.clone()).or_default();
+            }
+            view.lost
+                .iter()
+                .filter(|(_, marks)| !marks.fresh(limit))
+                .map(|(session, marks)| (session.clone(), marks.generation))
+                .collect()
+        };
+        for (session, generation) in wanted {
+            if let Ok(marks) = self.backend(&session).lost(&session) {
+                let mut view = self.write_view();
+                let entry = view.lost.entry(session).or_default();
+                entry.marks = marks;
+                entry.clean = generation;
+                entry.at = Some(Instant::now());
+                entry.wall_at = Some(SystemTime::now());
+            }
+        }
+    }
+
     /// One thread keeps the view current, so a slow server delays nothing a hook waits for.
     fn upkeep(&self) {
         while !self.stopped() {
@@ -1069,7 +1265,7 @@ impl<T: Transport + 'static> Shared<T> {
             let (zones, board) = {
                 let view = self.read_view();
                 (
-                    !view.fresh(half),
+                    !view.fresh(half) || view.extras_stale,
                     view.board_generation != view.board_clean
                         || view.board_at.is_none_or(|at| at.elapsed() >= half),
                 )
@@ -1081,6 +1277,8 @@ impl<T: Transport + 'static> Shared<T> {
                 self.refresh_board();
             }
             self.refresh_unread();
+            self.refresh_mail();
+            self.refresh_lost();
             self.refresh_session_events();
             self.flush_activity();
             let mut signal = self.signal();
@@ -1338,6 +1536,9 @@ mod tests {
     #[derive(Default)]
     struct FakeServer {
         claims: Mutex<Vec<Value>>,
+        queue: Mutex<Vec<Value>>,
+        requests: Mutex<Vec<Value>>,
+        lost: Mutex<Vec<Value>>,
         unread: Mutex<i64>,
         events: Mutex<Vec<Value>>,
         writes: Mutex<Vec<Call>>,
@@ -1348,6 +1549,8 @@ mod tests {
         calls: Mutex<Vec<String>>,
         event_calls: AtomicUsize,
         refuse_with: Mutex<Option<u16>>,
+        fail_queue: AtomicBool,
+        fail_inbox_for: Mutex<Option<String>>,
     }
 
     impl FakeServer {
@@ -1416,6 +1619,16 @@ mod tests {
             if self.down.load(Ordering::SeqCst) {
                 return Err(ClientError::Transport("down".into()));
             }
+            if route == "/api/v1/bus/inbox"
+                && self
+                    .fail_inbox_for
+                    .lock()
+                    .unwrap()
+                    .as_deref()
+                    .is_some_and(|session| session == call.session)
+            {
+                return Err(ClientError::Transport("inbox unavailable".into()));
+            }
             let marked_bad = call.body.as_ref().is_some_and(|body| body["body"] == "bad");
             let refusal = if marked_bad {
                 Some(404)
@@ -1428,9 +1641,24 @@ mod tests {
                     ..Default::default()
                 }));
             }
+            if route == "/api/v1/zones/queue"
+                && call.method == "GET"
+                && self.fail_queue.load(Ordering::SeqCst)
+            {
+                return Err(ClientError::Transport("queue unavailable".into()));
+            }
             match route.as_str() {
                 "/api/v1/zones/claims" if call.method == "GET" => {
                     Ok(json!({"claims": *self.claims.lock().unwrap()}))
+                }
+                "/api/v1/zones/queue" if call.method == "GET" => {
+                    Ok(json!({"queue": *self.queue.lock().unwrap()}))
+                }
+                "/api/v1/zones/requests" if call.method == "GET" => {
+                    Ok(json!({"requests": *self.requests.lock().unwrap()}))
+                }
+                "/api/v1/zones/lost" if call.method == "GET" => {
+                    Ok(json!({"lost": *self.lost.lock().unwrap()}))
                 }
                 "/api/v1/zones/check" => Ok(json!({"paths": [{"path": "src", "status": "free"}]})),
                 "/api/v1/bus/board" => Ok(json!([{"key": "k", "value": "v"}])),
@@ -1671,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn unread_answers_from_memory_after_the_first_count_and_an_event_refreshes_it() {
+    fn unread_registers_unknown_then_upkeep_fills_it_and_events_refresh_it() {
         let rig = start_with(
             Timing {
                 fresh: Duration::from_secs(30),
@@ -1682,14 +1910,18 @@ mod tests {
             },
         );
         view_ready(&rig);
+        rig.server.hang_ms.store(80, Ordering::SeqCst);
         let ask = || Request::Unread {
             session: "me".into(),
         };
+        let started = Instant::now();
         let first = rig.daemon.handle(ask());
-        assert_eq!(
-            (first.unread, first.source),
-            (Some(2), Some(Source::Server))
-        );
+        assert_eq!((first.unread, first.source), (None, Some(Source::None)));
+        assert!(started.elapsed() < Duration::from_millis(20));
+        wait_for("the first unread count", || {
+            let reply = rig.daemon.handle(ask());
+            reply.unread == Some(2) && reply.source == Some(Source::View)
+        });
         let second = rig.daemon.handle(ask());
         assert_eq!(
             (second.unread, second.source),
@@ -1701,6 +1933,97 @@ mod tests {
             let reply = rig.daemon.handle(ask());
             reply.unread == Some(3) && reply.source == Some(Source::View)
         });
+    }
+
+    #[test]
+    fn zone_snapshot_never_calls_the_backend_when_down_or_blocked() {
+        let rig = start_with(timing(), |_| {});
+        view_ready(&rig);
+        rig.daemon.shared.stop();
+        let before = rig.server.calls.lock().unwrap().len();
+        let ask = || Request::ZoneSnapshot {
+            session: "me".into(),
+        };
+        rig.server.down.store(true, Ordering::SeqCst);
+        let down = rig.daemon.handle(ask());
+        assert_eq!(down.source, Some(Source::View));
+        rig.server.down.store(false, Ordering::SeqCst);
+        rig.server.hang_ms.store(2_000, Ordering::SeqCst);
+        let started = Instant::now();
+        let blocked = rig.daemon.handle(ask());
+        assert!(started.elapsed() < Duration::from_millis(20));
+        assert_eq!(blocked.source, Some(Source::View));
+        assert_eq!(rig.server.calls.lock().unwrap().len(), before);
+    }
+
+    #[test]
+    fn a_zone_event_refreshes_claims_queue_and_requests_in_the_snapshot() {
+        let rig = start_with(timing(), |_| {});
+        view_ready(&rig);
+        rig.server.claim(8, "holder", "src");
+        *rig.server.queue.lock().unwrap() =
+            vec![json!({"id": 2, "session": "waiter", "paths": ["src"]})];
+        *rig.server.requests.lock().unwrap() =
+            vec![json!({"id": 3, "from": "asker", "text": "help"})];
+        rig.server.event("zone.claimed", None);
+        wait_for("the changed zone snapshot", || {
+            let reply = rig.daemon.handle(Request::ZoneSnapshot {
+                session: "me".into(),
+            });
+            reply.claims.as_ref().is_some_and(|items| items.len() == 1)
+                && reply.queue.as_ref().is_some_and(|items| items.len() == 1)
+                && reply
+                    .requests
+                    .as_ref()
+                    .is_some_and(|items| items.len() == 1)
+        });
+    }
+
+    #[test]
+    fn a_failed_queue_refresh_keeps_its_old_value_and_is_retried_while_claims_stay_fresh() {
+        let rig = start_with(timing(), |server| {
+            server.claim(1, "old", "old");
+            *server.queue.lock().unwrap() =
+                vec![json!({"id": 2, "session": "waiter", "paths": ["old"]})];
+        });
+        view_ready(&rig);
+        rig.server.claim(3, "new", "new");
+        *rig.server.queue.lock().unwrap() =
+            vec![json!({"id": 4, "session": "waiter", "paths": ["new"]})];
+        rig.server.fail_queue.store(true, Ordering::SeqCst);
+        rig.daemon.shared.write_view().zones_generation += 1;
+        rig.daemon.shared.refresh_zones();
+        let view = rig.daemon.shared.read_view();
+        assert_eq!(view.claims.last().unwrap().id, 3);
+        assert_eq!(view.queue[0].id, 2);
+        assert!(view.extras_stale);
+        assert!(view.fresh(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn lost_marks_are_loaded_for_heard_sessions_and_expired_sessions_are_dropped() {
+        let rig = start_with(
+            Timing {
+                active_window: Duration::from_millis(100),
+                ..timing()
+            },
+            |server| {
+                *server.lost.lock().unwrap() =
+                    vec![json!({"claim_id": 9, "session": "me", "paths": ["src"]})];
+            },
+        );
+        rig.daemon.handle(Request::ZoneSnapshot {
+            session: "me".into(),
+        });
+        rig.daemon.shared.refresh_lost();
+        let reply = rig.daemon.handle(Request::ZoneSnapshot {
+            session: "me".into(),
+        });
+        assert_eq!(reply.lost.as_ref().unwrap()[0].claim_id, 9);
+        rig.daemon.shared.sessions().get_mut("me").unwrap().heard =
+            Some(Instant::now() - Duration::from_millis(200));
+        rig.daemon.shared.refresh_lost();
+        assert!(!rig.daemon.shared.read_view().lost.contains_key("me"));
     }
 
     #[test]
@@ -1971,12 +2294,41 @@ mod tests {
     #[test]
     fn mail_is_taken_under_a_delivery_claim_and_marked_only_by_a_later_seen() {
         let rig = start_with(timing(), |server| *server.unread.lock().unwrap() = 2);
-        let taken = rig.daemon.handle(Request::TakeMail {
+        let unknown = rig.daemon.handle(Request::TakeMail {
             session: "me".into(),
             limit: 5,
             lease_seconds: 60,
         });
-        assert_eq!(taken.messages.unwrap().len(), 2);
+        assert_eq!(
+            (unknown.messages, unknown.source),
+            (None, Some(Source::None))
+        );
+        rig.daemon.handle(Request::Unread {
+            session: "me".into(),
+        });
+        wait_for("mail to be reserved", || {
+            rig.daemon.shared.read_view().mail.contains_key("me")
+        });
+        let taken = rig.daemon.handle(Request::TakeMail {
+            session: "me".into(),
+            limit: 1,
+            lease_seconds: 60,
+        });
+        assert_eq!(taken.messages.unwrap().len(), 1);
+        assert_eq!(
+            rig.daemon
+                .handle(Request::Unread {
+                    session: "me".into()
+                })
+                .unread,
+            Some(1)
+        );
+        let remaining = rig.daemon.handle(Request::TakeMail {
+            session: "me".into(),
+            limit: 1,
+            lease_seconds: 60,
+        });
+        assert_eq!(remaining.messages.unwrap().len(), 1);
         let claims = rig.server.writes_to("/bus/inbox/claim");
         assert_eq!(
             claims[0].body.as_ref().unwrap(),
@@ -1987,14 +2339,145 @@ mod tests {
     }
 
     #[test]
-    fn taking_mail_during_an_outage_is_unknown_not_empty() {
-        let rig = start_with(timing(), |server| server.down.store(true, Ordering::SeqCst));
+    fn taking_mail_uses_no_backend_calls_when_down_or_hung() {
+        let rig = start_with(timing(), |server| *server.unread.lock().unwrap() = 1);
+        rig.daemon.handle(Request::Unread {
+            session: "me".into(),
+        });
+        wait_for("mail to be reserved", || {
+            rig.daemon.shared.read_view().mail.contains_key("me")
+        });
+        rig.daemon.shared.stop();
+        let before = rig.server.calls.lock().unwrap().len();
+        rig.server.down.store(true, Ordering::SeqCst);
         let taken = rig.daemon.handle(Request::TakeMail {
             session: "me".into(),
             limit: 5,
             lease_seconds: 60,
         });
-        assert_eq!((taken.messages, taken.source), (None, Some(Source::None)));
+        assert_eq!(taken.messages.unwrap().len(), 1);
+        assert_eq!(rig.server.calls.lock().unwrap().len(), before);
+        rig.server.down.store(false, Ordering::SeqCst);
+        rig.server.hang_ms.store(500, Ordering::SeqCst);
+        let empty = rig.daemon.handle(Request::TakeMail {
+            session: "me".into(),
+            limit: 5,
+            lease_seconds: 5,
+        });
+        assert_eq!(
+            (empty.messages, empty.source),
+            (Some(Vec::new()), Some(Source::View))
+        );
+        assert_eq!(rig.server.calls.lock().unwrap().len(), before);
+    }
+
+    #[test]
+    fn take_mail_is_atomic_across_two_hundred_concurrent_rounds() {
+        let rig = start_with(timing(), |_| {});
+        rig.daemon.shared.stop();
+        for id in 1..=200 {
+            {
+                let mut view = rig.daemon.shared.write_view();
+                view.unread.insert(
+                    "me".into(),
+                    UnreadCount {
+                        count: 1,
+                        generation: 0,
+                        clean: 0,
+                        at: Some(Instant::now()),
+                        wall_at: Some(SystemTime::now()),
+                    },
+                );
+                let reserved_at = Instant::now();
+                view.mail.insert(
+                    "me".into(),
+                    MailBuffer {
+                        messages: VecDeque::from([serde_json::from_value(json!({
+                            "id": id, "body": "only once"
+                        }))
+                        .unwrap()]),
+                        reserved_at,
+                        lease_expires_at: reserved_at + MAIL_DELIVERY_LEASE,
+                    },
+                );
+            }
+            let (left, right) = thread::scope(|scope| {
+                let left = scope.spawn(|| {
+                    rig.daemon.handle(Request::TakeMail {
+                        session: "me".into(),
+                        limit: 5,
+                        lease_seconds: 60,
+                    })
+                });
+                let right = scope.spawn(|| {
+                    rig.daemon.handle(Request::TakeMail {
+                        session: "me".into(),
+                        limit: 5,
+                        lease_seconds: 60,
+                    })
+                });
+                (left.join().unwrap(), right.join().unwrap())
+            });
+            assert_eq!(
+                left.messages.unwrap_or_default().len() + right.messages.unwrap_or_default().len(),
+                1,
+                "round {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mail_buffer_with_less_than_ten_seconds_of_lease_is_dropped() {
+        let rig = start_with(timing(), |_| {});
+        rig.daemon.shared.stop();
+        let mut view = rig.daemon.shared.write_view();
+        let reserved_at = Instant::now();
+        view.unread.insert(
+            "me".into(),
+            UnreadCount {
+                count: 1,
+                generation: 0,
+                clean: 0,
+                at: Some(reserved_at),
+                wall_at: Some(SystemTime::now()),
+            },
+        );
+        view.mail.insert(
+            "me".into(),
+            MailBuffer {
+                messages: VecDeque::from([serde_json::from_value(
+                    json!({"id": 1, "body": "lease"}),
+                )
+                .unwrap()]),
+                reserved_at,
+                lease_expires_at: reserved_at + Duration::from_secs(9),
+            },
+        );
+        drop(view);
+        let taken = rig.daemon.handle(Request::TakeMail {
+            session: "me".into(),
+            limit: 5,
+            lease_seconds: 60,
+        });
+        assert_eq!(
+            (taken.messages, taken.source),
+            (Some(Vec::new()), Some(Source::View))
+        );
+    }
+
+    #[test]
+    fn upkeep_reserves_mail_for_each_session_even_if_another_session_fails() {
+        let rig = start_with(timing(), |server| *server.unread.lock().unwrap() = 1);
+        rig.daemon.shared.stop();
+        rig.daemon.shared.hear("fails");
+        rig.daemon.shared.hear("works");
+        rig.daemon.shared.store_unread("fails", 0, 1);
+        rig.daemon.shared.store_unread("works", 0, 1);
+        *rig.server.fail_inbox_for.lock().unwrap() = Some("fails".into());
+        rig.daemon.shared.refresh_mail();
+        assert!(!rig.daemon.shared.read_view().mail.contains_key("fails"));
+        assert!(rig.daemon.shared.read_view().mail.contains_key("works"));
+        assert_eq!(rig.server.writes_to("/bus/inbox/claim").len(), 1);
     }
 
     #[test]

@@ -564,8 +564,14 @@ fn through_the_agent_a_hook_delivers_mail_in_two_phases() {
     let _agent = start_agent(dir.path(), runtime.path());
     let event =
         json!({"hook_event_name": "UserPromptSubmit", "session_id": "me", "cwd": dir.path()});
-    let result = hook(dir.path(), runtime.path(), &event);
-    assert!(String::from_utf8_lossy(&result.stdout).contains("look at src"));
+    // The first hook registers the session; the agent reserves its mail in the background.
+    let end = Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&hook(dir.path(), runtime.path(), &event).stdout)
+        .contains("look at src")
+    {
+        assert!(Instant::now() < end, "the mail never reached a hook");
+        thread::sleep(Duration::from_millis(20));
+    }
     let claimed = server.seen("POST", "/api/v1/bus/inbox/claim");
     assert_eq!(claimed[0].body, json!({"ids": [7], "lease_seconds": 60}));
     let end = Instant::now() + Duration::from_secs(5);

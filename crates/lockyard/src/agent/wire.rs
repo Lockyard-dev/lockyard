@@ -3,7 +3,7 @@
 //! Messages on the agent socket: one JSON object per line, one answer per request.
 
 use lockyard_cloud_client::{Call, ClientError};
-use lockyard_core::proto::{Message, PathCheck};
+use lockyard_core::proto::{AccessRecord, Claim, LostClaim, Message, PathCheck, QueueEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -30,6 +30,8 @@ pub enum Request {
     Check { session: String, paths: Vec<String> },
     /// How much mail is waiting?
     Unread { session: String },
+    /// A memory-only snapshot of coordination state for one session.
+    ZoneSnapshot { session: String },
     /// Reserve mail for showing. It is marked later, through a `Call` to `inbox/seen`.
     TakeMail {
         session: String,
@@ -103,6 +105,16 @@ pub struct Reply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unread: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claims: Option<Vec<Claim>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<Vec<QueueEntry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<Vec<AccessRecord>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lost: Option<Vec<LostClaim>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<Message>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<Vec<lockyard_core::proto::Event>>,
@@ -136,6 +148,39 @@ mod tests {
         let line = serde_json::to_string(&envelope).unwrap();
         assert_eq!(line, r#"{"workspace":"w","op":"unread","session":"s"}"#);
         assert_eq!(serde_json::from_str::<Envelope>(&line).unwrap(), envelope);
+    }
+
+    #[test]
+    fn a_zone_snapshot_request_uses_the_additive_socket_shape() {
+        let request = Envelope {
+            workspace: "w".into(),
+            request: Request::ZoneSnapshot {
+                session: "s".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"workspace":"w","op":"zone_snapshot","session":"s"}"#
+        );
+        let mut reply = Reply {
+            source: Some(Source::None),
+            claims: Some(Vec::new()),
+            queue: Some(Vec::new()),
+            requests: Some(Vec::new()),
+            ..Reply::default()
+        };
+        let value = serde_json::to_value(&reply).unwrap();
+        assert_eq!(value["source"], "none");
+        assert_eq!(value["claims"], serde_json::json!([]));
+        assert_eq!(value["queue"], serde_json::json!([]));
+        assert_eq!(value["requests"], serde_json::json!([]));
+        assert!(value.get("lost").is_none());
+        assert!(value.get("age_ms").is_none());
+        reply.lost = Some(Vec::new());
+        assert_eq!(
+            serde_json::to_value(reply).unwrap()["lost"],
+            serde_json::json!([])
+        );
     }
 
     #[test]

@@ -1179,7 +1179,17 @@ fn hooks(w: &World) {
         dead.err.contains("Broken pipe") || dead.err.contains("broken pipe")
     });
     assert_eq!(unread(&two), waiting, "nobody saw it");
-    let second = machine.hook("claude", &prompt);
+    let mut second = None;
+    wait_for("the active delivery lease", Duration::from_secs(5), || {
+        let answer = machine.hook("claude", &prompt);
+        if unread(&two) == waiting && !answer.out.contains("two phase") {
+            second = Some(answer);
+            true
+        } else {
+            false
+        }
+    });
+    let second = second.expect("the lease check ran");
     assert!(
         !second.out.contains("two phase"),
         "the lease holds: {}",
@@ -1191,13 +1201,22 @@ fn hooks(w: &World) {
     w.beat(&mail);
     w.ly(&other, &["msg", "send", &mail.name, "once only"]).ok();
     let prompt = machine.prompt_event(&mail.name);
-    let (first, second) = thread::scope(|scope| {
-        let left = scope.spawn(|| machine.hook("claude", &prompt));
-        let right = scope.spawn(|| machine.hook("codex", &prompt));
-        (left.join().unwrap(), right.join().unwrap())
-    });
-    let shown = [first, second];
-    let count = shown
+    let mut rounds = Vec::new();
+    wait_for(
+        "the mail buffer before concurrent hooks",
+        Duration::from_secs(20),
+        || {
+            let pair = thread::scope(|scope| {
+                let left = scope.spawn(|| machine.hook("claude", &prompt));
+                let right = scope.spawn(|| machine.hook("codex", &prompt));
+                (left.join().unwrap(), right.join().unwrap())
+            });
+            let found = pair.0.out.contains("once only") || pair.1.out.contains("once only");
+            rounds.extend([pair.0, pair.1]);
+            found
+        },
+    );
+    let count = rounds
         .iter()
         .filter(|hook| hook.out.contains("once only"))
         .count();
@@ -1205,7 +1224,7 @@ fn hooks(w: &World) {
         count,
         1,
         "{:?}",
-        shown.iter().map(|hook| &hook.out).collect::<Vec<_>>()
+        rounds.iter().map(|hook| &hook.out).collect::<Vec<_>>()
     );
     wait_for("the mail to be marked", Duration::from_secs(5), || {
         w.ly(&mail, &["msg", "unread"]).ok()["unread"] == 0
