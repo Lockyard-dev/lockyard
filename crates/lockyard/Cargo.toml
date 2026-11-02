@@ -11,6 +11,7 @@ readme = "../../README.md"
 
 [dependencies]
 clap.workspace = true
+lockyard-cloud-client.workspace = true
 lockyard-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

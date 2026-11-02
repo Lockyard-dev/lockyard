@@ -1,11 +1,12 @@
 # Publishing
 
-Rust goes first because `lockyard` depends on `lockyard-core`, then npm, then PyPI. The release workflow builds the five
+Rust goes first because `lockyard` depends on `lockyard-core` and `lockyard-cloud-client`, then npm, then PyPI. The release workflow builds the five
 supported native targets before publishing. Versions in `Cargo.toml`, `packages/npm/package.json` and `packages/pypi`
 stay equal at `0.0.1` until an intentional version change.
 
 ```sh
 cargo publish -p lockyard-core
+cargo publish -p lockyard-cloud-client
 cargo publish -p lockyard
 cp LICENSE README.md packages/npm/
 node packages/npm/scripts/build-platform-packages.js <built-binaries-folder>

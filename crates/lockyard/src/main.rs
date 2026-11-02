@@ -1,24 +1,42 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
+mod agent;
 mod hook;
 mod mcp;
+mod open;
 
 use clap::{Args, Parser, Subcommand};
-use lockyard_core::bus::{BROADCAST, Message};
+use lockyard_core::bus::BROADCAST;
+use lockyard_core::proto::{
+    AccessAnswer, AccessRequest, ActivityRequest, BoardEntry, BoardWrite, CheckStatus, Claim,
+    ClaimMode, ClaimQuery, ClaimRequest, DirtyPath, EventQuery, Freeze, InboxPage, InboxQuery,
+    Message, PresenceBeat, Purpose, QueueRequest, ReleaseRequest, RenewRequest, SendRequest,
+    SessionActivity, SessionState, Stamp, Stream, WorkAction, WorkOffer, WorkStep, WorkTask,
+    expand_zones,
+};
 use lockyard_core::tasks::{Status, Task};
-use lockyard_core::zones::{Claim, DEFAULT_TTL_MINUTES};
-use lockyard_core::{Error, Result, Store, ZonePath};
+use lockyard_core::zones::DEFAULT_TTL_MINUTES;
+use lockyard_core::{Backend, Error, Result, Store};
+use open::Opened;
 use serde::Serialize;
-use std::io::Read;
+use serde_json::{Value, json};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A path is held by another agent.
 const EXIT_CONFLICT: u8 = 3;
 const EXIT_FAILURE: u8 = 1;
+/// A check could not learn the state of a path in time.
+const EXIT_UNKNOWN: u8 = 4;
 /// Messages `lockyard msg inbox` prints at most.
 const INBOX_LIMIT: usize = 200;
+/// The server keeps a place in line for this long.
+const MAX_SHORT_WAIT_SECONDS: u64 = 120;
+const WAIT_RETRY: Duration = Duration::from_secs(2);
+/// Lease of a queued claim unless the caller asks for another one.
+const DEFAULT_QUEUE_MINUTES: i64 = 60;
 
 #[derive(Parser)]
 #[command(name = "lockyard", version, about = lockyard_core::SUMMARY)]
@@ -52,6 +70,22 @@ enum Command {
     /// Work that outlives a session.
     #[command(subcommand)]
     Task(TaskCommand),
+    /// Task offers between agents. Needs cloud mode.
+    #[command(subcommand)]
+    Work(WorkCommand),
+    /// Short shared values.
+    #[command(subcommand)]
+    Board(BoardCommand),
+    /// Read the event streams. Needs cloud mode.
+    Events(EventsArgs),
+    /// Live sessions.
+    #[command(subcommand)]
+    Presence(PresenceCommand),
+    /// The background process of cloud mode. Without a subcommand it runs in the foreground.
+    Agent(AgentArgs),
+    /// Administration of the cloud workspace.
+    #[command(subcommand)]
+    Cloud(CloudCommand),
     /// Agent integrations.
     #[command(subcommand)]
     Hook(HookCommand),
@@ -75,47 +109,260 @@ struct Ttl {
     ttl: i64,
 }
 
+#[derive(Args)]
+struct ClaimStyle {
+    /// Share the paths with other shared claims.
+    #[arg(long)]
+    shared: bool,
+    /// Claim for a deploy rather than for work.
+    #[arg(long)]
+    deploy: bool,
+    /// A named zone or group of the catalog. Repeat for several.
+    #[arg(long = "zone")]
+    zones: Vec<String>,
+}
+
+impl ClaimStyle {
+    fn mode(&self) -> ClaimMode {
+        if self.shared {
+            ClaimMode::Shared
+        } else {
+            ClaimMode::Exclusive
+        }
+    }
+
+    fn purpose(&self) -> Purpose {
+        if self.deploy {
+            Purpose::Deploy
+        } else {
+            Purpose::Work
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum ZoneCommand {
     /// Claim paths, all of them or none.
     Claim {
-        #[arg(required = true)]
         paths: Vec<String>,
         /// What the claim is for.
         #[arg(long, default_value = "")]
         note: String,
         #[command(flatten)]
         ttl: Ttl,
+        /// Start empty and grow through add-path.
+        #[arg(long)]
+        lazy: bool,
+        #[command(flatten)]
+        style: ClaimStyle,
+        /// A JSON object stored with the claim.
+        #[arg(long, value_parser = parse_json)]
+        meta: Option<Value>,
     },
+    /// Claim paths, holding a place in line for a short time.
+    Wait {
+        paths: Vec<String>,
+        #[arg(long, default_value = "")]
+        note: String,
+        #[command(flatten)]
+        ttl: Ttl,
+        /// How long to wait, at most 120.
+        #[arg(long, default_value_t = 60)]
+        seconds: u64,
+        #[command(flatten)]
+        style: ClaimStyle,
+    },
+    /// Join the long queue for paths. Without paths, list this agent's entries.
+    Queue {
+        paths: Vec<String>,
+        #[arg(long, default_value = "")]
+        note: String,
+        /// Minutes the entry stays in line, 1 to 480.
+        #[arg(long, default_value_t = DEFAULT_QUEUE_MINUTES)]
+        ttl: i64,
+        #[command(flatten)]
+        style: ClaimStyle,
+    },
+    /// Leave the queue.
+    Unwait {
+        #[arg(value_parser = parse_id)]
+        id: i64,
+    },
+    /// Ask the holder of paths for them.
+    Request {
+        #[arg(required = true)]
+        paths: Vec<String>,
+        #[arg(long)]
+        text: String,
+        #[arg(long)]
+        urgent: bool,
+        #[arg(long)]
+        need_by: Option<String>,
+    },
+    /// Answer a request.
+    Answer {
+        #[arg(value_parser = parse_id)]
+        id: i64,
+        #[arg(long)]
+        reply: Option<String>,
+        #[arg(long)]
+        eta: Option<String>,
+    },
+    /// Offer a claim to another agent.
+    Handover {
+        #[arg(value_parser = parse_id)]
+        id: i64,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        fence: Option<i64>,
+    },
+    /// Accept a claim offered to this agent.
+    Accept {
+        #[arg(value_parser = parse_id)]
+        id: i64,
+    },
+    /// Shrink a claim to some of its paths.
+    Narrow {
+        #[arg(value_parser = parse_id)]
+        id: i64,
+        #[arg(required = true)]
+        paths: Vec<String>,
+        #[arg(long)]
+        fence: Option<i64>,
+    },
+    /// Add one path to a claim.
+    AddPath {
+        #[arg(value_parser = parse_id)]
+        id: i64,
+        path: String,
+        #[arg(long)]
+        fence: Option<i64>,
+    },
+    /// Take the claim of an unresponsive session. Needs the lead role and a reason.
+    Takeover {
+        #[arg(value_parser = parse_id)]
+        id: i64,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Uncommitted paths and who owns them.
+    #[command(subcommand)]
+    Dirty(DirtyCommand),
+    /// Report tool activity on a claim.
+    Activity {
+        #[arg(value_parser = parse_id)]
+        id: i64,
+        paths: Vec<String>,
+        /// The activity wrote to files.
+        #[arg(long)]
+        write: bool,
+        #[arg(long)]
+        fence: Option<i64>,
+    },
+    /// List claims this agent lost.
+    Lost,
+    /// Show the zone catalog.
+    Catalog,
     /// Extend one claim, or all of this agent's claims.
     Renew {
         #[arg(value_parser = parse_id)]
         id: Option<i64>,
         #[command(flatten)]
         ttl: Ttl,
+        /// Why the claim stays held while idle.
+        #[arg(long)]
+        hold_reason: Option<String>,
+        #[arg(long)]
+        hold_until: Option<String>,
+        #[arg(long)]
+        fence: Option<i64>,
     },
     /// Release one claim, or all of this agent's claims.
     Release {
         #[arg(value_parser = parse_id)]
         id: Option<i64>,
+        #[arg(long)]
+        note: Option<String>,
+        /// Uncommitted changes stay behind on purpose.
+        #[arg(long)]
+        leave_dirty: bool,
+        #[arg(long)]
+        fence: Option<i64>,
     },
     /// List active claims.
-    List,
-    /// Exit 3 if another agent holds this path.
+    List {
+        /// Only this agent's claims.
+        #[arg(long)]
+        session: Option<String>,
+        /// Only claims that touch this path.
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Exit 3 if another agent holds this path, 4 if that cannot be learned in time.
     Check { path: String },
+}
+
+#[derive(Subcommand)]
+enum DirtyCommand {
+    /// Report paths with uncommitted changes.
+    Report {
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// The session that owns the changes.
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, value_parser = parse_id)]
+        task: Option<i64>,
+    },
+    /// List reported paths.
+    List { path: Option<String> },
+    /// Say these paths are not this agent's.
+    Disown {
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
+    /// Take over paths that have no live owner.
+    Adopt {
+        #[arg(required = true)]
+        paths: Vec<String>,
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum MsgCommand {
     /// Send to an agent, or to `*` for everyone.
-    Send { to: String, body: String },
+    Send {
+        to: String,
+        body: String,
+        /// ask, notice or event.
+        #[arg(long)]
+        kind: Option<String>,
+        /// none, reply or ack.
+        #[arg(long)]
+        needs: Option<String>,
+        #[arg(long)]
+        zone: Option<String>,
+        #[arg(long)]
+        re: Option<String>,
+        /// Repeating this key repeats the same message.
+        #[arg(long)]
+        key: Option<String>,
+        /// Minutes a notice stays, 30 to 1440.
+        #[arg(long)]
+        ttl: Option<i64>,
+    },
     /// Answer a message.
     Reply {
         #[arg(value_parser = parse_id)]
         id: i64,
         body: String,
     },
-    /// Show unread mail and mark it read.
+    /// Show unread mail and mark it read once it is printed.
     Inbox {
         /// Include mail already read.
         #[arg(long)]
@@ -123,6 +370,26 @@ enum MsgCommand {
         /// Do not mark anything read.
         #[arg(long)]
         peek: bool,
+    },
+    /// Show the count of unread mail.
+    Unread,
+    /// Confirm a message that needs an ack.
+    Ack {
+        #[arg(value_parser = parse_id)]
+        id: i64,
+    },
+    /// Show a whole thread.
+    Thread {
+        #[arg(value_parser = parse_id)]
+        id: i64,
+    },
+    /// List sent messages still waiting for an ack.
+    Overdue,
+    /// List unseen mail across sessions. Needs the lead or dispatcher role.
+    Undelivered {
+        /// Only mail older than this.
+        #[arg(long, default_value_t = 0)]
+        older_than: i64,
     },
 }
 
@@ -200,6 +467,225 @@ enum TaskCommand {
     },
 }
 
+#[derive(Args)]
+struct WorkRef {
+    #[arg(value_parser = parse_id)]
+    id: i64,
+    /// Act only if the task is still at this version.
+    #[arg(long)]
+    if_version: Option<i64>,
+}
+
+#[derive(Subcommand)]
+enum WorkCommand {
+    /// Offer a task to an agent, or to `*`.
+    Offer {
+        title: String,
+        #[arg(long)]
+        to: String,
+        /// What counts as done.
+        #[arg(long)]
+        accept: String,
+        #[arg(long)]
+        brief: Option<String>,
+        #[arg(long)]
+        re: Option<String>,
+        #[arg(long)]
+        zone: Option<String>,
+    },
+    /// List work tasks.
+    List,
+    /// Show one work task.
+    Show {
+        #[arg(value_parser = parse_id)]
+        id: i64,
+    },
+    /// Take an offered task.
+    Claim(WorkRef),
+    /// Renew the lease on a held task.
+    Beat(WorkRef),
+    /// Send a held task to review.
+    Done {
+        #[command(flatten)]
+        task: WorkRef,
+        #[arg(long)]
+        report: Option<String>,
+        /// A commit of this work. Repeat for several.
+        #[arg(long = "commit")]
+        commits: Vec<String>,
+    },
+    /// Accept reviewed work.
+    Accept(WorkRef),
+    /// Return reviewed work to its assignee.
+    Reject {
+        #[command(flatten)]
+        task: WorkRef,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Give up on a held task.
+    Fail {
+        #[command(flatten)]
+        task: WorkRef,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Cancel a task that is not final.
+    Cancel {
+        #[command(flatten)]
+        task: WorkRef,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Offer a held task to another agent.
+    Handoff {
+        #[command(flatten)]
+        task: WorkRef,
+        #[arg(long)]
+        to: String,
+    },
+    /// Take a task handed to this agent. Needs the version.
+    Take {
+        #[arg(value_parser = parse_id)]
+        id: i64,
+        /// The version seen in `work show`.
+        #[arg(long)]
+        if_version: i64,
+    },
+    /// Refuse an offered task.
+    Decline {
+        #[command(flatten)]
+        task: WorkRef,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum BoardCommand {
+    /// Set a value.
+    Set {
+        key: String,
+        value: String,
+        #[arg(long)]
+        zone: Option<String>,
+        /// Minutes the value stays.
+        #[arg(long)]
+        ttl: Option<i64>,
+    },
+    /// Show one value.
+    Get { key: String },
+    /// Remove a value.
+    Rm { key: String },
+    /// List values.
+    List {
+        #[arg(long)]
+        zone: Option<String>,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy)]
+enum StreamName {
+    Coordination,
+    Registry,
+}
+
+#[derive(Args)]
+struct EventsArgs {
+    /// Show events after this sequence.
+    #[arg(long, default_value_t = 0)]
+    after: i64,
+    /// Wait for news, at most 25 seconds.
+    #[arg(long, default_value_t = 0)]
+    wait: u64,
+    #[arg(long, value_enum, default_value = "coordination")]
+    stream: StreamName,
+    /// Only these types. Repeat for several.
+    #[arg(long = "type")]
+    types: Vec<String>,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy)]
+enum StateName {
+    Working,
+    Idle,
+    Ended,
+    ApiFailure,
+}
+
+#[derive(Subcommand)]
+enum PresenceCommand {
+    /// List sessions active lately.
+    List {
+        /// Seconds of silence that still count as active.
+        #[arg(long, default_value_t = 900)]
+        active_within: i64,
+    },
+    /// Send one heartbeat.
+    Beat {
+        #[arg(long, default_value = "cli")]
+        client: String,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Do not disturb until this time.
+        #[arg(long)]
+        dnd_until: Option<i64>,
+        /// Report that a tool is running.
+        #[arg(long)]
+        tool_running: bool,
+        #[arg(long, value_enum)]
+        state: Option<StateName>,
+        /// A JSON object stored with the session.
+        #[arg(long, value_parser = parse_json)]
+        meta: Option<Value>,
+    },
+}
+
+#[derive(Args)]
+struct AgentArgs {
+    #[command(subcommand)]
+    command: Option<AgentCommand>,
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    /// Install a launchd or systemd user unit and start it. Needs LOCKYARD_TOKEN_FILE.
+    Install {
+        /// Write the unit without starting it.
+        #[arg(long)]
+        no_start: bool,
+    },
+    /// Stop the unit and remove it.
+    Uninstall {
+        /// Remove the unit without stopping it.
+        #[arg(long)]
+        no_start: bool,
+    },
+    /// Show whether the process runs and how fresh its view is.
+    Status,
+}
+
+#[derive(Subcommand)]
+enum CloudCommand {
+    /// Dump coordination state. Needs the owner or exporter role.
+    Export,
+    /// Freeze or unfreeze coordination writes. Needs the owner role.
+    Freeze {
+        #[arg(value_parser = parse_switch, action = clap::ArgAction::Set)]
+        state: bool,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Store the zone catalog from a JSON file. Needs the importer role.
+    ImportZones { file: PathBuf },
+    /// Import threads, the board and tasks from a JSON file. Needs the importer role.
+    ImportBus { file: PathBuf },
+}
+
 #[derive(Subcommand)]
 enum HookCommand {
     /// Handle a Claude Code hook event from stdin.
@@ -210,10 +696,10 @@ enum HookCommand {
     Cursor,
 }
 
-/// Accepts `12`, `T-12`, `Z-12` and `M-12`.
+/// Accepts `12`, `T-12`, `Z-12`, `M-12`, `W-12` and `Q-12`.
 fn parse_id(text: &str) -> std::result::Result<i64, String> {
     let digits = text
-        .strip_prefix(['T', 'Z', 'M', 't', 'z', 'm'])
+        .strip_prefix(['T', 'Z', 'M', 'W', 'Q', 't', 'z', 'm', 'w', 'q'])
         .and_then(|rest| rest.strip_prefix('-'))
         .unwrap_or(text);
     digits
@@ -225,6 +711,18 @@ fn parse_status(text: &str) -> std::result::Result<Status, String> {
     Status::parse(text).ok_or_else(|| {
         format!("{text:?} is not a status: use open, claimed, review, accepted or cancelled")
     })
+}
+
+fn parse_json(text: &str) -> std::result::Result<Value, String> {
+    serde_json::from_str(text).map_err(|error| format!("not JSON: {error}"))
+}
+
+fn parse_switch(text: &str) -> std::result::Result<bool, String> {
+    match text {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!("{text:?} is not on or off")),
+    }
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -240,18 +738,23 @@ pub(crate) fn env_agent() -> Option<String> {
         .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
 }
 
-fn resolve_agent(flag: Option<String>) -> Result<String> {
-    flag.or_else(env_agent).ok_or_else(|| {
+fn resolve_agent(flag: Option<&String>) -> Result<String> {
+    flag.cloned().or_else(env_agent).ok_or_else(|| {
         Error::Invalid(
             "this command needs an agent name: set LOCKYARD_AGENT or pass --agent".into(),
         )
     })
 }
 
+/// Work to do once a command's output is out, such as marking printed mail.
+pub(crate) type After = Box<dyn FnOnce() -> Result<()>>;
+
 /// Output of one command: the data for `--json` and the lines for a person.
 struct Output {
-    json: serde_json::Value,
+    json: Value,
     text: String,
+    after: Option<After>,
+    exit: u8,
 }
 
 fn output(data: &impl Serialize, text: impl Into<String>) -> Result<Output> {
@@ -260,6 +763,8 @@ fn output(data: &impl Serialize, text: impl Into<String>) -> Result<Output> {
     Ok(Output {
         json,
         text: text.into(),
+        after: None,
+        exit: 0,
     })
 }
 
@@ -267,13 +772,19 @@ fn minutes_left(expires_at: i64, now: i64) -> i64 {
     ((expires_at - now).max(0) + 59_999) / 60_000
 }
 
-fn claim_line(claim: &Claim, now: i64) -> String {
+/// Local leases count down on the local clock. A cloud lease is shown as the server stated it.
+fn claim_line(claim: &Claim, clock: Option<i64>) -> String {
+    let left = match (&claim.expires_at, clock) {
+        (Stamp::Millis(expires_at), Some(now)) => {
+            format!("{} min left", minutes_left(*expires_at, now))
+        }
+        (stamp, _) => format!("until {stamp}"),
+    };
     let mut line = format!(
-        "Z-{}  {}  {}  {} min left",
+        "Z-{}  {}  {}  {left}",
         claim.id,
-        claim.agent,
-        claim.paths.join(" "),
-        minutes_left(claim.expires_at, now)
+        claim.session,
+        claim.paths.join(" ")
     );
     if !claim.note.is_empty() {
         line.push_str("  ");
@@ -294,12 +805,38 @@ fn message_line(message: &Message) -> String {
     )
 }
 
+fn sent_line(message: &Message) -> String {
+    match (message.queued, message.deduplicated) {
+        (true, _) => "queued: the server is out of reach, the agent will send it".to_string(),
+        (_, true) => format!("already sent as M-{}", message.id),
+        _ => format!("sent M-{}", message.id),
+    }
+}
+
 fn task_line(task: &Task) -> String {
     let assignee = task.assignee.as_deref().unwrap_or("-");
     format!(
         "T-{}  {}  {}  {}",
         task.id, task.status, assignee, task.title
     )
+}
+
+fn work_line(task: &WorkTask) -> String {
+    let status = serde_json::to_value(task.status).ok();
+    let status = status.as_ref().and_then(Value::as_str).unwrap_or_default();
+    let assignee = task
+        .assignee
+        .as_deref()
+        .or(task.to.as_deref())
+        .unwrap_or("-");
+    format!(
+        "W-{}  {status}  {assignee}  v{}  {}",
+        task.id, task.version, task.title
+    )
+}
+
+fn board_line(entry: &BoardEntry) -> String {
+    format!("{} = {}", entry.key, entry.text())
 }
 
 fn join<T>(items: &[T], line: impl Fn(&T) -> String, empty: &str) -> String {
@@ -309,83 +846,468 @@ fn join<T>(items: &[T], line: impl Fn(&T) -> String, empty: &str) -> String {
     items.iter().map(line).collect::<Vec<_>>().join("\n")
 }
 
-fn zone_paths(store: &Store, cwd: &Path, raw: &str) -> Result<ZonePath> {
-    ZonePath::resolve(store.root(), cwd, raw)?
-        .ok_or_else(|| Error::Invalid(format!("{raw} is outside this project")))
+/// The clock to count local leases on. Cloud leases are not counted at all.
+fn clock(opened: &Opened) -> Option<i64> {
+    (!opened.backend.is_cloud()).then(now_ms)
+}
+
+/// Paths named on the command line plus those of named zones. The server knows paths only.
+fn with_zones(
+    opened: &Opened,
+    cwd: &Path,
+    raw: &[String],
+    zones: &[String],
+) -> Result<Vec<String>> {
+    let mut paths = opened.zone_paths(cwd, raw)?;
+    if !zones.is_empty() {
+        for path in expand_zones(&opened.backend.catalog()?, zones)? {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn zone_label(zones: &[String]) -> Option<String> {
+    match zones {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
+}
+
+fn claim_request(paths: Vec<String>, note: String, ttl: i64, style: &ClaimStyle) -> ClaimRequest {
+    ClaimRequest {
+        paths,
+        note,
+        ttl_minutes: ttl,
+        mode: style.mode(),
+        purpose: style.purpose(),
+        zone: zone_label(&style.zones),
+        zones: if style.zones.len() > 1 {
+            style.zones.clone()
+        } else {
+            Vec::new()
+        },
+        ..ClaimRequest::default()
+    }
+}
+
+/// Keeps asking for a claim until it is granted or the wait ends. Each try is its own write, because a
+/// repeat under one key would only repeat the first refusal.
+pub(crate) fn wait_for_claim(
+    backend: &mut dyn Backend,
+    agent: &str,
+    mut request: ClaimRequest,
+    seconds: u64,
+) -> Result<Claim> {
+    if seconds > MAX_SHORT_WAIT_SECONDS {
+        return Err(Error::Invalid(format!(
+            "a short wait is at most {MAX_SHORT_WAIT_SECONDS} seconds, use zone queue"
+        )));
+    }
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        request.queue_wait_seconds = Some(i64::try_from(left.as_secs()).unwrap_or(0));
+        match backend.claim(agent, &request, now_ms()) {
+            Err(Error::Conflict(_) | Error::Contended(_)) if !left.is_zero() => {
+                std::thread::sleep(WAIT_RETRY.min(left));
+            }
+            other => return other,
+        }
+    }
 }
 
 fn run_zone(
-    store: &mut Store,
+    mut opened: Opened,
     command: ZoneCommand,
-    agent: Option<String>,
+    agent: Option<&String>,
     cwd: &Path,
 ) -> Result<Output> {
     let now = now_ms();
+    let lease = clock(&opened);
     match command {
-        ZoneCommand::Claim { paths, note, ttl } => {
+        ZoneCommand::Claim {
+            paths,
+            note,
+            ttl,
+            lazy,
+            style,
+            meta,
+        } => {
             let agent = resolve_agent(agent)?;
-            let paths = paths
-                .iter()
-                .map(|raw| zone_paths(store, cwd, raw))
-                .collect::<Result<Vec<_>>>()?;
-            let claim = store.claim(&agent, &paths, &note, ttl.ttl, now)?;
-            let text = claim_line(&claim, now);
+            let paths = with_zones(&opened, cwd, &paths, &style.zones)?;
+            let mut request = claim_request(paths, note, ttl.ttl, &style);
+            request.lazy = lazy;
+            request.meta = meta;
+            let claim = opened.backend.claim(&agent, &request, now)?;
+            let text = claim_line(&claim, lease);
             output(&claim, text)
         }
-        ZoneCommand::Renew { id, ttl } => {
+        ZoneCommand::Wait {
+            paths,
+            note,
+            ttl,
+            seconds,
+            style,
+        } => {
             let agent = resolve_agent(agent)?;
-            let renewed = store.renew(&agent, id, ttl.ttl, now)?;
-            output(
-                &serde_json::json!({ "renewed": renewed }),
-                format!("renewed {renewed}"),
-            )
+            let paths = with_zones(&opened, cwd, &paths, &style.zones)?;
+            let request = claim_request(paths, note, ttl.ttl, &style);
+            let claim = wait_for_claim(opened.backend.as_mut(), &agent, request, seconds)?;
+            let text = claim_line(&claim, lease);
+            output(&claim, text)
         }
-        ZoneCommand::Release { id } => {
+        ZoneCommand::Queue {
+            paths,
+            note,
+            ttl,
+            style,
+        } => {
             let agent = resolve_agent(agent)?;
-            let released = store.release(&agent, id, now)?;
+            if paths.is_empty() && style.zones.is_empty() {
+                let entries = opened.backend.queue_list(&agent)?;
+                let line = |entry: &lockyard_core::proto::QueueEntry| {
+                    format!("Q-{}  {}", entry.id, entry.paths.join(" "))
+                };
+                let text = join(&entries, line, "nothing queued");
+                return output(&entries, text);
+            }
+            let paths = with_zones(&opened, cwd, &paths, &style.zones)?;
+            let request = QueueRequest {
+                paths,
+                note,
+                ttl_minutes: ttl,
+                mode: style.mode(),
+                purpose: style.purpose(),
+                zones: style.zones.clone(),
+            };
+            let entry = opened.backend.queue_add(&agent, &request)?;
+            output(&entry, format!("queued Q-{}", entry.id))
+        }
+        ZoneCommand::Unwait { id } => {
+            opened.backend.queue_cancel(&resolve_agent(agent)?, id)?;
+            output(&json!({"cancelled": id}), format!("left the queue: Q-{id}"))
+        }
+        ZoneCommand::Request {
+            paths,
+            text,
+            urgent,
+            need_by,
+        } => {
+            let paths = opened.zone_paths(cwd, &paths)?;
+            let request = AccessRequest {
+                paths,
+                text,
+                urgent,
+                need_by,
+            };
+            let record = opened
+                .backend
+                .zone_request(&resolve_agent(agent)?, &request)?;
+            output(&record, format!("requested as R-{}", record.id))
+        }
+        ZoneCommand::Answer { id, reply, eta } => {
+            let record = opened.backend.zone_answer(
+                &resolve_agent(agent)?,
+                id,
+                &AccessAnswer { reply, eta },
+            )?;
+            output(&record, format!("answered R-{}", record.id))
+        }
+        ZoneCommand::Handover { id, to, fence } => {
+            let record = opened
+                .backend
+                .handover(&resolve_agent(agent)?, id, &to, fence)?;
+            output(&record, format!("Z-{id} offered to {to}"))
+        }
+        ZoneCommand::Accept { id } => {
+            let claim = opened.backend.handover_accept(&resolve_agent(agent)?, id)?;
+            let text = claim_line(&claim, lease);
+            output(&claim, text)
+        }
+        ZoneCommand::Narrow { id, paths, fence } => {
+            let paths = opened.zone_paths(cwd, &paths)?;
+            let claim = opened
+                .backend
+                .narrow(&resolve_agent(agent)?, id, &paths, fence)?;
+            let text = claim_line(&claim, lease);
+            output(&claim, text)
+        }
+        ZoneCommand::AddPath { id, path, fence } => {
+            let path = opened.zone_path(cwd, &path)?;
+            let claim = opened
+                .backend
+                .add_path(&resolve_agent(agent)?, id, &path, fence)?;
+            let text = claim_line(&claim, lease);
+            output(&claim, text)
+        }
+        ZoneCommand::Takeover { id, reason } => {
+            let claim = opened
+                .backend
+                .takeover(&resolve_agent(agent)?, id, &reason)?;
+            let text = claim_line(&claim, lease);
+            output(&claim, text)
+        }
+        ZoneCommand::Dirty(command) => run_dirty(opened, command, agent, cwd),
+        ZoneCommand::Activity {
+            id,
+            paths,
+            write,
+            fence,
+        } => {
+            let paths = opened.zone_paths(cwd, &paths)?;
+            let request = ActivityRequest {
+                write,
+                paths,
+                fence,
+            };
+            opened
+                .backend
+                .activity(&resolve_agent(agent)?, id, &request)?;
+            output(&json!({"reported": id}), format!("reported Z-{id}"))
+        }
+        ZoneCommand::Lost => {
+            let lost = opened.backend.lost(&resolve_agent(agent)?)?;
+            let line = |claim: &lockyard_core::proto::LostClaim| {
+                format!("Z-{}  {}", claim.claim_id, claim.paths.join(" "))
+            };
+            let text = join(&lost, line, "no lost claims");
+            output(&lost, text)
+        }
+        ZoneCommand::Catalog => {
+            let catalog = opened.backend.catalog()?;
+            let text = catalog.to_string();
+            output(&catalog, text)
+        }
+        ZoneCommand::Renew {
+            id,
+            ttl,
+            hold_reason,
+            hold_until,
+            fence,
+        } => {
+            let agent = resolve_agent(agent)?;
+            let request = RenewRequest {
+                ttl_minutes: ttl.ttl,
+                hold_reason,
+                hold_until,
+                fence,
+            };
+            let renewed = opened.backend.renew(&agent, id, &request, now)?;
+            output(&json!({ "renewed": renewed }), format!("renewed {renewed}"))
+        }
+        ZoneCommand::Release {
+            id,
+            note,
+            leave_dirty,
+            fence,
+        } => {
+            let agent = resolve_agent(agent)?;
+            let request = ReleaseRequest {
+                note,
+                leave_dirty,
+                fence,
+            };
+            let released = opened.backend.release(&agent, id, &request, now)?;
             output(
-                &serde_json::json!({ "released": released }),
+                &json!({ "released": released }),
                 format!("released {released}"),
             )
         }
-        ZoneCommand::List => {
-            let claims = store.claims(now)?;
-            let text = join(&claims, |claim| claim_line(claim, now), "no active claims");
+        ZoneCommand::List { session, path } => {
+            let path = path.map(|raw| opened.zone_path(cwd, &raw)).transpose()?;
+            let claims = opened.backend.claims(&ClaimQuery { session, path }, now)?;
+            let text = join(
+                &claims,
+                |claim| claim_line(claim, lease),
+                "no active claims",
+            );
             output(&claims, text)
         }
         ZoneCommand::Check { path } => {
             let agent = resolve_agent(agent)?;
-            let path = zone_paths(store, cwd, &path)?;
-            match store.check(&agent, &path, now)? {
-                Some(conflict) => Err(Error::Conflict(vec![conflict])),
-                None => output(&serde_json::json!({ "free": true }), "free"),
+            let path = opened.zone_path(cwd, &path)?;
+            let mut checks =
+                opened
+                    .backend
+                    .check(&agent, std::slice::from_ref(&path), None, now)?;
+            let found = (!checks.is_empty()).then(|| checks.remove(0));
+            match found {
+                None => output(&json!({ "free": true }), "free"),
+                Some(check) => match check.status {
+                    CheckStatus::Held => match check.holder {
+                        Some(holder) => Err(Error::Conflict(vec![holder])),
+                        None => Err(Error::Contended(format!("{path} is held"))),
+                    },
+                    CheckStatus::Own => output(&json!({ "free": true, "own": true }), "own"),
+                    CheckStatus::Free => output(&json!({ "free": true }), "free"),
+                    CheckStatus::Unknown => {
+                        let mut out = output(&json!({ "unknown": true }), "unknown")?;
+                        out.exit = EXIT_UNKNOWN;
+                        Ok(out)
+                    }
+                },
             }
         }
     }
 }
 
-fn run_msg(store: &mut Store, command: MsgCommand, agent: Option<String>) -> Result<Output> {
-    let now = now_ms();
+fn run_dirty(
+    mut opened: Opened,
+    command: DirtyCommand,
+    agent: Option<&String>,
+    cwd: &Path,
+) -> Result<Output> {
     let agent = resolve_agent(agent)?;
     match command {
-        MsgCommand::Send { to, body } => {
-            let message = store.send(&agent, &to, &body, now)?;
-            output(&message, format!("sent M-{}", message.id))
+        DirtyCommand::Report {
+            paths,
+            owner,
+            reason,
+            task,
+        } => {
+            let paths = opened.zone_paths(cwd, &paths)?;
+            let report: Vec<DirtyPath> = paths
+                .into_iter()
+                .map(|path| DirtyPath {
+                    path,
+                    owner_session: owner.clone(),
+                    reason: reason.clone(),
+                    task_id: task,
+                })
+                .collect();
+            opened.backend.dirty_report(&agent, &report)?;
+            output(&report, format!("reported {}", report.len()))
         }
-        MsgCommand::Reply { id, body } => {
-            let message = store.reply(&agent, id, &body, now)?;
-            output(&message, format!("sent M-{}", message.id))
+        DirtyCommand::List { path } => {
+            let path = path.map(|raw| opened.zone_path(cwd, &raw)).transpose()?;
+            let list = opened.backend.dirty_list(&agent, path.as_deref())?;
+            let line = |entry: &DirtyPath| {
+                format!(
+                    "{}  {}",
+                    entry.path,
+                    entry.owner_session.as_deref().unwrap_or("-")
+                )
+            };
+            let text = join(&list, line, "nothing dirty");
+            output(&list, text)
         }
-        MsgCommand::Inbox { all, peek } => {
-            let mail = store.inbox(&agent, all, !peek, INBOX_LIMIT, now)?;
-            let text = join(&mail, message_line, "no new mail");
-            output(&mail, text)
+        DirtyCommand::Disown { paths } => {
+            let paths = opened.zone_paths(cwd, &paths)?;
+            opened.backend.dirty_disown(&agent, &paths)?;
+            output(
+                &json!({"disowned": paths}),
+                format!("disowned {}", paths.len()),
+            )
+        }
+        DirtyCommand::Adopt { paths, reason } => {
+            let paths = opened.zone_paths(cwd, &paths)?;
+            opened.backend.dirty_adopt(&agent, &paths, &reason)?;
+            output(
+                &json!({"adopted": paths}),
+                format!("adopted {}", paths.len()),
+            )
         }
     }
 }
 
-fn run_task(store: &mut Store, command: TaskCommand, agent: Option<String>) -> Result<Output> {
+fn inbox_text(page: &InboxPage) -> String {
+    let mut text = join(&page.messages, message_line, "no new mail");
+    if page.skipped > 0 {
+        text.push_str(&format!("\n{} older messages skipped", page.skipped));
+    }
+    text
+}
+
+fn run_msg(opened: Opened, command: MsgCommand, agent: Option<&String>) -> Result<Output> {
     let now = now_ms();
+    let agent = resolve_agent(agent)?;
+    let mut backend = opened.backend;
+    match command {
+        MsgCommand::Send {
+            to,
+            body,
+            kind,
+            needs,
+            zone,
+            re,
+            key,
+            ttl,
+        } => {
+            let request = SendRequest {
+                to,
+                body,
+                kind,
+                needs,
+                zone,
+                re,
+                key,
+                ttl_minutes: ttl,
+            };
+            let message = backend.send(&agent, &request, now)?;
+            output(&message, sent_line(&message))
+        }
+        MsgCommand::Reply { id, body } => {
+            let message = backend.reply(&agent, id, &body, now)?;
+            output(&message, sent_line(&message))
+        }
+        MsgCommand::Inbox { all, peek } => {
+            let page = backend.inbox(
+                &agent,
+                InboxQuery {
+                    all,
+                    limit: INBOX_LIMIT,
+                },
+                now,
+            )?;
+            let text = inbox_text(&page);
+            let ids: Vec<i64> = page.messages.iter().map(|message| message.id).collect();
+            let mut out = output(&page.messages, text)?;
+            if !peek && !ids.is_empty() {
+                // Marked only after the mail is on screen: a duplicate over a loss.
+                out.after = Some(Box::new(move || {
+                    backend.inbox_seen(&agent, &ids, now_ms()).map(|_| ())
+                }));
+            }
+            Ok(out)
+        }
+        MsgCommand::Unread => {
+            let unread = backend.unread(&agent)?;
+            output(&json!({"unread": unread}), format!("unread mail: {unread}"))
+        }
+        MsgCommand::Ack { id } => {
+            backend.ack(&agent, id)?;
+            output(&json!({"acked": id}), format!("acked M-{id}"))
+        }
+        MsgCommand::Thread { id } => {
+            let messages = backend.thread(&agent, id)?;
+            let text = join(&messages, message_line, "empty thread");
+            output(&messages, text)
+        }
+        MsgCommand::Overdue => {
+            let messages = backend.overdue(&agent)?;
+            let text = join(&messages, message_line, "nothing overdue");
+            output(&messages, text)
+        }
+        MsgCommand::Undelivered { older_than } => {
+            let list = backend.undelivered(&agent, older_than)?;
+            let line = |entry: &lockyard_core::proto::Undelivered| {
+                format!(
+                    "M-{}  to {}  {} s old",
+                    entry.id, entry.to, entry.age_seconds
+                )
+            };
+            let text = join(&list, line, "nothing undelivered");
+            output(&list, text)
+        }
+    }
+}
+
+fn run_task(mut opened: Opened, command: TaskCommand, agent: Option<&String>) -> Result<Output> {
+    let now = now_ms();
+    let store = opened.backend.as_mut();
     let changed = match command {
         TaskCommand::List { all, status } => {
             let tasks = store.tasks(status, all)?;
@@ -407,7 +1329,7 @@ fn run_task(store: &mut Store, command: TaskCommand, agent: Option<String>) -> R
                     .trim_end()
                     .to_string()
             }));
-            let data = serde_json::json!({ "task": task, "history": history });
+            let data = json!({ "task": task, "history": history });
             return output(&data, lines.join("\n"));
         }
         TaskCommand::Add { title, body } => {
@@ -438,14 +1360,263 @@ fn run_task(store: &mut Store, command: TaskCommand, agent: Option<String>) -> R
     output(&changed, task_line(&changed))
 }
 
-fn run_status(store: &Store, agent: Option<String>) -> Result<Output> {
+fn work_step(reference: &WorkRef) -> WorkStep {
+    WorkStep {
+        version: reference.if_version,
+        ..WorkStep::default()
+    }
+}
+
+fn run_work(mut opened: Opened, command: WorkCommand, agent: Option<&String>) -> Result<Output> {
+    let agent = resolve_agent(agent)?;
+    let backend = opened.backend.as_mut();
+    let (id, action, step) = match command {
+        WorkCommand::Offer {
+            title,
+            to,
+            accept,
+            brief,
+            re,
+            zone,
+        } => {
+            let task = backend.work_offer(
+                &agent,
+                &WorkOffer {
+                    title,
+                    to,
+                    accept,
+                    re,
+                    zone,
+                    brief,
+                },
+            )?;
+            return output(&task, work_line(&task));
+        }
+        WorkCommand::List => {
+            let tasks = backend.work_list(&agent)?;
+            let text = join(&tasks, work_line, "no work tasks");
+            return output(&tasks, text);
+        }
+        WorkCommand::Show { id } => {
+            let task = backend.work_get(&agent, id)?;
+            return output(&task, work_line(&task));
+        }
+        WorkCommand::Claim(task) => (task.id, WorkAction::Claim, work_step(&task)),
+        WorkCommand::Beat(task) => (task.id, WorkAction::Beat, work_step(&task)),
+        WorkCommand::Accept(task) => (task.id, WorkAction::Accept, work_step(&task)),
+        WorkCommand::Done {
+            task,
+            report,
+            commits,
+        } => (
+            task.id,
+            WorkAction::Done,
+            WorkStep {
+                report,
+                commits,
+                ..work_step(&task)
+            },
+        ),
+        WorkCommand::Reject { task, reason } => (
+            task.id,
+            WorkAction::Reject,
+            WorkStep {
+                reason,
+                ..work_step(&task)
+            },
+        ),
+        WorkCommand::Fail { task, reason } => (
+            task.id,
+            WorkAction::Fail,
+            WorkStep {
+                reason,
+                ..work_step(&task)
+            },
+        ),
+        WorkCommand::Cancel { task, reason } => (
+            task.id,
+            WorkAction::Cancel,
+            WorkStep {
+                reason,
+                ..work_step(&task)
+            },
+        ),
+        WorkCommand::Decline { task, reason } => (
+            task.id,
+            WorkAction::Decline,
+            WorkStep {
+                reason,
+                ..work_step(&task)
+            },
+        ),
+        WorkCommand::Handoff { task, to } => (
+            task.id,
+            WorkAction::Handoff,
+            WorkStep {
+                to: Some(to),
+                ..work_step(&task)
+            },
+        ),
+        WorkCommand::Take { id, if_version } => (
+            id,
+            WorkAction::Take,
+            WorkStep {
+                version: Some(if_version),
+                ..WorkStep::default()
+            },
+        ),
+    };
+    let task = backend.work_step(&agent, id, action, &step)?;
+    output(&task, work_line(&task))
+}
+
+fn run_board(mut opened: Opened, command: BoardCommand, agent: Option<&String>) -> Result<Output> {
     let now = now_ms();
-    let claims = store.claims(now)?;
-    let tasks = store.tasks(None, false)?;
-    let agent = agent.or_else(env_agent);
+    let backend = opened.backend.as_mut();
+    match command {
+        BoardCommand::Set {
+            key,
+            value,
+            zone,
+            ttl,
+        } => {
+            let write = BoardWrite {
+                key,
+                value,
+                zone,
+                ttl_minutes: ttl,
+            };
+            let entry = backend.board_set(&resolve_agent(agent)?, &write, now)?;
+            output(&entry, board_line(&entry))
+        }
+        BoardCommand::Get { key } => match backend.board_get(&key, now)? {
+            Some(entry) => output(&entry, board_line(&entry)),
+            None => Err(Error::NotFound(format!("board key {key:?} not found"))),
+        },
+        BoardCommand::Rm { key } => {
+            let removed = backend.board_remove(&resolve_agent(agent)?, &key)?;
+            output(
+                &json!({"removed": removed}),
+                if removed { "removed" } else { "no such key" },
+            )
+        }
+        BoardCommand::List { zone } => {
+            let entries = backend.board_list(zone.as_deref(), now)?;
+            let text = join(&entries, board_line, "the board is empty");
+            output(&entries, text)
+        }
+    }
+}
+
+fn run_events(opened: &Opened, args: EventsArgs, agent: Option<&String>) -> Result<Output> {
+    let stream = match args.stream {
+        StreamName::Coordination => Stream::Coordination,
+        StreamName::Registry => Stream::Registry,
+    };
+    let query = EventQuery {
+        stream,
+        after: args.after,
+        wait_seconds: args.wait,
+        session: agent.cloned().or_else(env_agent),
+        types: args.types,
+    };
+    let page = opened.backend.events(&query)?;
+    let line = |event: &lockyard_core::proto::Event| format!("{}  {}", event.seq, event.kind);
+    let text = join(&page.events, line, "no events");
+    output(&page.events, text)
+}
+
+fn run_presence(
+    mut opened: Opened,
+    command: PresenceCommand,
+    agent: Option<&String>,
+) -> Result<Output> {
+    let now = now_ms();
+    match command {
+        PresenceCommand::List { active_within } => {
+            let live = opened.backend.presence(active_within, now)?;
+            let line = |entry: &lockyard_core::proto::Presence| {
+                format!("{}  {}  {}", entry.session, entry.client, entry.last_seen)
+            };
+            let text = join(&live, line, "nobody active");
+            output(&live, text)
+        }
+        PresenceCommand::Beat {
+            client,
+            role,
+            model,
+            cwd,
+            dnd_until,
+            tool_running,
+            state,
+            meta,
+        } => {
+            let state = state.map(|name| match name {
+                StateName::Working => SessionState::Working,
+                StateName::Idle => SessionState::Idle,
+                StateName::Ended => SessionState::Ended,
+                StateName::ApiFailure => SessionState::ApiFailure,
+            });
+            let activity =
+                (tool_running || state.is_some() || meta.is_some()).then(|| SessionActivity {
+                    tool_running,
+                    tool_started_at: tool_running.then_some(Stamp::Millis(now)),
+                    state,
+                    meta,
+                });
+            let beat = PresenceBeat {
+                client,
+                model,
+                role,
+                version: Some(lockyard_core::VERSION.to_string()),
+                cwd,
+                dnd_until: dnd_until.map(Stamp::Millis),
+                activity,
+            };
+            opened
+                .backend
+                .heartbeat(&resolve_agent(agent)?, &beat, now)?;
+            output(&json!({"beat": true}), "beat")
+        }
+    }
+}
+
+fn read_json(path: &Path) -> Result<Value> {
+    let text = std::fs::read_to_string(path)?;
+    serde_json::from_str(&text)
+        .map_err(|error| Error::Invalid(format!("{}: {error}", path.display())))
+}
+
+fn run_cloud(mut opened: Opened, command: CloudCommand, agent: Option<&String>) -> Result<Output> {
+    let backend = opened.backend.as_mut();
+    if !backend.is_cloud() {
+        return Err(Error::needs_cloud("this command"));
+    }
+    let agent = agent
+        .cloned()
+        .or_else(env_agent)
+        .unwrap_or_else(|| "lockyard-cli".to_string());
+    let answer = match command {
+        CloudCommand::Export => backend.export()?,
+        CloudCommand::Freeze { state, reason } => {
+            backend.freeze(&agent, &Freeze { on: state, reason })?
+        }
+        CloudCommand::ImportZones { file } => backend.import_zones(&agent, &read_json(&file)?)?,
+        CloudCommand::ImportBus { file } => backend.import_bus(&agent, &read_json(&file)?)?,
+    };
+    let text = answer.to_string();
+    output(&answer, text)
+}
+
+fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
+    let now = now_ms();
+    let lease = clock(opened);
+    let backend = opened.backend.as_ref();
+    let claims = backend.claims(&ClaimQuery::default(), now)?;
+    let agent = agent.cloned().or_else(env_agent);
     let unread = agent
         .as_deref()
-        .map(|name| store.unread(name))
+        .map(|name| backend.unread(name))
         .transpose()?;
     let mut lines = Vec::new();
     if let Some(unread) = unread {
@@ -453,35 +1624,43 @@ fn run_status(store: &Store, agent: Option<String>) -> Result<Output> {
     }
     lines.push(join(
         &claims,
-        |claim| claim_line(claim, now),
+        |claim| claim_line(claim, lease),
         "no active claims",
     ));
+    if backend.is_cloud() {
+        let session = agent.as_deref().unwrap_or("lockyard-cli");
+        let work = backend.work_list(session)?;
+        lines.push(join(&work, work_line, "no work tasks"));
+        let data = json!({ "unread": unread, "claims": claims, "work": work });
+        return output(&data, lines.join("\n"));
+    }
+    let tasks = backend.tasks(None, false)?;
     lines.push(join(&tasks, task_line, "no tasks"));
-    let data = serde_json::json!({ "unread": unread, "claims": claims, "tasks": tasks });
+    let data = json!({ "unread": unread, "claims": claims, "tasks": tasks });
     output(&data, lines.join("\n"))
 }
 
-fn run_hook(command: HookCommand, agent: Option<String>, cwd: &Path) -> Output {
-    let text = match command {
-        client @ (HookCommand::Claude | HookCommand::Codex | HookCommand::Cursor) => {
-            let mut input = String::new();
-            let read = std::io::stdin().read_to_string(&mut input);
-            let answer = read.map_err(Error::Io).and_then(|_| {
-                match client {
-                    HookCommand::Claude => hook::claude(&input, agent.or_else(env_agent_explicit), cwd, now_ms()),
-                    HookCommand::Codex => hook::codex(&input, agent.or_else(env_agent_explicit), cwd, now_ms()),
-                    HookCommand::Cursor => hook::cursor(&input, agent.or_else(env_agent_explicit), cwd, now_ms()),
-                }
-            });
-            answer.unwrap_or_else(|error| {
-                eprintln!("lockyard hook: {error}");
-                None
-            })
-        }
+fn run_hook(command: HookCommand, agent: Option<String>, cwd: &Path) {
+    let tool = match command {
+        HookCommand::Claude => hook::Tool::Claude,
+        HookCommand::Codex => hook::Tool::Codex,
+        HookCommand::Cursor => hook::Tool::Cursor,
     };
-    Output {
-        json: serde_json::Value::Null,
-        text: text.unwrap_or_default(),
+    let mut input = String::new();
+    let read = std::io::stdin().read_to_string(&mut input);
+    let mut out = std::io::stdout().lock();
+    let answer = read.map_err(Error::Io).and_then(|_| {
+        hook::run(
+            tool,
+            &input,
+            agent.or_else(env_agent_explicit),
+            cwd,
+            now_ms(),
+            &mut out,
+        )
+    });
+    if let Err(error) = answer {
+        eprintln!("lockyard hook: {error}");
     }
 }
 
@@ -513,51 +1692,134 @@ fn env_agent_explicit() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[cfg(unix)]
+fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
+    use agent::daemon::{AgentConfig, Daemon};
+    use agent::service;
+    use agent::socket::AgentSocket;
+    use lockyard_cloud_client::Client;
+    use lockyard_core::config::{Config, Mode};
+    let project = || -> Result<(PathBuf, Config)> {
+        let root = lockyard_core::paths::find_root(cwd).ok_or(Error::NoProject)?;
+        let config = Config::load(&root)?;
+        if config.mode != Mode::Cloud {
+            return Err(Error::needs_cloud("lockyard agent"));
+        }
+        Ok((root, config))
+    };
+    match args.command {
+        None => {
+            let (_, config) = project()?;
+            let (url, workspace) = open::endpoint(&config)?;
+            let client = Client::new(&url, Config::token()?)?;
+            let settings = AgentConfig {
+                url,
+                workspace,
+                socket: agent::socket_path(),
+                state_root: agent::state_root()?,
+                timing: Default::default(),
+            };
+            Daemon::start(settings, client)?.wait();
+            output(&Value::Null, "")
+        }
+        Some(AgentCommand::Install { no_start }) => {
+            let (root, _) = project()?;
+            let path = service::install(&root, !no_start)?;
+            let shown = path.display().to_string();
+            output(&json!({"unit": shown}), format!("installed {shown}"))
+        }
+        Some(AgentCommand::Uninstall { no_start }) => {
+            let path = service::uninstall(!no_start)?;
+            let shown = path.display().to_string();
+            output(&json!({"unit": shown}), format!("removed {shown}"))
+        }
+        Some(AgentCommand::Status) => {
+            let installed = service::installed()?;
+            let socket = agent::socket_path();
+            match AgentSocket::status(&socket, Duration::from_secs(1)) {
+                Ok(status) => {
+                    let age = status
+                        .view_age_ms
+                        .map_or("none".to_string(), |ms| format!("{ms} ms"));
+                    let text = format!(
+                        "running, pid {}, workspace {}, view age {age}, outbox {}",
+                        status.pid, status.workspace, status.outbox
+                    );
+                    output(
+                        &json!({"running": true, "installed": installed, "status": status}),
+                        text,
+                    )
+                }
+                Err(_) => output(
+                    &json!({"running": false, "installed": installed}),
+                    format!(
+                        "not running, unit {}",
+                        if installed {
+                            "installed"
+                        } else {
+                            "not installed"
+                        }
+                    ),
+                ),
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn run_agent(_: AgentArgs, _: &Path) -> Result<Output> {
+    Err(Error::Invalid("lockyard agent needs a Unix socket".into()))
+}
+
 fn run(cli: Cli, cwd: &Path) -> Result<Output> {
     let Cli { agent, command, .. } = cli;
+    let name = agent.clone().or_else(env_agent);
+    let open = || open::open(cwd, name.as_deref());
     match command {
         Command::Init => {
             let store = Store::init(cwd)?;
             let root = store.root().display().to_string();
             output(
-                &serde_json::json!({ "root": root }),
+                &json!({ "root": root }),
                 format!("Lockyard project at {root}"),
             )
         }
         Command::About => output(
-            &serde_json::json!({ "version": lockyard_core::VERSION }),
+            &json!({ "version": lockyard_core::VERSION }),
             lockyard_core::about(),
         ),
         Command::Who => {
-            let store = Store::discover(cwd)?;
+            let opened = open()?;
             let now = now_ms();
-            let agents = store.agents()?;
-            let text = join(
-                &agents,
-                |agent| {
-                    format!(
-                        "{}  seen {} min ago",
-                        agent.id,
-                        (now - agent.last_seen) / 60_000
-                    )
-                },
-                "no agents yet",
-            );
+            let agents = opened.backend.agents()?;
+            let line = |entry: &lockyard_core::proto::AgentSeen| match &entry.last_seen {
+                Stamp::Millis(last) if !opened.backend.is_cloud() => {
+                    format!("{}  seen {} min ago", entry.id, (now - last) / 60_000)
+                }
+                other => format!("{}  seen {other}", entry.id),
+            };
+            let text = join(&agents, line, "no agents yet");
             output(&agents, text)
         }
-        Command::Status => run_status(&Store::discover(cwd)?, agent),
-        Command::Zone(command) => run_zone(&mut Store::discover(cwd)?, command, agent, cwd),
-        Command::Msg(command) => run_msg(&mut Store::discover(cwd)?, command, agent),
-        Command::Task(command) => run_task(&mut Store::discover(cwd)?, command, agent),
-        Command::Hook(command) => Ok(run_hook(command, agent, cwd)),
-        Command::Setup { client } => Ok(Output {
-            json: serde_json::Value::Null,
-            text: setup(client),
-        }),
-        Command::Mcp => Ok(Output {
-            json: serde_json::Value::Null,
-            text: String::new(),
-        }),
+        Command::Status => run_status(&open()?, agent.as_ref()),
+        Command::Zone(command) => run_zone(open()?, command, agent.as_ref(), cwd),
+        Command::Msg(command) => run_msg(open()?, command, agent.as_ref()),
+        Command::Task(command) => run_task(open()?, command, agent.as_ref()),
+        Command::Work(command) => run_work(open()?, command, agent.as_ref()),
+        Command::Board(command) => run_board(open()?, command, agent.as_ref()),
+        Command::Events(args) => run_events(&open()?, args, agent.as_ref()),
+        Command::Presence(command) => run_presence(open()?, command, agent.as_ref()),
+        Command::Agent(args) => run_agent(args, cwd),
+        Command::Cloud(command) => run_cloud(open()?, command, agent.as_ref()),
+        Command::Hook(command) => {
+            run_hook(command, agent, cwd);
+            output(&Value::Null, "")
+        }
+        Command::Setup { client } => {
+            let text = setup(client);
+            output(&json!({ "setup": text }), text)
+        }
+        Command::Mcp => output(&Value::Null, ""),
     }
 }
 
@@ -565,10 +1827,34 @@ fn current_dir() -> Result<PathBuf> {
     Ok(std::env::current_dir()?)
 }
 
+fn report(error: &Error, json: bool) {
+    if json {
+        eprintln!(
+            "{}",
+            json!({"error": {"kind": error.kind(), "message": error.to_string()}})
+        );
+    } else {
+        eprintln!("{error}");
+    }
+}
+
+/// Prints one result. A failed print leaves `after` undone: mail that never reached anyone stays unread.
+fn deliver(out: &Output, json: bool) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    if json {
+        if !out.json.is_null() {
+            writeln!(stdout, "{}", out.json)?;
+        }
+    } else if !out.text.is_empty() {
+        writeln!(stdout, "{}", out.text)?;
+    }
+    stdout.flush()
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
-    let result = if matches!(&cli.command, Command::Mcp) {
+    if matches!(&cli.command, Command::Mcp) {
         let agent = cli.agent.clone().or_else(env_lockyard_agent);
         return match current_dir().and_then(|cwd| mcp::serve(agent, &cwd).map_err(Error::Io)) {
             Ok(()) => ExitCode::SUCCESS,
@@ -577,27 +1863,29 @@ fn main() -> ExitCode {
                 ExitCode::from(EXIT_FAILURE)
             }
         };
-    } else {
-        current_dir().and_then(|cwd| run(cli, &cwd))
-    };
-    match result {
-        Ok(out) if json => {
-            println!("{}", out.json);
-            ExitCode::SUCCESS
-        }
-        Ok(out) => {
-            if !out.text.is_empty() {
-                println!("{}", out.text);
+    }
+    let is_hook = matches!(&cli.command, Command::Hook(_));
+    match current_dir().and_then(|cwd| run(cli, &cwd)) {
+        Ok(_) if is_hook => ExitCode::SUCCESS,
+        Ok(mut out) => {
+            if let Err(error) = deliver(&out, json) {
+                report(&Error::Io(error), json);
+                return ExitCode::from(EXIT_FAILURE);
             }
-            ExitCode::SUCCESS
+            if let Some(after) = out.after.take()
+                && let Err(error) = after()
+            {
+                report(&error, json);
+                return ExitCode::from(EXIT_FAILURE);
+            }
+            ExitCode::from(out.exit)
         }
-        Err(Error::Conflict(conflicts)) => {
-            let error = Error::Conflict(conflicts);
-            eprintln!("{error}");
+        Err(error @ (Error::Conflict(_) | Error::Contended(_))) => {
+            report(&error, json);
             ExitCode::from(EXIT_CONFLICT)
         }
         Err(error) => {
-            eprintln!("{error}");
+            report(&error, json);
             ExitCode::from(EXIT_FAILURE)
         }
     }
@@ -624,6 +1912,7 @@ mod tests {
         assert_eq!(parse_id("12"), Ok(12));
         assert_eq!(parse_id("T-12"), Ok(12));
         assert_eq!(parse_id("z-3"), Ok(3));
+        assert_eq!(parse_id("W-3"), Ok(3));
         assert!(parse_id("T12").is_err());
         assert!(parse_id("nope").is_err());
     }
@@ -633,5 +1922,167 @@ mod tests {
         assert_eq!(minutes_left(60_001, 0), 2);
         assert_eq!(minutes_left(60_000, 0), 1);
         assert_eq!(minutes_left(0, 5), 0);
+    }
+
+    #[test]
+    fn a_cloud_lease_is_shown_and_never_counted_down() {
+        let claim: Claim =
+            serde_json::from_value(json!({"id": 1, "session": "a", "expires_at": 90_000})).unwrap();
+        assert!(claim_line(&claim, Some(30_000)).contains("1 min left"));
+        assert!(claim_line(&claim, None).contains("until 90000"));
+    }
+
+    struct Scripted {
+        answers: Vec<Result<Claim>>,
+        waits: Vec<Option<i64>>,
+    }
+
+    impl Backend for Scripted {
+        fn touch_agent(&mut self, _: &str, _: i64) -> Result<()> {
+            Ok(())
+        }
+        fn agents(&self) -> Result<Vec<lockyard_core::proto::AgentSeen>> {
+            unreachable!()
+        }
+        fn claim(&mut self, _: &str, request: &ClaimRequest, _: i64) -> Result<Claim> {
+            self.waits.push(request.queue_wait_seconds);
+            self.answers.remove(0)
+        }
+        fn renew(&mut self, _: &str, _: Option<i64>, _: &RenewRequest, _: i64) -> Result<usize> {
+            unreachable!()
+        }
+        fn release(
+            &mut self,
+            _: &str,
+            _: Option<i64>,
+            _: &ReleaseRequest,
+            _: i64,
+        ) -> Result<usize> {
+            unreachable!()
+        }
+        fn claims(&self, _: &ClaimQuery, _: i64) -> Result<Vec<Claim>> {
+            unreachable!()
+        }
+        fn check(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<i64>,
+            _: i64,
+        ) -> Result<Vec<lockyard_core::proto::PathCheck>> {
+            unreachable!()
+        }
+        fn send(&mut self, _: &str, _: &SendRequest, _: i64) -> Result<Message> {
+            unreachable!()
+        }
+        fn reply(&mut self, _: &str, _: i64, _: &str, _: i64) -> Result<Message> {
+            unreachable!()
+        }
+        fn inbox(&mut self, _: &str, _: InboxQuery, _: i64) -> Result<InboxPage> {
+            unreachable!()
+        }
+        fn unread(&self, _: &str) -> Result<i64> {
+            unreachable!()
+        }
+        fn inbox_seen(&mut self, _: &str, _: &[i64], _: i64) -> Result<usize> {
+            unreachable!()
+        }
+        fn inbox_claim(&mut self, _: &str, _: &str, _: &[i64], _: i64, _: i64) -> Result<Vec<i64>> {
+            unreachable!()
+        }
+        fn tasks(&self, _: Option<Status>, _: bool) -> Result<Vec<Task>> {
+            unreachable!()
+        }
+        fn task(&self, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn task_history(&self, _: i64) -> Result<Vec<lockyard_core::tasks::TaskEvent>> {
+            unreachable!()
+        }
+        fn add_task(&mut self, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn claim_task(&mut self, _: &str, _: i64, _: i64, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn renew_task(&mut self, _: &str, _: i64, _: i64, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn release_task(&mut self, _: &str, _: i64, _: &str, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn submit_task(&mut self, _: &str, _: i64, _: &str, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn accept_task(&mut self, _: &str, _: i64, _: &str, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn reject_task(&mut self, _: &str, _: i64, _: &str, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn cancel_task(&mut self, _: &str, _: i64, _: &str, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn board_set(&mut self, _: &str, _: &BoardWrite, _: i64) -> Result<BoardEntry> {
+            unreachable!()
+        }
+        fn board_get(&self, _: &str, _: i64) -> Result<Option<BoardEntry>> {
+            unreachable!()
+        }
+        fn board_remove(&mut self, _: &str, _: &str) -> Result<bool> {
+            unreachable!()
+        }
+        fn board_list(&self, _: Option<&str>, _: i64) -> Result<Vec<BoardEntry>> {
+            unreachable!()
+        }
+        fn heartbeat(&mut self, _: &str, _: &PresenceBeat, _: i64) -> Result<()> {
+            unreachable!()
+        }
+        fn presence(&self, _: i64, _: i64) -> Result<Vec<lockyard_core::proto::Presence>> {
+            unreachable!()
+        }
+    }
+
+    fn claim() -> Claim {
+        serde_json::from_value(json!({"id": 1})).unwrap()
+    }
+
+    #[test]
+    fn a_short_wait_retries_a_conflict_and_stops_on_anything_else() {
+        let mut backend = Scripted {
+            answers: vec![Err(Error::Contended("reserved".into())), Ok(claim())],
+            waits: Vec::new(),
+        };
+        assert_eq!(
+            wait_for_claim(&mut backend, "a", ClaimRequest::default(), 3)
+                .unwrap()
+                .id,
+            1
+        );
+        assert_eq!(backend.waits.len(), 2);
+        assert!(backend.waits[0].is_some());
+
+        let mut failing = Scripted {
+            answers: vec![Err(Error::Frozen("x".into()))],
+            waits: Vec::new(),
+        };
+        assert!(matches!(
+            wait_for_claim(&mut failing, "a", ClaimRequest::default(), 3),
+            Err(Error::Frozen(_))
+        ));
+        assert_eq!(failing.waits.len(), 1);
+    }
+
+    #[test]
+    fn a_short_wait_gives_up_at_its_limit_and_refuses_a_long_one() {
+        let mut backend = Scripted {
+            answers: vec![Err(Error::Contended("reserved".into()))],
+            waits: Vec::new(),
+        };
+        assert!(matches!(
+            wait_for_claim(&mut backend, "a", ClaimRequest::default(), 0),
+            Err(Error::Contended(_))
+        ));
+        assert!(wait_for_claim(&mut backend, "a", ClaimRequest::default(), 121).is_err());
     }
 }

@@ -3,9 +3,10 @@
 //! Work zones. A claim is a lease on paths: nobody else can claim an overlapping path until it is
 //! released or expires, so a crashed agent cannot hold a zone forever.
 
+use crate::proto::Stamp;
 use crate::{Error, Result, Store, ZonePath};
 use rusqlite::{Connection, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Lease of a claim unless the caller asks for another one.
@@ -27,23 +28,31 @@ pub struct Claim {
 }
 
 /// A requested path that another agent's claim covers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conflict {
+    #[serde(default)]
     pub path: String,
+    #[serde(default)]
     pub held_path: String,
+    #[serde(default, alias = "claim_id", alias = "id")]
     pub claim: i64,
+    #[serde(default, alias = "session", alias = "holder")]
     pub agent: String,
+    #[serde(default)]
     pub note: String,
-    pub expires_at: i64,
+    #[serde(default)]
+    pub expires_at: Stamp,
 }
 
 impl fmt::Display for Conflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} is held by {} through {} (Z-{})",
-            self.path, self.agent, self.held_path, self.claim
-        )?;
+        write!(f, "{} is held by {}", self.path, self.agent)?;
+        if !self.held_path.is_empty() {
+            write!(f, " through {}", self.held_path)?;
+        }
+        if self.claim != 0 {
+            write!(f, " (Z-{})", self.claim)?;
+        }
         if !self.note.is_empty() {
             write!(f, ": {}", self.note)?;
         }
@@ -196,7 +205,7 @@ fn find_conflicts(
                     claim: *claim,
                     agent: holder.clone(),
                     note: note.clone(),
-                    expires_at: *expires_at,
+                    expires_at: Stamp::Millis(*expires_at),
                 });
             }
         }

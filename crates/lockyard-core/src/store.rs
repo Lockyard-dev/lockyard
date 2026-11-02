@@ -12,7 +12,7 @@ use std::time::Duration;
 pub const DIR_NAME: &str = ".lockyard";
 
 const DB_NAME: &str = "lockyard.db";
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_AGENT_LEN: usize = 128;
 const TOUCH_INTERVAL_MS: i64 = 60_000;
@@ -149,6 +149,26 @@ CREATE TABLE events (
 ) STRICT;
 ";
 
+const SCHEMA_V3: &str = "
+CREATE TABLE delivery_claims (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    agent TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    lease_until INTEGER NOT NULL,
+    PRIMARY KEY (message_id, agent)
+) STRICT;
+CREATE INDEX delivery_claims_by_lease ON delivery_claims(lease_until);
+";
+
+/// Tables reserved for features that now live on the server only. Nothing ever wrote to them.
+const SCHEMA_V4: &str = "
+DROP TABLE IF EXISTS zone_queue;
+DROP TABLE IF EXISTS zone_requests;
+DROP TABLE IF EXISTS handovers;
+DROP TABLE IF EXISTS work_tasks;
+DROP TABLE IF EXISTS events;
+";
+
 /// An agent that has acted in this project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Agent {
@@ -261,9 +281,22 @@ impl Store {
             transaction.execute_batch(SCHEMA)?;
             transaction.pragma_update(None, "user_version", 1)?;
         }
-        let version: i32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let version: i32 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version == 1 {
             transaction.execute_batch(SCHEMA_V2)?;
+            transaction.pragma_update(None, "user_version", 2)?;
+        }
+        let version: i32 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == 2 {
+            transaction.execute_batch(SCHEMA_V3)?;
+            transaction.pragma_update(None, "user_version", 3)?;
+        }
+        let version: i32 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == 3 {
+            transaction.execute_batch(SCHEMA_V4)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         transaction.commit()?;
@@ -373,13 +406,66 @@ mod tests {
         fs::create_dir_all(&state).unwrap();
         let connection = Connection::open(state.join(DB_NAME)).unwrap();
         connection.execute_batch(SCHEMA).unwrap();
-        connection.execute("INSERT INTO agents VALUES ('old', 1, 2)", []).unwrap();
+        connection
+            .execute("INSERT INTO agents VALUES ('old', 1, 2)", [])
+            .unwrap();
         connection.pragma_update(None, "user_version", 1).unwrap();
         drop(connection);
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.agents().unwrap()[0].id, "old");
-        assert_eq!(store.schema_version().unwrap(), 2);
-        assert_eq!(store.conn.query_row("SELECT count(*) FROM board", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM board", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn version_three_database_loses_the_placeholders_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join(DIR_NAME);
+        fs::create_dir_all(&state).unwrap();
+        let connection = Connection::open(state.join(DB_NAME)).unwrap();
+        connection
+            .execute_batch(&format!("{SCHEMA}{SCHEMA_V2}{SCHEMA_V3}"))
+            .unwrap();
+        connection
+            .execute("INSERT INTO agents VALUES ('old', 1, 2)", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO board VALUES ('k', 'v', NULL, NULL, 1)", [])
+            .unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
+        drop(connection);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.agents().unwrap()[0].id, "old");
+        assert_eq!(store.board_get("k", 0).unwrap().unwrap().value, "v");
+        let table = |name: &str| -> i64 {
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        for gone in [
+            "zone_queue",
+            "zone_requests",
+            "handovers",
+            "work_tasks",
+            "events",
+        ] {
+            assert_eq!(table(gone), 0, "{gone}");
+        }
+        for kept in ["board", "presence", "delivery_claims"] {
+            assert_eq!(table(kept), 1, "{kept}");
+        }
     }
 
     #[test]

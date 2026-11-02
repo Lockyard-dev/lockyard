@@ -107,6 +107,75 @@ impl Store {
         )?)
     }
 
+    /// Marks only messages returned to the named reader as seen.
+    pub fn inbox_seen(&mut self, agent: &str, ids: &[i64], now: i64) -> Result<usize> {
+        self.touch(agent, now)?;
+        if ids.iter().any(|id| *id <= 0) {
+            return Err(Error::Invalid(
+                "message ids must be positive integers".into(),
+            ));
+        }
+        let transaction = self.write()?;
+        let mut changed = 0;
+        for id in ids {
+            changed += transaction.execute(
+                "INSERT OR IGNORE INTO receipts(message_id,agent,read_at)
+                 SELECT id,?2,?3 FROM messages
+                 WHERE id=?1 AND (to_agent=?2 OR (to_agent='*' AND from_agent<>?2))",
+                params![id, agent, now],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    /// Reserves unseen mail for one delivery channel until the lease expires.
+    pub fn inbox_claim(
+        &mut self,
+        agent: &str,
+        channel: &str,
+        ids: &[i64],
+        lease_seconds: i64,
+        now: i64,
+    ) -> Result<Vec<i64>> {
+        self.touch(agent, now)?;
+        if channel.trim().is_empty() || lease_seconds <= 0 {
+            return Err(Error::Invalid(
+                "delivery channel is required and lease_seconds must be positive".into(),
+            ));
+        }
+        if ids.iter().any(|id| *id <= 0) {
+            return Err(Error::Invalid(
+                "message ids must be positive integers".into(),
+            ));
+        }
+        let transaction = self.write()?;
+        let mut claimed = Vec::new();
+        for id in ids {
+            transaction.execute(
+                "DELETE FROM delivery_claims WHERE message_id=?1 AND lease_until<=?2",
+                params![id, now],
+            )?;
+            let inserted = transaction.execute(
+                "INSERT OR IGNORE INTO delivery_claims(message_id,agent,channel,lease_until)
+                 SELECT m.id,?2,?3,?4 FROM messages m
+                 WHERE m.id=?1 AND (m.to_agent=?2 OR (m.to_agent='*' AND m.from_agent<>?2))
+                   AND NOT EXISTS(SELECT 1 FROM receipts r WHERE r.message_id=m.id AND r.agent=?2)",
+                params![
+                    id,
+                    agent,
+                    channel,
+                    now.saturating_add(lease_seconds.saturating_mul(1000))
+                ],
+            )?;
+            if inserted != 0 {
+                claimed.push(*id);
+            }
+        }
+        transaction.commit()?;
+        Ok(claimed)
+    }
+
     fn insert_message(
         &mut self,
         from: &str,
@@ -224,6 +293,46 @@ mod tests {
             bodies(&store.inbox("b", false, true, 2, 3).unwrap()),
             ["three"]
         );
+    }
+
+    #[test]
+    fn delivery_claim_is_exclusive_until_lease_or_seen_mark() {
+        let (_dir, mut store) = with_agents(&["a", "b"]);
+        let message = store.send("a", "b", "hello", 1).unwrap();
+        assert_eq!(
+            store
+                .inbox_claim("b", "hook-one", &[message.id], 10, 2)
+                .unwrap(),
+            [message.id]
+        );
+        assert!(
+            store
+                .inbox_claim("b", "hook-two", &[message.id], 10, 3)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .inbox_claim("b", "hook-two", &[message.id], 10, 10_002)
+                .unwrap(),
+            [message.id]
+        );
+        assert_eq!(store.inbox_seen("b", &[message.id], 10_003).unwrap(), 1);
+        assert!(
+            store
+                .inbox_claim("b", "hook-one", &[message.id], 10, 10_004)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn seen_marks_only_mail_addressed_to_the_reader() {
+        let (_dir, mut store) = with_agents(&["a", "b", "c"]);
+        let direct = store.send("a", "b", "direct", 1).unwrap();
+        let other = store.send("a", "c", "other", 1).unwrap();
+        assert_eq!(store.inbox_seen("b", &[direct.id, other.id], 2).unwrap(), 1);
+        assert_eq!(store.unread("b").unwrap(), 0);
     }
 
     #[test]

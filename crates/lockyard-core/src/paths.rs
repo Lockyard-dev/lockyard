@@ -41,7 +41,7 @@ impl ZonePath {
     }
 
     /// Wraps a path already stored in zone form.
-    pub(crate) fn stored(text: String) -> Self {
+    pub fn stored(text: String) -> Self {
         Self(text)
     }
 

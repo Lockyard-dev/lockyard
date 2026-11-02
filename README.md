@@ -2,8 +2,9 @@
 
 Coordination for coding agents. When several agents work on one codebase they collide: they edit the same files,
 repeat each other's work and lose track of what is done. Lockyard gives them work zones so that only one agent touches
-a path at a time, a shared bus to talk, and tasks that survive a session. All of it lives in one SQLite file under
-`.lockyard/` in your project. Nothing leaves the machine.
+a path at a time, a shared bus to talk, and tasks that survive a session. By default all of it lives in one SQLite
+file under `.lockyard/` in your project, and nothing leaves the machine. Teams across machines use [cloud
+mode](#cloud-mode).
 
 **Status: early release.** Install with Cargo, npm or pip. npm and pip packages include the native Lockyard executable.
 
@@ -70,6 +71,44 @@ and `NotebookEdit` on a path another agent holds, and shows unread mail in the a
 session id unless `LOCKYARD_AGENT` is set. If the hook itself fails, the tool call goes through and the failure is printed
 on stderr.
 
+## Cloud mode
+
+Local mode has zones, mail, tasks, the board and presence. Everything else needs cloud mode, and says so when asked for
+in local mode: `zone wait`, `queue`, `unwait`, `request`, `answer`, `handover`, `accept`, `narrow`, `add-path`,
+`takeover`, `dirty`, `msg ack`, `msg thread`, `events` and `work`.
+
+Create `.lockyard/config.toml`:
+
+```toml
+mode = "cloud"
+url = "https://your-server.example"
+workspace = "your-team"
+```
+
+The workspace is a label: the server takes the real one from the token. The token comes from `LOCKYARD_TOKEN` or from
+the file named by `LOCKYARD_TOKEN_FILE`, and never from the config file. In cloud mode the `task` commands are not
+available; agent work goes through `lockyard work`.
+
+### The agent process
+
+Hooks in cloud mode talk only to `lockyard agent`, one background process per user. It keeps a view of claims, unread
+counts and the board, so `zone check` answers in milliseconds.
+
+```sh
+export LOCKYARD_TOKEN_FILE=~/.config/lockyard/token
+lockyard agent install     # a launchd or systemd user unit
+lockyard agent status
+lockyard agent uninstall
+```
+
+- The view is used while it is fresher than 30 seconds. After that one server call gets 800 ms, and then the answer is
+  `unknown`: a hook allows the edit and notes it on stderr, and `zone check` exits 4.
+- Mail, heartbeats and activity go through a durable outbox under `$XDG_STATE_HOME/lockyard`, or
+  `~/.local/state/lockyard`, so they survive an outage and arrive in order. Claims never wait in it: during an outage
+  they fail, because a claim that lands minutes late is worse than one that was refused.
+- One agent serves one workspace, the one its token belongs to. A hook in any other workspace allows and says why.
+- With no agent running, the command line calls the server itself, and hooks allow and say so.
+
 ## Limits
 
 - Lockyard prevents accidents between cooperating agents. Agent names are not authenticated, and an agent can pretend to
@@ -78,7 +117,7 @@ on stderr.
 - Subagents of one Claude Code session share its session id, so they count as one agent.
 - On macOS and Windows, path comparisons fold ASCII case to match their usual case-insensitive file systems. Other
   platforms compare paths exactly.
-- All agents must run on one machine. Teams across machines are the job of Lockyard Cloud.
+- In local mode all agents must run on one machine.
 
 ## License
 

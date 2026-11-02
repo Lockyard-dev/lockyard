@@ -13,6 +13,7 @@ description = "Coordination for coding agents: a shared bus, work zones and task
 
 [workspace.dependencies]
 lockyard-core = { path = "crates/lockyard-core", version = "0.0.1" }
+lockyard-cloud-client = { path = "crates/lockyard-cloud-client", version = "0.0.1" }
 clap = { version = "4.6", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

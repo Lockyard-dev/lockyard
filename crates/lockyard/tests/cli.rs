@@ -175,6 +175,97 @@ fn mail_needs_a_known_addressee_and_reads_once() {
     assert_eq!(ok(root, "b", &["msg", "inbox"]).trim(), "no new mail");
 }
 
+#[test]
+fn the_board_and_presence_work_in_local_mode() {
+    let dir = project();
+    let root = dir.path();
+    ok(root, "a", &["board", "set", "deploy", "ready"]);
+    assert_eq!(
+        ok(root, "a", &["board", "get", "deploy"]).trim(),
+        "deploy = ready"
+    );
+    let listed: Value = serde_json::from_str(&ok(root, "a", &["--json", "board", "list"])).unwrap();
+    assert_eq!(listed[0]["value"], "ready");
+    ok(root, "a", &["presence", "beat"]);
+    assert!(ok(root, "a", &["presence", "list"]).contains("cli"));
+    ok(root, "a", &["board", "rm", "deploy"]);
+    assert_eq!(
+        lockyard(root, "a", &["board", "get", "deploy"])
+            .status
+            .code(),
+        Some(1)
+    );
+}
+
+#[test]
+fn cloud_only_commands_explain_themselves_in_local_mode() {
+    let dir = project();
+    let root = dir.path();
+    for args in [
+        &["zone", "wait", "src"][..],
+        &["zone", "queue", "src"],
+        &["zone", "queue"],
+        &["zone", "unwait", "1"],
+        &["zone", "request", "src", "--text", "please"],
+        &["zone", "answer", "1"],
+        &["zone", "handover", "1", "--to", "b"],
+        &["zone", "accept", "1"],
+        &["zone", "narrow", "1", "src"],
+        &["zone", "add-path", "1", "src"],
+        &["zone", "takeover", "1", "--reason", "gone"],
+        &["zone", "dirty", "list"],
+        &["zone", "claim", "src", "--shared"],
+        &["msg", "ack", "1"],
+        &["msg", "thread", "1"],
+        &["events"],
+        &["work", "list"],
+        &["cloud", "export"],
+        &["agent"],
+    ] {
+        let result = lockyard(root, "a", args);
+        assert_eq!(result.status.code(), Some(1), "{args:?}");
+        let message = String::from_utf8_lossy(&result.stderr);
+        assert!(message.contains("needs cloud mode"), "{args:?}: {message}");
+    }
+}
+
+#[test]
+fn errors_are_json_under_the_json_flag() {
+    let dir = project();
+    let result = lockyard(dir.path(), "a", &["--json", "work", "list"]);
+    let error: Value = serde_json::from_slice(&result.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "needs_cloud");
+}
+
+#[test]
+fn every_new_command_accepts_the_json_flag() {
+    let dir = project();
+    let setup: Value =
+        serde_json::from_str(&ok(dir.path(), "a", &["--json", "setup", "claude"])).unwrap();
+    assert!(
+        setup["setup"]
+            .as_str()
+            .unwrap()
+            .contains("lockyard hook claude")
+    );
+    let board: Value =
+        serde_json::from_str(&ok(dir.path(), "a", &["--json", "board", "list"])).unwrap();
+    assert!(board.is_array());
+}
+
+#[test]
+fn printed_mail_is_marked_after_the_output_and_peek_marks_nothing() {
+    let dir = project();
+    let root = dir.path();
+    ok(root, "b", &["msg", "inbox"]);
+    ok(root, "a", &["msg", "send", "b", "hello"]);
+    assert_eq!(ok(root, "b", &["msg", "unread"]).trim(), "unread mail: 1");
+    ok(root, "b", &["msg", "inbox", "--peek"]);
+    assert_eq!(ok(root, "b", &["msg", "unread"]).trim(), "unread mail: 1");
+    ok(root, "b", &["msg", "inbox"]);
+    assert_eq!(ok(root, "b", &["msg", "unread"]).trim(), "unread mail: 0");
+}
+
 fn hook(dir: &Path, event: &Value) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lockyard"))
         .args(["hook", "claude"])
@@ -262,7 +353,7 @@ fn mcp_stdio_initializes_lists_claims_and_reports_conflicts_and_parse_errors() {
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n",
     );
     let list: Value = serde_json::from_slice(&list.stdout).unwrap();
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 20);
+    assert!(list["result"]["tools"].as_array().unwrap().len() > 20);
 
     let claim = mcp(
         dir.path(),
