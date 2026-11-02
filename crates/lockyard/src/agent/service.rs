@@ -64,7 +64,7 @@ pub fn systemd_unit(spec: &UnitSpec) -> String {
     format!(
         "[Unit]\nDescription=Lockyard agent\n\n[Service]\nExecStart={} agent\nWorkingDirectory={}\nEnvironment={}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
         unit_quote(&spec.executable.display().to_string()),
-        unit_quote(&spec.root.display().to_string()),
+        spec.root.display().to_string().replace('%', "%%"),
         unit_quote(&format!(
             "LOCKYARD_TOKEN_FILE={}",
             spec.token_file.display()
@@ -213,6 +213,8 @@ mod tests {
         );
         assert!(text.contains("Restart=always"));
         assert!(!text.contains("LOCKYARD_TOKEN="));
+        assert!(text.contains("WorkingDirectory=/work/R&D\n"));
+        assert!(!text.contains("WorkingDirectory=\""));
     }
 
     #[test]

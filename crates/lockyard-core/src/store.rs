@@ -236,6 +236,27 @@ impl Store {
         Ok(())
     }
 
+    /// Best-effort hook heartbeat, after the hook has made its permission decision.
+    /// The read stays available in WAL while another process writes; the short timeout
+    /// keeps a busy writer from delaying the next tool call.
+    pub fn touch_best_effort(&self, agent: &str, now: i64) -> Result<()> {
+        validate_agent(agent)?;
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(25))?;
+        let last_seen: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT last_seen FROM agents WHERE id = ?1",
+                [agent],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if last_seen.is_none_or(|last| now >= last.saturating_add(TOUCH_INTERVAL_MS)) {
+            self.touch(agent, now)?;
+        }
+        Ok(())
+    }
+
     /// Every agent seen in this project, most recent first.
     pub fn agents(&self) -> Result<Vec<Agent>> {
         let mut statement = self
@@ -397,6 +418,18 @@ mod tests {
         store.touch("a", TOUCH_INTERVAL_MS).unwrap();
         assert_eq!(store.conn.changes(), 0);
         assert_eq!(store.agents().unwrap()[0].last_seen, 1);
+    }
+
+    #[test]
+    fn best_effort_touch_does_not_wait_for_another_writer() {
+        let (dir, store) = test_store();
+        store.touch("a", 1).unwrap();
+        let blocker = Connection::open(dir.path().join(DIR_NAME).join(DB_NAME)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        let _ = store.touch_best_effort("a", 1 + TOUCH_INTERVAL_MS);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        blocker.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]

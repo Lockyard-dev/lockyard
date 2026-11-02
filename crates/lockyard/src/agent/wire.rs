@@ -36,6 +36,10 @@ pub enum Request {
         limit: usize,
         lease_seconds: i64,
     },
+    /// Read coordination events addressed to this session without advancing its cursor.
+    TakeEvents { session: String },
+    /// Acknowledge events after they have been written to the hook output.
+    AckEvents { session: String, through: i64 },
     /// Tool activity of a session.
     Touch {
         session: String,
@@ -82,6 +86,8 @@ pub struct AgentStatus {
     pub board: usize,
     pub sessions: usize,
     pub outbox: usize,
+    #[serde(default)]
+    pub rejected: usize,
     pub coordination_seq: i64,
     pub registry_seq: i64,
 }
@@ -98,6 +104,8 @@ pub struct Reply {
     pub unread: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<Message>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<Vec<lockyard_core::proto::Event>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

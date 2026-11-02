@@ -7,6 +7,7 @@ use lockyard_core::config::{Config, Mode};
 use lockyard_core::paths::find_root;
 use lockyard_core::{Backend, Error, Result, Store, ZonePath};
 use std::path::{Path, PathBuf};
+use std::{fs, io::Write};
 
 /// Session name of a call that names no agent.
 const ANONYMOUS: &str = "lockyard-cli";
@@ -41,6 +42,79 @@ pub fn endpoint(config: &Config) -> Result<(String, String)> {
     }
 }
 
+pub(crate) fn trusted_url(url: &str) -> Result<()> {
+    let trusted = std::env::var("LOCKYARD_URL").unwrap_or_default();
+    if url_matches(&trusted, url) || trusted_file_contains(url)? {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "server {url} is not trusted; run `lockyard cloud trust {url}` before sending a token there"
+    )))
+}
+
+fn trusted_file() -> Result<PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => PathBuf::from(
+            std::env::var_os("HOME").ok_or_else(|| Error::Invalid("HOME is not set".into()))?,
+        )
+        .join(".config"),
+    };
+    Ok(base.join("lockyard/trusted-servers"))
+}
+
+fn trusted_file_contains(url: &str) -> Result<bool> {
+    let path = trusted_file()?;
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(contents.lines().any(|line| url_matches(line.trim(), url)))
+}
+
+pub(crate) fn trust_url(url: &str) -> Result<()> {
+    if url.is_empty() || url.chars().any(char::is_control) {
+        return Err(Error::Invalid(
+            "a trusted server URL must be one non-empty line".into(),
+        ));
+    }
+    let path = trusted_file()?;
+    let parent = path.parent().expect("trusted server file has parent");
+    fs::create_dir_all(parent)?;
+    if trusted_file_contains(url)? {
+        return Ok(());
+    }
+    let existing = match fs::read(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    if existing.last().is_some_and(|byte| *byte != b'\n') {
+        file.write_all(b"\n")?;
+    }
+    file.write_all(url.as_bytes())?;
+    file.write_all(b"\n")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn url_matches(trusted: &str, url: &str) -> bool {
+    !trusted.is_empty() && trusted.trim_end_matches('/') == url.trim_end_matches('/')
+}
+
 /// Opens the project that contains `cwd`.
 pub fn open(cwd: &Path, agent: Option<&str>) -> Result<Opened> {
     let root = find_root(cwd).ok_or(Error::NoProject)?;
@@ -54,6 +128,7 @@ pub fn open(cwd: &Path, agent: Option<&str>) -> Result<Opened> {
 }
 
 fn direct(url: &str, session: &str) -> Result<Box<dyn Backend>> {
+    trusted_url(url)?;
     let client = Client::new(url, Config::token()?)?;
     Ok(Box::new(CloudBackend::new(client, session)))
 }
@@ -80,7 +155,21 @@ fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::url_matches;
+
+    #[test]
+    fn a_project_url_must_match_the_user_trust_url() {
+        assert!(url_matches("https://one.test/", "https://one.test"));
+        assert!(!url_matches("", "https://one.test"));
+        assert!(!url_matches("https://one.test", "https://two.test"));
+    }
+}
+
 #[cfg(not(unix))]
 fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
-    direct(&endpoint(config)?.0, session)
+    let (url, _) = endpoint(config)?;
+    trusted_url(&url)?;
+    direct(&url, session)
 }

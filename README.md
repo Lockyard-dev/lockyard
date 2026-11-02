@@ -88,6 +88,11 @@ workspace = "your-team"
 The workspace is a label: the server takes the real one from the token. The token comes from `LOCKYARD_TOKEN` or from
 the file named by `LOCKYARD_TOKEN_FILE`, and never from the config file. A session can be addressed once it has sent a
 heartbeat: `lockyard presence beat`, or any hook through the agent process.
+Before the client or `lockyard agent` sends a user token to the URL in a project file, trust that URL with
+`lockyard cloud trust https://your-server.example`. This adds it to
+`~/.config/lockyard/trusted-servers` (or `$XDG_CONFIG_HOME/lockyard/trusted-servers`) with private file permissions.
+Alternatively, set `LOCKYARD_URL` to the trusted server URL. Hooks connect only to the local agent socket and do not
+need either setting.
 
 ### Tokens
 

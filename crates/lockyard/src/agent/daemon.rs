@@ -9,17 +9,18 @@
 //! when the server says so.
 
 use super::outbox::Outbox;
+use super::private_dir;
 use super::wire::{AgentStatus, Envelope, Phase, Reply, Request, Source};
-use super::{folder_name, private_dir};
 use lockyard_cloud_client::{Call, ClientError, CloudBackend, Transport, ulid};
 use lockyard_core::proto::{
-    ActivityRequest, BoardEntry, CheckStatus, Claim, ClaimMode, ClaimQuery, EventPage, EventQuery,
-    InboxQuery, Message, PathCheck, PresenceBeat, SessionActivity, SessionState, Stamp, Stream,
-    rfc3339,
+    ActivityRequest, BoardEntry, CheckStatus, Claim, ClaimMode, ClaimQuery, DirtyPath, EventPage,
+    EventQuery, InboxQuery, Message, PathCheck, PresenceBeat, SessionActivity, SessionState, Stamp,
+    Stream, rfc3339,
 };
 use lockyard_core::zones::Conflict;
 use lockyard_core::{Backend, Error, ZonePath};
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -101,11 +102,16 @@ struct UnreadCount {
     generation: u64,
     clean: u64,
     at: Option<Instant>,
+    wall_at: Option<SystemTime>,
 }
 
 impl UnreadCount {
     fn fresh(&self, limit: Duration) -> bool {
-        self.generation == self.clean && self.at.is_some_and(|at| at.elapsed() < limit)
+        self.generation == self.clean
+            && self.at.is_some_and(|at| at.elapsed() < limit)
+            && self
+                .wall_at
+                .is_some_and(|at| SystemTime::now().duration_since(at).unwrap_or_default() < limit)
     }
 }
 
@@ -116,9 +122,11 @@ struct View {
     zones_generation: u64,
     zones_clean: u64,
     zones_at: Option<Instant>,
+    zones_wall_at: Option<SystemTime>,
     board_generation: u64,
     board_clean: u64,
     board_at: Option<Instant>,
+    board_wall_at: Option<SystemTime>,
     unread: HashMap<String, UnreadCount>,
 }
 
@@ -126,20 +134,28 @@ impl View {
     fn fresh(&self, limit: Duration) -> bool {
         self.zones_generation == self.zones_clean
             && self.zones_at.is_some_and(|at| at.elapsed() < limit)
+            && self
+                .zones_wall_at
+                .is_some_and(|at| SystemTime::now().duration_since(at).unwrap_or_default() < limit)
     }
 
     fn board_fresh(&self, limit: Duration) -> bool {
         self.board_generation == self.board_clean
             && self.board_at.is_some_and(|at| at.elapsed() < limit)
+            && self
+                .board_wall_at
+                .is_some_and(|at| SystemTime::now().duration_since(at).unwrap_or_default() < limit)
     }
 
     /// A poll came back and everything it held is in the view: the view is current as of now.
     fn confirm(&mut self, at: Instant) {
         if self.zones_generation == self.zones_clean {
             self.zones_at = Some(at);
+            self.zones_wall_at = Some(SystemTime::now());
         }
         if self.board_generation == self.board_clean {
             self.board_at = Some(at);
+            self.board_wall_at = Some(SystemTime::now());
         }
     }
 
@@ -156,11 +172,11 @@ impl View {
         // A claim of an unavailable session stops blocking, as it does on the server.
         let covering =
             |claim: &&Claim| claim.holder_available != Some(false) && covers(claim, &path);
+        // Availability is about other sessions: a session that comes back still holds its own claims.
         let mine: Vec<&Claim> = self
             .claims
             .iter()
-            .filter(|claim| claim.session == session)
-            .filter(covering)
+            .filter(|claim| claim.session == session && covers(claim, &path))
             .collect();
         let shares = mine.iter().any(|claim| claim.mode == ClaimMode::Shared);
         let holder = self
@@ -224,8 +240,18 @@ struct SessionTrack {
 struct ClaimActivity {
     sent: Option<Instant>,
     paths: Vec<String>,
+    reported: HashSet<String>,
     session: String,
 }
+
+#[derive(Default)]
+struct SessionEvents {
+    after: i64,
+    last_poll: Option<Instant>,
+    events: VecDeque<lockyard_core::proto::Event>,
+}
+
+const SESSION_EVENT_CACHE: usize = 256;
 
 #[derive(Default)]
 struct Signal {
@@ -254,6 +280,7 @@ fn write_class(call: &Call) -> WriteClass {
     match parts.as_slice() {
         ["api", "v1", "presence"]
         | ["api", "v1", "bus", "inbox", "seen"]
+        | ["api", "v1", "zones", "dirty"]
         | ["api", "v1", "zones", "claims", _, "activity"] => WriteClass::Background,
         ["api", "v1", "bus", "messages"] | ["api", "v1", "bus", "messages", _, "reply" | "ack"] => {
             WriteClass::Mail
@@ -275,6 +302,8 @@ struct Shared<T: Transport + 'static> {
     wake: Condvar,
     coordination_seq: AtomicI64,
     registry_seq: AtomicI64,
+    session_event_cursors: Mutex<HashMap<String, i64>>,
+    session_events: Mutex<HashMap<String, SessionEvents>>,
 }
 
 fn now_ms() -> i64 {
@@ -443,6 +472,7 @@ impl<T: Transport + 'static> Shared<T> {
         entry.count = count;
         entry.clean = generation;
         entry.at = Some(Instant::now());
+        entry.wall_at = Some(SystemTime::now());
     }
 
     fn take_mail(&self, session: &str, limit: usize, lease_seconds: i64) -> Reply {
@@ -473,6 +503,147 @@ impl<T: Transport + 'static> Shared<T> {
                 source: Some(Source::None),
                 ..Reply::default()
             },
+        }
+    }
+
+    fn take_events(&self, session: &str) -> Reply {
+        let after = self
+            .session_event_cursors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(session)
+            .copied()
+            .unwrap_or_default();
+        let events = self
+            .session_events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let cached = events
+            .get(session)
+            .map(|entry| {
+                entry
+                    .events
+                    .iter()
+                    .filter(|event| event.seq > after)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        Reply {
+            events: Some(cached),
+            ..Reply::default()
+        }
+    }
+
+    fn ack_events(&self, session: &str, through: i64) -> Reply {
+        let cursor_name = format!(
+            "cursor-session-{}",
+            lockyard_cloud_client::token_id(session)
+        );
+        let mut cursors = self
+            .session_event_cursors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let current = cursors
+            .entry(session.to_string())
+            .or_insert_with(|| load_seq(&self.state_dir, &cursor_name));
+        if through > *current {
+            let temporary = self.state_dir.join(format!("{cursor_name}.tmp"));
+            let cursor = self.state_dir.join(cursor_name);
+            if let Err(error) = fs::write(&temporary, through.to_string())
+                .and_then(|()| fs::rename(&temporary, cursor))
+            {
+                return Reply::failed(ClientError::Transport(format!(
+                    "cannot save event cursor: {error}"
+                )));
+            }
+            *current = through;
+        }
+        if let Some(cache) = self
+            .session_events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(session)
+        {
+            cache.events.retain(|event| event.seq > through);
+        }
+        Reply::default()
+    }
+
+    fn refresh_session_events(&self) {
+        let active: Vec<String> = {
+            let sessions = self.sessions();
+            sessions
+                .iter()
+                .filter_map(|(session, track)| {
+                    track
+                        .heard
+                        .filter(|heard| heard.elapsed() < self.timing().active_window)
+                        .map(|_| session.clone())
+                })
+                .collect()
+        };
+        for session in active {
+            let acked = {
+                let cursor_name = format!(
+                    "cursor-session-{}",
+                    lockyard_cloud_client::token_id(&session)
+                );
+                let mut cursors = self
+                    .session_event_cursors
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                *cursors
+                    .entry(session.clone())
+                    .or_insert_with(|| load_seq(&self.state_dir, &cursor_name))
+            };
+            let after = {
+                let mut caches = self
+                    .session_events
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let cache = caches.entry(session.clone()).or_default();
+                if cache
+                    .last_poll
+                    .is_some_and(|at| at.elapsed() < self.timing().upkeep)
+                {
+                    continue;
+                }
+                cache.last_poll = Some(Instant::now());
+                cache.after = cache.after.max(acked);
+                cache
+                    .after
+                    .max(cache.events.back().map_or(0, |event| event.seq))
+            };
+            let query = EventQuery {
+                stream: Stream::Coordination,
+                after,
+                wait_seconds: 0,
+                session: Some(session.clone()),
+                types: Vec::new(),
+            };
+            if let Ok(page) = self.backend(&session).events(&query) {
+                let mut caches = self
+                    .session_events
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let cache = caches.entry(session).or_default();
+                for event in page.events {
+                    if event.seq > cache.after
+                        && !cache
+                            .events
+                            .iter()
+                            .any(|existing| existing.seq == event.seq)
+                    {
+                        cache.events.push_back(event);
+                    }
+                }
+                while cache.events.len() > SESSION_EVENT_CACHE {
+                    if let Some(event) = cache.events.pop_front() {
+                        cache.after = cache.after.max(event.seq);
+                    }
+                }
+            }
         }
     }
 
@@ -559,14 +730,41 @@ impl<T: Transport + 'static> Shared<T> {
             })
             .collect()
         };
-        {
+        let dirty_paths = {
             let mut activity = self.activity();
-            for (claim, path) in matches {
-                let entry = activity.entry(claim).or_default();
+            let mut fresh = Vec::new();
+            for (claim, path) in &matches {
+                let entry = activity.entry(*claim).or_default();
                 entry.session = session.to_string();
-                if !entry.paths.contains(&path) {
-                    entry.paths.push(path);
+                if !entry.paths.contains(path) {
+                    entry.paths.push(path.clone());
                 }
+                if entry.reported.insert(path.clone()) {
+                    fresh.push(path.clone());
+                }
+            }
+            fresh.sort();
+            fresh.dedup();
+            fresh
+        };
+        if !dirty_paths.is_empty() {
+            let report: Vec<DirtyPath> = dirty_paths
+                .into_iter()
+                .map(|path| DirtyPath {
+                    path,
+                    owner_session: Some(session.to_string()),
+                    reason: Some("uncommitted changes reported by a tool hook".into()),
+                    task_id: None,
+                })
+                .collect();
+            let call = Call::write(
+                session,
+                "POST",
+                "/api/v1/zones/dirty".into(),
+                json!({"paths": report}),
+            );
+            if let Err(error) = self.outbox.append(call) {
+                eprintln!("lockyard agent: could not queue dirty paths: {error}");
             }
         }
         self.flush_activity();
@@ -702,6 +900,7 @@ impl<T: Transport + 'static> Shared<T> {
             board: view.board.len(),
             sessions: view.unread.len(),
             outbox: self.outbox.len(),
+            rejected: self.outbox.rejected(),
             coordination_seq: self.coordination_seq.load(Ordering::Relaxed),
             registry_seq: self.registry_seq.load(Ordering::Relaxed),
         }
@@ -725,6 +924,8 @@ impl<T: Transport + 'static> Shared<T> {
                 limit,
                 lease_seconds,
             } => self.take_mail(&session, limit, lease_seconds),
+            Request::TakeEvents { session } => self.take_events(&session),
+            Request::AckEvents { session, through } => self.ack_events(&session, through),
             Request::Touch {
                 session,
                 client,
@@ -823,6 +1024,7 @@ impl<T: Transport + 'static> Shared<T> {
             view.claims = claims;
             view.zones_clean = generation;
             view.zones_at = Some(started);
+            view.zones_wall_at = Some(SystemTime::now());
         }
     }
 
@@ -833,6 +1035,7 @@ impl<T: Transport + 'static> Shared<T> {
             view.board = board;
             view.board_clean = generation;
             view.board_at = Some(started);
+            view.board_wall_at = Some(SystemTime::now());
         }
     }
 
@@ -878,6 +1081,7 @@ impl<T: Transport + 'static> Shared<T> {
                 self.refresh_board();
             }
             self.refresh_unread();
+            self.refresh_session_events();
             self.flush_activity();
             let mut signal = self.signal();
             if !signal.nudged && !signal.stop {
@@ -902,6 +1106,14 @@ impl<T: Transport + 'static> Shared<T> {
             call.deadline_ms =
                 Some(u64::try_from(self.timing().send_limit.as_millis()).unwrap_or(u64::MAX));
             match self.transport.call(&call) {
+                Err(ClientError::RateLimited(error)) => {
+                    let delay = error
+                        .retry_after
+                        .map(Duration::from_secs)
+                        .unwrap_or(self.timing().retry_min)
+                        .min(MAX_RETRY_AFTER);
+                    self.outbox.defer(entry.n, delay);
+                }
                 Err(error) if error.is_outage() => {
                     let asked = error
                         .retry_after()
@@ -921,8 +1133,8 @@ impl<T: Transport + 'static> Shared<T> {
 }
 
 fn answer<T: Transport + 'static>(shared: &Shared<T>, stream: UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(IDLE_CONNECTION))?;
-    stream.set_write_timeout(Some(IDLE_CONNECTION))?;
+    let _ = stream.set_read_timeout(Some(IDLE_CONNECTION));
+    let _ = stream.set_write_timeout(Some(IDLE_CONNECTION));
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
     loop {
@@ -958,6 +1170,11 @@ fn load_seq(dir: &Path, name: &str) -> i64 {
         .ok()
         .and_then(|text| text.trim().parse().ok())
         .unwrap_or(0)
+}
+
+fn state_folder(config: &AgentConfig) -> String {
+    let identity = format!("{}\0{}", config.url, config.token_id);
+    format!("target-{}", lockyard_cloud_client::token_id(&identity))
 }
 
 fn bind(path: &Path) -> io::Result<(File, UnixListener)> {
@@ -1003,7 +1220,7 @@ impl<T: Transport + 'static> Daemon<T> {
     pub fn start(config: AgentConfig, transport: T) -> io::Result<Self> {
         let (lock, listener) = bind(&config.socket)?;
         private_dir(&config.state_root)?;
-        let state_dir = config.state_root.join(folder_name(&config.workspace));
+        let state_dir = config.state_root.join(state_folder(&config));
         private_dir(&state_dir)?;
         let outbox = Outbox::open(&state_dir)?;
         let shared = Arc::new(Shared {
@@ -1011,6 +1228,8 @@ impl<T: Transport + 'static> Daemon<T> {
             session: format!("lockyard-agent-{}", super::uid()),
             coordination_seq: AtomicI64::new(load_seq(&state_dir, "coordination")),
             registry_seq: AtomicI64::new(load_seq(&state_dir, "registry")),
+            session_event_cursors: Mutex::new(HashMap::new()),
+            session_events: Mutex::new(HashMap::new()),
             state_dir,
             config,
             view: RwLock::new(View {
@@ -1127,6 +1346,7 @@ mod tests {
         hang_ms: AtomicUsize,
         /// Every request that is not an event poll.
         calls: Mutex<Vec<String>>,
+        event_calls: AtomicUsize,
         refuse_with: Mutex<Option<u16>>,
     }
 
@@ -1166,6 +1386,7 @@ mod tests {
         fn call(&self, call: &Call) -> Result<Value, ClientError> {
             let route = call.path.split('?').next().unwrap_or_default().to_string();
             if call.long_poll || route.ends_with("/events") {
+                self.event_calls.fetch_add(1, Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(20));
                 if self.down.load(Ordering::SeqCst) {
                     return Err(ClientError::Transport("down".into()));
@@ -1263,6 +1484,23 @@ mod tests {
             state_root: dir.join("state"),
             timing,
         }
+    }
+
+    #[test]
+    fn outbox_identity_separates_same_label_across_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = config(dir.path(), timing());
+        let mut second = first.clone();
+        second.url = "https://other.test".into();
+        let mut third = first.clone();
+        third.token_id = "other-token".into();
+        assert_ne!(state_folder(&first), state_folder(&second));
+        assert_ne!(state_folder(&first), state_folder(&third));
+        first.workspace = "different-label".into();
+        assert_eq!(
+            state_folder(&first),
+            state_folder(&config(dir.path(), timing()))
+        );
     }
 
     fn start_with(timing: Timing, prepare: impl FnOnce(&FakeServer)) -> Rig {
@@ -1396,6 +1634,18 @@ mod tests {
     }
 
     #[test]
+    fn a_view_that_aged_during_suspend_is_stale_after_wake() {
+        let mut view = View {
+            zones_at: Some(Instant::now()),
+            zones_wall_at: Some(SystemTime::now() - Duration::from_secs(60)),
+            ..View::default()
+        };
+        assert!(!view.fresh(Duration::from_secs(30)));
+        view.confirm(Instant::now());
+        assert!(view.fresh(Duration::from_secs(30)));
+    }
+
+    #[test]
     fn a_claim_of_an_unavailable_holder_stops_blocking_in_the_view() {
         let view = View {
             claims: vec![
@@ -1413,6 +1663,11 @@ mod tests {
         let status = |path: &str| view.check("me", &[path.to_string()]).remove(0).status;
         assert_eq!(status("src/a"), CheckStatus::Free);
         assert_eq!(status("docs/a"), CheckStatus::Held);
+        assert_eq!(
+            view.check("bob", &["src/a".to_string()]).remove(0).status,
+            CheckStatus::Own,
+            "a session that comes back still holds its own claim"
+        );
     }
 
     #[test]
@@ -1441,7 +1696,7 @@ mod tests {
             (Some(2), Some(Source::View))
         );
         *rig.server.unread.lock().unwrap() = 3;
-        rig.server.event("bus.message", Some("me"));
+        rig.server.event("bus.unread", Some("me"));
         wait_for("the new count", || {
             let reply = rig.daemon.handle(ask());
             reply.unread == Some(3) && reply.source == Some(Source::View)
@@ -1793,16 +2048,38 @@ mod tests {
         for path in ["src/a", "src/b", "src/c", "elsewhere"] {
             rig.daemon.handle(write(path));
         }
+        for _ in 0..10 {
+            rig.daemon.handle(write("src/a"));
+        }
+        wait_for("dirty path reporting", || {
+            rig.server.writes_to("/zones/dirty").len() >= 3
+        });
+        let dirty = rig.server.writes_to("/zones/dirty");
+        assert_eq!(
+            dirty.len(),
+            3,
+            "unclaimed and repeated paths are not reported twice"
+        );
+        assert_eq!(dirty[0].body.as_ref().unwrap()["paths"][0]["path"], "src/a");
+        assert_eq!(
+            dirty[0].body.as_ref().unwrap()["paths"][0]["owner_session"],
+            "me"
+        );
         wait_for("both batches", || {
             rig.server.writes_to("/activity").len() == 2
         });
         let batches = rig.server.writes_to("/activity");
         assert_eq!(batches[0].body.as_ref().unwrap()["paths"], json!(["src/a"]));
-        assert_eq!(
-            batches[1].body.as_ref().unwrap()["paths"],
-            json!(["src/b", "src/c"])
+        // Activity keeps counting repeated writes of src/a, which only the dirty report folds.
+        let second = batches[1].body.as_ref().unwrap()["paths"].to_string();
+        assert!(
+            second.contains("src/b") && second.contains("src/c"),
+            "{second}"
         );
         assert_eq!(batches[1].session, "me");
+        rig.daemon.handle(write("src/a"));
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(rig.server.writes_to("/zones/dirty").len(), 3);
     }
 
     #[test]
@@ -1824,6 +2101,50 @@ mod tests {
         wait_for("the board", || {
             rig.daemon.handle(Request::Ping).status.unwrap().board == 1
         });
+    }
+
+    #[test]
+    fn session_events_repeat_until_the_hook_acknowledges_written_output() {
+        let rig = start_with(
+            Timing {
+                upkeep: Duration::from_secs(1),
+                ..timing()
+            },
+            |server| server.event("zone.requested", Some("alice")),
+        );
+        let take = Request::TakeEvents {
+            session: "alice".into(),
+        };
+        rig.daemon.handle(Request::Touch {
+            session: "alice".into(),
+            client: "test".into(),
+            phase: Phase::Post,
+            write_paths: Vec::new(),
+        });
+        wait_for("session event cache", || {
+            rig.daemon
+                .shared
+                .session_events
+                .lock()
+                .unwrap()
+                .get("alice")
+                .is_some_and(|cache| !cache.events.is_empty())
+        });
+        let polls = rig.server.event_calls.load(Ordering::SeqCst);
+        let first = rig.daemon.handle(take.clone()).events.unwrap();
+        assert_eq!(
+            rig.server.event_calls.load(Ordering::SeqCst),
+            polls,
+            "TakeEvents must read memory only"
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].kind, "zone.requested");
+        assert_eq!(rig.daemon.handle(take.clone()).events.unwrap(), first);
+        rig.daemon.handle(Request::AckEvents {
+            session: "alice".into(),
+            through: first[0].seq,
+        });
+        assert!(rig.daemon.handle(take).events.unwrap().is_empty());
     }
 
     #[test]
@@ -1873,6 +2194,27 @@ mod tests {
             second.err().map(|error| error.kind()),
             Some(io::ErrorKind::AddrInUse)
         );
+    }
+
+    #[test]
+    fn a_told_touch_is_processed_after_the_client_closes() {
+        let rig = start_with(timing(), |_| {});
+        let mut stream = UnixStream::connect(&rig.daemon.shared.config.socket).unwrap();
+        let envelope = Envelope {
+            workspace: "team".into(),
+            request: Request::Touch {
+                session: "alice".into(),
+                client: "test".into(),
+                phase: Phase::Prompt,
+                write_paths: Vec::new(),
+            },
+        };
+        serde_json::to_writer(&mut stream, &envelope).unwrap();
+        stream.write_all(b"\n").unwrap();
+        drop(stream);
+        wait_for("closed tell heartbeat", || {
+            rig.server.writes_to("/presence").len() == 1
+        });
     }
 
     #[test]
@@ -1937,6 +2279,7 @@ mod tests {
             class("POST", "/api/v1/zones/claims/3/activity"),
             WriteClass::Background
         );
+        assert_eq!(class("POST", "/api/v1/zones/dirty"), WriteClass::Background);
         for direct in [
             "/api/v1/zones/claims",
             "/api/v1/zones/claims/3/renew",

@@ -22,6 +22,7 @@ use std::time::Duration;
 const QUEUE_FILE: &str = "outbox.jsonl";
 const CURSOR_FILE: &str = "outbox.cursor";
 const REJECTED_FILE: &str = "outbox.rejected";
+const DONE_FILE: &str = "outbox.done";
 /// An outage this long must not fill the disk. Past it, a write fails for its caller to see.
 const MAX_QUEUE_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -40,6 +41,7 @@ struct Queue {
     pending: VecDeque<Entry>,
     next: u64,
     waiters: HashMap<u64, Sender<Outcome>>,
+    deferred: HashMap<u64, std::time::Instant>,
 }
 
 pub struct Outbox {
@@ -63,6 +65,11 @@ impl Outbox {
             .append(true)
             .open(dir.join(QUEUE_FILE))?;
         let cursor = read_cursor(dir);
+        let completed: std::collections::HashSet<u64> = fs::read_to_string(dir.join(DONE_FILE))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.parse().ok())
+            .collect();
         let mut text = Vec::new();
         file.read_to_end(&mut text)?;
         let mut pending = VecDeque::new();
@@ -77,7 +84,7 @@ impl Outbox {
             let Some(entry) = parsed else { break };
             intact += line.len();
             last = last.max(entry.n);
-            if entry.n > cursor {
+            if entry.n > cursor && !completed.contains(&entry.n) {
                 pending.push_back(entry);
             }
         }
@@ -93,6 +100,7 @@ impl Outbox {
                 pending,
                 next: last + 1,
                 waiters: HashMap::new(),
+                deferred: HashMap::new(),
             }),
             ready: Condvar::new(),
         })
@@ -122,29 +130,72 @@ impl Outbox {
         Ok((n, receiver))
     }
 
-    /// The oldest entry, left in place until [`Outbox::finish`]. Waits up to `timeout` for one.
+    /// The oldest eligible entry, left in place until [`Outbox::finish`]. Entries stay ordered
+    /// within one session while a rate limited session backs off.
     pub fn head(&self, timeout: Duration) -> Option<Entry> {
-        let queue = self.lock();
-        let (queue, _) = self
-            .ready
-            .wait_timeout_while(queue, timeout, |queue| queue.pending.is_empty())
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queue.pending.front().cloned()
+        let until = std::time::Instant::now() + timeout;
+        let mut queue = self.lock();
+        loop {
+            let now = std::time::Instant::now();
+            let mut blocked = std::collections::HashSet::new();
+            for entry in &queue.pending {
+                let key = pair_key(entry);
+                let ready_at = queue.deferred.get(&entry.n).copied();
+                if !blocked.contains(&key) && ready_at.is_none_or(|at| at <= now) {
+                    return Some(entry.clone());
+                }
+                blocked.insert(key);
+            }
+            let next = queue
+                .deferred
+                .values()
+                .copied()
+                .min()
+                .unwrap_or(until)
+                .min(until);
+            let wait = next.saturating_duration_since(now);
+            if wait.is_zero() {
+                return None;
+            }
+            let (guard, _) = self
+                .ready
+                .wait_timeout(queue, wait)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            queue = guard;
+            if std::time::Instant::now() >= until && queue.pending.is_empty() {
+                return None;
+            }
+        }
+    }
+
+    pub fn defer(&self, n: u64, duration: Duration) {
+        let mut queue = self.lock();
+        queue
+            .deferred
+            .insert(n, std::time::Instant::now() + duration);
+        self.ready.notify_all();
     }
 
     /// Removes the head after a final answer and tells whoever waits for it.
     pub fn finish(&self, n: u64, outcome: Outcome) -> io::Result<()> {
         let mut queue = self.lock();
-        if queue.pending.front().is_none_or(|entry| entry.n != n) {
+        let Some(index) = queue.pending.iter().position(|entry| entry.n == n) else {
             return Ok(());
-        }
-        queue.pending.pop_front();
+        };
+        let entry = queue.pending.remove(index).expect("entry index exists");
+        queue.deferred.remove(&n);
+        let mut done = private_options()
+            .create(true)
+            .append(true)
+            .open(self.dir.join(DONE_FILE))?;
+        writeln!(done, "{n}")?;
+        done.sync_data()?;
         let waiter = queue.waiters.remove(&n);
-        // The cursor needs no fsync: a stale one sends again, and the key makes that harmless.
-        let cursor = fs::write(self.dir.join(CURSOR_FILE), n.to_string());
         let truncated = if queue.pending.is_empty() {
             queue.bytes = 0;
-            queue.file.set_len(0)
+            queue.file.set_len(0)?;
+            let _ = fs::remove_file(self.dir.join(DONE_FILE));
+            fs::write(self.dir.join(CURSOR_FILE), (queue.next - 1).to_string())
         } else {
             Ok(())
         };
@@ -154,14 +205,20 @@ impl Outbox {
             None => Some(outcome),
         };
         if let Some(outcome) = unheard {
-            log_rejection(&self.dir, n, &outcome);
+            log_rejection(&self.dir, &entry, &outcome);
         }
-        cursor.and(truncated)
+        truncated
     }
 
     /// How many entries wait.
     pub fn len(&self) -> usize {
         self.lock().pending.len()
+    }
+
+    pub fn rejected(&self) -> usize {
+        fs::read_to_string(self.dir.join(REJECTED_FILE))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
     }
 }
 
@@ -199,10 +256,13 @@ fn read_cursor(dir: &Path) -> u64 {
 }
 
 /// Keeps a write the server refused for good, because no caller is left to hear about it.
-fn log_rejection(dir: &Path, n: u64, outcome: &Outcome) {
+fn log_rejection(dir: &Path, entry: &Entry, outcome: &Outcome) {
     let Err(error) = outcome else { return };
-    eprintln!("lockyard agent: the server refused queued write {n}: {error}");
-    let record = serde_json::json!({"n": n, "error": error.to_string()});
+    eprintln!(
+        "lockyard agent: the server refused queued write {}: {error}",
+        entry.n
+    );
+    let record = serde_json::json!({"n": entry.n, "call": entry.call, "error": error.to_string()});
     let file = private_options()
         .create(true)
         .append(true)
@@ -210,6 +270,10 @@ fn log_rejection(dir: &Path, n: u64, outcome: &Outcome) {
     if let Ok(mut file) = file {
         let _ = writeln!(file, "{record}");
     }
+}
+
+fn pair_key(entry: &Entry) -> String {
+    entry.call.session.clone()
 }
 
 #[cfg(test)]
@@ -312,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_nobody_waits_for_is_kept_on_disk() {
+    fn a_refusal_nobody_waits_for_keeps_the_call_and_body() {
         let dir = tempfile::tempdir().unwrap();
         let outbox = Outbox::open(dir.path()).unwrap();
         let n = outbox.append(mail("one")).unwrap();
@@ -321,6 +385,34 @@ mod tests {
             .unwrap();
         let kept = fs::read_to_string(dir.path().join(REJECTED_FILE)).unwrap();
         assert!(kept.contains("no"));
+        assert!(kept.contains("\"call\""));
+        assert!(kept.contains("one"));
+        assert_eq!(outbox.rejected(), 1);
+    }
+
+    #[test]
+    fn a_deferred_session_does_not_block_another_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Outbox::open(dir.path()).unwrap();
+        let first = outbox.append(mail("one")).unwrap();
+        let mut other = mail("two");
+        other.session = "other".into();
+        outbox.append(other).unwrap();
+        outbox.defer(first, Duration::from_secs(10));
+        assert_eq!(body(&outbox.head(NOW).unwrap()), "two");
+    }
+
+    #[test]
+    fn a_later_completion_does_not_hide_earlier_work_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Outbox::open(dir.path()).unwrap();
+        let first = outbox.append(mail("one")).unwrap();
+        let second = outbox.append(mail("two")).unwrap();
+        outbox.finish(second, Ok(Value::Null)).unwrap();
+        drop(outbox);
+        let reopened = Outbox::open(dir.path()).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened.head(NOW).unwrap().n, first);
     }
 
     #[test]

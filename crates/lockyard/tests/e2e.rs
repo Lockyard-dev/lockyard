@@ -70,6 +70,7 @@ struct Who {
 struct Machine {
     project: tempfile::TempDir,
     runtime: tempfile::TempDir,
+    url: String,
     agent: Mutex<Option<Child>>,
 }
 
@@ -93,6 +94,7 @@ impl Machine {
         Self {
             project,
             runtime,
+            url: url.to_string(),
             agent: Mutex::new(None),
         }
     }
@@ -111,6 +113,7 @@ impl Machine {
             .env("PATH", "/usr/bin:/bin")
             .env("XDG_RUNTIME_DIR", run.join("run"))
             .env("XDG_STATE_HOME", run.join("state"))
+            .env("LOCKYARD_URL", &self.url)
             .stdin(Stdio::null());
         if let Some(token) = token {
             command.env("LOCKYARD_TOKEN", token);
@@ -508,6 +511,15 @@ fn zones(w: &World) {
     assert!(
         rows.iter().any(|row| row["payload"]["id"] == asked["id"]),
         "{seen}"
+    );
+    let waiting = w.ly(&third, &["zone", "requests"]).ok();
+    assert!(
+        waiting
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == asked["id"]),
+        "{waiting}"
     );
     w.ly(&two, &["zone", "answer", &w.id(&asked), "--reply", "soon"])
         .ok();
@@ -1335,6 +1347,13 @@ fn import(w: &World) {
         .to_string(),
     )
     .unwrap();
+    let registry = dir.join("registry.json");
+    fs::write(&registry, json!({"items": []}).to_string()).unwrap();
+    let registry = registry.to_str().unwrap();
+    w.ly(&one, &["cloud", "import-registry", registry])
+        .refused(1, "importer");
+    w.ly(&importer, &["cloud", "import-registry", registry])
+        .refused(1, "1 to 1000 items");
     let file = catalog.to_str().unwrap();
     w.ly(&one, &["cloud", "import-zones", file])
         .refused(1, "role");
@@ -1387,6 +1406,7 @@ fn import(w: &World) {
 
 fn plain(w: &World) {
     let one = w.a("plain");
+    assert!(w.ly(&one, &["cloud", "trust", &w.server.url]).ok()["trusted"].is_string());
     w.beat(&one);
     let who = w.ly(&one, &["who"]).ok();
     assert!(

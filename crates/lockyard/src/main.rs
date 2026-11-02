@@ -221,6 +221,8 @@ enum ZoneCommand {
         #[arg(long)]
         need_by: Option<String>,
     },
+    /// List unexpired requests sent by or addressed to this agent.
+    Requests,
     /// Answer a request.
     Answer {
         #[arg(value_parser = parse_id)]
@@ -731,6 +733,8 @@ enum AgentCommand {
 
 #[derive(Subcommand)]
 enum CloudCommand {
+    /// Trust a server URL before sending a user token to it.
+    Trust { url: String },
     /// Dump coordination state. Needs the owner or exporter role.
     Export,
     /// Freeze or unfreeze coordination writes. Needs the owner role.
@@ -744,6 +748,8 @@ enum CloudCommand {
     ImportZones { file: PathBuf },
     /// Import threads, the board and tasks from a JSON file. Needs the importer role.
     ImportBus { file: PathBuf },
+    /// Import registry items. Needs the importer role.
+    ImportRegistry { file: PathBuf },
     /// Service tokens of the workspace. Needs the owner role.
     #[command(subcommand)]
     Token(TokenCommand),
@@ -871,6 +877,17 @@ fn claim_line(claim: &Claim, clock: Option<i64>) -> String {
         line.push_str("  ");
         line.push_str(&claim.note);
     }
+    for dirty in &claim.foreign_dirty_paths {
+        let path = serde_json::to_string(&dirty.path).unwrap_or_else(|_| "\"?\"".into());
+        let owner = dirty
+            .owner_session
+            .as_deref()
+            .map(|owner| serde_json::to_string(owner).unwrap_or_else(|_| "\"?\"".into()))
+            .unwrap_or_else(|| "unknown owner".into());
+        line.push_str(&format!(
+            "\nForeign uncommitted work: {path} (owner: {owner})"
+        ));
+    }
     line
 }
 
@@ -882,8 +899,34 @@ fn message_line(message: &Message) -> String {
     };
     format!(
         "M-{}  {}{}: {}",
-        message.id, message.from, scope, message.body
+        message.id,
+        message.from,
+        scope,
+        escape_controls(&message.body)
     )
+}
+
+fn escape_controls(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '\n' => "\\n".to_string(),
+            '\r' => "\\r".to_string(),
+            '\t' => "\\t".to_string(),
+            ch if ch.is_control() => format!("\\u{{{:x}}}", ch as u32),
+            ch => ch.to_string(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod output_escape_tests {
+    #[test]
+    fn preserves_cyrillic_and_emoji() {
+        assert_eq!(
+            super::escape_controls("Почта 😀\nready"),
+            "Почта 😀\\nready"
+        );
+    }
 }
 
 fn sent_line(message: &Message) -> String {
@@ -1090,6 +1133,10 @@ fn run_zone(
                 .backend
                 .zone_request(&resolve_agent(agent)?, &request)?;
             output(&record, format!("requested as R-{}", record.id))
+        }
+        ZoneCommand::Requests => {
+            let records = opened.backend.zone_requests(&resolve_agent(agent)?)?;
+            output(&records, format!("{} active requests", records.len()))
         }
         ZoneCommand::Answer { id, reply, eta } => {
             let record = opened.backend.zone_answer(
@@ -1720,12 +1767,16 @@ fn run_cloud(mut opened: Opened, command: CloudCommand, agent: Option<&String>) 
         .or_else(env_agent)
         .unwrap_or_else(|| "lockyard-cli".to_string());
     let answer = match command {
+        CloudCommand::Trust { .. } => unreachable!("trust is handled before opening the project"),
         CloudCommand::Export => backend.export()?,
         CloudCommand::Freeze { state, reason } => {
             backend.freeze(&agent, &Freeze { on: state, reason })?
         }
         CloudCommand::ImportZones { file } => backend.import_zones(&agent, &read_json(&file)?)?,
         CloudCommand::ImportBus { file } => backend.import_bus(&agent, &read_json(&file)?)?,
+        CloudCommand::ImportRegistry { file } => {
+            backend.registry_import(&agent, &read_json(&file)?)?
+        }
         CloudCommand::Token(command) => return run_token(backend, command, &agent),
     };
     let text = answer.to_string();
@@ -1893,6 +1944,7 @@ fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
         None => {
             let (_, config) = project()?;
             let (url, workspace) = open::endpoint(&config)?;
+            open::trusted_url(&url)?;
             let token = Config::token()?;
             let token_id = lockyard_cloud_client::token_id(&token);
             let client = Client::new(&url, token)?;
@@ -1927,8 +1979,8 @@ fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
                         .view_age_ms
                         .map_or("none".to_string(), |ms| format!("{ms} ms"));
                     let text = format!(
-                        "running, pid {}, workspace {}, view age {age}, outbox {}",
-                        status.pid, status.workspace, status.outbox
+                        "running, pid {}, workspace {}, view age {age}, outbox {}, rejected {}",
+                        status.pid, status.workspace, status.outbox, status.rejected
                     );
                     output(
                         &json!({"running": true, "installed": installed, "status": status}),
@@ -2015,6 +2067,10 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
         Command::Events(args) => run_events(&open()?, args, agent.as_ref()),
         Command::Presence(command) => run_presence(open()?, command, agent.as_ref()),
         Command::Agent(args) => run_agent(args, cwd),
+        Command::Cloud(CloudCommand::Trust { url }) => {
+            open::trust_url(&url)?;
+            output(&json!({"trusted": url}), format!("trusted {url}"))
+        }
         Command::Cloud(command) => run_cloud(open()?, command, agent.as_ref()),
         Command::Hook(command) => {
             run_hook(command, agent, cwd);
@@ -2131,10 +2187,17 @@ mod tests {
 
     #[test]
     fn a_cloud_lease_is_shown_and_never_counted_down() {
-        let claim: Claim =
-            serde_json::from_value(json!({"id": 1, "session": "a", "expires_at": 90_000})).unwrap();
+        let claim: Claim = serde_json::from_value(json!({
+            "id": 1,
+            "session": "a",
+            "expires_at": 90_000,
+            "foreign_dirty_paths": [{"path": "src/a.rs", "owner_session": "other"}]
+        }))
+        .unwrap();
         assert!(claim_line(&claim, Some(30_000)).contains("1 min left"));
         assert!(claim_line(&claim, None).contains("until 90000"));
+        assert!(claim_line(&claim, None).contains("Foreign uncommitted work: \"src/a.rs\""));
+        assert!(claim_line(&claim, None).contains("owner: \"other\""));
     }
 
     struct Scripted {

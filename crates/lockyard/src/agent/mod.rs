@@ -82,20 +82,6 @@ mod unix {
         Ok(())
     }
 
-    /// Turns a workspace label into one safe folder name.
-    pub fn folder_name(label: &str) -> String {
-        label
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -112,11 +98,6 @@ mod unix {
             let link = dir.path().join("link");
             std::os::unix::fs::symlink(&folder, &link).unwrap();
             assert!(private_dir(&link).is_err());
-        }
-
-        #[test]
-        fn labels_become_one_folder() {
-            assert_eq!(folder_name("team/../x y"), "team____x_y");
         }
     }
 }

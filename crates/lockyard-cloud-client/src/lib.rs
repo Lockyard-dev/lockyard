@@ -132,10 +132,9 @@ impl ClientError {
     /// True when the same request may work later, so an outbox entry stays queued.
     pub fn is_outage(&self) -> bool {
         match self {
-            Self::Transport(_) | Self::Frozen(_) | Self::RateLimited(_) | Self::Unauthorized(_) => {
-                true
-            }
-            Self::Http(error) => error.status >= 500,
+            Self::Transport(_) | Self::Frozen(_) | Self::Unauthorized(_) => true,
+            Self::Http(error) => error.status >= 500 || (300..400).contains(&error.status),
+            Self::Decode(_) => true,
             _ => false,
         }
     }
@@ -326,10 +325,12 @@ impl Client {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(2))
             .timeout_read(Duration::from_secs(5))
+            .redirects(0)
             .build();
         let poll_agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(2))
             .timeout_read(Duration::from_secs(MAX_POLL_WAIT_SECONDS + 7))
+            .redirects(0)
             .build();
         Ok(Self {
             base_url: base_url.into(),
@@ -376,7 +377,14 @@ impl Client {
             None => request.call(),
         };
         match result {
-            Ok(response) => decode(response).map_err(Failure::Final),
+            // With redirects off a 3xx arrives as a success. It delivered nothing, so a queued write stays queued.
+            Ok(response) if (300..400).contains(&response.status()) => {
+                Err(Failure::Final(ClientError::Transport(format!(
+                    "the server redirected with status {}",
+                    response.status()
+                ))))
+            }
+            Ok(response) => decode(response).map_err(Failure::Retry),
             Err(ureq::Error::Status(status, response)) => {
                 let retry_after = response
                     .header("Retry-After")
@@ -384,7 +392,9 @@ impl Client {
                 let body = response.into_string().unwrap_or_default();
                 let error = ClientError::from_api(ApiError::parse(status, &body, retry_after));
                 // A frozen server stays frozen for its whole window: the caller decides what to do.
-                let again = status == 429 || (status >= 500 && status != 503);
+                let again = status == 429
+                    || (300..400).contains(&status)
+                    || (status >= 500 && status != 503);
                 Err(if again {
                     Failure::Retry(error)
                 } else {
@@ -444,7 +454,18 @@ fn allowed_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("http://") else {
         return false;
     };
-    let host = rest.split(['/', ':']).next().unwrap_or_default();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed
+            .split_once(']')
+            .map(|(host, _)| host)
+            .unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
     matches!(host, "localhost" | "127.0.0.1")
 }
 
@@ -557,6 +578,7 @@ mod tests {
         assert!(Client::new("http://example.test", "t".into()).is_err());
         assert!(Client::new("http://localhost.example.test", "t".into()).is_err());
         assert!(Client::new("http://localhost:8080/", "t".into()).is_ok());
+        assert!(Client::new("http://localhost@127.0.0.1:9000", "t".into()).is_err());
     }
 
     #[test]
@@ -648,6 +670,100 @@ mod tests {
         let error = client.call(&call).unwrap_err();
         assert_eq!(error.retry_after(), Some(120));
         assert!(error.is_outage());
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn a_rate_limited_write_keeps_retry_after_and_idempotency_key() {
+        let server = FakeServer::start(vec![
+            Reply::json(
+                429,
+                json!({"error": {"code": "limit", "message": "slow down"}}),
+            )
+            .header("Retry-After", "0"),
+            Reply::json(200, json!({"ok": true})),
+        ]);
+        let client = Client::new(&server.url(), "secret".into()).unwrap();
+        let call = Call::write(
+            "same-session",
+            "POST",
+            "/api/v1/registry/items".into(),
+            json!({}),
+        );
+        assert_eq!(client.call(&call).unwrap()["ok"], true);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].header("idempotency-key"),
+            requests[1].header("idempotency-key")
+        );
+        assert_eq!(
+            requests[0].header("x-lockyard-session"),
+            Some("same-session")
+        );
+        assert_eq!(
+            requests[1].header("x-lockyard-session"),
+            Some("same-session")
+        );
+    }
+
+    #[test]
+    fn a_rate_limited_event_waiter_receives_retry_after_without_a_write_retry() {
+        let server = FakeServer::start(vec![
+            Reply::json(
+                429,
+                json!({"error": {"code": "waiters", "message": "too many waiters"}}),
+            )
+            .header("Retry-After", "17"),
+        ]);
+        let client = Client::new(&server.url(), "secret".into()).unwrap();
+        let mut call = Call::get("worker-session", "/api/v1/events?wait=25".into());
+        call.long_poll = true;
+        assert_eq!(client.call(&call).unwrap_err().retry_after(), Some(17));
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn a_403_session_conflict_is_reported_and_token_rotation_keeps_the_session_name() {
+        let server = FakeServer::start(vec![
+            Reply::json(
+                403,
+                json!({"error": {"code": "session_owned", "message": "session belongs to another token"}}),
+            ),
+            Reply::json(200, json!({"ok": true})),
+        ]);
+        let active = Client::new(&server.url(), "active-token".into()).unwrap();
+        let rotated = Client::new(&server.url(), "rotated-token".into()).unwrap();
+        let call = Call::write(
+            "worker-session",
+            "POST",
+            "/api/v1/zones/claims".into(),
+            json!({}),
+        );
+        assert!(matches!(active.call(&call), Err(ClientError::Denied(_))));
+        assert_eq!(rotated.call(&call).unwrap()["ok"], true);
+        let requests = server.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "403 must not be retried with a renamed session"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.header("x-lockyard-session") == Some("worker-session"))
+        );
+    }
+
+    #[test]
+    fn a_redirect_is_never_followed_and_stays_retryable() {
+        let server = FakeServer::start(vec![
+            Reply::text(307, "").header("Location", "http://example.test/moved"),
+        ]);
+        let client = Client::new(&server.url(), "secret".into()).unwrap();
+        let call = Call::write("a", "POST", "/api/v1/bus/messages".into(), json!({}));
+        let error = client.call(&call).unwrap_err();
+        assert!(error.is_outage(), "{error:?}");
         assert_eq!(server.requests().len(), 1);
     }
 

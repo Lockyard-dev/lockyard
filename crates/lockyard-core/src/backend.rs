@@ -65,6 +65,9 @@ pub trait Backend {
     fn zone_request(&mut self, _agent: &str, _request: &AccessRequest) -> Result<AccessRecord> {
         cloud("zone request")
     }
+    fn zone_requests(&self, _agent: &str) -> Result<Vec<AccessRecord>> {
+        cloud("zone requests")
+    }
     fn zone_answer(
         &mut self,
         _agent: &str,
@@ -224,6 +227,9 @@ pub trait Backend {
     }
     fn import_bus(&mut self, _agent: &str, _dump: &Value) -> Result<Value> {
         cloud("import")
+    }
+    fn registry_import(&mut self, _agent: &str, _dump: &Value) -> Result<Value> {
+        cloud("registry import")
     }
     fn tokens(&self) -> Result<Value> {
         cloud("cloud token")

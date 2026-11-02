@@ -469,7 +469,7 @@ fn call_tool(params: &Value, agent: Option<&str>, cwd: &Path) -> (Value, Option<
     let mut after = None;
     let answer = run_tool(name, Args(args), agent, cwd, &mut after);
     let result = match answer {
-        Ok(result) if name == "msg_inbox" => {
+        Ok(result) if ["msg_inbox", "msg_thread", "board_get", "work_show"].contains(&name) => {
             tool_result(format!("{MAIL_WARNING}\n{result}"), false)
         }
         Ok(result) => tool_result(result.to_string(), false),

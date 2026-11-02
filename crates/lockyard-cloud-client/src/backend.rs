@@ -22,6 +22,9 @@ use serde_json::{Value, json};
 const ITEMS: &str = "/api/v1/registry/items";
 const TOKENS: &str = "/api/v1/registry/tokens";
 const AREAS: &str = "/api/v1/registry/areas";
+const MAX_REGISTRY_TEXT_BYTES: usize = 8 * 1024;
+const MAX_EVIDENCE_BYTES: usize = 1024;
+const MAX_EVIDENCE_COUNT: usize = 4;
 const ITEM_PAGE: usize = 200;
 const DEFAULT_PRIORITY: &str = "P2";
 const DEFAULT_TARGET: &str = "code_accepted";
@@ -257,6 +260,70 @@ fn millis(value: &Value, key: &str) -> Option<i64> {
     parse_rfc3339(value.get(key)?.as_str()?)
 }
 
+fn validate_registry_text(field: &str, value: &str) -> Result<()> {
+    if value.len() > MAX_REGISTRY_TEXT_BYTES {
+        return Err(Error::Invalid(format!(
+            "registry {field} exceeds {MAX_REGISTRY_TEXT_BYTES} UTF-8 bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_title(value: &str) -> Result<()> {
+    if value.chars().count() > 200 {
+        return Err(Error::Invalid(
+            "registry title exceeds 200 characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_evidence(values: &[String]) -> Result<()> {
+    if values.len() > MAX_EVIDENCE_COUNT {
+        return Err(Error::Invalid(format!(
+            "registry items allow at most {MAX_EVIDENCE_COUNT} evidence records"
+        )));
+    }
+    for value in values {
+        if value.len() > MAX_EVIDENCE_BYTES {
+            return Err(Error::Invalid(format!(
+                "registry evidence value exceeds {MAX_EVIDENCE_BYTES} UTF-8 bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_registry_import(dump: &Value) -> Result<()> {
+    let Some(items) = dump.get("items").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for item in items {
+        if let Some(title) = item.get("title").and_then(Value::as_str) {
+            validate_title(title)?;
+        }
+        for field in ["body", "acceptance", "legacy_raw"] {
+            if let Some(value) = item.get(field).and_then(Value::as_str) {
+                validate_registry_text(field, value)?;
+            }
+        }
+        if let Some(evidence) = item.get("evidence").and_then(Value::as_array) {
+            if evidence.len() > MAX_EVIDENCE_COUNT {
+                return Err(Error::Invalid(format!(
+                    "registry items allow at most {MAX_EVIDENCE_COUNT} evidence records"
+                )));
+            }
+            let values: Vec<String> = evidence
+                .iter()
+                .filter_map(|entry| entry.get("value").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect();
+            validate_evidence(&values)?;
+        }
+    }
+    Ok(())
+}
+
 /// The session inside an identity `token:<id>:<session>`.
 fn session_of(identity: &str) -> String {
     identity
@@ -405,6 +472,20 @@ impl<T: Transport> Backend for CloudBackend<T> {
                 Ok(1)
             }
             None => {
+                if request.fence.is_some() {
+                    let claims = self.claims(
+                        &ClaimQuery {
+                            session: Some(agent.to_string()),
+                            ..ClaimQuery::default()
+                        },
+                        _now,
+                    )?;
+                    if claims.len() != 1 {
+                        return Err(Error::Invalid(
+                            "a release fence requires exactly one live claim".into(),
+                        ));
+                    }
+                }
                 let route = format!(
                     "/api/v1/zones/claims{}",
                     query(&[("session", Some(agent.to_string()))])
@@ -472,6 +553,11 @@ impl<T: Transport> Backend for CloudBackend<T> {
     fn zone_request(&mut self, agent: &str, request: &AccessRequest) -> Result<AccessRecord> {
         let value = self.post(agent, "/api/v1/zones/requests".into(), request)?;
         Ok(one(value, "request")?)
+    }
+
+    fn zone_requests(&self, agent: &str) -> Result<Vec<AccessRecord>> {
+        let value = self.get(agent, "/api/v1/zones/requests".into())?;
+        Ok(list(value, &["requests", "items"])?)
     }
 
     fn zone_answer(&mut self, agent: &str, id: i64, answer: &AccessAnswer) -> Result<AccessRecord> {
@@ -628,6 +714,9 @@ impl<T: Transport> Backend for CloudBackend<T> {
 
     fn inbox_seen(&mut self, agent: &str, ids: &[i64], _now: i64) -> Result<usize> {
         let value = self.post(agent, "/api/v1/bus/inbox/seen".into(), &json!({"ids": ids}))?;
+        if let Some(marked) = value.get("seen").and_then(Value::as_array) {
+            return Ok(marked.len());
+        }
         Ok(count(&value, &["seen", "marked", "count"], ids.len()))
     }
 
@@ -709,7 +798,19 @@ impl<T: Transport> Backend for CloudBackend<T> {
     }
 
     fn add_task(&mut self, author: &str, spec: &tasks::TaskSpec, now: i64) -> Result<tasks::Task> {
+        validate_title(&spec.title)?;
+        validate_registry_text("body", &spec.body)?;
+        validate_registry_text(
+            "acceptance",
+            spec.acceptance.as_deref().unwrap_or(&spec.title),
+        )?;
+        validate_evidence(&spec.evidence.iter().cloned().collect::<Vec<_>>())?;
         let target = spec.target.as_deref().unwrap_or(DEFAULT_TARGET);
+        if !matches!(target, "code_accepted" | "ci_passed") {
+            return Err(Error::Invalid(format!(
+                "task target {target:?} needs evidence this client cannot provide; use code_accepted or ci_passed"
+            )));
+        }
         let evidence: Vec<Value> = spec
             .evidence
             .iter()
@@ -776,6 +877,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
         evidence: &str,
         now: i64,
     ) -> Result<tasks::Task> {
+        validate_evidence(&[evidence.to_string()])?;
         let item = self.item(agent, id)?;
         let target = item["target"].as_str().unwrap_or(DEFAULT_TARGET);
         let body = evidence_body(agent, target, evidence, now);
@@ -933,6 +1035,11 @@ impl<T: Transport> Backend for CloudBackend<T> {
 
     fn import_bus(&mut self, agent: &str, dump: &Value) -> Result<Value> {
         self.post(agent, "/api/v1/import/bus".into(), dump)
+    }
+
+    fn registry_import(&mut self, agent: &str, dump: &Value) -> Result<Value> {
+        validate_registry_import(dump)?;
+        self.post(agent, "/api/v1/registry/import".into(), dump)
     }
 
     fn tokens(&self) -> Result<Value> {
@@ -1152,6 +1259,43 @@ mod tests {
             seen[7].body,
             json!({"note": "done", "leave_dirty": true, "fence": 7})
         );
+    }
+
+    #[test]
+    fn bulk_release_sends_options_in_the_delete_body_and_fences_only_one_live_claim() {
+        let (server, mut cloud) = backend(vec![
+            json!([claim_json(5)]),
+            json!({"released": 1}),
+            json!([claim_json(5), claim_json(6)]),
+        ]);
+        let request = ReleaseRequest {
+            note: Some("finished".into()),
+            leave_dirty: true,
+            fence: Some(9),
+        };
+        assert_eq!(cloud.release("me", None, &request, 0).unwrap(), 1);
+        assert!(matches!(
+            cloud.release("me", None, &request, 0),
+            Err(Error::Invalid(_))
+        ));
+        let seen = server.requests();
+        assert_eq!(seen[1].method, "DELETE");
+        assert_eq!(seen[1].path, "/api/v1/zones/claims?session=me");
+        assert_eq!(
+            seen[1].body,
+            json!({"note": "finished", "leave_dirty": true, "fence": 9})
+        );
+        assert_eq!(
+            seen.len(),
+            3,
+            "a multi-claim fence must be rejected before DELETE"
+        );
+    }
+
+    #[test]
+    fn seen_returns_only_ids_the_server_marked() {
+        let (_server, mut cloud) = backend(vec![json!({"seen": [7]})]);
+        assert_eq!(cloud.inbox_seen("me", &[7, 8], 0).unwrap(), 1);
     }
 
     #[test]
@@ -1654,12 +1798,14 @@ mod tests {
     #[test]
     fn export_freeze_and_import() {
         let (server, mut cloud) = backend(vec![
-            json!({"claims": []}),
+            json!({"claims": [], "messages": [{"id": 4, "seen_by": ["alice"]}], "board": [{"key": "k", "expires_at": "2027-01-01T00:00:00Z"}]}),
             json!({"frozen": true}),
             json!({"ok": true}),
             json!({"ok": true}),
         ]);
-        assert!(cloud.export().unwrap().get("claims").is_some());
+        let exported = cloud.export().unwrap();
+        assert_eq!(exported["messages"][0]["seen_by"], json!(["alice"]));
+        assert_eq!(exported["board"][0]["expires_at"], "2027-01-01T00:00:00Z");
         cloud
             .freeze(
                 "me",
@@ -1670,7 +1816,8 @@ mod tests {
             )
             .unwrap();
         cloud.import_zones("me", &json!({"zones": {}})).unwrap();
-        cloud.import_bus("me", &json!({"threads": []})).unwrap();
+        let bus_dump = json!({"messages": [{"id": 4, "seen_by": ["alice"]}], "board": [{"key": "k", "expires_at": "2027-01-01T00:00:00Z"}]});
+        cloud.import_bus("me", &bus_dump).unwrap();
         let seen = sees(
             &server,
             &[
@@ -1682,6 +1829,56 @@ mod tests {
         );
         assert_eq!(seen[1].body, json!({"on": true, "reason": "switch"}));
         assert_eq!(seen[2].body["catalog"], json!({"zones": {}}));
+        assert_eq!(
+            seen[3].body, bus_dump,
+            "import must retain seen_by and board expiry"
+        );
+    }
+
+    #[test]
+    fn registry_create_and_import_limits_are_checked_before_requests() {
+        let (server, mut cloud) = backend(vec![json!([])]);
+        let too_long = tasks::TaskSpec {
+            title: "t".into(),
+            body: "é".repeat(4097),
+            ..tasks::TaskSpec::default()
+        };
+        assert!(matches!(
+            cloud.add_task("me", &too_long, 0),
+            Err(Error::Invalid(_))
+        ));
+        let too_long_evidence = tasks::TaskSpec {
+            title: "t".into(),
+            evidence: Some("x".repeat(1025)),
+            ..tasks::TaskSpec::default()
+        };
+        assert!(matches!(
+            cloud.add_task("me", &too_long_evidence, 0),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            cloud.registry_import("me", &json!({"items": [{"legacy_raw": "x".repeat(8193)}]})),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            cloud.registry_import(
+                "me",
+                &json!({"items": [{"evidence": [{"value": "x".repeat(1025)}]}]})
+            ),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(cloud.registry_import("me", &json!({"items": [{"evidence": [{"value": "1"}, {"value": "2"}, {"value": "3"}, {"value": "4"}, {"value": "5"}]}]})), Err(Error::Invalid(_))));
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn requests_for_the_active_session_use_the_new_list_route() {
+        let (server, cloud) = backend(vec![
+            json!({"requests": [{"id": 4, "from": "me", "text": "please"}]}),
+        ]);
+        assert_eq!(cloud.zone_requests("me").unwrap()[0].id, 4);
+        let seen = sees(&server, &[("GET", "/api/v1/zones/requests")]);
+        assert_eq!(seen[0].header("x-lockyard-session"), Some("me"));
     }
 
     fn item(status: &str, version: i64) -> Value {
@@ -1725,6 +1922,34 @@ mod tests {
         assert_eq!(body["type"], "code");
         assert_eq!(body["target"], "code_accepted");
         assert_eq!(body["client_key"].as_str().unwrap().len(), 26);
+    }
+
+    #[test]
+    fn a_new_item_refuses_targets_the_client_cannot_prove_before_sending_it() {
+        struct UnexpectedTransport;
+        impl Transport for UnexpectedTransport {
+            fn call(&self, _: &Call) -> std::result::Result<Value, ClientError> {
+                panic!("unsupported targets must be rejected before any server call")
+            }
+        }
+        let mut cloud = CloudBackend::new(UnexpectedTransport, "me");
+        for target in [
+            "deployed_staging",
+            "deployed_prod",
+            "verified_prod",
+            "owner_decision",
+            "external_confirmation",
+        ] {
+            let spec = tasks::TaskSpec {
+                title: "t".into(),
+                target: Some(target.into()),
+                ..tasks::TaskSpec::default()
+            };
+            assert!(matches!(
+                cloud.add_task("me", &spec, 0),
+                Err(Error::Invalid(_))
+            ));
+        }
     }
 
     #[test]

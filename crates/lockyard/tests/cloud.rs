@@ -180,13 +180,67 @@ fn cloud_project(server: &Server) -> tempfile::TempDir {
 
 fn binary(dir: &Path, runtime: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lockyard"));
+    let config = std::fs::read_to_string(dir.join(".lockyard/config.toml")).unwrap_or_default();
+    let url = config
+        .lines()
+        .find_map(|line| line.strip_prefix("url = '")?.strip_suffix("'"))
+        .unwrap_or_default();
     command
         .current_dir(dir)
+        .env("LOCKYARD_URL", url)
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", runtime.join("state"))
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("LOCKYARD_TOKEN_FILE");
     command
+}
+
+#[test]
+fn cloud_trust_writes_a_private_xdg_allowlist() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let config_home = tempfile::tempdir().unwrap();
+    let urls = ["https://trusted.example", "https://another.example"];
+    for url in urls {
+        let result = binary(dir.path(), runtime.path())
+            .args(["cloud", "trust", url])
+            .env("XDG_CONFIG_HOME", config_home.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let path = config_home.path().join("lockyard/trusted-servers");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{}\n{}\n", urls[0], urls[1])
+    );
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn an_untrusted_project_url_sends_no_token() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let config_home = tempfile::tempdir().unwrap();
+    let result = binary(dir.path(), runtime.path())
+        .args(["zone", "list"])
+        .env_remove("LOCKYARD_URL")
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("LOCKYARD_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("lockyard cloud trust"));
+    assert!(server.seen("GET", "/api/v1/zones/claims").is_empty());
 }
 
 fn cli(dir: &Path, runtime: &Path, args: &[&str]) -> Output {
@@ -233,6 +287,11 @@ fn the_config_selects_the_cloud_backend_and_the_token_comes_only_from_the_enviro
 
     let token_file = runtime.path().join("token");
     std::fs::write(&token_file, "test-token\n").unwrap();
+    std::fs::set_permissions(
+        &token_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let listed = binary(dir.path(), runtime.path())
         .args(["--json", "zone", "list"])
         .env_remove("LOCKYARD_TOKEN")

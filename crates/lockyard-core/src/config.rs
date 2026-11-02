@@ -64,7 +64,7 @@ impl Config {
             return Ok(token.trim().to_string());
         }
         if let Ok(path) = std::env::var("LOCKYARD_TOKEN_FILE") {
-            let token = fs::read_to_string(path)?;
+            let token = read_token_file(Path::new(&path))?;
             if !token.trim().is_empty() {
                 return Ok(token.trim().to_string());
             }
@@ -73,6 +73,23 @@ impl Config {
             "cloud mode requires LOCKYARD_TOKEN or LOCKYARD_TOKEN_FILE".into(),
         ))
     }
+}
+
+fn read_token_file(path: &Path) -> Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path)?;
+        // The token is sent as a bearer credential. Refuse files readable by another user or
+        // owned by someone else, matching the private agent-state directory policy.
+        if metadata.mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(Error::Invalid(format!(
+                "token file {} must be owned by this user and private (mode 0600)",
+                path.display()
+            )));
+        }
+    }
+    Ok(fs::read_to_string(path)?)
 }
 
 #[cfg(test)]
@@ -97,6 +114,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(Config::load(dir.path()).unwrap().mode, Mode::Cloud);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_files_readable_by_other_users_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        fs::write(&path, "secret").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_token_file(&path).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_token_file(&path).unwrap(), "secret");
     }
 
     #[test]
