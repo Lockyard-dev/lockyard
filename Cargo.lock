@@ -340,6 +340,7 @@ name = "lockyard"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "libc",
  "lockyard-cloud-client",
  "lockyard-core",
  "serde",
@@ -361,6 +362,7 @@ dependencies = [
 name = "lockyard-core"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

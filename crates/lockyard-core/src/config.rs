@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -106,6 +106,18 @@ mod tests {
         fs::write(
             dir.path().join(DIR_NAME).join("config.toml"),
             "mode='cloud'\nurl='https://example.test'\nworkspace='w'\ntoken='secret'\n",
+        )
+        .unwrap();
+        assert!(Config::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn project_config_does_not_contain_machine_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        Store::init(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(DIR_NAME).join("config.toml"),
+            "[machine]\nslots=2\n",
         )
         .unwrap();
         assert!(Config::load(dir.path()).is_err());

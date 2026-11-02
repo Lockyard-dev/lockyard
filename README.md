@@ -139,11 +139,21 @@ lockyard agent uninstall
 - One agent serves one token. A command run with another token goes straight to the server, so it keeps its own role.
 - With no agent running, the command line calls the server itself, and hooks allow and say so.
 
+## Machine guard
+
+`lockyard machine` reports local memory, swap, disk and load pressure in any folder. `lockyard run --heavy -- <command>`
+uses a local slot, waits while pressure is high, and pauses only the process group it started when memory or disk reaches
+the critical threshold. While its supervisor is running, it resumes that group after pressure falls. A shell hook also
+refuses configured heavy commands while pressure is at hold. Machine thresholds and heavy commands are shared across
+projects in `~/.config/lockyard/machine.toml` (or `$XDG_CONFIG_HOME/lockyard/machine.toml`); memory thresholds default to
+percentages of installed memory. The guard lowers the chance of a hang. It cannot stop work started outside Lockyard or
+guarantee that a machine cannot hang.
+
 ## Testing against a real server
 
 `crates/lockyard/tests/e2e.rs` drives the real binary as several agents. It needs `LOCKYARD_E2E_URL`, `LOCKYARD_E2E_OWNER_TOKEN`
 and `LOCKYARD_E2E_SERVER`, a shell command that runs the server in the foreground on a database that survives a restart.
-The suite starts and stops that server itself. Without the URL it skips, and with `CI=true` it fails instead.
+The suite starts and stops that server itself. Without the URL it skips, and with `LOCKYARD_E2E_REQUIRED=1` it fails instead.
 
 ## Limits
 

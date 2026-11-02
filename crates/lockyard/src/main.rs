@@ -1,6 +1,7 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
 mod agent;
+mod guard;
 mod hook;
 mod mcp;
 mod open;
@@ -65,6 +66,10 @@ enum Command {
     Who,
     /// Show this agent's mail count, all active claims and unfinished tasks.
     Status,
+    /// Show local machine pressure. Works outside a project.
+    Machine,
+    /// Run a command through the local heavy-work gate.
+    Run(RunArgs),
     /// Claim paths so that no other agent edits them.
     #[command(subcommand)]
     Zone(ZoneCommand),
@@ -97,6 +102,19 @@ enum Command {
     Setup { client: SetupClient },
     /// Run the MCP server over standard input and output.
     Mcp,
+}
+
+#[derive(Args)]
+struct RunArgs {
+    /// Acquire a machine slot and wait while the machine is under pressure.
+    #[arg(long)]
+    heavy: bool,
+    /// Stop waiting after this many seconds (default: 1800).
+    #[arg(long, default_value_t = 1800)]
+    max_wait: u64,
+    /// Command and arguments, after `--`.
+    #[arg(last = true, required = true)]
+    command: Vec<std::ffi::OsString>,
 }
 
 #[derive(clap::ValueEnum, Clone)]
@@ -1770,6 +1788,17 @@ fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
         .map(|name| backend.unread(name))
         .transpose()?;
     let mut lines = Vec::new();
+    let machine_config = guard::project_config(&std::env::current_dir().unwrap_or_default());
+    let machine_level = guard::snapshot(&machine_config).ok().map(|report| {
+        let name = match report.level {
+            lockyard_core::machine::Level::Ok => "ok",
+            lockyard_core::machine::Level::Warn => "warn",
+            lockyard_core::machine::Level::Hold => "hold",
+            lockyard_core::machine::Level::Critical => "critical",
+        };
+        lines.push(format!("machine: {name}"));
+        name
+    });
     if let Some(unread) = unread {
         lines.push(format!("unread mail: {unread}"));
     }
@@ -1784,12 +1813,12 @@ fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
         lines.push(join(&work, work_line, "no work tasks"));
         let tasks = backend.tasks(None, false)?;
         lines.push(join(&tasks, task_line, "no tasks"));
-        let data = json!({ "unread": unread, "claims": claims, "work": work, "tasks": tasks });
+        let data = json!({ "unread": unread, "claims": claims, "work": work, "tasks": tasks, "machine_level": machine_level });
         return output(&data, lines.join("\n"));
     }
     let tasks = backend.tasks(None, false)?;
     lines.push(join(&tasks, task_line, "no tasks"));
-    let data = json!({ "unread": unread, "claims": claims, "tasks": tasks });
+    let data = json!({ "unread": unread, "claims": claims, "tasks": tasks, "machine_level": machine_level });
     output(&data, lines.join("\n"))
 }
 
@@ -1944,6 +1973,26 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             &json!({ "version": lockyard_core::VERSION }),
             lockyard_core::about(),
         ),
+        Command::Machine => {
+            guard::recover();
+            let report = guard::report(guard::project_config(cwd)).map_err(Error::Io)?;
+            output(&report, guard::text(&report))
+        }
+        Command::Run(args) => {
+            if !args.heavy {
+                return Err(Error::Invalid(
+                    "use `lockyard run --heavy -- <command>` for heavy work".into(),
+                ));
+            }
+            let status = guard::run_heavy(guard::project_config(cwd), &args.command, args.max_wait)
+                .map_err(Error::Io)?;
+            let mut out = output(
+                &json!({"success": status.success(), "code": status.code()}),
+                "",
+            )?;
+            out.exit = status.code().unwrap_or(EXIT_FAILURE as i32).clamp(0, 255) as u8;
+            Ok(out)
+        }
         Command::Who => {
             let opened = open()?;
             let now = now_ms();

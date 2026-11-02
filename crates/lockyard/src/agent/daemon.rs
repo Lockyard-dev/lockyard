@@ -507,6 +507,20 @@ impl<T: Transport + 'static> Shared<T> {
             } else {
                 SessionState::Working
             };
+            let machine_config = lockyard_core::machine::MachineConfig::load_user();
+            let machine = crate::guard::snapshot(&machine_config).ok();
+            let meta = machine.map(|report| {
+                let level = match report.level {
+                    lockyard_core::machine::Level::Ok => "ok",
+                    lockyard_core::machine::Level::Warn => "warn",
+                    lockyard_core::machine::Level::Hold => "hold",
+                    lockyard_core::machine::Level::Critical => "critical",
+                };
+                json!({"level": level, "memory_available": report.sample.memory_available,
+                    "memory_total": report.sample.memory_total, "disk_free": report.sample.disk_free,
+                    "temp_free": report.sample.temp_free, "swap_used": report.sample.swap_used,
+                    "load": report.sample.load, "cpus": report.sample.cpus})
+            });
             let beat = PresenceBeat {
                 client: client.to_string(),
                 version: Some(lockyard_core::VERSION.to_string()),
@@ -514,7 +528,7 @@ impl<T: Transport + 'static> Shared<T> {
                     tool_running: running,
                     tool_started_at: running.then(|| Stamp::Text(rfc3339(now_ms()))),
                     state: Some(state),
-                    meta: None,
+                    meta,
                 }),
                 ..PresenceBeat::default()
             };
@@ -1016,6 +1030,21 @@ impl<T: Transport + 'static> Daemon<T> {
         };
         let copy = Arc::clone(&shared);
         threads.push(spawn("upkeep", Box::new(move || copy.upkeep()))?);
+        let copy = Arc::clone(&shared);
+        threads.push(spawn(
+            "machine-tick",
+            Box::new(move || {
+                while !copy.stopped() {
+                    crate::guard::tick();
+                    for _ in 0..50 {
+                        if copy.stopped() {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }),
+        )?);
         let copy = Arc::clone(&shared);
         threads.push(spawn("outbox", Box::new(move || copy.drain()))?);
         let copy = Arc::clone(&shared);

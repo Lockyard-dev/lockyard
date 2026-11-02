@@ -10,6 +10,7 @@ pub mod bus;
 pub mod config;
 pub mod coordination;
 mod error;
+pub mod machine;
 pub mod paths;
 pub mod proto;
 mod store;

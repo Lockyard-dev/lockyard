@@ -721,6 +721,20 @@ fn mail(w: &World) {
     w.ly(&one, &["msg", "undelivered"]).refused(1, "role");
 }
 
+/// Real pressure on the machine running the suite decides the level, so only the shape is checked here.
+/// The behaviour of the guard is proven with fake samples and real process groups in its own tests.
+fn machine(w: &World) {
+    let reader = w.a("machine-reader");
+    let report = w.ly(&reader, &["machine"]).ok();
+    assert!(report["level"].is_string(), "{report}");
+    assert!(
+        report["sample"]["memory_total"].as_u64().unwrap() > 0,
+        "{report}"
+    );
+    w.ly(&reader, &["run", "--", "/bin/echo", "x"])
+        .refused(1, "--heavy");
+}
+
 fn board(w: &World) {
     let (lead, reader) = (w.lead("board-lead"), w.a("board-reader"));
     let key = w.name("key");
@@ -1850,7 +1864,8 @@ fn the_real_client_against_the_real_server() {
     w.server.start();
     tokens(&mut w);
     let w = &w;
-    let scenarios: [Scenario; 14] = [
+    let scenarios: [Scenario; 15] = [
+        ("machine", machine),
         ("import", import),
         ("zones", zones),
         ("dirty", dirty),

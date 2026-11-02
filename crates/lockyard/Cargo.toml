@@ -15,6 +15,7 @@ lockyard-cloud-client.workspace = true
 lockyard-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
