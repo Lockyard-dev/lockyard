@@ -481,9 +481,11 @@ impl Client {
         if let Some(key) = &call.key {
             request = request.set("Idempotency-Key", key);
         }
-        if let Some(limit) =
-            remaining.or_else(|| call.attempt_timeout_ms.map(Duration::from_millis))
-        {
+        // The caller's remaining wait decides whether a retry fits; it never cuts a request short.
+        // A short per-request timeout broke TLS handshakes on macOS ("Resource temporarily
+        // unavailable"), so only the outbox's own attempt limit bounds a single request.
+        let _ = remaining;
+        if let Some(limit) = call.attempt_timeout_ms.map(Duration::from_millis) {
             request = request.timeout(limit);
         }
         let result = match encoded {
@@ -554,7 +556,8 @@ impl Transport for Client {
         let encoded = body.as_ref().map(Value::to_string);
         // Only writes have a key that makes repeating safe. A caller deadline controls which
         // rate-limit retries fit; it does not disable them outright.
-        let attempts = if call.is_write() { WRITE_ATTEMPTS } else { 1 };
+        // A read may repeat once when the connection itself failed, before anything was sent.
+        let attempts = if call.is_write() { WRITE_ATTEMPTS } else { 2 };
         let started = std::time::Instant::now();
         let mut delay = Duration::from_millis(100);
         for attempt in 1..=attempts {
@@ -598,10 +601,15 @@ impl Transport for Client {
                 Err(Failure::Final(error)) => return Err(error),
                 Err(Failure::Retry(error)) if attempt == attempts => return Err(error),
                 Err(Failure::Retry(error)) => {
-                    if call.deadline_ms.is_some()
-                        && (!call.is_write()
-                            || !matches!(&error, ClientError::RateLimited(_))
-                            || !wait_fits_deadline(call.deadline_ms, started, &error, delay))
+                    // Writes repeat under their idempotency key; a read repeats only a failed
+                    // connection. With a caller deadline, only a wait that fits is taken.
+                    let repeatable = match &error {
+                        ClientError::Transport(_) => true,
+                        _ => call.is_write(),
+                    };
+                    if !repeatable
+                        || (call.deadline_ms.is_some()
+                            && !wait_fits_deadline(call.deadline_ms, started, &error, delay))
                     {
                         return Err(error);
                     }
