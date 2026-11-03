@@ -140,13 +140,20 @@ jobs:
   publish-pypi:
     needs: publish-npm
     runs-on: ubuntu-latest
+    # PyPI is optional: without its token the release still ships to crates.io and npm.
+    env:
+      HAS_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN != '' }}
     steps:
-      - uses: actions/download-artifact@v4
+      - if: env.HAS_PYPI_TOKEN != 'true'
+        run: echo "No PYPI_TOKEN secret; skipping the PyPI upload."
+      - if: env.HAS_PYPI_TOKEN == 'true'
+        uses: actions/download-artifact@v4
         with:
           pattern: wheel-*
           path: dist
           merge-multiple: true
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - if: env.HAS_PYPI_TOKEN == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_TOKEN }}
           packages-dir: dist

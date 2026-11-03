@@ -12,11 +12,13 @@ const { binaryPath } = require('../bin/lockyard.js');
 
 const launcher = path.resolve(__dirname, '../bin/lockyard.js');
 
-test('launcher passes arguments, stdio and child exit code through', () => {
+// The fake binary is a shell script, so this runs where a shell does; Windows is covered by the release build.
+test('launcher passes arguments, stdio and child exit code through', { skip: process.platform === 'win32' }, () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lockyard-npm-'));
-  const pkg = path.join(dir, 'node_modules', 'lockyard-linux-x64');
+  const name = `lockyard-${process.platform}-${process.arch}`;
+  const pkg = path.join(dir, 'node_modules', name);
   fs.mkdirSync(path.join(pkg, 'bin'), { recursive: true });
-  fs.writeFileSync(path.join(pkg, 'package.json'), '{"name":"lockyard-linux-x64"}');
+  fs.writeFileSync(path.join(pkg, 'package.json'), JSON.stringify({ name }));
   const binary = path.join(pkg, 'bin', 'lockyard');
   fs.writeFileSync(binary, '#!/bin/sh\nprintf "%s\\n" "$@"\nexit 7\n', { mode: 0o755 });
   const result = spawnSync(process.execPath, [launcher, 'zone', 'list'], {
