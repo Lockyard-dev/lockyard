@@ -1097,6 +1097,20 @@ mod tests {
     }
 
     #[test]
+    fn a_read_is_not_repeated_after_the_server_answered() {
+        let server = FakeServer::start(vec![
+            Reply::json(429, json!({})).header("Retry-After", "1"),
+            Reply::json(200, json!({"ok": true})),
+        ]);
+        let client = Client::new(&server.url(), "secret".into()).unwrap();
+        let mut call = Call::get("s", "/api/v1/zones/claims".into());
+        call.deadline_ms = Some(5_000);
+        assert!(client.call(&call).is_err());
+        // Only a failed connection repeats a read; an answer from the server never does.
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
     fn a_rate_limited_write_fails_without_retry_when_retry_after_exceeds_the_budget() {
         let server = FakeServer::start(vec![
             Reply::json(
