@@ -40,6 +40,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const WRITE_ATTEMPTS: u32 = 3;
 /// A retry waits at most this long, whatever `Retry-After` says. A caller with more patience loops.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(5);
+/// Reserve time for the next request after a `Retry-After` pause.
+const RETRY_ROUND_TRIP_ESTIMATE: Duration = Duration::from_secs(1);
 /// Longest wait of a long poll, in seconds.
 pub const MAX_POLL_WAIT_SECONDS: u64 = 25;
 
@@ -242,9 +244,12 @@ pub struct Call {
     pub key: Option<String>,
     #[serde(default)]
     pub long_poll: bool,
-    /// When set, the whole call is one attempt inside this many milliseconds.
+    /// How long the caller can wait for this call, including retries, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_ms: Option<u64>,
+    /// Per-request timeout for internal transports such as the agent outbox.
+    #[serde(skip)]
+    pub attempt_timeout_ms: Option<u64>,
 }
 
 impl Call {
@@ -444,7 +449,12 @@ impl Client {
         self.call(&Call::write(session, "POST", ENCRYPTION_PATH.into(), body))
     }
 
-    fn attempt(&self, call: &Call, encoded: Option<&str>) -> Result<Value, Failure> {
+    fn attempt(
+        &self,
+        call: &Call,
+        encoded: Option<&str>,
+        remaining: Option<Duration>,
+    ) -> Result<Value, Failure> {
         let url = format!("{}{}", self.base_url, call.path);
         let client = if call.long_poll {
             &self.poll_agent
@@ -471,8 +481,10 @@ impl Client {
         if let Some(key) = &call.key {
             request = request.set("Idempotency-Key", key);
         }
-        if let Some(limit) = call.deadline_ms {
-            request = request.timeout(Duration::from_millis(limit));
+        if let Some(limit) =
+            remaining.or_else(|| call.attempt_timeout_ms.map(Duration::from_millis))
+        {
+            request = request.timeout(limit);
         }
         let result = match encoded {
             Some(body) => request
@@ -540,15 +552,19 @@ impl Transport for Client {
             .map_err(ClientError::Invalid)?;
         }
         let encoded = body.as_ref().map(Value::to_string);
-        // Only a write has a key that makes a repeat safe, and a deadline leaves no room for one.
-        let attempts = if call.is_write() && call.deadline_ms.is_none() {
-            WRITE_ATTEMPTS
-        } else {
-            1
-        };
+        // Only writes have a key that makes repeating safe. A caller deadline controls which
+        // rate-limit retries fit; it does not disable them outright.
+        let attempts = if call.is_write() { WRITE_ATTEMPTS } else { 1 };
+        let started = std::time::Instant::now();
         let mut delay = Duration::from_millis(100);
         for attempt in 1..=attempts {
-            match self.attempt(call, encoded.as_deref()) {
+            let remaining = call
+                .deadline_ms
+                .map(|limit| Duration::from_millis(limit).saturating_sub(started.elapsed()));
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                return Err(ClientError::Transport("call deadline elapsed".into()));
+            }
+            match self.attempt(call, encoded.as_deref(), remaining) {
                 Ok(mut value) => {
                     if let Some(workspace) = self.workspace.as_deref() {
                         transform_fields(
@@ -563,17 +579,60 @@ impl Transport for Client {
                     }
                     return Ok(value);
                 }
+                Err(Failure::Final(error))
+                    if call.deadline_ms.is_some()
+                        && call.is_write()
+                        && matches!(
+                            &error,
+                            ClientError::Frozen(_) | ClientError::RateLimited(_)
+                        )
+                        && attempt < attempts =>
+                {
+                    if !wait_fits_deadline(call.deadline_ms, started, &error, delay) {
+                        return Err(error);
+                    }
+                    let wait = retry_wait(&error, delay);
+                    thread::sleep(wait);
+                    delay *= 2;
+                }
                 Err(Failure::Final(error)) => return Err(error),
                 Err(Failure::Retry(error)) if attempt == attempts => return Err(error),
                 Err(Failure::Retry(error)) => {
-                    let asked = error.retry_after().map(Duration::from_secs);
-                    thread::sleep(asked.unwrap_or(delay).min(MAX_RETRY_WAIT));
+                    if call.deadline_ms.is_some()
+                        && (!call.is_write()
+                            || !matches!(&error, ClientError::RateLimited(_))
+                            || !wait_fits_deadline(call.deadline_ms, started, &error, delay))
+                    {
+                        return Err(error);
+                    }
+                    thread::sleep(retry_wait(&error, delay));
                     delay *= 2;
                 }
             }
         }
         Err(ClientError::Transport("request retry limit reached".into()))
     }
+}
+
+fn retry_wait(error: &ClientError, fallback: Duration) -> Duration {
+    error
+        .retry_after()
+        .map(Duration::from_secs)
+        .unwrap_or(fallback)
+        .min(MAX_RETRY_WAIT)
+}
+
+fn wait_fits_deadline(
+    deadline_ms: Option<u64>,
+    started: std::time::Instant,
+    error: &ClientError,
+    fallback: Duration,
+) -> bool {
+    let Some(deadline_ms) = deadline_ms else {
+        return true;
+    };
+    let remaining = Duration::from_millis(deadline_ms).saturating_sub(started.elapsed());
+    retry_wait(error, fallback).saturating_add(RETRY_ROUND_TRIP_ESTIMATE) <= remaining
 }
 
 fn allowed_url(url: &str) -> bool {
@@ -1008,6 +1067,46 @@ mod tests {
             requests[1].header("x-lockyard-session"),
             Some("same-session")
         );
+    }
+
+    #[test]
+    fn a_rate_limited_write_retries_when_retry_after_fits_the_callers_budget() {
+        let server = FakeServer::start(vec![
+            Reply::json(429, json!({})).header("Retry-After", "1"),
+            Reply::json(200, json!({"ok": true})),
+        ]);
+        let client = Client::new(&server.url(), "secret".into()).unwrap();
+        let mut call = Call::write("s", "POST", "/api/v1/registry/items".into(), json!({}));
+        call.deadline_ms = Some(3_000);
+
+        assert_eq!(client.call(&call).unwrap()["ok"], true);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].header("idempotency-key"),
+            requests[1].header("idempotency-key")
+        );
+    }
+
+    #[test]
+    fn a_rate_limited_write_fails_without_retry_when_retry_after_exceeds_the_budget() {
+        let server = FakeServer::start(vec![
+            Reply::json(
+                429,
+                json!({"error": {"code": "limit", "message": "slow down"}}),
+            )
+            .header("Retry-After", "5"),
+            Reply::json(200, json!({"ok": true})),
+        ]);
+        let client = Client::new(&server.url(), "secret".into()).unwrap();
+        let mut call = Call::write("s", "POST", "/api/v1/registry/items".into(), json!({}));
+        call.deadline_ms = Some(3_000);
+
+        assert!(matches!(
+            client.call(&call),
+            Err(ClientError::RateLimited(_))
+        ));
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[test]

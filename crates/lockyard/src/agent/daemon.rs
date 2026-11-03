@@ -926,6 +926,10 @@ impl<T: Transport + 'static> Shared<T> {
                 Err(error) => Reply::failed(error),
             };
         }
+        let caller_budget = call.deadline_ms.map(Duration::from_millis);
+        // Once a write enters the durable queue, the socket caller's patience no longer
+        // bounds delivery. The outbox owns retries and keeps the entry until it can finish.
+        call.deadline_ms = None;
         let key = call.key.get_or_insert_with(ulid).clone();
         let queued = json!({"queued": true, "key": key});
         let session = call.session.clone();
@@ -946,7 +950,11 @@ impl<T: Transport + 'static> Shared<T> {
         }
         match self.outbox.append_waiting(call) {
             Err(error) => Reply::failed(ClientError::Transport(error.to_string())),
-            Ok((_, outcome)) => match outcome.recv_timeout(self.timing().mail_wait) {
+            Ok((_, outcome)) => match outcome.recv_timeout(
+                caller_budget.map_or(self.timing().mail_wait, |budget| {
+                    budget.min(self.timing().mail_wait)
+                }),
+            ) {
                 Ok(Ok(value)) => Reply {
                     value: Some(value),
                     ..Reply::default()
@@ -1301,7 +1309,7 @@ impl<T: Transport + 'static> Shared<T> {
                 continue;
             };
             let mut call = entry.call.clone();
-            call.deadline_ms =
+            call.attempt_timeout_ms =
                 Some(u64::try_from(self.timing().send_limit.as_millis()).unwrap_or(u64::MAX));
             match self.transport.call(&call) {
                 Err(ClientError::RateLimited(error)) => {
