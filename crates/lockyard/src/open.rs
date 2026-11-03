@@ -129,8 +129,14 @@ pub fn open(cwd: &Path, agent: Option<&str>) -> Result<Opened> {
 
 fn direct(url: &str, session: &str) -> Result<Box<dyn Backend>> {
     trusted_url(url)?;
-    let client = Client::new(url, Config::token()?)?;
+    let client = Client::new(url, Config::token()?)?.configure_content_encryption(session)?;
     Ok(Box::new(CloudBackend::new(client, session)))
+}
+
+/// A trusted direct client for workspace administration commands.
+pub(crate) fn direct_client(url: &str) -> Result<Client> {
+    trusted_url(url)?;
+    Ok(Client::new(url, Config::token()?)?)
 }
 
 #[cfg(unix)]
@@ -170,6 +176,5 @@ mod tests {
 #[cfg(not(unix))]
 fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
     let (url, _) = endpoint(config)?;
-    trusted_url(&url)?;
     direct(&url, session)
 }

@@ -333,6 +333,31 @@ impl World {
         self.on(&self.box_a, who, args)
     }
 
+    /// Like `on`, with text on standard input, for commands that read a confirmation or a phrase.
+    fn on_input(&self, machine: &Machine, who: &Who, args: &[&str], input: &str) -> Out {
+        self.ran
+            .lock()
+            .unwrap()
+            .push(args.iter().map(|word| (*word).to_string()).collect());
+        let mut child = machine
+            .command(Some(&who.token))
+            .arg("--json")
+            .args(["--agent", &who.name])
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        collect(child.wait_with_output().unwrap())
+    }
+
     fn beat(&self, who: &Who) {
         self.ly(who, &["presence", "beat"]).ok();
     }
@@ -1836,6 +1861,55 @@ fn leaves(prefix: &[String], found: &mut Vec<Vec<String>>) {
     }
 }
 
+/// Content is sealed on one machine, stored as ciphertext, locked on a machine without the key, and
+/// readable there once the recovery phrase is imported. Runs last: it changes the whole workspace.
+fn encryption(w: &World) {
+    let boss = w.owner.clone();
+    let (one, two) = (w.a("sealed-one"), w.a("sealed-two"));
+    w.beat(&two);
+    let created = w.ly(&boss, &["cloud", "key", "create"]).ok();
+    let key_id = created["key_id"].as_str().expect("a key id").to_string();
+    let shown = w
+        .on_input(&w.box_a, &boss, &["cloud", "key", "show-phrase"], "SHOW\n")
+        .ok();
+    let phrase = shown["recovery_phrase"]
+        .as_str()
+        .expect("a phrase")
+        .to_string();
+    assert_eq!(phrase.split_whitespace().count(), 24);
+    w.ly(&boss, &["cloud", "encryption", "require"]).ok();
+    let status = w.ly(&boss, &["cloud", "encryption", "status"]);
+    assert_eq!(status.code, 0, "{}", status.err);
+    assert!(
+        status.out.contains("required") && status.out.contains(&key_id),
+        "{}",
+        status.out
+    );
+
+    let secret = "sealed words for the second agent";
+    w.ly(&one, &["msg", "send", &two.name, secret]).ok();
+    let dump = w
+        .ly(&w.who("sealed-export", &w.exporter), &["cloud", "export"])
+        .ok();
+    let stored = dump.to_string();
+    assert!(!stored.contains(secret), "the server holds clear text");
+    assert!(stored.contains("lyenc1."), "the server holds no envelope");
+
+    let locked = w.on(&w.box_b, &two, &["msg", "inbox", "--all", "--peek"]);
+    assert_eq!(locked.code, 0, "{}", locked.err);
+    assert!(
+        !locked.out.contains(secret) && locked.out.contains("[locked]"),
+        "{}",
+        locked.out
+    );
+    w.on_input(&w.box_b, &boss, &["cloud", "key", "import"], &phrase)
+        .ok();
+    let clear = w.on(&w.box_b, &two, &["msg", "inbox", "--all", "--peek"]);
+    assert!(clear.out.contains(secret), "{}", clear.out);
+
+    w.ly(&boss, &["cloud", "encryption", "off"]).ok();
+}
+
 fn every_command_ran(w: &World) {
     // `agent install` and `uninstall` write a real service unit, so no test may run them.
     let skipped = [["agent", "install"], ["agent", "uninstall"]];
@@ -1903,7 +1977,7 @@ fn the_real_client_against_the_real_server() {
     w.server.start();
     tokens(&mut w);
     let w = &w;
-    let scenarios: [Scenario; 15] = [
+    let scenarios: [Scenario; 16] = [
         ("machine", machine),
         ("import", import),
         ("zones", zones),
@@ -1919,6 +1993,7 @@ fn the_real_client_against_the_real_server() {
         ("freeze", freeze),
         ("plain", plain),
         ("mcp", mcp),
+        ("encryption", encryption),
     ];
     for (name, scenario) in scenarios {
         let start = Instant::now();

@@ -138,6 +138,10 @@ fn route_reply(state: &mut State, method: &str, route: &str, body: &Value) -> (u
             (200, claim)
         }
         ("GET", "/api/v1/zones/claims") => (200, json!({"claims": state.claims})),
+        ("GET", "/api/v1/workspace/encryption") => (
+            200,
+            json!({"encryption": "off", "key_id": null, "workspace_id": "00000000-0000-0000-0000-000000000001"}),
+        ),
         ("POST", "/api/v1/zones/check") => (
             200,
             json!({"paths": [{"path": body["paths"][0], "status": "free"}]}),

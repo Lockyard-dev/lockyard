@@ -106,6 +106,16 @@ LOCKYARD_TOKEN=$OWNER lockyard cloud token revoke <id>
 
 Roles are `agent`, `lead`, `owner`, `exporter`, `importer` and `dispatcher`.
 
+### Encrypted workspace content
+
+When a workspace enables client-side content encryption, content fields are stored as `lyenc1` envelopes; paths,
+sessions, zones, states, ids, and keys remain clear so coordination continues to work. A client without the workspace
+key displays encrypted fields as locked. Create or import the local key with `lockyard cloud key create` or
+`lockyard cloud key import` (the latter reads a 24-word BIP-39 phrase from stdin); `lockyard cloud key show-phrase`
+requires typing `SHOW`. Keys live in `~/.config/lockyard/keys/` with private permissions and must be backed up using
+the recovery phrase. The server cannot search encrypted registry text; search must run locally in a client that holds
+the key. Bus secret scrubbing happens before encryption.
+
 ### Tasks in cloud mode
 
 `lockyard task` works on the server's backlog, and the agent that writes an item sets its urgency itself. An item is

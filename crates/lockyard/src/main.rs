@@ -753,6 +753,32 @@ enum CloudCommand {
     /// Service tokens of the workspace. Needs the owner role.
     #[command(subcommand)]
     Token(TokenCommand),
+    /// Manage this client's local workspace encryption key.
+    #[command(subcommand)]
+    Key(KeyCommand),
+    /// View or change workspace content encryption. Changes need the owner role.
+    #[command(subcommand)]
+    Encryption(EncryptionCommand),
+}
+
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// Generate and store a workspace key locally.
+    Create,
+    /// Show the recovery phrase after typing SHOW.
+    ShowPhrase,
+    /// Read a 24 word recovery phrase from stdin and store its key.
+    Import,
+}
+
+#[derive(Subcommand)]
+enum EncryptionCommand {
+    /// Show encryption mode and whether this machine has the matching key.
+    Status,
+    /// Require client-side content encryption. Needs the owner role and a local key.
+    Require,
+    /// Turn off the workspace encryption requirement. Needs the owner role.
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -1778,9 +1804,151 @@ fn run_cloud(mut opened: Opened, command: CloudCommand, agent: Option<&String>) 
             backend.registry_import(&agent, &read_json(&file)?)?
         }
         CloudCommand::Token(command) => return run_token(backend, command, &agent),
+        CloudCommand::Key(_) => {
+            unreachable!("local key commands are handled before opening the cloud backend")
+        }
+        CloudCommand::Encryption(_) => {
+            unreachable!("workspace encryption commands use the direct client")
+        }
     };
     let text = answer.to_string();
     output(&answer, text)
+}
+
+/// The agent must start while the server is away, so the encryption setting it last saw is kept
+/// in its state folder and used until the server answers again. A setting the server sends wins.
+fn agent_client(client: lockyard_cloud_client::Client) -> Result<lockyard_cloud_client::Client> {
+    use lockyard_cloud_client::{ClientError, WorkspaceEncryption};
+    let cache = agent::state_root()?.join("encryption.json");
+    let session = format!("lockyard-agent-{}", agent::uid());
+    match client.workspace_encryption(&session) {
+        Ok(setting) => {
+            if let Ok(text) = serde_json::to_string(&setting) {
+                let _ = std::fs::create_dir_all(cache.parent().unwrap_or(&cache));
+                let _ = std::fs::write(&cache, text);
+            }
+            Ok(client.apply_content_encryption(setting)?)
+        }
+        Err(ClientError::NotFound(_)) => Ok(client),
+        Err(
+            error @ (ClientError::Transport(_)
+            | ClientError::Frozen(_)
+            | ClientError::RateLimited(_)
+            | ClientError::Http(_)),
+        ) => {
+            match std::fs::read_to_string(&cache)
+                .ok()
+                .and_then(|text| serde_json::from_str::<WorkspaceEncryption>(&text).ok())
+            {
+                Some(setting) => Ok(client.apply_content_encryption(setting)?),
+                None => {
+                    eprintln!(
+                        "lockyard agent: encryption setting unavailable ({error}); starting without it until the server answers"
+                    );
+                    Ok(client)
+                }
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn run_cloud_key(cwd: &Path, command: KeyCommand) -> Result<Output> {
+    use lockyard_cloud_client::WorkspaceKey;
+    let root = lockyard_core::paths::find_root(cwd).ok_or(Error::NoProject)?;
+    let config = lockyard_core::config::Config::load(&root)?;
+    let (url, _) = open::endpoint(&config)?;
+    let client = open::direct_client(&url)?;
+    let setting = client.workspace_encryption("lockyard-cli")?;
+    let workspace = setting.workspace_id;
+    match command {
+        KeyCommand::Create => {
+            let (key, _phrase) = WorkspaceKey::generate().map_err(Error::Invalid)?;
+            key.store_for_workspace(&workspace)
+                .map_err(Error::Invalid)?;
+            output(
+                &json!({"created":true,"key_id":key.key_id()}),
+                format!("created local key {}", key.key_id()),
+            )
+        }
+        KeyCommand::ShowPhrase => {
+            eprint!("Type SHOW to display this workspace recovery phrase: ");
+            std::io::stderr().flush()?;
+            let mut confirmation = String::new();
+            std::io::stdin().read_line(&mut confirmation)?;
+            if confirmation.trim() != "SHOW" {
+                return Err(Error::Invalid(
+                    "recovery phrase display was not confirmed".into(),
+                ));
+            }
+            let key = WorkspaceKey::load_for_workspace(&workspace)
+                .map_err(Error::Invalid)?
+                .ok_or_else(|| Error::Invalid("no local key exists for this workspace".into()))?;
+            let phrase = key.phrase();
+            output(&json!({"recovery_phrase":phrase}), phrase)
+        }
+        KeyCommand::Import => {
+            let mut phrase = String::new();
+            std::io::stdin().read_to_string(&mut phrase)?;
+            let key = WorkspaceKey::from_phrase(&phrase).map_err(Error::Invalid)?;
+            key.store_for_workspace(&workspace)
+                .map_err(Error::Invalid)?;
+            output(
+                &json!({"imported":true,"key_id":key.key_id()}),
+                format!("imported local key {}", key.key_id()),
+            )
+        }
+    }
+}
+
+fn run_cloud_encryption(cwd: &Path, command: EncryptionCommand) -> Result<Output> {
+    use lockyard_cloud_client::WorkspaceKey;
+    let root = lockyard_core::paths::find_root(cwd).ok_or(Error::NoProject)?;
+    let config = lockyard_core::config::Config::load(&root)?;
+    let (url, _) = open::endpoint(&config)?;
+    let client = open::direct_client(&url)?;
+    let setting = client.workspace_encryption("lockyard-cli")?;
+    let key = WorkspaceKey::load_for_workspace(&setting.workspace_id).map_err(Error::Invalid)?;
+    match command {
+        EncryptionCommand::Status => {
+            let local_id = key.as_ref().map(WorkspaceKey::key_id);
+            let matches = match (&local_id, &setting.key_id) {
+                (Some(local), Some(server)) => local == server,
+                _ => false,
+            };
+            let text = format!(
+                "encryption {}, key id {}, local key {}",
+                setting.encryption,
+                setting.key_id.as_deref().unwrap_or("none"),
+                if matches {
+                    "matches"
+                } else if local_id.is_some() {
+                    "does not match"
+                } else {
+                    "missing"
+                }
+            );
+            output(
+                &json!({"encryption":setting.encryption,"key_id":setting.key_id,"local_key_matches":matches}),
+                text,
+            )
+        }
+        EncryptionCommand::Require => {
+            let key = key.ok_or_else(|| Error::Invalid(
+                "no local workspace key exists; create one with `lockyard cloud key create` or import it with `lockyard cloud key import`".into(),
+            ))?;
+            let id = key.key_id();
+            client.set_workspace_encryption("lockyard-cli", "required", Some(&id))?;
+            output(
+                &json!({"encryption":"required","key_id":id}),
+                format!("encryption required with key {id}"),
+            )
+        }
+        EncryptionCommand::Off => {
+            client.set_workspace_encryption("lockyard-cli", "off", None)?;
+            output(&json!({"encryption":"off"}), "encryption off")
+        }
+    }
 }
 
 fn run_token(backend: &mut dyn Backend, command: TokenCommand, agent: &str) -> Result<Output> {
@@ -1947,7 +2115,7 @@ fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
             open::trusted_url(&url)?;
             let token = Config::token()?;
             let token_id = lockyard_cloud_client::token_id(&token);
-            let client = Client::new(&url, token)?;
+            let client = agent_client(Client::new(&url, token)?)?;
             let settings = AgentConfig {
                 url,
                 workspace,
@@ -2071,6 +2239,8 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             open::trust_url(&url)?;
             output(&json!({"trusted": url}), format!("trusted {url}"))
         }
+        Command::Cloud(CloudCommand::Key(command)) => run_cloud_key(cwd, command),
+        Command::Cloud(CloudCommand::Encryption(command)) => run_cloud_encryption(cwd, command),
         Command::Cloud(command) => run_cloud(open()?, command, agent.as_ref()),
         Command::Hook(command) => {
             run_hook(command, agent, cwd);

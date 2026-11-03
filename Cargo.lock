@@ -353,6 +353,7 @@ name = "lockyard-cloud-client"
 version = "0.0.1"
 dependencies = [
  "lockyard-core",
+ "ring",
  "serde",
  "serde_json",
  "ureq",

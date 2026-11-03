@@ -6,10 +6,22 @@
 //! offers the same seam over its socket, and tests replace it with a fake.
 
 mod backend;
+mod crypto;
 #[cfg(test)]
 mod fake;
 
 pub use backend::CloudBackend;
+pub use crypto::{CONTENT_FIELDS, FieldRule, WorkspaceKey, route_matches, transform_fields};
+
+const ENCRYPTION_PATH: &str = "/api/v1/workspace/encryption";
+
+/// Workspace-level content encryption state returned by the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceEncryption {
+    pub encryption: String,
+    pub key_id: Option<String>,
+    pub workspace_id: String,
+}
 
 use lockyard_core::Error as CoreError;
 use lockyard_core::proto::PathCheck;
@@ -309,6 +321,9 @@ pub struct Client {
     token: String,
     agent: ureq::Agent,
     poll_agent: ureq::Agent,
+    workspace: Option<String>,
+    content_key: Option<WorkspaceKey>,
+    encryption_enabled: bool,
 }
 
 impl Client {
@@ -337,7 +352,96 @@ impl Client {
             token,
             agent,
             poll_agent,
+            workspace: None,
+            content_key: None,
+            encryption_enabled: false,
         })
+    }
+
+    /// Enables local content encryption for a workspace. The key stays in this process.
+    pub fn with_content_encryption(
+        mut self,
+        workspace: &str,
+        key: Option<WorkspaceKey>,
+        enabled: bool,
+    ) -> Self {
+        self.workspace = Some(workspace.to_string());
+        self.content_key = key;
+        self.encryption_enabled = enabled;
+        self
+    }
+
+    /// Read the server setting once and configure this client. A 404 means the server predates
+    /// the setting endpoint, so the client stays in cleartext compatibility mode.
+    pub fn configure_content_encryption(self, session: &str) -> Result<Self, ClientError> {
+        let response = match self.call(&Call::get(session, ENCRYPTION_PATH.into())) {
+            Ok(value) => value,
+            Err(ClientError::NotFound(_)) => return Ok(self),
+            Err(error) => return Err(error),
+        };
+        let setting: WorkspaceEncryption = serde_json::from_value(response).map_err(|error| {
+            ClientError::Decode(format!("invalid workspace encryption setting: {error}"))
+        })?;
+        self.apply_content_encryption(setting)
+    }
+
+    /// Configure this client from a setting already known, such as the last one the agent saw.
+    pub fn apply_content_encryption(
+        self,
+        setting: WorkspaceEncryption,
+    ) -> Result<Self, ClientError> {
+        if !matches!(setting.encryption.as_str(), "off" | "required")
+            || (setting.encryption == "required" && setting.key_id.is_none())
+        {
+            return Err(ClientError::Decode(
+                "invalid workspace encryption setting values".into(),
+            ));
+        }
+        let key = WorkspaceKey::load_for_workspace(&setting.workspace_id)
+            .map_err(ClientError::Invalid)?;
+        if setting.encryption == "required"
+            && let (Some(key), Some(expected)) = (&key, setting.key_id.as_deref())
+        {
+            let actual = key.key_id();
+            if actual != expected {
+                return Err(ClientError::Invalid(format!(
+                    "local encryption key id {actual} does not match workspace key id {expected}"
+                )));
+            }
+        }
+        Ok(self.with_content_encryption(
+            &setting.workspace_id,
+            key,
+            setting.encryption == "required",
+        ))
+    }
+
+    /// Fetch the server's setting without enabling transformations, for encryption management.
+    pub fn workspace_encryption(&self, session: &str) -> Result<WorkspaceEncryption, ClientError> {
+        serde_json::from_value(self.call(&Call::get(session, ENCRYPTION_PATH.into()))?).map_err(
+            |error| ClientError::Decode(format!("invalid workspace encryption setting: {error}")),
+        )
+    }
+
+    /// Update the workspace setting. The server enforces the owner role.
+    pub fn set_workspace_encryption(
+        &self,
+        session: &str,
+        encryption: &str,
+        key_id: Option<&str>,
+    ) -> Result<Value, ClientError> {
+        let body = match (encryption, key_id) {
+            ("off", None) => serde_json::json!({"encryption":"off"}),
+            ("required", Some(key_id)) => {
+                serde_json::json!({"encryption":"required","key_id":key_id})
+            }
+            _ => {
+                return Err(ClientError::Invalid(
+                    "invalid workspace encryption update".into(),
+                ));
+            }
+        };
+        self.call(&Call::write(session, "POST", ENCRYPTION_PATH.into(), body))
     }
 
     fn attempt(&self, call: &Call, encoded: Option<&str>) -> Result<Value, Failure> {
@@ -423,7 +527,19 @@ impl Transport for Client {
                 "request path must be an absolute API path".into(),
             ));
         }
-        let encoded = call.body.as_ref().map(Value::to_string);
+        let mut body = call.body.clone();
+        if let (Some(value), Some(workspace)) = (&mut body, self.workspace.as_deref()) {
+            transform_fields(
+                value,
+                &call.method,
+                &call.path,
+                workspace,
+                self.content_key.as_ref(),
+                self.encryption_enabled,
+            )
+            .map_err(ClientError::Invalid)?;
+        }
+        let encoded = body.as_ref().map(Value::to_string);
         // Only a write has a key that makes a repeat safe, and a deadline leaves no room for one.
         let attempts = if call.is_write() && call.deadline_ms.is_none() {
             WRITE_ATTEMPTS
@@ -433,7 +549,20 @@ impl Transport for Client {
         let mut delay = Duration::from_millis(100);
         for attempt in 1..=attempts {
             match self.attempt(call, encoded.as_deref()) {
-                Ok(value) => return Ok(value),
+                Ok(mut value) => {
+                    if let Some(workspace) = self.workspace.as_deref() {
+                        transform_fields(
+                            &mut value,
+                            &call.method,
+                            &call.path,
+                            workspace,
+                            self.content_key.as_ref(),
+                            false,
+                        )
+                        .map_err(ClientError::Invalid)?;
+                    }
+                    return Ok(value);
+                }
                 Err(Failure::Final(error)) => return Err(error),
                 Err(Failure::Retry(error)) if attempt == attempts => return Err(error),
                 Err(Failure::Retry(error)) => {
@@ -542,6 +671,180 @@ mod tests {
     use super::*;
     use crate::fake::{FakeServer, Reply};
     use serde_json::json;
+    use std::sync::Mutex;
+
+    static KEY_ENV: Mutex<()> = Mutex::new(());
+
+    struct KeyEnv {
+        previous: Option<std::ffi::OsString>,
+        path: std::path::PathBuf,
+    }
+    impl KeyEnv {
+        fn new() -> Self {
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            let path = std::env::temp_dir().join(format!("lockyard-test-{}", ulid()));
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", &path) };
+            Self { previous, path }
+        }
+    }
+    impl Drop for KeyEnv {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.take() {
+                unsafe { std::env::set_var("XDG_CONFIG_HOME", value) };
+            } else {
+                unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+            }
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn setting(mode: &str, key_id: Option<&str>) -> Reply {
+        Reply::json(
+            200,
+            json!({"encryption":mode,"key_id":key_id,"workspace_id":"123e4567-e89b-12d3-a456-426614174000"}),
+        )
+    }
+
+    #[test]
+    fn setting_off_leaves_content_clear() {
+        let _lock = KEY_ENV.lock().unwrap();
+        let _env = KeyEnv::new();
+        let server = FakeServer::start(vec![
+            setting("off", None),
+            Reply::json(200, json!({"body":"plain"})),
+        ]);
+        let client = Client::new(&server.url(), "secret".into())
+            .unwrap()
+            .configure_content_encryption("a")
+            .unwrap();
+        let result = client
+            .call(&Call::write(
+                "a",
+                "POST",
+                "/api/v1/bus/messages".into(),
+                json!({"body":"plain"}),
+            ))
+            .unwrap();
+        assert_eq!(result["body"], "plain");
+        assert_eq!(server.requests()[1].body["body"], "plain");
+    }
+
+    #[test]
+    fn required_setting_encrypts_requests_and_decrypts_replies() {
+        let _lock = KEY_ENV.lock().unwrap();
+        let _env = KeyEnv::new();
+        let (key, _) = WorkspaceKey::generate().unwrap();
+        key.store_for_workspace("123e4567-e89b-12d3-a456-426614174000")
+            .unwrap();
+        let envelope = key
+            .encrypt(
+                "123e4567-e89b-12d3-a456-426614174000",
+                "body",
+                "reply clear",
+            )
+            .unwrap();
+        let server = FakeServer::start(vec![
+            setting("required", Some(&key.key_id())),
+            Reply::json(200, json!({"body":envelope})),
+        ]);
+        let client = Client::new(&server.url(), "secret".into())
+            .unwrap()
+            .configure_content_encryption("a")
+            .unwrap();
+        let result = client
+            .call(&Call::write(
+                "a",
+                "POST",
+                "/api/v1/bus/messages".into(),
+                json!({"body":"send clear"}),
+            ))
+            .unwrap();
+        assert_eq!(result["body"], "reply clear");
+        let wire = &server.requests()[1].body["body"];
+        assert!(wire.as_str().unwrap().starts_with("lyenc1."));
+        assert_eq!(
+            key.decrypt(
+                "123e4567-e89b-12d3-a456-426614174000",
+                "body",
+                wire.as_str().unwrap()
+            )
+            .unwrap(),
+            "send clear"
+        );
+    }
+
+    #[test]
+    fn required_setting_without_key_refuses_content_write() {
+        let _lock = KEY_ENV.lock().unwrap();
+        let _env = KeyEnv::new();
+        let server = FakeServer::start(vec![
+            setting("required", Some("expected")),
+            Reply::json(
+                200,
+                json!({"messages":[{"body":"lyenc1.unavailable.payload"}]}),
+            ),
+        ]);
+        let client = Client::new(&server.url(), "secret".into())
+            .unwrap()
+            .configure_content_encryption("a")
+            .unwrap();
+        let inbox = client
+            .call(&Call::get("a", "/api/v1/bus/inbox".into()))
+            .unwrap();
+        assert_eq!(inbox["messages"][0]["body"], "[locked]");
+        let error = client
+            .call(&Call::write(
+                "a",
+                "POST",
+                "/api/v1/bus/messages".into(),
+                json!({"body":"plain"}),
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("lockyard cloud key import"));
+        // The setting and the inbox were read; the refused write never left the client.
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    #[test]
+    fn required_setting_rejects_a_mismatched_local_key_id() {
+        let _lock = KEY_ENV.lock().unwrap();
+        let _env = KeyEnv::new();
+        let (key, _) = WorkspaceKey::generate().unwrap();
+        key.store_for_workspace("123e4567-e89b-12d3-a456-426614174000")
+            .unwrap();
+        let server = FakeServer::start(vec![setting("required", Some("server-key-id"))]);
+        let result = Client::new(&server.url(), "secret".into())
+            .unwrap()
+            .configure_content_encryption("a");
+        let Err(error) = result else {
+            panic!("mismatched key id was accepted")
+        };
+        let message = error.to_string();
+        assert!(message.contains(&key.key_id()), "{message}");
+        assert!(message.contains("server-key-id"), "{message}");
+    }
+
+    #[test]
+    fn older_server_without_setting_route_keeps_cleartext_compatibility() {
+        let server = FakeServer::start(vec![
+            Reply::json(404, json!({"message":"missing"})),
+            Reply::json(200, json!({"body":"plain"})),
+        ]);
+        let client = Client::new(&server.url(), "secret".into())
+            .unwrap()
+            .configure_content_encryption("a")
+            .unwrap();
+        let result = client
+            .call(&Call::write(
+                "a",
+                "POST",
+                "/api/v1/bus/messages".into(),
+                json!({"body":"plain"}),
+            ))
+            .unwrap();
+        assert_eq!(result["body"], "plain");
+        assert_eq!(server.requests()[1].body["body"], "plain");
+    }
 
     #[test]
     fn sends_session_user_agent_and_idempotency_key_without_workspace_header() {
