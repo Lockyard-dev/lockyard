@@ -1817,6 +1817,7 @@ fn run_cloud(mut opened: Opened, command: CloudCommand, agent: Option<&String>) 
 
 /// The agent must start while the server is away, so the encryption setting it last saw is kept
 /// in its state folder and used until the server answers again. A setting the server sends wins.
+#[cfg(unix)]
 fn agent_client(client: lockyard_cloud_client::Client) -> Result<lockyard_cloud_client::Client> {
     use lockyard_cloud_client::{ClientError, WorkspaceEncryption};
     let cache = agent::state_root()?.join("encryption.json");
