@@ -38,27 +38,6 @@ const EDIT_TOOLS: [&str; 10] = [
     "write_file",
 ];
 
-/// Lines for `.claude/settings.json`.
-pub const SETTINGS: &str = r#"{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
-        "hooks": [{ "type": "command", "command": "lockyard hook claude" }]
-      }
-    ],
-    "PostToolUse": [
-      { "hooks": [{ "type": "command", "command": "lockyard hook claude" }] }
-    ],
-    "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "lockyard hook claude" }] }
-    ],
-    "SessionEnd": [
-      { "hooks": [{ "type": "command", "command": "lockyard hook claude" }] }
-    ]
-  }
-}"#;
-
 /// Which tool sent the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -1372,13 +1351,6 @@ mod tests {
             json!({ "hook_event_name": "PostToolUse", "session_id": "me", "cwd": dir.path() });
         let answer = claude(&input.to_string(), None, Path::new("/"), 1);
         assert!(matches!(answer, Err(Error::Db(_))));
-    }
-
-    #[test]
-    fn the_settings_snippet_is_valid_json() {
-        let settings: Value = serde_json::from_str(SETTINGS).unwrap();
-        assert!(settings["hooks"]["PreToolUse"].is_array());
-        assert!(settings["hooks"]["SessionEnd"].is_array());
     }
 
     #[test]

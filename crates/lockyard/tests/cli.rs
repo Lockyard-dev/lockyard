@@ -237,11 +237,108 @@ fn errors_are_json_under_the_json_flag() {
     assert_eq!(error["error"]["kind"], "needs_cloud");
 }
 
+/// Runs the binary with a home folder of its own and an empty search path, so detection answers
+/// from the folders the test made and never from the machine running it.
+fn lockyard_at_home(dir: &Path, home: &Path, agent: &str, args: &[&str]) -> Output {
+    let empty = home.join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_lockyard"))
+        .args(args)
+        .current_dir(dir)
+        .env("LOCKYARD_AGENT", agent)
+        .env("PATH", &empty)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("COPILOT_HOME", home.join(".copilot"))
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .output()
+        .unwrap()
+}
+
+fn ok_at_home(dir: &Path, home: &Path, agent: &str, args: &[&str]) -> String {
+    let result = lockyard_at_home(dir, home, agent, args);
+    assert!(
+        result.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    String::from_utf8(result.stdout).unwrap()
+}
+
+/// Gemini stands in for the clients here: its files sit in folders a sandbox will let a test
+/// create, while `.claude/` and `.cursor/` are refused by some hosts.
+#[test]
+fn setup_writes_a_client_config_and_uninstall_takes_it_back() {
+    let dir = project();
+    let root = dir.path();
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let settings = root.join(".gemini/settings.json");
+    let instructions = root.join("GEMINI.md");
+    std::fs::write(&instructions, "# House rules\n").unwrap();
+
+    let dry = ok_at_home(
+        root,
+        &home,
+        "a",
+        &["setup", "--client", "gemini", "--dry-run"],
+    );
+    assert!(dry.contains("would create"), "{dry}");
+    assert!(!settings.exists(), "a dry run writes nothing");
+
+    let done = ok_at_home(root, &home, "a", &["setup", "--client", "gemini"]);
+    assert!(done.contains("create"), "{done}");
+    let written = std::fs::read_to_string(&settings).unwrap();
+    assert!(written.contains("\"lockyard\""));
+    let block = std::fs::read_to_string(&instructions).unwrap();
+    assert!(block.starts_with("# House rules\n"));
+    assert!(block.contains("lockyard:start"));
+
+    let again = ok_at_home(root, &home, "a", &["setup", "--client", "gemini"]);
+    assert!(
+        !again.contains("create") && !again.contains("update"),
+        "a second run must change nothing: {again}"
+    );
+
+    let health: Value =
+        serde_json::from_str(&ok_at_home(root, &home, "a", &["--json", "doctor"])).unwrap();
+    assert_eq!(health["ok"], true, "{health}");
+
+    ok_at_home(
+        root,
+        &home,
+        "a",
+        &["setup", "--client", "gemini", "--uninstall"],
+    );
+    assert!(
+        !settings.exists(),
+        "a file Lockyard created alone goes away"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&instructions).unwrap(),
+        "# House rules\n"
+    );
+}
+
+#[test]
+fn doctor_fails_outside_a_project_and_names_the_fix() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = lockyard_at_home(dir.path(), dir.path(), "a", &["doctor"]);
+    assert_eq!(result.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&result.stdout);
+    assert!(text.contains("lockyard init"), "{text}");
+}
+
 #[test]
 fn every_new_command_accepts_the_json_flag() {
     let dir = project();
-    let setup: Value =
-        serde_json::from_str(&ok(dir.path(), "a", &["--json", "setup", "claude"])).unwrap();
+    let setup: Value = serde_json::from_str(&ok(
+        dir.path(),
+        "a",
+        &["--json", "setup", "--print", "--client", "claude"],
+    ))
+    .unwrap();
     assert!(
         setup["setup"]
             .as_str()
@@ -317,8 +414,17 @@ fn a_broken_project_never_blocks_the_agent() {
 }
 
 fn mcp(dir: &Path, agent: &str, input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lockyard"))
-        .args(["mcp"])
+    mcp_with(dir, agent, &[], &[], input)
+}
+
+/// The same server with extra flags or environment, for the two tool surfaces.
+fn mcp_with(dir: &Path, agent: &str, extra: &[&str], env: &[(&str, &str)], input: &str) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lockyard"));
+    command.arg("mcp").args(extra);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command
         .current_dir(dir)
         .env("LOCKYARD_AGENT", agent)
         .env_remove("CLAUDE_CODE_SESSION_ID")
@@ -353,7 +459,23 @@ fn mcp_stdio_initializes_lists_claims_and_reports_conflicts_and_parse_errors() {
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n",
     );
     let list: Value = serde_json::from_slice(&list.stdout).unwrap();
-    assert!(list["result"]["tools"].as_array().unwrap().len() > 20);
+    let compact = list["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = compact
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "start_work",
+            "check",
+            "update",
+            "handover",
+            "finish_work",
+            "status"
+        ],
+        "the default surface is the short one"
+    );
 
     let claim = mcp(
         dir.path(),
@@ -380,4 +502,79 @@ fn mcp_stdio_initializes_lists_claims_and_reports_conflicts_and_parse_errors() {
     let bad = mcp(dir.path(), "first", "{bad json}\n");
     let bad: Value = serde_json::from_slice(&bad.stdout).unwrap();
     assert_eq!(bad["error"]["code"], -32700);
+}
+
+#[test]
+fn the_full_tool_surface_is_a_flag_or_an_environment_variable_away() {
+    let dir = project();
+    let list = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n";
+    let count = |out: Output| -> usize {
+        let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+        value["result"]["tools"].as_array().unwrap().len()
+    };
+    let compact = count(mcp(dir.path(), "a", list));
+    let by_flag = count(mcp_with(dir.path(), "a", &["--tools", "full"], &[], list));
+    let by_env = count(mcp_with(
+        dir.path(),
+        "a",
+        &[],
+        &[("LOCKYARD_MCP_TOOLS", "full")],
+        list,
+    ));
+    assert_eq!(compact, 6);
+    assert!(by_flag > 50, "the full surface keeps every tool: {by_flag}");
+    assert_eq!(by_flag, by_env, "the flag and the variable agree");
+    // The flag wins, so a client can ask for the short surface on a machine set to full.
+    assert_eq!(
+        count(mcp_with(
+            dir.path(),
+            "a",
+            &["--tools", "compact"],
+            &[("LOCKYARD_MCP_TOOLS", "full")],
+            list,
+        )),
+        6
+    );
+    let bad = mcp_with(dir.path(), "a", &["--tools", "nope"], &[], list);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("compact"));
+}
+
+#[test]
+fn a_composite_tool_claims_and_finishes_a_whole_piece_of_work() {
+    let dir = project();
+    let start = mcp(
+        dir.path(),
+        "first",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"start_work\",\"arguments\":{\"paths\":[\"src/api\"],\"note\":\"rewrite\"}}}\n",
+    );
+    let start: Value = serde_json::from_slice(&start.stdout).unwrap();
+    assert_eq!(start["result"]["isError"], false, "{start}");
+
+    let refused = mcp(
+        dir.path(),
+        "second",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"start_work\",\"arguments\":{\"paths\":[\"src/api/routes.rs\"]}}}\n",
+    );
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        refused["result"]["isError"], true,
+        "a composite refuses a held path exactly as the plain claim does"
+    );
+
+    let finish = mcp(
+        dir.path(),
+        "first",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"finish_work\",\"arguments\":{\"paths\":[\"src/api\"]}}}\n",
+    );
+    let finish: Value = serde_json::from_slice(&finish.stdout).unwrap();
+    assert_eq!(finish["result"]["isError"], false, "{finish}");
+
+    let after = mcp(
+        dir.path(),
+        "second",
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"start_work\",\"arguments\":{\"paths\":[\"src/api/routes.rs\"]}}}\n",
+    );
+    let after: Value = serde_json::from_slice(&after.stdout).unwrap();
+    assert_eq!(after["result"]["isError"], false, "the release frees it");
 }

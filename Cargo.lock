@@ -337,7 +337,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "lockyard"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "clap",
  "libc",
@@ -346,11 +346,12 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "toml",
 ]
 
 [[package]]
 name = "lockyard-cloud-client"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "lockyard-core",
  "ring",
@@ -361,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "lockyard-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "libc",
  "rusqlite",

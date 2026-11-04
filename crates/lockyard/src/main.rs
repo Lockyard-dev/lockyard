@@ -5,6 +5,7 @@ mod guard;
 mod hook;
 mod mcp;
 mod open;
+mod setup;
 
 use clap::{Args, Parser, Subcommand};
 use lockyard_core::bus::BROADCAST;
@@ -98,10 +99,35 @@ enum Command {
     /// Agent integrations.
     #[command(subcommand)]
     Hook(HookCommand),
-    /// Print setup snippets for agent tools.
-    Setup { client: SetupClient },
+    /// Write Lockyard into the agent tools installed here.
+    Setup(SetupArgs),
+    /// Check that this project and its agent tools are wired up.
+    Doctor,
     /// Run the MCP server over standard input and output.
-    Mcp,
+    Mcp(McpArgs),
+}
+
+#[derive(Args)]
+struct SetupArgs {
+    /// claude, codex, cursor, gemini, copilot or all. Default: the ones found here.
+    #[arg(long = "client")]
+    clients: Vec<String>,
+    /// Show what would be written and write nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Take back what setup wrote.
+    #[arg(long)]
+    uninstall: bool,
+    /// Print the snippets instead of writing any file.
+    #[arg(long)]
+    print: bool,
+}
+
+#[derive(Args)]
+struct McpArgs {
+    /// compact (six composite tools, the default) or full (every tool).
+    #[arg(long = "tools")]
+    tools: Option<String>,
 }
 
 #[derive(Args)]
@@ -115,13 +141,6 @@ struct RunArgs {
     /// Command and arguments, after `--`.
     #[arg(last = true, required = true)]
     command: Vec<std::ffi::OsString>,
-}
-
-#[derive(clap::ValueEnum, Clone)]
-enum SetupClient {
-    Claude,
-    Codex,
-    Cursor,
 }
 
 #[derive(Args)]
@@ -2066,25 +2085,147 @@ fn run_hook(command: HookCommand, agent: Option<String>, cwd: &Path) {
     }
 }
 
-fn setup(client: SetupClient) -> String {
-    let server = r#"{
-  "mcpServers": {
-    "lockyard": { "command": "lockyard", "args": ["mcp"] }
-  }
-}"#;
-    let mut sections = match client {
-        SetupClient::Claude => vec![
-            format!("Add to .claude/settings.json:\n{}", hook::SETTINGS),
-            format!("Add to .mcp.json:\n{server}"),
-        ],
-        SetupClient::Codex => vec![
-            "Add to ~/.codex/config.toml:\n[mcp_servers.lockyard]\ncommand = \"lockyard\"\nargs = [\"mcp\"]"
-                .to_string(),
-        ],
-        SetupClient::Cursor => vec![format!("Add to .cursor/mcp.json:\n{server}")],
+/// The clients a run covers: the named ones, or every one found in this project and home.
+fn chosen_clients(args: &SetupArgs, site: &setup::Site) -> Result<Vec<setup::Client>> {
+    if args.clients.iter().any(|name| name == "all") {
+        return Ok(setup::ALL.to_vec());
+    }
+    if args.clients.is_empty() {
+        return Ok(setup::ALL
+            .into_iter()
+            .filter(|client| client.installed(site))
+            .collect());
+    }
+    args.clients
+        .iter()
+        .map(|name| {
+            setup::Client::parse(name).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "unknown client {name:?}: use claude, codex, cursor, gemini, copilot or all"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn run_setup(args: SetupArgs, cwd: &Path) -> Result<Output> {
+    // Setup configures one project, so it needs one: the files it writes name this folder.
+    let root = lockyard_core::paths::find_root(cwd).ok_or(Error::NoProject)?;
+    let site = setup::Site::discover(&root)?;
+    let clients = chosen_clients(&args, &site)?;
+    if args.print {
+        let text = clients
+            .iter()
+            .map(|client| format!("# {}\n{}", client.label(), client.snippet(&site)))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        return output(&json!({"setup": text}), text);
+    }
+    let changes = setup::plan(&clients, &site, args.uninstall)?;
+    let done = setup::apply(&changes, args.dry_run)?;
+    let mut text = setup::describe(&done, args.dry_run);
+    if !args.dry_run && !args.uninstall && !done.is_empty() {
+        text.push_str(
+            "\n\nRestart the clients you had open, then set LOCKYARD_AGENT to a unique name for each agent.",
+        );
+    }
+    output(&setup::as_json(&done), text)
+}
+
+fn run_doctor(cwd: &Path, agent: Option<&String>) -> Result<Output> {
+    use lockyard_core::config::{Config, Mode};
+    let mut findings = Vec::new();
+    let root = lockyard_core::paths::find_root(cwd);
+    let Some(root) = root else {
+        findings.push(setup::Finding::missing_project(cwd));
+        return doctor_output(findings);
     };
-    sections.push("Set LOCKYARD_AGENT to a unique name for each agent.".to_string());
-    sections.join("\n\n")
+    findings.push(setup::Finding::ok_check(
+        "project",
+        format!("{} holds the Lockyard store", root.display()),
+    ));
+    match Store::open(&root).and_then(|mut store| {
+        // A read-only store would fail only at the first claim, which is the worst moment.
+        lockyard_core::Backend::touch_agent(&mut store, "lockyard-doctor", now_ms())
+    }) {
+        Ok(()) => findings.push(setup::Finding::ok_check("store", "writable")),
+        Err(error) => findings.push(setup::Finding::failed("store", error.to_string())),
+    }
+    let name = agent.cloned().or_else(env_agent);
+    findings.push(match &name {
+        Some(name) => setup::Finding::ok_check("agent name", name.to_string()),
+        None => setup::Finding::failed(
+            "agent name",
+            "unset: export LOCKYARD_AGENT=<name> so your work is attributed",
+        ),
+    });
+
+    let config = Config::load(&root)?;
+    if config.mode == Mode::Cloud {
+        findings.push(cloud_finding(&config, name.as_deref()));
+    } else {
+        findings.push(setup::Finding::ok_check(
+            "mode",
+            "local: everything stays in .lockyard/",
+        ));
+    }
+
+    let site = setup::Site::discover(&root)?;
+    let detected: Vec<setup::Client> = setup::ALL
+        .into_iter()
+        .filter(|client| client.installed(&site))
+        .collect();
+    if detected.is_empty() {
+        // Not a failure: Lockyard is useful from the command line with no agent tool installed.
+        findings.push(setup::Finding::ok_check(
+            "clients",
+            "none detected; name one with `lockyard setup --client <name>`",
+        ));
+    }
+    for client in detected {
+        findings.extend(setup::inspect(client, &site)?);
+    }
+    doctor_output(findings)
+}
+
+/// Asks the configured server for something only a working token and URL can answer.
+fn cloud_finding(config: &lockyard_core::config::Config, agent: Option<&str>) -> setup::Finding {
+    let endpoint = match open::endpoint(config) {
+        Ok((url, _)) => url,
+        Err(error) => return setup::Finding::failed("cloud", error.to_string()),
+    };
+    match open::direct_client(&endpoint) {
+        Ok(client) => {
+            let session = agent.unwrap_or("lockyard-doctor");
+            let call = lockyard_cloud_client::Call::get(session, "/api/v1/presence".into());
+            match lockyard_cloud_client::Transport::call(&client, &call) {
+                Ok(_) => setup::Finding::ok_check("cloud", format!("{endpoint} answers")),
+                Err(error) => setup::Finding::failed("cloud", format!("{endpoint}: {error}")),
+            }
+        }
+        Err(error) => setup::Finding::failed("cloud", error.to_string()),
+    }
+}
+
+fn doctor_output(findings: Vec<setup::Finding>) -> Result<Output> {
+    let text = findings
+        .iter()
+        .map(|finding| {
+            format!(
+                "{} {:<24} {}",
+                if finding.ok { "ok  " } else { "FAIL" },
+                finding.check,
+                finding.detail
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let healthy = findings.iter().all(|finding| finding.ok);
+    let mut out = output(&json!({"ok": healthy, "checks": findings}), text)?;
+    if !healthy {
+        out.exit = EXIT_FAILURE;
+    }
+    Ok(out)
 }
 
 /// Inside a hook the event names the session, so only an explicit name overrides it.
@@ -2247,11 +2388,9 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             run_hook(command, agent, cwd);
             output(&Value::Null, "")
         }
-        Command::Setup { client } => {
-            let text = setup(client);
-            output(&json!({ "setup": text }), text)
-        }
-        Command::Mcp => output(&Value::Null, ""),
+        Command::Setup(args) => run_setup(args, cwd),
+        Command::Doctor => run_doctor(cwd, agent.as_ref()),
+        Command::Mcp(_) => output(&Value::Null, ""),
     }
 }
 
@@ -2286,9 +2425,18 @@ fn deliver(out: &Output, json: bool) -> std::io::Result<()> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
-    if matches!(&cli.command, Command::Mcp) {
+    if let Command::Mcp(args) = &cli.command {
+        let surface = match mcp::Surface::choose(args.tools.as_deref()) {
+            Ok(surface) => surface,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(EXIT_FAILURE);
+            }
+        };
         let agent = cli.agent.clone().or_else(env_lockyard_agent);
-        return match current_dir().and_then(|cwd| mcp::serve(agent, &cwd).map_err(Error::Io)) {
+        return match current_dir()
+            .and_then(|cwd| mcp::serve(agent, &cwd, surface).map_err(Error::Io))
+        {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");

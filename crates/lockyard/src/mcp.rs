@@ -26,8 +26,36 @@ const DEFAULT_QUEUE_MINUTES: i64 = 60;
 const DEFAULT_WAIT_SECONDS: i64 = 60;
 const DEFAULT_ACTIVE_SECONDS: i64 = 900;
 
+/// How many tools the server lists.
+///
+/// A model pays for every tool description on every turn, so the default is six composites that
+/// cover the whole working loop. `full` stays for integrations written against the long list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Surface {
+    Compact,
+    Full,
+}
+
+impl Surface {
+    /// The flag wins over `LOCKYARD_MCP_TOOLS`, which wins over the compact default.
+    pub fn choose(flag: Option<&str>) -> Result<Self> {
+        let chosen = flag.map(str::to_string).or_else(|| {
+            std::env::var("LOCKYARD_MCP_TOOLS")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        });
+        match chosen.as_deref().map(str::trim) {
+            None | Some("compact") => Ok(Self::Compact),
+            Some("full") => Ok(Self::Full),
+            Some(other) => Err(Error::Invalid(format!(
+                "unknown tool set {other:?}: use compact or full"
+            ))),
+        }
+    }
+}
+
 /// Reads one JSON-RPC message per line and writes one response for each request.
-pub fn serve(agent: Option<String>, cwd: &Path) -> io::Result<()> {
+pub fn serve(agent: Option<String>, cwd: &Path, surface: Surface) -> io::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     for line in stdin.lock().lines() {
@@ -36,7 +64,7 @@ pub fn serve(agent: Option<String>, cwd: &Path) -> io::Result<()> {
             continue;
         }
         let (response, after) = match serde_json::from_str::<Value>(&line) {
-            Ok(request) => respond(&request, agent.as_deref(), cwd),
+            Ok(request) => respond(&request, agent.as_deref(), cwd, surface),
             Err(_) => (Some(error(Value::Null, -32700, "Parse error")), None),
         };
         if let Some(response) = response {
@@ -56,8 +84,8 @@ pub fn serve(agent: Option<String>, cwd: &Path) -> io::Result<()> {
 
 /// Handles one decoded JSON-RPC message and runs its follow-up at once.
 #[cfg(test)]
-pub fn handle(request: &Value, agent: Option<&str>, cwd: &Path) -> Option<Value> {
-    let (response, after) = respond(request, agent, cwd);
+pub fn handle(request: &Value, agent: Option<&str>, cwd: &Path, surface: Surface) -> Option<Value> {
+    let (response, after) = respond(request, agent, cwd, surface);
     if let Some(after) = after {
         after().unwrap();
     }
@@ -65,7 +93,12 @@ pub fn handle(request: &Value, agent: Option<&str>, cwd: &Path) -> Option<Value>
 }
 
 /// Handles one decoded JSON-RPC message. Notifications return no response.
-fn respond(request: &Value, agent: Option<&str>, cwd: &Path) -> (Option<Value>, Option<After>) {
+fn respond(
+    request: &Value,
+    agent: Option<&str>,
+    cwd: &Path,
+    surface: Surface,
+) -> (Option<Value>, Option<After>) {
     let id = request.get("id").cloned();
     let method = request.get("method").and_then(Value::as_str);
     let is_rpc = request.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
@@ -88,7 +121,7 @@ fn respond(request: &Value, agent: Option<&str>, cwd: &Path) -> (Option<Value>, 
             "serverInfo": {"name": "lockyard", "version": lockyard_core::VERSION}
         }),
         "ping" => json!({}),
-        "tools/list" => json!({"tools": tools()}),
+        "tools/list" => json!({"tools": tools(surface)}),
         "tools/call" => {
             let (result, follow_up) = call_tool(params, agent, cwd);
             after = follow_up;
@@ -119,7 +152,62 @@ fn tool_def(name: &str, description: &str, properties: Value, required: &[&str])
     })
 }
 
-fn tools() -> Vec<Value> {
+/// The tools the server lists for this surface.
+fn tools(surface: Surface) -> Vec<Value> {
+    match surface {
+        Surface::Compact => compact_tools(),
+        Surface::Full => full_tools(),
+    }
+}
+
+/// The whole working loop in six tools. Every one of them is a few of the full tools in order,
+/// so nothing here can do what the full surface cannot: a claim is still refused on conflict.
+fn compact_tools() -> Vec<Value> {
+    let int = json!({"type": "integer"});
+    let text = json!({"type": "string"});
+    let flag = json!({"type": "boolean"});
+    let names = json!({"type": "array", "items": {"type": "string"}});
+    vec![
+        tool_def(
+            "start_work",
+            "Claim paths before editing them, and optionally take a task. Refused when another agent holds a path.",
+            json!({"paths": names, "note": text, "ttl": int, "shared": flag, "zones": names, "task": int}),
+            &[],
+        ),
+        tool_def(
+            "check",
+            "Is this path free to edit? Errors when another agent holds it.",
+            json!({"path": text}),
+            &["path"],
+        ),
+        tool_def(
+            "update",
+            "Read your mail, and send a note first when to and body are given.",
+            json!({"to": text, "body": text, "peek": flag, "all": flag}),
+            &[],
+        ),
+        tool_def(
+            "handover",
+            "Give your claim to another agent and tell them why.",
+            json!({"to": text, "id": int, "note": text}),
+            &["to"],
+        ),
+        tool_def(
+            "finish_work",
+            "Submit a task with evidence and release your claims.",
+            json!({"task": int, "evidence": text, "id": int, "note": text}),
+            &[],
+        ),
+        tool_def(
+            "status",
+            "Your claims, unfinished tasks and unread mail count.",
+            json!({}),
+            &[],
+        ),
+    ]
+}
+
+fn full_tools() -> Vec<Value> {
     let int = json!({"type": "integer"});
     let text = json!({"type": "string"});
     let flag = json!({"type": "boolean"});
@@ -469,7 +557,16 @@ fn call_tool(params: &Value, agent: Option<&str>, cwd: &Path) -> (Value, Option<
     let mut after = None;
     let answer = run_tool(name, Args(args), agent, cwd, &mut after);
     let result = match answer {
-        Ok(result) if ["msg_inbox", "msg_thread", "board_get", "work_show"].contains(&name) => {
+        Ok(result)
+            if [
+                "msg_inbox",
+                "msg_thread",
+                "board_get",
+                "work_show",
+                "update",
+            ]
+            .contains(&name) =>
+        {
             tool_result(format!("{MAIL_WARNING}\n{result}"), false)
         }
         Ok(result) => tool_result(result.to_string(), false),
@@ -643,6 +740,127 @@ fn session_state(text: Option<String>) -> Result<Option<SessionState>> {
     .transpose()
 }
 
+/// Names only the compact surface answers.
+const COMPOSITES: [&str; 4] = ["start_work", "update", "handover", "finish_work"];
+
+/// Runs one composite tool as the full tools it stands for, in order.
+///
+/// Each step is the same call an agent on the full surface would make, so a conflict is still a
+/// refusal. `start_work` undoes its own claim when the task it was asked for cannot be taken:
+/// a zone held for work that never started is exactly the stuck lease leases exist to prevent.
+fn run_composite(
+    name: &str,
+    args: Args<'_>,
+    agent: Option<&str>,
+    cwd: &Path,
+    after: &mut Option<After>,
+) -> Result<Value> {
+    let step = |tool: &str, arguments: Value, after: &mut Option<After>| {
+        run_tool(tool, Args(&arguments), agent, cwd, after)
+    };
+    match name {
+        "start_work" => {
+            let paths = args.strings("paths")?;
+            let claim = if paths.is_empty() {
+                Value::Null
+            } else {
+                step(
+                    "zone_claim",
+                    json!({
+                        "paths": paths,
+                        "note": args.optional_text("note")?,
+                        "ttl": args.get("ttl").cloned(),
+                        "shared": args.flag("shared")?,
+                        "zones": args.strings("zones")?,
+                    }),
+                    after,
+                )?
+            };
+            let mut answer = json!({"claim": claim});
+            if let Some(id) = args.some_int("task")? {
+                match step("task_claim", json!({"id": id}), after) {
+                    Ok(task) => answer["task"] = task,
+                    Err(failure) => {
+                        if !claim.is_null() {
+                            let _ = step("zone_release", json!({}), after);
+                        }
+                        return Err(failure);
+                    }
+                }
+            }
+            if let Some(name) = agent {
+                answer["unread"] = step("msg_unread", json!({}), after)?["unread"].clone();
+                answer["agent"] = json!(name);
+            }
+            Ok(answer)
+        }
+        "update" => {
+            let mut answer = json!({});
+            if let (Some(to), Some(body)) = (args.some_text("to")?, args.some_text("body")?) {
+                answer["sent"] = step("msg_send", json!({"to": to, "body": body}), after)?;
+            } else if args.get("to").is_some() || args.get("body").is_some() {
+                return Err(Error::Invalid(
+                    "sending a note needs both to and body".into(),
+                ));
+            }
+            answer["mail"] = step(
+                "msg_inbox",
+                json!({"peek": args.flag("peek")?, "all": args.flag("all")?}),
+                after,
+            )?;
+            Ok(answer)
+        }
+        "handover" => {
+            let to = args.text("to")?;
+            let note = args.optional_text("note")?;
+            let body = if note.is_empty() {
+                format!("Lockyard: the zone is yours, {to}.")
+            } else {
+                format!("Lockyard: the zone is yours, {to}. {note}")
+            };
+            // Only the cloud can offer a claim to a named agent; locally the honest move is to
+            // let it go and say so, rather than pretend the other agent now holds it.
+            let cloud = open(cwd, agent)?.backend.is_cloud();
+            let mut answer = if cloud {
+                let id = args.id()?;
+                json!({"mode": "offered", "claim": step("zone_handover", json!({"id": id, "to": to}), after)?})
+            } else {
+                let released = step(
+                    "zone_release",
+                    match args.optional_id()? {
+                        Some(id) => json!({"id": id, "note": note}),
+                        None => json!({"note": note}),
+                    },
+                    after,
+                )?;
+                json!({"mode": "released", "released": released["released"].clone()})
+            };
+            answer["message"] = step("msg_send", json!({"to": to, "body": body}), after)?;
+            Ok(answer)
+        }
+        "finish_work" => {
+            let mut answer = json!({});
+            if let Some(id) = args.some_int("task")? {
+                let evidence = args.some_text("evidence")?.ok_or_else(|| {
+                    Error::Invalid("finishing a task needs evidence of the work".into())
+                })?;
+                answer["task"] = step(
+                    "task_submit",
+                    json!({"id": id, "evidence": evidence}),
+                    after,
+                )?;
+            }
+            let release = match args.optional_id()? {
+                Some(id) => json!({"id": id, "note": args.optional_text("note")?}),
+                None => json!({"note": args.optional_text("note")?}),
+            };
+            answer["released"] = step("zone_release", release, after)?["released"].clone();
+            Ok(answer)
+        }
+        _ => Err(Error::Invalid(format!("unknown tool {name:?}"))),
+    }
+}
+
 fn run_tool(
     name: &str,
     args: Args<'_>,
@@ -650,6 +868,14 @@ fn run_tool(
     cwd: &Path,
     after: &mut Option<After>,
 ) -> Result<Value> {
+    if COMPOSITES.contains(&name) {
+        return run_composite(name, args, agent, cwd, after);
+    }
+    // The compact surface's short names for tools that need no composing.
+    let name = match name {
+        "check" => "zone_check",
+        other => other,
+    };
     let now = crate::now_ms();
     let mut opened = open(cwd, agent)?;
     let me = || {
@@ -1101,7 +1327,17 @@ mod tests {
             "method": "tools/call",
             "params": {"name": name, "arguments": arguments}
         });
-        handle(&request, Some(agent), dir.path()).unwrap()["result"].clone()
+        handle(&request, Some(agent), dir.path(), Surface::Full).unwrap()["result"].clone()
+    }
+
+    fn listed(surface: Surface, dir: &tempfile::TempDir) -> Vec<String> {
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        handle(&request, None, dir.path(), surface).unwrap()["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect()
     }
 
     fn text(result: &Value) -> &str {
@@ -1113,12 +1349,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"});
-        let init = handle(&init, None, path).unwrap();
+        let init = handle(&init, None, path, Surface::Full).unwrap();
         assert_eq!(init["result"]["protocolVersion"], PROTOCOL_VERSION);
         let bad = json!({"jsonrpc": "2.0", "id": 3, "method": "absent"});
-        assert_eq!(handle(&bad, None, path).unwrap()["error"]["code"], -32601);
+        assert_eq!(
+            handle(&bad, None, path, Surface::Full).unwrap()["error"]["code"],
+            -32601
+        );
         let wrong = json!({"id": 4, "method": "ping"});
-        assert_eq!(handle(&wrong, None, path).unwrap()["error"]["code"], -32600);
+        assert_eq!(
+            handle(&wrong, None, path, Surface::Full).unwrap()["error"]["code"],
+            -32600
+        );
     }
 
     #[test]
@@ -1126,13 +1368,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for method in ["notifications/initialized", "absent", "ping"] {
             let note = json!({"jsonrpc": "2.0", "method": method});
-            assert_eq!(handle(&note, None, dir.path()), None);
+            assert_eq!(handle(&note, None, dir.path(), Surface::Full), None);
         }
     }
 
     #[test]
     fn every_schema_is_an_object_with_a_required_array_of_its_own_properties() {
-        let tools = tools();
+        let tools = [compact_tools(), full_tools()].concat();
         for tool in &tools {
             let schema = &tool["inputSchema"];
             assert_eq!(schema["type"], "object");
@@ -1144,7 +1386,7 @@ mod tests {
 
     #[test]
     fn every_command_of_the_brief_has_a_tool() {
-        let tools = tools();
+        let tools = full_tools();
         let names: Vec<&str> = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -1185,7 +1427,7 @@ mod tests {
     #[test]
     fn every_listed_tool_is_implemented() {
         let dir = project();
-        for tool in tools() {
+        for tool in [compact_tools(), full_tools()].concat() {
             let name = tool["name"].as_str().unwrap();
             let result = call(&dir, "a", name, json!({}));
             assert!(!text(&result).contains("unknown tool"), "{name}");
@@ -1218,7 +1460,7 @@ mod tests {
             "method": "tools/call",
             "params": {"name": "task_add", "arguments": {"title": "x"}}
         });
-        let nameless = handle(&request, None, dir.path()).unwrap();
+        let nameless = handle(&request, None, dir.path(), Surface::Full).unwrap();
         assert_eq!(nameless["result"]["isError"], true);
 
         call(
@@ -1267,12 +1509,156 @@ mod tests {
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "msg_inbox", "arguments": {}}
         });
-        let (_, after) = respond(&request, Some("b"), dir.path());
+        let (_, after) = respond(&request, Some("b"), dir.path(), Surface::Full);
         let unread =
             |dir: &tempfile::TempDir| text(&call(dir, "b", "msg_unread", json!({}))).to_string();
         assert!(unread(&dir).contains('1'), "the answer has not left yet");
         after.unwrap()().unwrap();
         assert!(unread(&dir).contains('0'));
+    }
+
+    #[test]
+    fn the_default_surface_lists_six_tools_and_full_lists_them_all() {
+        let dir = project();
+        let compact = listed(Surface::Compact, &dir);
+        assert_eq!(
+            compact,
+            [
+                "start_work",
+                "check",
+                "update",
+                "handover",
+                "finish_work",
+                "status"
+            ]
+        );
+        let full = listed(Surface::Full, &dir);
+        assert!(
+            full.len() >= 61,
+            "the full surface lost tools: {}",
+            full.len()
+        );
+        for name in ["zone_claim", "msg_inbox", "task_submit", "work_offer"] {
+            assert!(full.contains(&name.to_string()), "{name}");
+        }
+        // A compact description costs the model context on every turn; keep them one line.
+        for tool in compact_tools() {
+            let description = tool["description"].as_str().unwrap();
+            assert!(description.len() <= 110, "{description}");
+        }
+    }
+
+    #[test]
+    fn the_surface_comes_from_the_flag_then_the_environment_then_the_default() {
+        assert_eq!(Surface::choose(Some("full")).unwrap(), Surface::Full);
+        assert_eq!(Surface::choose(Some("compact")).unwrap(), Surface::Compact);
+        assert!(Surface::choose(Some("some")).is_err());
+        // SAFETY: single-threaded test process; the variable is removed before it returns.
+        unsafe { std::env::set_var("LOCKYARD_MCP_TOOLS", "full") };
+        assert_eq!(Surface::choose(None).unwrap(), Surface::Full);
+        assert_eq!(
+            Surface::choose(Some("compact")).unwrap(),
+            Surface::Compact,
+            "the flag wins over the environment"
+        );
+        unsafe { std::env::remove_var("LOCKYARD_MCP_TOOLS") };
+        assert_eq!(Surface::choose(None).unwrap(), Surface::Compact);
+    }
+
+    #[test]
+    fn start_work_claims_and_is_still_refused_when_another_agent_holds_the_path() {
+        let dir = project();
+        let started = call(
+            &dir,
+            "a",
+            "start_work",
+            json!({"paths": ["src"], "note": "auth"}),
+        );
+        assert_eq!(started["isError"], false);
+        assert!(text(&started).contains("\"unread\":0"));
+        let refused = call(&dir, "b", "start_work", json!({"paths": ["src/api"]}));
+        assert_eq!(refused["isError"], true);
+        assert!(text(&refused).contains("held by a"));
+    }
+
+    #[test]
+    fn start_work_gives_the_zone_back_when_the_task_it_was_asked_for_is_taken() {
+        let dir = project();
+        call(&dir, "lead", "task_add", json!({"title": "ship"}));
+        call(&dir, "first", "task_claim", json!({"id": 1}));
+        let refused = call(
+            &dir,
+            "second",
+            "start_work",
+            json!({"paths": ["src"], "task": 1}),
+        );
+        assert_eq!(refused["isError"], true);
+        let free = call(&dir, "third", "zone_claim", json!({"paths": ["src"]}));
+        assert_eq!(free["isError"], false, "the rolled-back zone is free again");
+    }
+
+    #[test]
+    fn update_sends_then_reads_and_marks_the_mail_it_showed() {
+        let dir = project();
+        call(&dir, "b", "msg_inbox", json!({}));
+        call(&dir, "a", "msg_send", json!({"to": "b", "body": "ping"}));
+        let read = call(&dir, "b", "update", json!({"to": "a", "body": "on it"}));
+        assert!(text(&read).starts_with(MAIL_WARNING));
+        assert!(text(&read).contains("ping"));
+        assert!(text(&read).contains("on it"));
+        assert!(text(&call(&dir, "b", "msg_unread", json!({}))).contains("\"unread\":0"));
+        let half = call(&dir, "b", "update", json!({"to": "a"}));
+        assert_eq!(half["isError"], true);
+    }
+
+    #[test]
+    fn handover_in_local_mode_releases_the_zone_and_says_so() {
+        let dir = project();
+        call(&dir, "b", "msg_inbox", json!({}));
+        call(&dir, "a", "start_work", json!({"paths": ["src"]}));
+        let handed = call(
+            &dir,
+            "a",
+            "handover",
+            json!({"to": "b", "note": "all yours"}),
+        );
+        assert!(text(&handed).contains("\"mode\":\"released\""));
+        assert!(text(&handed).contains("\"released\":1"));
+        let taken = call(&dir, "b", "start_work", json!({"paths": ["src"]}));
+        assert_eq!(taken["isError"], false);
+        assert!(text(&call(&dir, "b", "msg_unread", json!({}))).contains("\"unread\":1"));
+    }
+
+    #[test]
+    fn finish_work_submits_with_evidence_and_releases() {
+        let dir = project();
+        call(&dir, "lead", "task_add", json!({"title": "ship"}));
+        call(
+            &dir,
+            "w",
+            "start_work",
+            json!({"paths": ["src"], "task": 1}),
+        );
+        let without = call(&dir, "w", "finish_work", json!({"task": 1}));
+        assert_eq!(without["isError"], true, "evidence is not optional");
+        let done = call(
+            &dir,
+            "w",
+            "finish_work",
+            json!({"task": 1, "evidence": "abc1234, 9/9 tests"}),
+        );
+        assert!(text(&done).contains("\"review\""));
+        assert!(text(&done).contains("\"released\":1"));
+        assert!(text(&call(&dir, "w", "zone_list", json!({}))).starts_with('['));
+    }
+
+    #[test]
+    fn check_is_the_short_name_for_a_zone_check() {
+        let dir = project();
+        call(&dir, "a", "zone_claim", json!({"paths": ["src"]}));
+        let held = call(&dir, "b", "check", json!({"path": "src/x.rs"}));
+        assert_eq!(held["isError"], true);
+        assert!(text(&call(&dir, "b", "check", json!({"path": "docs"}))).contains("free"));
     }
 
     #[test]
