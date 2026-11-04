@@ -2,22 +2,19 @@
 
 Six commits on `e484b55`. `cargo fmt --check` and `clippy --all-targets -D warnings` clean.
 
-1. **Honest install.** 0.1.0 in Cargo, npm, PyPI, `server.json` and the Python package's `__version__` (left at
-   0.0.1); a version gate in CI and on each tag keeps them together. README lists exactly four channels:
-   `install.sh`, cargo, npm, pip. **The npm package could not have run:** a bare `bin/` rule in `.gitignore`
-   excluded `packages/npm/bin/lockyard.js`, the file the manifest points at. Added, with tests. `CHANGELOG.md`.
+1. **Honest install.** 0.1.0 in Cargo, npm, PyPI, `server.json` and the Python `__version__` (left at 0.0.1), held
+   together by a gate in CI and on each tag; `CHANGELOG.md` added; README lists exactly four channels. **The npm
+   package could not have run:** a bare `bin/` in `.gitignore` excluded the launcher its manifest names.
 2. **`install.sh`.** POSIX sh, macOS/Linux × arm64/x64, verifies SHA-256 against the release `SHA256SUMS`, installs
    to `~/.local/bin`, no sudo, no telemetry. `tests/install-sh.test.sh` runs it offline with stubbed `curl`/`uname`
    against a fake release: 12 checks, including a tampered archive and an unlisted asset.
 3. **`lockyard setup` writes.** Merges MCP config, installs the hook, adds a marked block to the instruction file;
    backup before every write, idempotent, `--dry-run`, `--uninstall`, `--print`, `--client`, and it refuses to
-   rewrite a config file it cannot parse. `lockyard doctor` checks project, store, agent name, mode, cloud and each
-   detected client. 24 unit tests, 2 CLI tests.
-4. **Clients.** Gemini CLI and GitHub Copilot CLI added. A README table says per client what is registered, whether
+   rewrite a config it cannot parse. `doctor` checks project, store, agent name, mode, cloud, clients. 26 tests.
+4. **Clients.** Gemini CLI and GitHub Copilot CLI added; a README table says per client what is registered, whether
    an edit can be refused and when mail arrives. **Only Claude Code gets a hook**: nothing else documents a pre-edit
-   hook that can deny, and a hook that cannot refuse reads like protection without being any (`lockyard hook
-   cursor|codex` still work by hand). Mail is "on the next turn" everywhere — nothing here documents a supported way
-   to interrupt a running turn, so nothing claims to.
+   hook that can deny, and one that cannot refuse reads like protection without being any (`lockyard hook
+   cursor|codex` still work by hand). Mail is "on the next turn" everywhere; no supported way to interrupt exists.
 5. **Compact MCP.** Six composite tools by default, 66 under `--tools full` or `LOCKYARD_MCP_TOOLS=full` (flag
    wins). Composites are ordered runs of the same tools, so a conflict is refused identically; `start_work` gives
    its zone back if the task cannot be claimed. 7 unit tests, 2 CLI tests across both surfaces.
@@ -33,8 +30,7 @@ Six commits on `e484b55`. `cargo fmt --check` and `clippy --all-targets -D warni
     builds five targets, smoke-runs each, publishes archives + `SHA256SUMS` + `install.sh` before any registry.
 
 **Tests: 310 pass** — core 90, cloud client 86, binary 102, cli 22, e2e 1; plus npm 4, Python 4, install.sh 12,
-check-versions 10. Both new gates were watched failing: `if false` in `check-versions.sh` fails its test, and
-breaking the checksum comparison fails two install.sh checks.
+check-versions 10. Both new gates were watched failing: `if false` in `check-versions.sh`, a broken checksum compare.
 
 ## Not done, and why
 
