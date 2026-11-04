@@ -11,11 +11,14 @@ pub mod config;
 pub mod coordination;
 pub mod credentials;
 mod error;
+pub mod fsio;
 pub mod machine;
+pub mod outside;
 pub mod paths;
 pub mod proto;
 mod store;
 pub mod tasks;
+pub mod watch;
 pub mod zones;
 
 pub use backend::Backend;

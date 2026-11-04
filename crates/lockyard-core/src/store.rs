@@ -12,7 +12,7 @@ use std::time::Duration;
 pub const DIR_NAME: &str = ".lockyard";
 
 const DB_NAME: &str = "lockyard.db";
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_AGENT_LEN: usize = 128;
 const TOUCH_INTERVAL_MS: i64 = 60_000;
@@ -189,6 +189,23 @@ CREATE TABLE message_outcomes (
 CREATE INDEX message_outcomes_by_sender ON message_outcomes(from_agent, message_id);
 ";
 
+/// Writes to a claimed path that no hook announced. Detection only: by the time a row lands here the
+/// write has already happened, and the holder is told rather than protected.
+const SCHEMA_V6: &str = "
+CREATE TABLE unannounced_writes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL,
+    holder TEXT NOT NULL,
+    claim_id INTEGER NOT NULL,
+    first_at INTEGER NOT NULL,
+    last_at INTEGER NOT NULL,
+    hits INTEGER NOT NULL,
+    told_at INTEGER,
+    UNIQUE (path, holder)
+) STRICT;
+CREATE INDEX unannounced_writes_by_time ON unannounced_writes(last_at);
+";
+
 /// An agent that has acted in this project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Agent {
@@ -344,6 +361,12 @@ impl Store {
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version == 4 {
             transaction.execute_batch(SCHEMA_V5)?;
+            transaction.pragma_update(None, "user_version", 5)?;
+        }
+        let version: i32 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == 5 {
+            transaction.execute_batch(SCHEMA_V6)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         transaction.commit()?;
