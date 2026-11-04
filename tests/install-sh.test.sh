@@ -97,6 +97,8 @@ build_release
 # Every supported platform resolves to the archive built for it.
 for pair in "Darwin arm64 darwin-arm64" "Darwin x86_64 darwin-x64" \
             "Linux x86_64 linux-x64" "Linux aarch64 linux-arm64"; do
+    # Splitting the triple into three arguments is the point here.
+    # shellcheck disable=SC2086
     set -- $pair
     build_stubs "$1" "$2"
     dest="$work/dest-$3"
@@ -138,7 +140,11 @@ else
         *) fail "a tampered archive failed for the wrong reason: $output" ;;
     esac
 fi
-[ -e "$dest/lockyard" ] && fail "a tampered archive left an executable behind" || ok
+if [ -e "$dest/lockyard" ]; then
+    fail "a tampered archive left an executable behind"
+else
+    ok
+fi
 
 # A release whose checksums file does not list this asset is refused too.
 build_release

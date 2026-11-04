@@ -27,13 +27,8 @@ jobs:
       - shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
-          check() { [ "$2" = "$tag" ] || { echo "$1 is $2, tag is $tag" >&2; exit 1; }; }
-          check Cargo.toml "$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
-          check packages/npm/package.json "$(node -p "require('./packages/npm/package.json').version")"
-          check packages/pypi/pyproject.toml "$(sed -n 's/^version = "\(.*\)"$/\1/p' packages/pypi/pyproject.toml | head -1)"
-          check server.json "$(node -p "require('./server.json').version")"
-          grep -q "^## \[$tag\]" CHANGELOG.md || { echo "CHANGELOG.md has no $tag section" >&2; exit 1; }
+          sh tests/check-versions.test.sh
+          sh scripts/check-versions.sh "${GITHUB_REF_NAME}"
 
   build:
     needs: versions

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.lockyard-dev/lockyard",
+  "title": "Lockyard",
+  "description": "Work zones, a message bus and tasks for coding agents sharing one repository.",
+  "version": "0.1.0",
+  "websiteUrl": "https://lockyard.dev",
+  "repository": {
+    "url": "https://github.com/lockyard-dev/lockyard",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "lockyard",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeArguments": [
+        {
+          "type": "positional",
+          "value": "mcp",
+          "valueHint": "mcp",
+          "isRequired": true
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "LOCKYARD_AGENT",
+          "description": "The name this agent is known by to the others in the project.",
+          "isRequired": false
+        },
+        {
+          "name": "LOCKYARD_MCP_TOOLS",
+          "description": "Set to full to expose every tool instead of the six composite ones.",
+          "isRequired": false
+        }
+      ]
+    },
+    {
+      "registryType": "pypi",
+      "identifier": "lockyard",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeArguments": [
+        {
+          "type": "positional",
+          "value": "mcp",
+          "valueHint": "mcp",
+          "isRequired": true
+        }
+      ]
+    }
+  ]
+}

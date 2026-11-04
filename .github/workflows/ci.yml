@@ -57,11 +57,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sh tests/install-sh.test.sh
-      - name: Check install.sh with shellcheck
+      - run: sh tests/check-versions.test.sh
+      - name: Check the shell scripts with shellcheck
         if: matrix.runner == 'ubuntu-latest'
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
-          shellcheck --shell=sh install.sh tests/install-sh.test.sh
+          shellcheck --shell=sh install.sh scripts/check-versions.sh \
+            tests/install-sh.test.sh tests/check-versions.test.sh \
+            examples/two-agents/run.sh
 
   # The two-agent example is the README's claim that Lockyard refuses a second claim; run it.
   example:
