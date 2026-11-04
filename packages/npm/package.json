@@ -1,0 +1,30 @@
+{
+  "name": "lockyard",
+  "version": "0.0.1",
+  "description": "Coordination for coding agents: a shared bus, work zones and tasks.",
+  "license": "Apache-2.0",
+  "homepage": "https://lockyard.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lockyard-dev/lockyard.git",
+    "directory": "packages/npm"
+  },
+  "bin": {
+    "lockyard": "bin/lockyard.js"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "lockyard-darwin-arm64": "0.0.1",
+    "lockyard-darwin-x64": "0.0.1",
+    "lockyard-linux-x64": "0.0.1",
+    "lockyard-linux-arm64": "0.0.1",
+    "lockyard-win32-x64": "0.0.1"
+  }
+}

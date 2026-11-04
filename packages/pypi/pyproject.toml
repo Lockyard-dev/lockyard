@@ -1,0 +1,26 @@
+# Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lockyard"
+version = "0.0.1"
+description = "Coordination for coding agents: a shared bus, work zones and tasks."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+
+[project.urls]
+Homepage = "https://lockyard.dev"
+Repository = "https://github.com/lockyard-dev/lockyard"
+
+[project.scripts]
+lockyard = "lockyard.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lockyard"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"

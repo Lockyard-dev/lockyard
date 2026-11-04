@@ -1,0 +1,16 @@
+# Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
+[package]
+name = "lockyard-cloud-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[dependencies]
+lockyard-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+ring = "0.17"
