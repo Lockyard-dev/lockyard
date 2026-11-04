@@ -194,6 +194,30 @@ pub fn is_internal(path: &Path) -> bool {
     })
 }
 
+/// Which backend this machine can construct, without watching any folder.
+///
+/// Used by `doctor`: attaching a recursive watcher to a real tree just to print a name can stall.
+pub fn detect() -> Backend {
+    let (sender, _receiver) = channel::<Vec<PathBuf>>();
+    let sink = move |result: notify::Result<notify::Event>| {
+        if let Ok(event) = result {
+            let _ = sender.send(event.paths);
+        }
+    };
+    if RecommendedWatcher::new(Box::new(sink.clone()) as Sink, Config::default()).is_ok() {
+        return Backend::Native;
+    }
+    if notify::PollWatcher::new(
+        Box::new(sink) as Sink,
+        Config::default().with_poll_interval(POLL_INTERVAL),
+    )
+    .is_ok()
+    {
+        return Backend::Poll;
+    }
+    Backend::None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +302,14 @@ mod tests {
         assert_eq!(Backend::Native.as_str(), "native");
         assert_eq!(Backend::Poll.as_str(), "poll");
         assert_eq!(Backend::None.as_str(), "none");
+    }
+
+    #[test]
+    fn detect_names_a_backend_without_watching_anything() {
+        let name = detect().as_str();
+        assert!(
+            matches!(name, "native" | "poll" | "none"),
+            "unexpected backend {name}"
+        );
     }
 }

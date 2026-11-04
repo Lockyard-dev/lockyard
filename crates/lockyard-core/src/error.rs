@@ -68,20 +68,40 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoProject => write!(f, "no Lockyard project here, run `lockyard init`"),
-            Self::Invalid(text)
-            | Self::NotFound(text)
-            | Self::Denied(text)
-            | Self::Contended(text)
-            | Self::Protocol(text) => f.write_str(text),
-            Self::StaleFence(text) => write!(f, "stale fence: {text}"),
-            Self::Frozen(text) => write!(f, "coordination is frozen: {text}"),
-            Self::Unavailable(text) => write!(f, "cloud unavailable: {text}"),
+            Self::NoProject => write!(
+                f,
+                "no Lockyard project here. Next: run `lockyard init` in the repository root."
+            ),
+            Self::Invalid(text) | Self::NotFound(text) | Self::Denied(text) => f.write_str(text),
+            Self::Contended(text) => write!(
+                f,
+                "{text}. Next: refresh with `lockyard zone list`, then retry with the current fence."
+            ),
+            Self::Protocol(text) => write!(
+                f,
+                "{text}. Next: upgrade Lockyard, or check the server is on the same protocol version."
+            ),
+            Self::StaleFence(text) => write!(
+                f,
+                "stale fence: {text}. Next: `lockyard zone list` for the current fence, then retry."
+            ),
+            Self::Frozen(text) => write!(
+                f,
+                "coordination is frozen: {text}. Next: wait for an owner to thaw, or ask in the bus."
+            ),
+            Self::Unavailable(text) => write!(
+                f,
+                "cloud unavailable: {text}. Next: check the network, then `lockyard doctor`."
+            ),
             Self::NeedsCloud(feature) => write!(
                 f,
-                "{feature} needs cloud mode: set mode = \"cloud\" in .lockyard/config.toml"
+                "{feature} needs cloud mode. Next: set mode = \"cloud\" in .lockyard/config.toml \
+                 and run `lockyard cloud login`."
             ),
-            Self::NeedsLocal(feature) => write!(f, "{feature} needs local mode"),
+            Self::NeedsLocal(feature) => write!(
+                f,
+                "{feature} needs local mode. Next: set mode = \"local\" in .lockyard/config.toml."
+            ),
             Self::Conflict(conflicts) => {
                 for (index, conflict) in conflicts.iter().enumerate() {
                     if index > 0 {
@@ -89,10 +109,20 @@ impl fmt::Display for Error {
                     }
                     write!(f, "{conflict}")?;
                 }
-                Ok(())
+                write!(
+                    f,
+                    ". Next: wait, ask the holder with `lockyard msg send <agent> \"...\"`, or join the queue."
+                )
             }
-            Self::Io(error) => write!(f, "file system: {error}"),
-            Self::Db(error) => write!(f, "database: {error}"),
+            Self::Io(error) => write!(
+                f,
+                "file system: {error}. Next: check permissions on `.lockyard/` and the path named above."
+            ),
+            Self::Db(error) => write!(
+                f,
+                "database: {error}. Next: ensure no other process holds `.lockyard/lockyard.db` exclusively, \
+                 then retry; if it stays corrupt, restore from backup."
+            ),
         }
     }
 }

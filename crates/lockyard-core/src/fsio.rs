@@ -93,6 +93,9 @@ pub fn append_line(path: &Path, line: &str, mode: u32) -> io::Result<()> {
     if !line.ends_with('\n') {
         file.write_all(b"\n")?;
     }
+    // The announcement journal is how a hook proves an edit was allowed. Losing the last line
+    // after a crash would look like an outside write, so the bytes must reach the disk.
+    file.sync_all()?;
     Ok(())
 }
 

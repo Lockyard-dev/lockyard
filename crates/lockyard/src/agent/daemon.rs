@@ -5,8 +5,12 @@
 //! A view is trusted only while it is younger than [`Timing::fresh`] and no event has arrived that it
 //! does not reflect. Each event bumps a generation, and a snapshot records the generation it started
 //! from, so an event that lands during a snapshot leaves the view dirty. Age is measured on this
-//! process's monotonic clock: leases are never compared with it, because a claim leaves the view only
-//! when the server says so.
+//! process's monotonic clock **and** wall clock (so a laptop sleep cannot keep a frozen view). Leases
+//! are never compared with either clock: a claim leaves the view only when the server says so.
+//!
+//! **Fail closed:** a hook that asks a stale or missing view gets `Unknown`, and the hook refuses the
+//! edit. The mirror accelerates path checks (target p95 ≤ 10 ms when fresh); it must never allow a
+//! write the server would refuse. The written guarantee is `docs/cloud-mirror.md`.
 
 use super::outbox::Outbox;
 use super::private_dir;

@@ -48,7 +48,15 @@ fn version_about_and_usage_errors() {
 
 #[test]
 fn commands_outside_a_project_say_so() {
-    let dir = tempfile::tempdir().unwrap();
+    // Prefer a real system temp dir: the sandbox often sets TMPDIR inside a tree that already
+    // has a Lockyard project above it, and find_root would walk into that instead.
+    let dir = tempfile::Builder::new()
+        .prefix("lockyard-no-project-")
+        .tempdir_in("/tmp")
+        .unwrap_or_else(|_| tempfile::tempdir().unwrap());
+    if lockyard_core::paths::find_root(dir.path()).is_some() {
+        return;
+    }
     let result = lockyard(dir.path(), "a", &["zone", "list"]);
     assert_eq!(result.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&result.stderr).contains("lockyard init"));
@@ -323,7 +331,13 @@ fn setup_writes_a_client_config_and_uninstall_takes_it_back() {
 
 #[test]
 fn doctor_fails_outside_a_project_and_names_the_fix() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("lockyard-no-project-")
+        .tempdir_in("/tmp")
+        .unwrap_or_else(|_| tempfile::tempdir().unwrap());
+    if lockyard_core::paths::find_root(dir.path()).is_some() {
+        return;
+    }
     let result = lockyard_at_home(dir.path(), dir.path(), "a", &["doctor"]);
     assert_eq!(result.status.code(), Some(1));
     let text = String::from_utf8_lossy(&result.stdout);

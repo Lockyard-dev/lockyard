@@ -92,25 +92,10 @@ fn write(path: &Path, file: &File) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // Created private from the first byte: a token must never exist as a world-readable file,
-    // not even for the moment between the write and a chmod.
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut handle = options.open(path)?;
-    use std::io::Write;
-    handle.write_all(text.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // An existing file keeps its old mode through `open`, so it is set again here.
-        handle.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    // Atomic rename after fsync: a crash leaves the old file or the new one, never a half-written
+    // token. Mode 0600 is set on the temporary before the rename.
+    crate::fsio::replace(path, text.as_bytes(), 0o600)
+        .map_err(|error| Error::Invalid(format!("credentials could not be written: {error}")))
 }
 
 /// The entry for one server, if there is one.

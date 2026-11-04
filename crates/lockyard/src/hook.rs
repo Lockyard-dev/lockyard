@@ -2,8 +2,9 @@
 
 //! Agent tool hooks. They stop an edit of a path another agent holds and deliver unread mail.
 //!
-//! A coordination tool must not wedge the agent it serves: when anything here fails, the hook lets the
-//! tool call through and only reports the failure on stderr.
+//! A coordination tool must not wedge the agent it serves for mail and presence: when those fail the
+//! hook reports on stderr and continues. Zone checks are different: an unknown or unreachable view
+//! refuses the edit (fail closed), so a stale mirror can never allow a write the server would refuse.
 //!
 //! Mail delivery has two phases: reserve the mail, write it out, and only then mark it seen. A hook that
 //! dies in between shows the mail again next time, a duplicate over a loss.
@@ -70,7 +71,7 @@ enum Moment {
 enum Verdict {
     Free,
     Held(Box<Conflict>),
-    /// The state could not be learned in time. A hook lets the call through and says so.
+    /// The state could not be learned in time. A hook refuses the edit (fail closed).
     Unknown,
 }
 
@@ -347,29 +348,63 @@ fn run_cloud(
 ) -> Result<()> {
     let (url, workspace) = crate::open::endpoint(config)?;
     let Some(mut port) = cloud::connect(&url, &workspace, root, tool) else {
-        eprintln!(
-            "lockyard hook: no agent process for this workspace, allowing. Start one with `lockyard agent install`."
-        );
-        return Ok(());
+        // Fail closed: without the agent there is no zone mirror, so an edit cannot be allowed.
+        return deny_cloud_unavailable(tool, event, out);
     };
     let machine = lockyard_core::machine::MachineConfig::load_user();
     handle(tool, &mut port, event, agent, cwd, now, &machine, out)
 }
 
+/// Refuses a PreToolUse edit when cloud mode has no agent process to answer from.
+fn deny_cloud_unavailable(tool: Tool, event: &Value, out: &mut dyn Write) -> Result<()> {
+    if event.get("hook_event_name").and_then(Value::as_str) != Some("PreToolUse") {
+        eprintln!(
+            "lockyard hook: no agent process for this workspace. Start one with `lockyard agent install`."
+        );
+        return Ok(());
+    }
+    // Non-edit tools still need a running agent for presence, but they are not refused here.
+    let is_edit = event
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| EDIT_TOOLS.contains(&name));
+    if !is_edit {
+        eprintln!(
+            "lockyard hook: no agent process for this workspace. Start one with `lockyard agent install`."
+        );
+        return Ok(());
+    }
+    let reason = "Lockyard: cloud mode needs a running agent to answer zone checks. \
+                  Start one with `lockyard agent install`, then retry the edit.";
+    let text = if tool == Tool::Cursor {
+        json!({"permission":"deny","agent_message":reason}).to_string()
+    } else {
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        })
+        .to_string()
+    };
+    emit(out, &text)
+}
+
 #[cfg(not(unix))]
 #[allow(clippy::too_many_arguments)]
 fn run_cloud(
-    _: Tool,
-    _: &Value,
+    tool: Tool,
+    event: &Value,
     _: &str,
     _: &Path,
     _: PathBuf,
     _: &Config,
     _: i64,
-    _: &mut dyn Write,
+    out: &mut dyn Write,
 ) -> Result<()> {
-    eprintln!("lockyard hook: the agent process needs a Unix socket, allowing.");
-    Ok(())
+    eprintln!("lockyard hook: the agent process needs a Unix socket.");
+    deny_cloud_unavailable(tool, event, out)
 }
 
 /// Cursor events may provide the path directly; normalize that shape before using the common decision.
@@ -519,10 +554,31 @@ fn pre_tool_use(
         return Ok(None);
     };
     let conflict = match port.check(agent, &path, now)? {
-        Verdict::Free => return Ok(None),
-        Verdict::Unknown => {
-            eprintln!("lockyard hook: the state of {path} is unknown, allowing.");
+        Verdict::Free => {
+            // Record that this edit was allowed through the hook, so a later write can be told
+            // apart from one that never asked (shell `sed -i`, an editor, a build script).
+            if let Err(error) = lockyard_core::outside::announce(port.root(), agent, &path, now) {
+                eprintln!("lockyard hook: could not record allowed write to {path}: {error}");
+            }
             return Ok(None);
+        }
+        // Fail closed: a stale or unreachable mirror must never allow an edit the server would
+        // refuse. The agent process refreshes the view; until it does, the edit waits.
+        Verdict::Unknown => {
+            let reason = format!(
+                "Lockyard: the zone view for {path} is not fresh enough to allow this edit. \
+                 Wait a moment, or check `lockyard agent status` and `lockyard doctor`."
+            );
+            return Ok(Some(
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": reason,
+                    }
+                })
+                .to_string(),
+            ));
         }
         Verdict::Held(conflict) => conflict,
     };
@@ -1238,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_zone_state_is_allowed() {
+    fn an_unknown_zone_state_is_refused() {
         let (mut port, log) = recording(None, None);
         port.verdict = Some(Verdict::Unknown);
         let event = json!({"hook_event_name": "PreToolUse", "tool_name": "Edit", "tool_input": {"file_path": "/src/a.rs"}});
@@ -1254,8 +1310,51 @@ mod tests {
             &mut out,
         )
         .unwrap();
-        assert!(out.is_empty(), "unknown must not deny");
-        assert_eq!(*log.borrow(), ["check src/a.rs", "Before"]);
+        let answer: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(answer["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            answer["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("not fresh enough")
+        );
+        assert_eq!(*log.borrow(), ["check src/a.rs"]);
+    }
+
+    #[test]
+    fn a_free_path_is_announced_so_outside_writes_can_be_told_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        Store::init(dir.path()).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = Store::open(&root).unwrap();
+        Backend::touch_agent(&mut store, "me", 0).unwrap();
+        let mut port = LocalPort {
+            store,
+            root: root.clone(),
+            now: 1_000,
+        };
+        let event = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": root.join("src/a.rs")}
+        });
+        let mut out = Vec::new();
+        handle(
+            Tool::Claude,
+            &mut port,
+            &event,
+            "me",
+            &root,
+            1_000,
+            &lockyard_core::machine::MachineConfig::default(),
+            &mut out,
+        )
+        .unwrap();
+        assert!(out.is_empty(), "free path must allow: {out:?}");
+        let seen = lockyard_core::outside::announcements(&root, 0).unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].path, "src/a.rs");
+        assert_eq!(seen[0].agent, "me");
     }
 
     #[test]

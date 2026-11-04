@@ -4,6 +4,7 @@ mod agent;
 mod guard;
 mod hook;
 mod mcp;
+mod monitor;
 mod open;
 mod setup;
 
@@ -99,6 +100,8 @@ enum Command {
     /// Agent integrations.
     #[command(subcommand)]
     Hook(HookCommand),
+    /// Show mail and writes made outside the hook as they happen.
+    Monitor(MonitorArgs),
     /// Write Lockyard into the agent tools installed here.
     Setup(SetupArgs),
     /// Check that this project and its agent tools are wired up.
@@ -128,6 +131,25 @@ struct McpArgs {
     /// compact (six composite tools, the default) or full (every tool).
     #[arg(long = "tools")]
     tools: Option<String>,
+}
+
+#[derive(Args)]
+struct MonitorArgs {
+    /// How often to re-read the store even when the file system said nothing (seconds).
+    #[arg(long, default_value = "10")]
+    reconcile: u64,
+    /// Do not print new mail.
+    #[arg(long)]
+    no_mail: bool,
+    /// Do not watch claimed paths for writes outside the hook.
+    #[arg(long)]
+    no_zones: bool,
+    /// Stop after the first mail or unannounced write.
+    #[arg(long)]
+    once: bool,
+    /// Stop after this many seconds, whether or not anything arrived.
+    #[arg(long)]
+    timeout: Option<u64>,
 }
 
 #[derive(Args)]
@@ -2208,19 +2230,103 @@ fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
         |claim| claim_line(claim, lease),
         "no active claims",
     ));
+    // Outside-hook writes live in the local store in both modes; they are detection, not a lock.
+    let unannounced = Store::open(&opened.root)
+        .ok()
+        .and_then(|store| {
+            store
+                .unannounced(now.saturating_sub(24 * 60 * 60 * 1000))
+                .ok()
+        })
+        .unwrap_or_default();
+    if !unannounced.is_empty() {
+        lines.push(format!(
+            "writes outside the hook: {} (detection only — Lockyard cannot refuse a shell write)",
+            unannounced.len()
+        ));
+        for record in unannounced.iter().take(5) {
+            lines.push(format!(
+                "  ! {} held by {} ({} hits)",
+                record.path, record.holder, record.hits
+            ));
+        }
+    }
     if backend.is_cloud() {
         let session = agent.as_deref().unwrap_or("lockyard-cli");
         let work = backend.work_list(session)?;
         lines.push(join(&work, work_line, "no work tasks"));
         let tasks = backend.tasks(None, false)?;
         lines.push(join(&tasks, task_line, "no tasks"));
-        let data = json!({ "unread": unread, "claims": claims, "work": work, "tasks": tasks, "machine_level": machine_level });
+        let data = json!({
+            "unread": unread,
+            "claims": claims,
+            "work": work,
+            "tasks": tasks,
+            "machine_level": machine_level,
+            "unannounced": unannounced,
+        });
         return output(&data, lines.join("\n"));
     }
     let tasks = backend.tasks(None, false)?;
     lines.push(join(&tasks, task_line, "no tasks"));
-    let data = json!({ "unread": unread, "claims": claims, "tasks": tasks, "machine_level": machine_level });
+    let data = json!({
+        "unread": unread,
+        "claims": claims,
+        "tasks": tasks,
+        "machine_level": machine_level,
+        "unannounced": unannounced,
+    });
     output(&data, lines.join("\n"))
+}
+
+fn run_monitor(
+    args: MonitorArgs,
+    agent: Option<&String>,
+    cwd: &Path,
+    json: bool,
+) -> Result<Output> {
+    let name = resolve_agent(agent)?;
+    let mut opened = open::open(cwd, Some(&name))?;
+    let store = Store::open(&opened.root)?;
+    let settings = monitor::Settings {
+        root: opened.root.clone(),
+        agent: name,
+        reconcile: Duration::from_secs(args.reconcile.max(1)),
+        mail: !args.no_mail,
+        zones: !args.no_zones,
+        once: args.once,
+        timeout: args.timeout.map(Duration::from_secs),
+        json,
+    };
+    let now = || now_ms();
+    let mut ports = monitor::Ports {
+        backend: opened.backend.as_mut(),
+        store,
+        now: &now,
+    };
+    // The monitor writes its own lines as events arrive; the command's Output is only a summary.
+    let mut sink = std::io::stdout();
+    let summary = monitor::run(&settings, &mut ports, &mut sink)?;
+    let text = if json {
+        String::new()
+    } else {
+        format!(
+            "monitor stopped: {} mail, {} outside writes, {} rounds ({})",
+            summary.delivered,
+            summary.unannounced,
+            summary.rounds,
+            summary.backend.unwrap_or("off")
+        )
+    };
+    output(
+        &json!({
+            "delivered": summary.delivered,
+            "unannounced": summary.unannounced,
+            "rounds": summary.rounds,
+            "backend": summary.backend,
+        }),
+        text,
+    )
 }
 
 fn run_hook(command: HookCommand, agent: Option<String>, cwd: &Path) {
@@ -2347,6 +2453,32 @@ fn run_doctor(cwd: &Path, agent: Option<&String>) -> Result<Output> {
     for client in detected {
         findings.extend(setup::inspect(client, &site)?);
     }
+
+    findings.push(setup::Finding::ok_check(
+        "file watch",
+        format!(
+            "{} (events accelerate; a 10s reconcile is the source of truth)",
+            monitor::backend_name(&root)
+        ),
+    ));
+    if let Ok(store) = Store::open(&root) {
+        let recent = store.unannounced(now_ms().saturating_sub(24 * 60 * 60 * 1000))?;
+        if recent.is_empty() {
+            findings.push(setup::Finding::ok_check(
+                "outside writes",
+                "none recorded in the last day",
+            ));
+        } else {
+            findings.push(setup::Finding::failed(
+                "outside writes",
+                format!(
+                    "{} path(s) changed under a claim without a hook — detection only, see `lockyard status`",
+                    recent.len()
+                ),
+            ));
+        }
+    }
+
     doctor_output(findings)
 }
 
@@ -2481,7 +2613,11 @@ fn run_agent(_: AgentArgs, _: &Path) -> Result<Output> {
 }
 
 fn run(cli: Cli, cwd: &Path) -> Result<Output> {
-    let Cli { agent, command, .. } = cli;
+    let Cli {
+        agent,
+        json,
+        command,
+    } = cli;
     let name = agent.clone().or_else(env_agent);
     let open = || open::open(cwd, name.as_deref());
     match command {
@@ -2554,6 +2690,7 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             run_hook(command, agent, cwd);
             output(&Value::Null, "")
         }
+        Command::Monitor(args) => run_monitor(args, agent.as_ref(), cwd, json),
         Command::Setup(args) => run_setup(args, cwd),
         Command::Doctor => run_doctor(cwd, agent.as_ref()),
         Command::Mcp(_) => output(&Value::Null, ""),
