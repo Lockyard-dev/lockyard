@@ -37,6 +37,9 @@ check Cargo.toml "$(toml_version Cargo.toml)"
 check packages/npm/package.json "$(json_version packages/npm/package.json)"
 check packages/pypi/pyproject.toml "$(toml_version packages/pypi/pyproject.toml)"
 check server.json "$(json_version server.json)"
+# Reported by `import lockyard; lockyard.__version__`, so it is part of the release too.
+check packages/pypi/src/lockyard/__init__.py \
+	"$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' packages/pypi/src/lockyard/__init__.py | head -1)"
 
 if ! grep -q "^## \[$version\]" CHANGELOG.md; then
 	echo "CHANGELOG.md has no section for $version" >&2
@@ -48,4 +51,4 @@ if [ "$failed" -ne 0 ]; then
 	exit 1
 fi
 
-echo "release $version: 4 manifests and the changelog agree"
+echo "release $version: 5 manifests and the changelog agree"

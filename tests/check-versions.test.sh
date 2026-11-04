@@ -21,6 +21,8 @@ fresh() {
 	printf '{\n  "name": "lockyard",\n  "version": "9.9.9"\n}\n' >"$work/repo/packages/npm/package.json"
 	printf 'version = "9.9.9"\n' >"$work/repo/packages/pypi/pyproject.toml"
 	printf '{\n  "name": "x",\n  "version": "9.9.9"\n}\n' >"$work/repo/server.json"
+	mkdir -p "$work/repo/packages/pypi/src/lockyard"
+	printf '__version__ = "9.9.9"\n' >"$work/repo/packages/pypi/src/lockyard/__init__.py"
 	printf '## [9.9.9] - 2026-01-01\n' >"$work/repo/CHANGELOG.md"
 }
 
@@ -62,6 +64,10 @@ check fail "a stale PyPI package"
 fresh
 printf '{\n  "name": "x",\n  "version": "9.9.8"\n}\n' >"$work/repo/server.json"
 check fail "a stale MCP registry entry"
+
+fresh
+printf '__version__ = "9.9.8"\n' >"$work/repo/packages/pypi/src/lockyard/__init__.py"
+check fail "a stale version reported by the Python package"
 
 fresh
 printf '## [9.9.8] - 2026-01-01\n' >"$work/repo/CHANGELOG.md"

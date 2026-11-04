@@ -30,7 +30,7 @@ First release published to crates.io, npm, PyPI and GitHub Releases.
   states per client what Lockyard registers, whether edits can be blocked and how mail arrives.
 - `lockyard mcp` exposes six composite tools by default (`start_work`, `check`, `update`,
   `handover`, `finish_work`, `status`). `lockyard mcp --tools full`, or `LOCKYARD_MCP_TOOLS=full`,
-  keeps all 61 tools for existing integrations.
+  keeps every tool (66 in this release) for integrations built against them.
 - `lockyard cloud login` and `lockyard cloud logout`: device authorization against the cloud
   server, with the browser opened when possible and the token stored with mode 0600.
 - `install.sh`: a POSIX one-liner that downloads the matching GitHub release asset, verifies it

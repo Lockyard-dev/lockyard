@@ -42,5 +42,19 @@ class CliTests(unittest.TestCase):
                 run.assert_called_once_with([str(binary), "status"], check=False)
 
 
+class VersionTests(unittest.TestCase):
+    def test_the_package_reports_the_version_its_manifest_declares(self):
+        """`import lockyard; lockyard.__version__` is what a user checks against PyPI."""
+        import lockyard
+
+        manifest = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        declared = next(
+            line.split('"')[1]
+            for line in manifest.read_text().splitlines()
+            if line.startswith("version = ")
+        )
+        self.assertEqual(lockyard.__version__, declared)
+
+
 if __name__ == "__main__":
     unittest.main()
