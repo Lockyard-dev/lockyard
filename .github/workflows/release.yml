@@ -19,7 +19,24 @@ jobs:
       - run: node --test test/launcher.test.js
         working-directory: packages/npm
 
+  # A tag that does not match the manifests would publish a version nobody can reproduce.
+  versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          check() { [ "$2" = "$tag" ] || { echo "$1 is $2, tag is $tag" >&2; exit 1; }; }
+          check Cargo.toml "$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          check packages/npm/package.json "$(node -p "require('./packages/npm/package.json').version")"
+          check packages/pypi/pyproject.toml "$(sed -n 's/^version = "\(.*\)"$/\1/p' packages/pypi/pyproject.toml | head -1)"
+          check server.json "$(node -p "require('./server.json').version")"
+          grep -q "^## \[$tag\]" CHANGELOG.md || { echo "CHANGELOG.md has no $tag section" >&2; exit 1; }
+
   build:
+    needs: versions
     strategy:
       fail-fast: false
       matrix:
@@ -71,6 +88,13 @@ jobs:
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/$name" "$stage/$name"
           echo "LOCKYARD_BINARY=$stage/$name" >> "$GITHUB_ENV"
+      # The built binary must answer before it is published; a release artifact nobody ran is a guess.
+      - name: Smoke test the built binary
+        if: matrix.arch == 'x64' || matrix.platform == 'darwin'
+        shell: bash
+        run: |
+          "$LOCKYARD_BINARY" --version
+          "$LOCKYARD_BINARY" about
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -94,8 +118,58 @@ jobs:
           path: packages/pypi/dist/*.whl
           if-no-files-found: error
 
-  publish-crates:
+  # install.sh downloads these assets, so the release exists before anything else is published.
+  publish-release:
     needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: binaries
+      - name: Pack archives and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          for target in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
+            folder="binaries/binary-$target"
+            [ -d "$folder" ] || { echo "missing build for $target" >&2; exit 1; }
+            if [ "$target" = win32-x64 ]; then
+              # Artifact download drops the executable bit, which matters for the tarballs below.
+              (cd "$folder" && zip -q "$OLDPWD/assets/lockyard-$target.zip" lockyard.exe)
+            else
+              chmod 755 "$folder/lockyard"
+              tar -czf "assets/lockyard-$target.tar.gz" -C "$folder" lockyard
+            fi
+          done
+          (cd assets && sha256sum ./* | sed 's|\./||' > SHA256SUMS)
+          cat assets/SHA256SUMS
+      # install.sh is published with the release, so its asset names must be the ones just packed.
+      - name: Check the asset names install.sh asks for
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh tests/install-sh.test.sh
+          for target in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            grep -q " lockyard-$target.tar.gz\$" assets/SHA256SUMS ||
+              { echo "install.sh asks for lockyard-$target.tar.gz, which this release does not have" >&2; exit 1; }
+          done
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file CHANGELOG.md \
+            assets/* install.sh
+
+  publish-crates:
+    needs: publish-release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
