@@ -119,12 +119,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: binary-*
           path: binaries
+      - uses: sigstore/cosign-installer@v3
       - name: Pack archives and checksums
         shell: bash
         run: |
@@ -143,6 +145,26 @@ jobs:
           done
           (cd assets && sha256sum ./* | sed 's|\./||' > SHA256SUMS)
           cat assets/SHA256SUMS
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          file: Cargo.lock
+          format: cyclonedx-json
+          output-file: assets/lockyard.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Sign archives, checksums and SBOM (Sigstore keyless)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keyless signatures via GitHub OIDC. install.sh verifies them when cosign is present.
+          for asset in assets/lockyard-*.tar.gz assets/lockyard-*.zip assets/SHA256SUMS assets/lockyard.cdx.json; do
+            [ -f "$asset" ] || continue
+            cosign sign-blob --yes \
+              --output-signature "${asset}.sig" \
+              --output-certificate "${asset}.pem" \
+              "$asset"
+          done
       # install.sh is published with the release, so its asset names must be the ones just packed.
       - name: Check the asset names install.sh asks for
         shell: bash
@@ -182,6 +204,9 @@ jobs:
   publish-npm:
     needs: [publish-crates, npm-test]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -196,33 +221,25 @@ jobs:
         working-directory: packages/npm
       - run: node scripts/build-platform-packages.js binaries
         working-directory: packages/npm
-      # The ./ matters: without it npm reads dist/x as a GitHub repository.
-      - run: for package in ./dist/*; do npm publish "$package" --access public; done
+      # Trusted Publishing / OIDC provenance. The ./ matters: without it npm reads dist/x as a repo.
+      - run: for package in ./dist/*; do npm publish "$package" --access public --provenance; done
         working-directory: packages/npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - run: npm publish --access public
+      - run: npm publish --access public --provenance
         working-directory: packages/npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-pypi:
     needs: publish-npm
     runs-on: ubuntu-latest
-    # PyPI is optional: without its token the release still ships to crates.io and npm.
-    env:
-      HAS_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN != '' }}
+    # Trusted Publishing (OIDC). Configure the GitHub environment on PyPI; no long-lived token.
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - if: env.HAS_PYPI_TOKEN != 'true'
-        run: echo "No PYPI_TOKEN secret; skipping the PyPI upload."
-      - if: env.HAS_PYPI_TOKEN == 'true'
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           pattern: wheel-*
           path: dist
           merge-multiple: true
-      - if: env.HAS_PYPI_TOKEN == 'true'
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          password: ${{ secrets.PYPI_TOKEN }}
           packages-dir: dist

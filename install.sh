@@ -62,6 +62,19 @@ download() {
     fi
 }
 
+# Like download, but returns non-zero instead of exiting — used for optional signature files.
+try_download() {
+    url="$1"
+    output="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --proto '=https' --tlsv1.2 -o "$output" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --https-only -O "$output" "$url"
+    else
+        return 1
+    fi
+}
+
 # Prints the SHA-256 of a file as lowercase hex, using whichever tool this system has.
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -102,6 +115,26 @@ if [ "$expected" != "$actual" ]; then
     fail "checksum mismatch for $asset: expected $expected, got $actual"
 fi
 say "Checksum verified."
+
+# When cosign is present, also check the Sigstore signature published with the release.
+# Absence of cosign is fine: the checksum still binds the bytes to SHA256SUMS.
+if command -v cosign >/dev/null 2>&1; then
+    sig="$asset.sig"
+    cert="$asset.pem"
+    if try_download "$base/$sig" "$work/$sig" && try_download "$base/$cert" "$work/$cert"; then
+        cosign verify-blob \
+            --signature "$work/$sig" \
+            --certificate "$work/$cert" \
+            --certificate-identity-regexp "https://github.com/${REPO}/\\.github/workflows/release\\.yml@refs/tags/v.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$work/$asset" || fail "cosign could not verify $asset"
+        say "Signature verified (cosign)."
+    else
+        say "No cosign signature published for this release; checksum alone was checked."
+    fi
+else
+    say "cosign not on PATH; checksum alone was checked. Install cosign to verify the Sigstore signature too."
+fi
 
 tar -xzf "$work/$asset" -C "$work" || fail "could not unpack $asset"
 [ -f "$work/lockyard" ] || fail "$asset does not contain a lockyard executable"

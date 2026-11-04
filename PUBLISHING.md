@@ -12,12 +12,15 @@ The workflow runs for tags named `v*` and only for them. In order:
 
 1. `versions` — tag, manifests and changelog agree.
 2. `build` — one job per target, each one running the binary it just built.
-3. `publish-release` — packs `lockyard-<target>.tar.gz` (a `.zip` for Windows), writes `SHA256SUMS`, runs the
-   installer's own test suite against those files, and creates the GitHub release with the archives, the checksums
-   and `install.sh`. The one-line installer reads this release, so it is published before the registries.
-4. `publish-crates`, then `publish-npm`, then `publish-pypi`.
+3. `publish-release` — packs `lockyard-<target>.tar.gz` (a `.zip` for Windows), writes `SHA256SUMS`, attaches a
+   CycloneDX SBOM, signs every asset with Sigstore cosign (keyless via GitHub OIDC), runs the installer's own test
+   suite against those files, and creates the GitHub release with the archives, checksums, signatures, SBOM and
+   `install.sh`. The one-line installer reads this release, so it is published before the registries.
+4. `publish-crates`, then `publish-npm` (with `--provenance` / Trusted Publishing OIDC), then `publish-pypi`
+   (Trusted Publishing OIDC — configure the GitHub environment on PyPI; no long-lived token).
 
-Secrets: `CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`, `PYPI_TOKEN`.
+Secrets: `CARGO_REGISTRY_TOKEN`. npm and PyPI use OIDC Trusted Publishing; configure the repository on each
+registry before the first release.
 
 ## By hand
 

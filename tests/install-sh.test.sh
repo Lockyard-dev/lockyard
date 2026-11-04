@@ -111,6 +111,11 @@ for pair in "Darwin arm64 darwin-arm64" "Darwin x86_64 darwin-x64" \
             *"Checksum verified."*) ok ;;
             *) fail "$1 $2 did not report a verified checksum" ;;
         esac
+        # Cosign is optional: without signatures on the fake release the script must still install.
+        case "$output" in
+            *"Signature verified"*|*"checksum alone was checked"*) ok ;;
+            *) fail "$1 $2 said nothing about signature verification: $output" ;;
+        esac
     else
         fail "$1 $2 did not install: $output"
     fi
