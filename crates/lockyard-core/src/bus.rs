@@ -17,6 +17,53 @@ pub const RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 const COLUMNS: &str = "id, from_agent, to_agent, body, reply_to, created_at";
 
+/// How far a message got, in the words of the shared contract.
+///
+/// A sender who cannot tell "nobody has looked at it" from "they read it and said nothing" ends
+/// up asking again, which is the noise the bus exists to avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Delivery {
+    /// Written down, not yet put in front of anyone.
+    Sent,
+    /// Shown to the recipient by a hook or an inbox read.
+    Delivered,
+    /// The recipient marked it read.
+    Read,
+    /// The recipient answered it.
+    Replied,
+    /// It will not arrive: it aged out before it was ever shown.
+    Failed,
+}
+
+impl Delivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Delivered => "delivered",
+            Self::Read => "read",
+            Self::Replied => "replied",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// One of this agent's own messages and what became of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Receipt {
+    pub id: i64,
+    pub to: String,
+    pub body: String,
+    pub created_at: i64,
+    pub status: Delivery,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replied_at: Option<i64>,
+}
+
 /// One message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Message {
@@ -82,6 +129,15 @@ impl Store {
                 .query_map(params![agent, all, limit], read_message)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        // Returning a message is the moment it reaches its recipient, whether or not the caller
+        // goes on to mark it read: that is exactly "delivered" in the contract.
+        for message in &messages {
+            transaction.execute(
+                "INSERT OR IGNORE INTO deliveries (message_id, agent, delivered_at)
+                 VALUES (?1, ?2, ?3)",
+                params![message.id, agent, now],
+            )?;
+        }
         if mark {
             for message in &messages {
                 transaction.execute(
@@ -120,6 +176,14 @@ impl Store {
         for id in ids {
             changed += transaction.execute(
                 "INSERT OR IGNORE INTO receipts(message_id,agent,read_at)
+                 SELECT id,?2,?3 FROM messages
+                 WHERE id=?1 AND (to_agent=?2 OR (to_agent='*' AND from_agent<>?2))",
+                params![id, agent, now],
+            )?;
+            // A message cannot be read without having arrived, so a receipt backfills the
+            // delivery an earlier reader may have skipped.
+            transaction.execute(
+                "INSERT OR IGNORE INTO deliveries(message_id,agent,delivered_at)
                  SELECT id,?2,?3 FROM messages
                  WHERE id=?1 AND (to_agent=?2 OR (to_agent='*' AND from_agent<>?2))",
                 params![id, agent, now],
@@ -169,11 +233,77 @@ impl Store {
                 ],
             )?;
             if inserted != 0 {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO deliveries(message_id,agent,delivered_at)
+                     VALUES (?1,?2,?3)",
+                    params![id, agent, now],
+                )?;
                 claimed.push(*id);
             }
         }
         transaction.commit()?;
         Ok(claimed)
+    }
+
+    /// This agent's own messages, newest first, each with how far it got.
+    pub fn sent(&self, agent: &str, limit: usize) -> Result<Vec<Receipt>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self.conn.prepare(
+            "SELECT m.id, m.to_agent, m.body, m.created_at,
+                    (SELECT min(d.delivered_at) FROM deliveries d WHERE d.message_id = m.id),
+                    (SELECT min(r.read_at) FROM receipts r WHERE r.message_id = m.id),
+                    (SELECT min(a.created_at) FROM messages a
+                      WHERE a.reply_to = m.id AND a.from_agent <> m.from_agent)
+             FROM messages m WHERE m.from_agent = ?1
+             ORDER BY m.id DESC LIMIT ?2",
+        )?;
+        let mut receipts = statement
+            .query_map(params![agent, limit], |row| {
+                let delivered_at: Option<i64> = row.get(4)?;
+                let read_at: Option<i64> = row.get(5)?;
+                let replied_at: Option<i64> = row.get(6)?;
+                Ok(Receipt {
+                    id: row.get(0)?,
+                    to: row.get(1)?,
+                    body: row.get(2)?,
+                    created_at: row.get(3)?,
+                    status: match (replied_at, read_at, delivered_at) {
+                        (Some(_), _, _) => Delivery::Replied,
+                        (_, Some(_), _) => Delivery::Read,
+                        (_, _, Some(_)) => Delivery::Delivered,
+                        _ => Delivery::Sent,
+                    },
+                    delivered_at,
+                    read_at,
+                    replied_at,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut expired = self
+            .conn
+            .prepare(
+                "SELECT message_id, to_agent, created_at FROM message_outcomes
+                 WHERE from_agent = ?1 AND outcome = 'failed'
+                 ORDER BY message_id DESC LIMIT ?2",
+            )?
+            .query_map(params![agent, limit], |row| {
+                Ok(Receipt {
+                    id: row.get(0)?,
+                    to: row.get(1)?,
+                    // The body went with the message; only the fact of it is kept.
+                    body: String::new(),
+                    created_at: row.get(2)?,
+                    status: Delivery::Failed,
+                    delivered_at: None,
+                    read_at: None,
+                    replied_at: None,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        receipts.append(&mut expired);
+        receipts.sort_by_key(|receipt| std::cmp::Reverse(receipt.id));
+        receipts.truncate(limit.max(0) as usize);
+        Ok(receipts)
     }
 
     fn insert_message(
@@ -194,9 +324,24 @@ impl Store {
             )));
         }
         let transaction = self.write()?;
+        // What the sweep removes is still worth one line to the sender: silence and "it expired
+        // before anyone looked at it" are different answers to "did my message land?".
+        transaction.execute(
+            "INSERT OR IGNORE INTO message_outcomes
+                 (message_id, from_agent, to_agent, outcome, created_at, at)
+             SELECT m.id, m.from_agent, m.to_agent, 'failed', m.created_at, ?2 FROM messages m
+             WHERE m.created_at <= ?1
+               AND NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.message_id = m.id)",
+            params![now - RETENTION_MS, now],
+        )?;
         transaction.execute(
             "DELETE FROM messages WHERE created_at <= ?1",
             [now - RETENTION_MS],
+        )?;
+        // The outcomes outlive their messages but not for ever.
+        transaction.execute(
+            "DELETE FROM message_outcomes WHERE created_at <= ?1",
+            [now - 2 * RETENTION_MS],
         )?;
         transaction.execute(
             "INSERT INTO messages (from_agent, to_agent, body, reply_to, created_at)
@@ -410,5 +555,138 @@ mod tests {
             )
             .unwrap();
         assert_eq!(marks, 0);
+    }
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+    use crate::store::test_store;
+
+    const ANY: usize = 100;
+
+    fn with_agents(names: &[&str]) -> (tempfile::TempDir, Store) {
+        let (dir, store) = test_store();
+        for name in names {
+            store.touch(name, 0).unwrap();
+        }
+        (dir, store)
+    }
+
+    fn status(store: &Store, agent: &str, id: i64) -> Delivery {
+        store
+            .sent(agent, ANY)
+            .unwrap()
+            .into_iter()
+            .find(|receipt| receipt.id == id)
+            .unwrap_or_else(|| panic!("M-{id} is not among the sent messages"))
+            .status
+    }
+
+    #[test]
+    fn a_message_walks_from_sent_to_delivered_to_read_to_replied() {
+        let (_dir, mut store) = with_agents(&["a", "b"]);
+        let sent = store.send("a", "b", "look at src/api", 10).unwrap();
+        assert_eq!(status(&store, "a", sent.id), Delivery::Sent);
+
+        store.inbox("b", false, false, ANY, 20).unwrap();
+        assert_eq!(
+            status(&store, "a", sent.id),
+            Delivery::Delivered,
+            "showing mail to its recipient is delivery, even before it is marked read"
+        );
+
+        store.inbox_seen("b", &[sent.id], 30).unwrap();
+        assert_eq!(status(&store, "a", sent.id), Delivery::Read);
+
+        store.reply("b", sent.id, "looking", 40).unwrap();
+        assert_eq!(status(&store, "a", sent.id), Delivery::Replied);
+
+        let receipt = store
+            .sent("a", ANY)
+            .unwrap()
+            .into_iter()
+            .find(|receipt| receipt.id == sent.id)
+            .unwrap();
+        assert_eq!(receipt.delivered_at, Some(20));
+        assert_eq!(receipt.read_at, Some(30));
+        assert_eq!(receipt.replied_at, Some(40));
+        assert_eq!(receipt.to, "b");
+    }
+
+    #[test]
+    fn a_senders_own_reply_does_not_count_as_an_answer_to_itself() {
+        let (_dir, mut store) = with_agents(&["a", "b"]);
+        let sent = store.send("a", "b", "first", 10).unwrap();
+        store.reply("a", sent.id, "and another thing", 20).unwrap();
+        assert_eq!(status(&store, "a", sent.id), Delivery::Sent);
+    }
+
+    #[test]
+    fn reading_mail_marks_it_delivered_even_when_the_reader_never_looked_at_the_inbox() {
+        let (_dir, mut store) = with_agents(&["a", "b"]);
+        let sent = store.send("a", "b", "hello", 10).unwrap();
+        store.inbox_seen("b", &[sent.id], 30).unwrap();
+        let receipt = store.sent("a", ANY).unwrap().remove(0);
+        assert_eq!(receipt.status, Delivery::Read);
+        assert_eq!(
+            receipt.delivered_at,
+            Some(30),
+            "a message cannot be read without having arrived"
+        );
+    }
+
+    #[test]
+    fn a_claimed_message_counts_as_delivered_because_it_is_about_to_be_shown() {
+        let (_dir, mut store) = with_agents(&["a", "b"]);
+        let sent = store.send("a", "b", "hello", 10).unwrap();
+        let claimed = store.inbox_claim("b", "hook", &[sent.id], 60, 20).unwrap();
+        assert_eq!(claimed, vec![sent.id]);
+        assert_eq!(status(&store, "a", sent.id), Delivery::Delivered);
+    }
+
+    #[test]
+    fn a_message_nobody_ever_saw_fails_when_it_ages_out() {
+        let (_dir, mut store) = with_agents(&["a", "b"]);
+        let seen = store.send("a", "b", "this one landed", 10).unwrap();
+        store.inbox("b", false, false, ANY, 11).unwrap();
+        let lost = store.send("a", "b", "nobody read this", 12).unwrap();
+
+        // Any later send runs the sweep, which is where the outcome is written down.
+        let now = 12 + RETENTION_MS + 1;
+        store.send("a", "b", "much later", now).unwrap();
+
+        let receipts = store.sent("a", ANY).unwrap();
+        let failed: Vec<i64> = receipts
+            .iter()
+            .filter(|receipt| receipt.status == Delivery::Failed)
+            .map(|receipt| receipt.id)
+            .collect();
+        assert_eq!(failed, vec![lost.id], "only the one nobody saw failed");
+        assert!(
+            !receipts.iter().any(|receipt| receipt.id == seen.id),
+            "a delivered message that ages out leaves no failure behind"
+        );
+    }
+
+    #[test]
+    fn a_broadcast_is_delivered_once_the_first_agent_sees_it() {
+        let (_dir, mut store) = with_agents(&["a", "b", "c"]);
+        let sent = store.send("a", BROADCAST, "standup", 10).unwrap();
+        assert_eq!(status(&store, "a", sent.id), Delivery::Sent);
+        store.inbox("c", false, true, ANY, 20).unwrap();
+        assert_eq!(status(&store, "a", sent.id), Delivery::Read);
+    }
+
+    #[test]
+    fn sent_shows_the_newest_first_and_only_this_agents_own_messages() {
+        let (_dir, mut store) = with_agents(&["a", "b"]);
+        store.send("a", "b", "one", 10).unwrap();
+        let second = store.send("a", "b", "two", 11).unwrap();
+        store.send("b", "a", "not yours", 12).unwrap();
+        let receipts = store.sent("a", ANY).unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].id, second.id);
+        assert_eq!(store.sent("a", 1).unwrap().len(), 1);
     }
 }

@@ -428,6 +428,12 @@ enum MsgCommand {
     },
     /// List sent messages still waiting for an ack.
     Overdue,
+    /// Show this agent's own messages and how far each one got.
+    Sent {
+        /// How many of the newest to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// List unseen mail across sessions. Needs the lead or dispatcher role.
     Undelivered {
         /// Only mail older than this.
@@ -1480,6 +1486,21 @@ fn run_msg(opened: Opened, command: MsgCommand, agent: Option<&String>) -> Resul
             let messages = backend.overdue(&agent)?;
             let text = join(&messages, message_line, "nothing overdue");
             output(&messages, text)
+        }
+        MsgCommand::Sent { limit } => {
+            let receipts = backend.sent(&agent, limit)?;
+            let line = |receipt: &lockyard_core::bus::Receipt| {
+                let first = receipt.body.lines().next().unwrap_or_default();
+                format!(
+                    "M-{:<5} to {:<12} {:<10} {}",
+                    receipt.id,
+                    receipt.to,
+                    receipt.status.as_str(),
+                    first
+                )
+            };
+            let text = join(&receipts, line, "nothing sent yet");
+            output(&receipts, text)
         }
         MsgCommand::Undelivered { older_than } => {
             let list = backend.undelivered(&agent, older_than)?;

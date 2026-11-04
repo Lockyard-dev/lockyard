@@ -14,7 +14,7 @@ use lockyard_core::proto::{
     WorkAction, WorkOffer, WorkStep, WorkTask, parse_rfc3339, rfc3339,
 };
 use lockyard_core::zones::Conflict;
-use lockyard_core::{Backend, Error, Result, tasks};
+use lockyard_core::{Backend, Error, Result, bus, tasks};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -142,6 +142,25 @@ impl<T: Transport> CloudBackend<T> {
         self.get(session, format!("{ITEMS}/{}", item_id(id)))
     }
 
+    /// Tells the server how far a message got, for the sender's `lockyard msg sent`.
+    ///
+    /// Only ever called from a path that already writes. Reading the inbox stays a read — hooks
+    /// run it on every edit, and a frozen or read-only server must not turn that into a refusal
+    /// — so `delivered` is the server's own observation of what its inbox endpoint handed out.
+    ///
+    /// Best effort by design: a receipt is a courtesy to the sender, and a server that has not
+    /// shipped the endpoint must not stop the recipient marking mail read. A receipt can never
+    /// move backwards, which the contract makes the server's job.
+    fn report_receipts(&self, agent: &str, ids: &[i64], status: &str) {
+        for id in ids {
+            let _ = self.post(
+                agent,
+                format!("/api/v1/messages/{id}/receipt"),
+                &json!({"status": status}),
+            );
+        }
+    }
+
     /// One registry operation on an item, at the version the caller read.
     fn item_step(
         &self,
@@ -221,6 +240,39 @@ fn inbox_page(value: Value) -> std::result::Result<InboxPage, ClientError> {
         messages: list(value, &["messages", "items"])?,
         skipped,
     })
+}
+
+/// Reads one line of `msg sent` from the server.
+///
+/// An unknown status is reported as it came rather than being rounded down to `sent`: a sender
+/// deciding whether to nudge is worse off with a confident wrong answer than with a strange one.
+fn receipt_from(value: &Value) -> bus::Receipt {
+    let stamp = |name: &str| value.get(name).and_then(Value::as_i64);
+    let status = value.get("status").and_then(Value::as_str).unwrap_or("");
+    bus::Receipt {
+        id: value.get("id").and_then(Value::as_i64).unwrap_or_default(),
+        to: value
+            .get("to")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        body: value
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        created_at: stamp("created_at").unwrap_or_default(),
+        status: match status {
+            "replied" => bus::Delivery::Replied,
+            "read" => bus::Delivery::Read,
+            "delivered" => bus::Delivery::Delivered,
+            "failed" => bus::Delivery::Failed,
+            _ => bus::Delivery::Sent,
+        },
+        delivered_at: stamp("delivered_at"),
+        read_at: stamp("read_at"),
+        replied_at: stamp("replied_at"),
+    }
 }
 
 fn message(value: Value) -> Result<Message> {
@@ -714,6 +766,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
 
     fn inbox_seen(&mut self, agent: &str, ids: &[i64], _now: i64) -> Result<usize> {
         let value = self.post(agent, "/api/v1/bus/inbox/seen".into(), &json!({"ids": ids}))?;
+        self.report_receipts(agent, ids, "read");
         if let Some(marked) = value.get("seen").and_then(Value::as_array) {
             return Ok(marked.len());
         }
@@ -748,6 +801,22 @@ impl<T: Transport> Backend for CloudBackend<T> {
         let tail = query(&[("older_than_seconds", Some(older_than_seconds.to_string()))]);
         let value = self.get(agent, format!("/api/v1/bus/undelivered{tail}"))?;
         Ok(list(value, &["messages", "undelivered", "items"])?)
+    }
+
+    fn sent(&self, agent: &str, limit: usize) -> Result<Vec<bus::Receipt>> {
+        let tail = query(&[("limit", (limit > 0).then(|| limit.to_string()))]);
+        let value = self.get(agent, format!("/api/v1/bus/sent{tail}"))?;
+        let items = value
+            .get("messages")
+            .or_else(|| value.get("items"))
+            .unwrap_or(&value);
+        let empty = Vec::new();
+        Ok(items
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .map(receipt_from)
+            .collect())
     }
 
     fn tasks(
@@ -1480,6 +1549,7 @@ mod tests {
             json!({"messages": [{"id": 12}], "skipped": 3}),
             json!({"claimed": [12]}),
             json!({"seen": 1}),
+            json!({}),
         ]);
         let send = SendRequest {
             to: "bob".into(),
@@ -1519,11 +1589,43 @@ mod tests {
                 ("GET", "/api/v1/bus/inbox"),
                 ("POST", "/api/v1/bus/inbox/claim"),
                 ("POST", "/api/v1/bus/inbox/seen"),
+                // Marking mail read tells the sender so, through the endpoint in the contract.
+                ("POST", "/api/v1/messages/12/receipt"),
             ],
         );
         assert_eq!(seen[0].body["needs"], "reply");
         assert_eq!(seen[5].body, json!({"ids": [12, 13], "lease_seconds": 60}));
         assert_eq!(seen[6].body, json!({"ids": [12]}));
+        assert_eq!(seen[7].body, json!({"status": "read"}));
+    }
+
+    #[test]
+    fn sent_mail_comes_back_with_the_status_the_server_gave_each_message() {
+        let (server, cloud) = backend(vec![json!({"messages": [
+            {"id": 7, "to": "bob", "body": "take src/api", "created_at": 10,
+             "status": "replied", "delivered_at": 20, "read_at": 30, "replied_at": 40},
+            {"id": 8, "to": "bob", "body": "and this", "created_at": 11, "status": "sent"},
+            {"id": 9, "to": "gone", "body": "", "created_at": 12, "status": "failed"},
+            {"id": 10, "to": "bob", "body": "?", "created_at": 13, "status": "something new"}
+        ]})]);
+        let receipts = cloud.sent("me", 20).unwrap();
+        let statuses: Vec<bus::Delivery> = receipts.iter().map(|r| r.status).collect();
+        assert_eq!(
+            statuses,
+            [
+                bus::Delivery::Replied,
+                bus::Delivery::Sent,
+                bus::Delivery::Failed,
+                bus::Delivery::Sent
+            ]
+        );
+        assert_eq!(receipts[0].delivered_at, Some(20));
+        assert_eq!(receipts[0].read_at, Some(30));
+        assert_eq!(receipts[0].replied_at, Some(40));
+        assert_eq!(receipts[0].to, "bob");
+        let seen = server.requests();
+        assert_eq!(seen[0].method, "GET");
+        assert_eq!(seen[0].path, "/api/v1/bus/sent?limit=20");
     }
 
     #[test]

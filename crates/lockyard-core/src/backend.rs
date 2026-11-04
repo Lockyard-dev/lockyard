@@ -157,6 +157,10 @@ pub trait Backend {
     fn undelivered(&self, _agent: &str, _older_than_seconds: i64) -> Result<Vec<Undelivered>> {
         cloud("msg undelivered")
     }
+    /// This agent's own messages and how far each one got.
+    fn sent(&self, _agent: &str, _limit: usize) -> Result<Vec<bus::Receipt>> {
+        cloud("msg sent")
+    }
 
     fn tasks(&self, status: Option<tasks::Status>, include_final: bool)
     -> Result<Vec<tasks::Task>>;
@@ -483,6 +487,10 @@ impl Backend for Store {
         now: i64,
     ) -> Result<Vec<i64>> {
         Store::inbox_claim(self, agent, channel, ids, lease_seconds, now)
+    }
+
+    fn sent(&self, agent: &str, limit: usize) -> Result<Vec<bus::Receipt>> {
+        Store::sent(self, agent, limit)
     }
 
     fn tasks(

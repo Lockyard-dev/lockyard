@@ -627,3 +627,39 @@ fn logout_forgets_one_server_and_login_refuses_a_plain_http_one() {
     let guessing = run(&["cloud", "login"]);
     assert!(!guessing.status.success());
 }
+
+#[test]
+fn a_sender_can_see_whether_mail_was_delivered_read_or_answered() {
+    let dir = project();
+    let root = dir.path();
+    ok(root, "b", &["msg", "inbox"]);
+    let sent: Value = serde_json::from_str(&ok(
+        root,
+        "a",
+        &["--json", "msg", "send", "b", "take src/api"],
+    ))
+    .unwrap();
+    let id = sent["id"].as_i64().unwrap();
+
+    let status = |expected: &str| {
+        let list: Value = serde_json::from_str(&ok(root, "a", &["--json", "msg", "sent"])).unwrap();
+        let line = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .unwrap_or_else(|| panic!("M-{id} is missing from msg sent"))
+            .clone();
+        assert_eq!(line["status"], expected, "{line}");
+    };
+    status("sent");
+    ok(root, "b", &["msg", "inbox", "--peek"]);
+    status("delivered");
+    ok(root, "b", &["msg", "inbox"]);
+    status("read");
+    ok(root, "b", &["msg", "reply", &format!("M-{id}"), "on it"]);
+    status("replied");
+
+    let text = ok(root, "a", &["msg", "sent"]);
+    assert!(text.contains("replied"), "{text}");
+}

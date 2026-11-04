@@ -12,7 +12,7 @@ use std::time::Duration;
 pub const DIR_NAME: &str = ".lockyard";
 
 const DB_NAME: &str = "lockyard.db";
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_AGENT_LEN: usize = 128;
 const TOUCH_INTERVAL_MS: i64 = 60_000;
@@ -169,6 +169,26 @@ DROP TABLE IF EXISTS work_tasks;
 DROP TABLE IF EXISTS events;
 ";
 
+/// Message receipts: when a message was put in front of its recipient, and what became of one
+/// that never was. Reading is kept in `receipts`, so the unread predicates are untouched.
+const SCHEMA_V5: &str = "
+CREATE TABLE deliveries (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    agent TEXT NOT NULL,
+    delivered_at INTEGER NOT NULL,
+    PRIMARY KEY (message_id, agent)
+) STRICT;
+CREATE TABLE message_outcomes (
+    message_id INTEGER PRIMARY KEY,
+    from_agent TEXT NOT NULL,
+    to_agent TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX message_outcomes_by_sender ON message_outcomes(from_agent, message_id);
+";
+
 /// An agent that has acted in this project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Agent {
@@ -318,6 +338,12 @@ impl Store {
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version == 3 {
             transaction.execute_batch(SCHEMA_V4)?;
+            transaction.pragma_update(None, "user_version", 4)?;
+        }
+        let version: i32 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == 4 {
+            transaction.execute_batch(SCHEMA_V5)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         transaction.commit()?;

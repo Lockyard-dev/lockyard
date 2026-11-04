@@ -371,6 +371,12 @@ fn full_tools() -> Vec<Value> {
             &[],
         ),
         tool_def(
+            "msg_sent",
+            "Show your own messages and whether each was delivered, read or answered",
+            json!({"limit": int}),
+            &[],
+        ),
+        tool_def(
             "task_add",
             "Add a task. In cloud mode the writer sets its urgency",
             json!({
@@ -1134,6 +1140,10 @@ fn run_tool(
                 .backend
                 .undelivered(me()?, args.some_int("older_than")?.unwrap_or(0))?,
         ),
+        "msg_sent" => {
+            let limit = args.some_int("limit")?.unwrap_or(20).clamp(1, 200);
+            encode(&opened.backend.sent(me()?, limit as usize)?)
+        }
         "task_add" => {
             let spec = TaskSpec {
                 title: args.text("title")?.to_string(),
