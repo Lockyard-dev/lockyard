@@ -32,3 +32,26 @@ test('launcher passes arguments, stdio and child exit code through', { skip: pro
 test('unsupported platform reports a clear error', () => {
   assert.throws(() => binaryPath('freebsd', 'x64'), /No Lockyard binary package is available for freebsd-x64/);
 });
+
+test('every optional dependency of the wrapper has a platform entry', () => {
+  const manifest = require('../package.json');
+  const { PLATFORMS } = require('../bin/lockyard.js');
+  assert.deepEqual(
+    Object.keys(manifest.optionalDependencies).sort(),
+    Object.values(PLATFORMS).sort()
+  );
+  for (const version of Object.values(manifest.optionalDependencies)) {
+    assert.equal(version, manifest.version);
+  }
+});
+
+// An install that skipped the optional binary package must say so instead of crashing with a stack trace.
+test('a missing binary package exits 1 with an explanation', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lockyard-npm-'));
+  const result = spawnSync(process.execPath, [launcher, 'status'], {
+    env: { ...process.env, NODE_PATH: dir }, cwd: dir, encoding: 'utf8',
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /is not installed/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});

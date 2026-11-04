@@ -3,14 +3,13 @@ dist/
 node_modules/
 __pycache__/
 *.tgz
+# Copied in by the release workflow next to each package manifest.
 packages/npm/LICENSE
 packages/npm/README.md
 packages/pypi/LICENSE
 packages/pypi/README.md
-bin/
-obj/
-.next/
-out/
+# Binaries downloaded or built into a package, never the checked-in launcher sources.
+packages/pypi/src/lockyard/bin/
 .codex-tmp/
 .cursor-tmp/
 .lockyard/
