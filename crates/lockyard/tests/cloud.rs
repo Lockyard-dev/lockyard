@@ -512,14 +512,20 @@ fn pre_edit(root: &Path) -> Value {
 }
 
 #[test]
-fn without_an_agent_a_hook_allows_and_says_so_and_sends_nothing() {
+fn without_an_agent_a_hook_denies_the_edit_and_sends_nothing() {
     let server = Server::start();
     let dir = cloud_project(&server);
     let runtime = tempfile::tempdir().unwrap();
     let result = hook(dir.path(), runtime.path(), &pre_edit(dir.path()));
     assert!(result.status.success());
-    assert!(result.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("allowing"));
+    let answer: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(answer["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(
+        answer["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("needs a running agent")
+    );
     assert!(server.state.lock().unwrap().seen.is_empty());
 }
 

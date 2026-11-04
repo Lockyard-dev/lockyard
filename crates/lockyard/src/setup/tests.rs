@@ -105,6 +105,52 @@ fn an_existing_config_is_merged_and_backed_up_not_clobbered() {
 }
 
 #[test]
+fn backups_are_private_and_an_existing_backup_is_never_overwritten() {
+    let (_dir, site) = site();
+    let mcp = site.root.join(".mcp.json");
+    let backup = site.root.join(format!(".mcp.json{BACKUP_SUFFIX}"));
+    fs::write(&mcp, r#"{"theme":"dark"}"#).unwrap();
+    fs::write(&backup, "user backup").unwrap();
+
+    install(Client::Claude, &site);
+
+    assert_eq!(read_text(&backup), "user backup");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let (_private_dir, private_site) = self::site();
+        let original = private_site.root.join(".mcp.json");
+        fs::write(&original, r#"{"theme":"private"}"#).unwrap();
+        install(Client::Claude, &private_site);
+        let private_backup = private_site.root.join(format!(".mcp.json{BACKUP_SUFFIX}"));
+        let mode = fs::metadata(private_backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_replaces_a_symlink_without_writing_through_to_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let (_dir, site) = site();
+    let target = site.root.join("outside-settings.json");
+    let config = site.root.join(".mcp.json");
+    fs::write(&target, r#"{"theme":"do not overwrite"}"#).unwrap();
+    symlink(&target, &config).unwrap();
+
+    install(Client::Claude, &site);
+
+    assert_eq!(read_text(&target), r#"{"theme":"do not overwrite"}"#);
+    assert!(
+        !fs::symlink_metadata(&config)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
 fn an_unparseable_config_stops_the_run_instead_of_overwriting_it() {
     let (_dir, site) = site();
     let mcp = site.root.join(".mcp.json");
@@ -133,6 +179,43 @@ fn uninstall_takes_back_what_setup_added_and_leaves_the_rest() {
         !site.claude_settings.exists(),
         "a settings file Lockyard created alone is removed again"
     );
+}
+
+#[test]
+fn uninstall_restores_original_bytes_when_owned_files_were_not_changed() {
+    let (_dir, site) = site();
+    let mcp = site.root.join(".mcp.json");
+    let instructions = site.root.join("CLAUDE.md");
+    let original_mcp = "{\"theme\":\"dark\",\"mcpServers\":{\"other\":{}}}\n";
+    let original_instructions = "# Project\n\nKeep this formatting.\n";
+    fs::write(&mcp, original_mcp).unwrap();
+    fs::write(&instructions, original_instructions).unwrap();
+    install(Client::Claude, &site);
+
+    apply(&plan(&[Client::Claude], &site, true).unwrap(), false).unwrap();
+
+    assert_eq!(read_text(&mcp), original_mcp);
+    assert_eq!(read_text(&instructions), original_instructions);
+}
+
+#[test]
+fn uninstall_preserves_edits_made_after_setup() {
+    let (_dir, site) = site();
+    let mcp = site.root.join(".mcp.json");
+    let instructions = site.root.join("CLAUDE.md");
+    fs::write(&mcp, r#"{"theme":"dark"}"#).unwrap();
+    install(Client::Claude, &site);
+    let mut config: Value = serde_json::from_str(&read_text(&mcp)).unwrap();
+    config["userSetting"] = json!(true);
+    fs::write(&mcp, serde_json::to_string(&config).unwrap()).unwrap();
+    fs::write(&instructions, "User added this after setup.\n").unwrap();
+
+    apply(&plan(&[Client::Claude], &site, true).unwrap(), false).unwrap();
+
+    let config: Value = serde_json::from_str(&read_text(&mcp)).unwrap();
+    assert_eq!(config["userSetting"], true);
+    assert!(config.get("mcpServers").is_none());
+    assert_eq!(read_text(&instructions), "User added this after setup.\n");
 }
 
 #[test]

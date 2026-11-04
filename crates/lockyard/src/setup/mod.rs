@@ -14,7 +14,8 @@ use lockyard_core::{Error, Result};
 use serde::Serialize;
 use serde_json::Value;
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Suffix of the copy taken before a file is changed.
@@ -322,6 +323,22 @@ pub fn plan_client(client: Client, site: &Site, uninstall: bool) -> Result<Vec<C
         )),
         (McpSite::Toml(_), Some(current), true) => merge::toml_table_remove(current, CODEX_TABLE),
     };
+    let after = if uninstall {
+        match &mcp {
+            McpSite::Json(_) => {
+                restore_if_unchanged(mcp.path(), before.as_deref(), after, |original| {
+                    merge::mcp_set(&shown, Some(original), &merge::server_entry())
+                })?
+            }
+            McpSite::Toml(_) => {
+                restore_if_unchanged(mcp.path(), before.as_deref(), after, |original| {
+                    Ok(merge::toml_table_set(original, CODEX_TABLE, &codex_body()))
+                })?
+            }
+        }
+    } else {
+        after
+    };
     changes.push(Change {
         client,
         part: "mcp",
@@ -337,6 +354,13 @@ pub fn plan_client(client: Client, site: &Site, uninstall: bool) -> Result<Vec<C
             (None, true) => None,
             (current, false) => Some(merge::claude_hooks_set(&shown, current.as_deref())?),
             (Some(current), true) => merge::claude_hooks_remove(&shown, current)?,
+        };
+        let after = if uninstall {
+            restore_if_unchanged(&path, before.as_deref(), after, |original| {
+                merge::claude_hooks_set(&shown, Some(original))
+            })?
+        } else {
+            after
         };
         changes.push(Change {
             client,
@@ -356,6 +380,13 @@ pub fn plan_client(client: Client, site: &Site, uninstall: bool) -> Result<Vec<C
             &client.block(),
         )),
         (Some(current), true) => merge::block_remove(current),
+    };
+    let after = if uninstall {
+        restore_if_unchanged(&path, before.as_deref(), after, |original| {
+            Ok(merge::block_set(original, &client.block()))
+        })?
+    } else {
+        after
     };
     changes.push(Change {
         client,
@@ -408,14 +439,14 @@ pub fn apply(changes: &[Change], dry_run: bool) -> Result<Vec<Applied>> {
         if !dry_run {
             // The copy is taken first: a failure after it still leaves the user's file recoverable.
             if let (Some(backup), Some(before)) = (&backup, &change.before) {
-                fs::write(backup, before)?;
+                write_backup(backup, before.as_bytes())?;
             }
             match &change.after {
                 Some(text) => {
                     if let Some(parent) = change.path.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    fs::write(&change.path, text)?;
+                    lockyard_core::fsio::replace(&change.path, text.as_bytes(), 0o600)?;
                 }
                 None => match fs::remove_file(&change.path) {
                     Ok(()) => {}
@@ -435,10 +466,55 @@ pub fn apply(changes: &[Change], dry_run: bool) -> Result<Vec<Applied>> {
     Ok(done)
 }
 
+/// Creates a private backup without replacing a file that already belongs to the user.
+fn write_backup(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
+                let _ = fs::remove_file(path);
+                return Err(error);
+            }
+            Ok(())
+        }
+        // A previous setup run or the user already owns this backup path. Never truncate it.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
     PathBuf::from(name)
+}
+
+/// Restores the original bytes when the file still exactly matches our installed version.
+/// If someone edited it after setup, `after` is the surgical removal that preserves their edits.
+fn restore_if_unchanged(
+    path: &Path,
+    current: Option<&str>,
+    after: Option<String>,
+    install: impl FnOnce(&str) -> Result<String>,
+) -> Result<Option<String>> {
+    let Some(current) = current else {
+        return Ok(after);
+    };
+    let backup = read(&with_suffix(path, BACKUP_SUFFIX))?;
+    let Some(original) = backup else {
+        return Ok(after);
+    };
+    if current == install(&original)? {
+        Ok(Some(original))
+    } else {
+        Ok(after)
+    }
 }
 
 /// One line of `lockyard doctor`.

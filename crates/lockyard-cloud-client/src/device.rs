@@ -76,6 +76,16 @@ pub fn start(post: &dyn DevicePost, machine: &str) -> Result<Start, ClientError>
     if status != 200 {
         return Err(status_error(status, &body));
     }
+    let user_code = field(&body, "user_code")?;
+    if !(3..=32).contains(&user_code.len())
+        || !user_code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(ClientError::Decode(
+            "the server returned an invalid user_code for device login".into(),
+        ));
+    }
     let interval = body
         .get("interval")
         .and_then(Value::as_u64)
@@ -83,7 +93,7 @@ pub fn start(post: &dyn DevicePost, machine: &str) -> Result<Start, ClientError>
         .clamp(MIN_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS);
     Ok(Start {
         device_code: field(&body, "device_code")?.to_string(),
-        user_code: field(&body, "user_code")?.to_string(),
+        user_code: user_code.to_string(),
         verification_uri: field(&body, "verification_uri")?.to_string(),
         verification_uri_complete: body
             .get("verification_uri_complete")
@@ -209,6 +219,16 @@ pub fn login(
     sleep: &mut dyn FnMut(Duration),
 ) -> Result<Granted, ClientError> {
     let begun = start(post, machine)?;
+    if !is_device_uri(&begun.verification_uri, url, &begun.user_code)
+        || begun
+            .verification_uri_complete
+            .as_deref()
+            .is_some_and(|uri| !is_device_uri(uri, url, &begun.user_code))
+    {
+        return Err(ClientError::Invalid(
+            "the server returned a verification link outside its own /device page".into(),
+        ));
+    }
     announce(&begun);
     let mut pacing = Pacing::new(&begun);
     let mut slow_down = false;
@@ -236,6 +256,15 @@ pub fn login(
             }
         }
     }
+}
+
+/// Device links must stay on the server the user chose. A compromised endpoint must not be able
+/// to send the terminal to a lookalike login page with the user code already filled in.
+fn is_device_uri(uri: &str, server: &str, user_code: &str) -> bool {
+    let expected = format!("{}/device", server.trim_end_matches('/'));
+    uri == expected
+        || uri == format!("{expected}?code={user_code}")
+        || uri == format!("{expected}?user_code={user_code}")
 }
 
 /// The real transport: plain HTTPS, no token, no redirects.
@@ -363,6 +392,65 @@ mod tests {
     }
 
     #[test]
+    fn a_device_login_rejects_a_verification_link_to_another_origin() {
+        let script = Script::new(vec![(
+            200,
+            json!({
+                "device_code": "d",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "https://attacker.test/device",
+                "verification_uri_complete": "https://attacker.test/device?code=ABCD-EFGH",
+                "interval": 5,
+                "expires_in": 600
+            }),
+        )]);
+        let mut announced = false;
+
+        let error = login(
+            &script,
+            "laptop",
+            "https://panel.test",
+            &mut |_| announced = true,
+            &mut |_| panic!("invalid verification links must not start polling"),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error}").contains("outside its own /device page"));
+        assert!(
+            !announced,
+            "the attacker link must never be shown or opened"
+        );
+    }
+
+    #[test]
+    fn a_device_login_rejects_unexpected_query_parameters_on_the_verification_link() {
+        let script = Script::new(vec![(
+            200,
+            json!({
+                "device_code": "d",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "https://panel.test/device",
+                "verification_uri_complete": "https://panel.test/device?next=https://attacker.test",
+                "interval": 5,
+                "expires_in": 600
+            }),
+        )]);
+        let mut announced = false;
+
+        assert!(
+            login(
+                &script,
+                "laptop",
+                "https://panel.test",
+                &mut |_| announced = true,
+                &mut |_| panic!("unexpected query parameters must not start polling"),
+            )
+            .is_err()
+        );
+        assert!(!announced);
+    }
+
+    #[test]
     fn a_refused_start_carries_the_servers_reason() {
         let script = Script::new(vec![(429, json!({"error": "too many logins"}))]);
         let error = start(&script, "laptop").unwrap_err();
@@ -373,7 +461,7 @@ mod tests {
     fn an_absurd_interval_is_pulled_back_into_range() {
         let reply = |interval: Value| {
             json!({
-                "device_code": "d", "user_code": "u",
+                "device_code": "d", "user_code": "ABCD-EFGH",
                 "verification_uri": "https://panel.test/device",
                 "interval": interval
             })
@@ -499,7 +587,7 @@ mod tests {
             200,
             json!({
                 "device_code": "d", "user_code": "ABCD-EFGH",
-                "verification_uri": "https://panel.test/device",
+                "verification_uri": "https://cloud.test/device",
                 "interval": interval, "expires_in": expires_in
             }),
         )

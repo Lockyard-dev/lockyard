@@ -9,7 +9,10 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// Replaces `path` with `bytes`, or leaves it exactly as it was.
 ///
@@ -22,17 +25,46 @@ pub fn replace(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other(format!("{} is not a file name", path.display())))?;
-    // The pid keeps two processes replacing the same file from sharing a temporary.
-    let temporary = parent.join(format!(
-        ".{}.{}.tmp",
-        name.to_string_lossy(),
-        std::process::id()
-    ));
-    let result = write_then_rename(&temporary, path, parent, bytes, mode);
+    let (temporary, file) = create_temporary(parent, name, mode)?;
+    let result = write_then_rename(&temporary, path, parent, bytes, file);
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn create_temporary(
+    parent: &Path,
+    name: &std::ffi::OsStr,
+    mode: u32,
+) -> io::Result<(PathBuf, File)> {
+    for _ in 0..128 {
+        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            name.to_string_lossy(),
+            std::process::id(),
+            serial
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        match options.open(&temporary) {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary file",
+    ))
 }
 
 fn write_then_rename(
@@ -40,18 +72,8 @@ fn write_then_rename(
     path: &Path,
     parent: &Path,
     bytes: &[u8],
-    mode: u32,
+    mut file: File,
 ) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(mode);
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    let mut file = options.open(temporary)?;
     file.write_all(bytes)?;
     // The bytes must be on the disk before the name points at them.
     file.sync_all()?;
@@ -115,6 +137,29 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(left.len(), 1, "{left:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_precreated_temporary_symlink_is_never_truncated() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside");
+        fs::write(&target, "keep me").unwrap();
+        let serial = NEXT_TEMP.load(Ordering::Relaxed);
+        let temporary = dir
+            .path()
+            .join(format!(".state.{}.{}.tmp", std::process::id(), serial));
+        symlink(&target, &temporary).unwrap();
+
+        replace(&dir.path().join("state"), b"new value", 0o600).unwrap();
+
+        assert_eq!(fs::read_to_string(target).unwrap(), "keep me");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("state")).unwrap(),
+            "new value"
+        );
     }
 
     #[cfg(unix)]

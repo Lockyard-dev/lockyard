@@ -6,6 +6,8 @@
 use crate::store::DIR_NAME;
 use crate::{Error, Result};
 use std::path::{Component, Path, PathBuf};
+#[cfg(target_os = "macos")]
+use unicode_normalization::UnicodeNormalization;
 
 /// The project root in zone form.
 const ROOT: &str = ".";
@@ -32,7 +34,10 @@ impl ZonePath {
             let Some(part) = component.as_os_str().to_str() else {
                 return Err(Error::Invalid(format!("path is not UTF-8: {raw:?}")));
             };
-            parts.push(part);
+            #[cfg(target_os = "macos")]
+            parts.push(part.nfd().collect::<String>().to_lowercase());
+            #[cfg(not(target_os = "macos"))]
+            parts.push(part.to_string());
         }
         if parts.is_empty() {
             return Ok(Some(Self(ROOT.into())));
@@ -62,8 +67,14 @@ impl ZonePath {
 
 fn overlaps(a: &str, b: &str, fold_ascii_case: bool) -> bool {
     if fold_ascii_case {
-        let a = a.to_ascii_lowercase();
-        let b = b.to_ascii_lowercase();
+        #[cfg(target_os = "macos")]
+        let a = a.nfd().collect::<String>().to_lowercase();
+        #[cfg(not(target_os = "macos"))]
+        let a = a.to_lowercase();
+        #[cfg(target_os = "macos")]
+        let b = b.nfd().collect::<String>().to_lowercase();
+        #[cfg(not(target_os = "macos"))]
+        let b = b.to_lowercase();
         return overlaps_exact(&a, &b);
     }
     overlaps_exact(a, b)
@@ -133,6 +144,12 @@ mod tests {
         assert!(!overlaps("Src", "src/file.rs", false));
     }
 
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn path_overlap_folds_unicode_case_on_case_insensitive_platforms() {
+        assert!(overlaps("src/É", "src/é/file", true));
+    }
+
     fn zone(root: &Path, cwd: &Path, raw: &str) -> String {
         ZonePath::resolve(root, cwd, raw)
             .unwrap()
@@ -178,6 +195,24 @@ mod tests {
         let (_dir, root) = project();
         std::os::unix::fs::symlink(root.join("src"), root.join("link")).unwrap();
         assert_eq!(zone(&root, &root, "link/new.rs"), "src/new.rs");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unicode_spellings_of_a_new_file_resolve_to_one_zone() {
+        let (_dir, root) = project();
+        let composed = ZonePath::resolve(&root, &root, "src/caf\u{00e9}.rs")
+            .unwrap()
+            .unwrap();
+        let decomposed = ZonePath::resolve(&root, &root, "src/cafe\u{0301}.rs")
+            .unwrap()
+            .unwrap();
+        let case_alias = ZonePath::resolve(&root, &root, "src/CAF\u{00c9}.rs")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(composed, decomposed);
+        assert_eq!(composed, case_alias);
     }
 
     #[test]

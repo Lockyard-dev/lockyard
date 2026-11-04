@@ -11,7 +11,7 @@ repo=$(cd "$here/.." && pwd)
 script="$repo/scripts/check-versions.sh"
 passed=0
 
-work=$(mktemp -d)
+work=$(mktemp -d "${TMPDIR:-/tmp}/lockyard-versions-test.XXXXXX")
 trap 'rm -rf "$work"' EXIT INT TERM
 
 fresh() {

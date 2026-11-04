@@ -11,7 +11,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/../install.sh"
 [ -f "$script" ] || { echo "install.sh not found next to tests/" >&2; exit 1; }
 
-work="$(mktemp -d)"
+work="$(mktemp -d "${TMPDIR:-/tmp}/lockyard-install-test.XXXXXX")"
 trap 'rm -rf "$work"' EXIT INT TERM
 failures=0
 checks=0
@@ -47,6 +47,10 @@ build_release() {
             printf '%s  %s\n' "$(sha256 "$archive")" "$archive"
         done
     ) > "$release/SHA256SUMS"
+    for archive in "$release"/lockyard-*.tar.gz; do
+        : > "$archive.sig"
+        : > "$archive.pem"
+    done
 }
 
 # Stubs curl and uname so install.sh runs offline on any machine.
@@ -80,13 +84,18 @@ case "\$1" in
     *) echo "$stub_os" ;;
 esac
 EOF
+    cat > "$bin/cosign" <<'EOF'
+#!/bin/sh
+[ "$1" = verify-blob ] || exit 1
+exit 0
+EOF
     # wget must not be picked up instead of the stubbed curl.
-    chmod 755 "$bin/curl" "$bin/uname"
+    chmod 755 "$bin/curl" "$bin/uname" "$bin/cosign"
 }
 
 run_install() {
     target_dir="$1"
-    PATH="$work/stub-bin:$PATH" \
+    PATH="$work/stub-bin:/usr/bin:/bin" \
     LOCKYARD_INSTALL_DIR="$target_dir" \
     LOCKYARD_VERSION="v0.1.0" \
         sh "$script" 2>&1
@@ -111,15 +120,79 @@ for pair in "Darwin arm64 darwin-arm64" "Darwin x86_64 darwin-x64" \
             *"Checksum verified."*) ok ;;
             *) fail "$1 $2 did not report a verified checksum" ;;
         esac
-        # Cosign is optional: without signatures on the fake release the script must still install.
+        # Signature verification is required after the checksum check.
         case "$output" in
-            *"Signature verified"*|*"checksum alone was checked"*) ok ;;
+            *"Signature verified (cosign)."*) ok ;;
             *) fail "$1 $2 said nothing about signature verification: $output" ;;
         esac
     else
         fail "$1 $2 did not install: $output"
     fi
 done
+
+# The destination temp name is exclusive and unpredictable; a pre-created symlink is not followed.
+build_release
+build_stubs "Darwin" "arm64"
+dest="$work/dest-symlink"
+mkdir -p "$dest"
+printf 'keep me\n' > "$work/victim"
+ln -s "$work/victim" "$dest/lockyard.new"
+if output="$(run_install "$dest")" && [ -x "$dest/lockyard" ]; then
+    [ "$(cat "$work/victim")" = "keep me" ] && ok || fail "installer wrote through a symlink in its destination"
+else
+    fail "installer could not replace a symlink safely: $output"
+fi
+
+# A checksum served beside the archive is not enough when the publisher identity cannot be checked.
+build_release
+build_stubs "Darwin" "arm64"
+mv "$work/stub-bin/cosign" "$work/cosign.stub"
+if output="$(PATH="$work/stub-bin:/usr/bin:/bin" LOCKYARD_INSTALL_DIR="$work/dest-no-cosign" \
+    LOCKYARD_VERSION="v0.1.0" sh "$script" 2>&1)"; then
+    fail "installer accepted an unsigned release without cosign"
+else
+    case "$output" in
+        *"cosign is required"*) ok ;;
+        *) fail "missing cosign failed for the wrong reason: $output" ;;
+    esac
+fi
+
+# If cosign is installed, a release without a signature is refused.
+build_release
+build_stubs "Darwin" "arm64"
+rm "$work/release/lockyard-darwin-arm64.tar.gz.sig" "$work/release/lockyard-darwin-arm64.tar.gz.pem"
+cat > "$work/stub-bin/cosign" <<'EOF'
+#!/bin/sh
+if [ "$1" = verify-blob ]; then
+    exit 0
+fi
+exit 1
+EOF
+chmod 755 "$work/stub-bin/cosign"
+dest="$work/dest-missing-signature"
+if output="$(PATH="$work/stub-bin:$PATH" LOCKYARD_INSTALL_DIR="$dest" \
+    LOCKYARD_VERSION="v0.1.0" sh "$script" 2>&1)"; then
+    fail "cosign accepted a release with no signature"
+else
+    case "$output" in
+        *"release signature is missing"*) ok ;;
+        *) fail "missing signature failed for the wrong reason: $output" ;;
+    esac
+fi
+[ ! -e "$dest/lockyard" ] && ok || fail "unsigned release left an executable behind"
+
+# With both signature files present, cosign must run before the archive is installed.
+: > "$work/release/lockyard-darwin-arm64.tar.gz.sig"
+: > "$work/release/lockyard-darwin-arm64.tar.gz.pem"
+dest="$work/dest-signed"
+if output="$(run_install "$dest")" && [ -x "$dest/lockyard" ]; then
+    case "$output" in
+        *"Signature verified (cosign)."*) ok ;;
+        *) fail "cosign did not report signature verification: $output" ;;
+    esac
+else
+    fail "a signed release did not install: $output"
+fi
 
 # An unsupported platform refuses and names the other install channels.
 build_stubs "Linux" "riscv64"

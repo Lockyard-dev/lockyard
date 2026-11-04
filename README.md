@@ -224,14 +224,15 @@ lockyard agent status
 lockyard agent uninstall
 ```
 
-- The view is used while it is fresher than 30 seconds. After that one server call gets 800 ms, and then the answer is
-  `unknown`: a hook allows the edit and notes it on stderr, and `zone check` exits 4.
+- The view is used while it is fresher than 30 seconds. After that one server call gets 800 ms; if the answer is still
+  `unknown`, the edit hook denies the edit and `zone check` exits 4.
 - Mail, heartbeats and activity go through a durable outbox under `$XDG_STATE_HOME/lockyard`, or
   `~/.local/state/lockyard`, so they survive an outage and arrive in order. Claims never wait in it: during an outage
   they fail, because a claim that lands minutes late is worse than one that was refused.
-- One agent serves one workspace, the one its token belongs to. A hook in any other workspace allows and says why.
+- One agent serves one workspace, the one its token belongs to. Without a matching agent and fresh mirror, an edit
+  hook denies the edit and says to start the agent.
 - One agent serves one token. A command run with another token goes straight to the server, so it keeps its own role.
-- With no agent running, the command line calls the server itself, and hooks allow and say so.
+- With no agent running, the command line calls the server itself, and cloud edit hooks deny until the agent starts.
 
 ## Machine guard
 

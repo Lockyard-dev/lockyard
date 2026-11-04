@@ -313,16 +313,31 @@ pub fn run(
     let text = |key: &str| event.get(key).and_then(Value::as_str);
     let cwd = text("cwd").map_or_else(|| fallback_cwd.to_path_buf(), PathBuf::from);
     let Some(root) = lockyard_core::paths::find_root(&cwd) else {
-        return Ok(());
+        return deny_unchecked_edit(
+            tool,
+            &event,
+            "Lockyard cannot check this edit because no project root is available. Run the client from the project, then retry.",
+            out,
+        );
     };
     let Some(agent) = agent_override.or_else(|| text("session_id").map(str::to_string)) else {
-        return Ok(());
+        return deny_unchecked_edit(
+            tool,
+            &event,
+            "Lockyard cannot check this edit because the client did not provide a session identity. Restart the client session, then retry.",
+            out,
+        );
     };
     let config = match Config::load(&root) {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("lockyard hook: config unavailable ({error}); allowing this call.");
-            return Ok(());
+            eprintln!("lockyard hook: config unavailable ({error}).");
+            return deny_unchecked_edit(
+                tool,
+                &event,
+                "Lockyard: project configuration is unavailable, so this edit cannot be checked. Fix `.lockyard/config.toml` or run `lockyard doctor`, then retry.",
+                out,
+            );
         }
     };
     if config.mode == Mode::Cloud {
@@ -332,6 +347,31 @@ pub fn run(
     let mut port = LocalPort { store, root, now };
     let machine = lockyard_core::machine::MachineConfig::load_user();
     handle(tool, &mut port, &event, &agent, &cwd, now, &machine, out)
+}
+
+/// Refuses an edit when the hook lacks information required to check its lock.
+fn deny_unchecked_edit(tool: Tool, event: &Value, reason: &str, out: &mut dyn Write) -> Result<()> {
+    if event.get("hook_event_name").and_then(Value::as_str) != Some("PreToolUse")
+        || !event
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| EDIT_TOOLS.contains(&name))
+    {
+        return Ok(());
+    }
+    let text = if tool == Tool::Cursor {
+        json!({"permission":"deny","agent_message":reason}).to_string()
+    } else {
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        })
+        .to_string()
+    };
+    emit(out, &text)
 }
 
 #[cfg(unix)]
@@ -517,6 +557,20 @@ fn edited_path(root: &Path, event: &Value, cwd: &Path) -> Result<Option<String>>
     Ok(ZonePath::resolve(root, cwd, target)?.map(|path| path.as_str().to_string()))
 }
 
+fn has_edit_target(event: &Value) -> bool {
+    event
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| EDIT_TOOLS.contains(&name))
+        && ["file_path", "notebook_path"].iter().any(|key| {
+            event
+                .get("tool_input")
+                .and_then(|input| input.get(key))
+                .and_then(Value::as_str)
+                .is_some()
+        })
+}
+
 fn pre_tool_use(
     port: &mut dyn Port,
     event: &Value,
@@ -549,6 +603,20 @@ fn pre_tool_use(
                 ),
             }
         }
+    }
+    if event
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| EDIT_TOOLS.contains(&name))
+        && !has_edit_target(event)
+    {
+        return Ok(Some(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "Lockyard cannot check this edit because the client did not provide a file path. Retry with a path-bearing edit operation.",
+            }
+        }).to_string()));
     }
     let Some(path) = edited_path(port.root(), event, cwd)? else {
         return Ok(None);
@@ -1052,6 +1120,43 @@ mod tests {
     }
 
     #[test]
+    fn a_pathless_edit_tool_is_denied_instead_of_skipping_the_zone_check() {
+        let (_dir, store) = project();
+        let mut port = LocalPort {
+            root: store.root().to_path_buf(),
+            store,
+            now: 1,
+        };
+        let event = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "MultiEdit",
+            "tool_input": {"edits": [{"old_string": "a", "new_string": "b"}]}
+        });
+        let mut out = Vec::new();
+
+        handle(
+            Tool::Claude,
+            &mut port,
+            &event,
+            "me",
+            Path::new("."),
+            1,
+            &lockyard_core::machine::MachineConfig::default(),
+            &mut out,
+        )
+        .unwrap();
+
+        let answer: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(answer["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            answer["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("did not provide a file path")
+        );
+    }
+
+    #[test]
     fn mail_arrives_once_and_is_labelled_as_information() {
         let (_dir, mut store) = project();
         store.touch("me", 0).unwrap();
@@ -1450,6 +1555,101 @@ mod tests {
             json!({ "hook_event_name": "PostToolUse", "session_id": "me", "cwd": dir.path() });
         let answer = claude(&input.to_string(), None, Path::new("/"), 1);
         assert!(matches!(answer, Err(Error::Db(_))));
+    }
+
+    #[test]
+    fn an_edit_is_denied_when_project_config_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        Store::init(dir.path()).unwrap();
+        fs::write(dir.path().join(".lockyard/config.toml"), "mode = [broken").unwrap();
+        let event = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "me",
+            "cwd": dir.path(),
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "src/a.rs"}
+        });
+        let mut out = Vec::new();
+        run(
+            Tool::Claude,
+            &event.to_string(),
+            None,
+            Path::new("/"),
+            1,
+            &mut out,
+        )
+        .unwrap();
+        let answer: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(answer["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            answer["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("configuration is unavailable")
+        );
+    }
+
+    #[test]
+    fn an_edit_without_a_session_identity_is_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        Store::init(dir.path()).unwrap();
+        let event = json!({
+            "hook_event_name": "PreToolUse",
+            "cwd": dir.path(),
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "src/a.rs"}
+        });
+        let mut out = Vec::new();
+
+        run(
+            Tool::Claude,
+            &event.to_string(),
+            None,
+            Path::new("/"),
+            1,
+            &mut out,
+        )
+        .unwrap();
+
+        let answer: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(answer["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            answer["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("session identity")
+        );
+    }
+
+    #[test]
+    fn an_edit_without_a_project_root_is_denied() {
+        let event = json!({
+            "hook_event_name": "PreToolUse",
+            "cwd": "/tmp",
+            "session_id": "me",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "src/a.rs"}
+        });
+        let mut out = Vec::new();
+
+        run(
+            Tool::Claude,
+            &event.to_string(),
+            None,
+            Path::new("/"),
+            1,
+            &mut out,
+        )
+        .unwrap();
+
+        let answer: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(answer["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            answer["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("no project root")
+        );
     }
 
     #[test]

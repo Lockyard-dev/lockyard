@@ -3,11 +3,11 @@
 #
 # Installs the Lockyard executable from a GitHub release.
 #
-#   curl -fsSL https://raw.githubusercontent.com/lockyard-dev/lockyard/main/install.sh | sh
+#   curl -fsSL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/lockyard-dev/lockyard/main/install.sh | sh
 #
-# It downloads one archive, checks it against the release SHA256SUMS file and unpacks the
-# executable into ~/.local/bin. It asks for no privileges, installs nothing else and sends
-# no telemetry. Windows is not covered: use npm or cargo (see the README).
+# It downloads one archive, verifies its checksum and Sigstore signature, then installs the
+# executable into ~/.local/bin. It asks for no privileges, installs nothing else and sends no
+# telemetry. Windows is not covered: use npm or cargo (see the README).
 #
 # Settings, all optional:
 #   LOCKYARD_VERSION      tag to install, "latest" by default
@@ -53,7 +53,7 @@ download() {
     url="$1"
     output="$2"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --proto '=https' --tlsv1.2 -o "$output" "$url" ||
+        curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 -o "$output" "$url" ||
             fail "could not download $url"
     elif command -v wget >/dev/null 2>&1; then
         wget -q --https-only -O "$output" "$url" || fail "could not download $url"
@@ -67,7 +67,7 @@ try_download() {
     url="$1"
     output="$2"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --proto '=https' --tlsv1.2 -o "$output" "$url"
+        curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 -o "$output" "$url"
     elif command -v wget >/dev/null 2>&1; then
         wget -q --https-only -O "$output" "$url"
     else
@@ -90,6 +90,7 @@ sha256_of() {
 
 need uname
 need tar
+need cosign
 
 target="$(detect_target)"
 asset="lockyard-$target.tar.gz"
@@ -100,9 +101,15 @@ else
     base="https://github.com/$REPO/releases/download/$VERSION"
 fi
 
-work="$(mktemp -d)"
+work="$(mktemp -d "${TMPDIR:-/tmp}/lockyard-install.XXXXXX")"
+installed_tmp=""
+cleanup() {
+    rm -rf "$work"
+    [ -z "$installed_tmp" ] || rm -f "$installed_tmp"
+}
 # A failed install leaves nothing behind, including on an interrupt.
-trap 'rm -rf "$work"' EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
 say "Downloading $asset from $base"
 download "$base/$asset" "$work/$asset"
@@ -116,34 +123,29 @@ if [ "$expected" != "$actual" ]; then
 fi
 say "Checksum verified."
 
-# When cosign is present, also check the Sigstore signature published with the release.
-# Absence of cosign is fine: the checksum still binds the bytes to SHA256SUMS.
-if command -v cosign >/dev/null 2>&1; then
-    sig="$asset.sig"
-    cert="$asset.pem"
-    if try_download "$base/$sig" "$work/$sig" && try_download "$base/$cert" "$work/$cert"; then
-        cosign verify-blob \
-            --signature "$work/$sig" \
-            --certificate "$work/$cert" \
-            --certificate-identity-regexp "https://github.com/${REPO}/\\.github/workflows/release\\.yml@refs/tags/v.*" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "$work/$asset" || fail "cosign could not verify $asset"
-        say "Signature verified (cosign)."
-    else
-        say "No cosign signature published for this release; checksum alone was checked."
-    fi
-else
-    say "cosign not on PATH; checksum alone was checked. Install cosign to verify the Sigstore signature too."
-fi
+# Verify the publisher identity on every installation. The checksum is fetched from the same
+# release, so it is not an independent authenticity check by itself.
+sig="$asset.sig"
+cert="$asset.pem"
+try_download "$base/$sig" "$work/$sig" || fail "release signature is missing for $asset"
+try_download "$base/$cert" "$work/$cert" || fail "release certificate is missing for $asset"
+cosign verify-blob \
+    --signature "$work/$sig" \
+    --certificate "$work/$cert" \
+    --certificate-identity-regexp "https://github.com/${REPO}/\\.github/workflows/release\\.yml@refs/tags/v.*" \
+    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+    "$work/$asset" || fail "cosign could not verify $asset"
+say "Signature verified (cosign)."
 
 tar -xzf "$work/$asset" -C "$work" || fail "could not unpack $asset"
 [ -f "$work/lockyard" ] || fail "$asset does not contain a lockyard executable"
 
 mkdir -p "$INSTALL_DIR" || fail "could not create $INSTALL_DIR"
-# Replace by rename so a running Lockyard is never a half-written file.
-cp "$work/lockyard" "$INSTALL_DIR/lockyard.new" || fail "could not write to $INSTALL_DIR"
-chmod 755 "$INSTALL_DIR/lockyard.new"
-mv "$INSTALL_DIR/lockyard.new" "$INSTALL_DIR/lockyard"
+# An exclusive temp file in the destination directory avoids following a pre-created symlink.
+installed_tmp="$(mktemp "$INSTALL_DIR/.lockyard.XXXXXX")" || fail "could not create a temporary file in $INSTALL_DIR"
+cp "$work/lockyard" "$installed_tmp" || fail "could not write to $INSTALL_DIR"
+chmod 755 "$installed_tmp"
+mv -f "$installed_tmp" "$INSTALL_DIR/lockyard"
 
 say ""
 say "Installed $("$INSTALL_DIR/lockyard" --version) to $INSTALL_DIR/lockyard"
