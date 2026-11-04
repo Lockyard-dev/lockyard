@@ -58,6 +58,14 @@ impl Config {
 
     /// Gets the bearer token from the environment or the named file, never from project config.
     pub fn token() -> Result<String> {
+        Self::token_for("")
+    }
+
+    /// The same, falling back to the token `lockyard cloud login` stored for this server.
+    ///
+    /// The environment still wins, so a CI job that exports `LOCKYARD_TOKEN` is unaffected by
+    /// whatever a developer happens to be logged in to on the same machine.
+    pub fn token_for(url: &str) -> Result<String> {
         if let Ok(token) = std::env::var("LOCKYARD_TOKEN")
             && !token.trim().is_empty()
         {
@@ -69,8 +77,16 @@ impl Config {
                 return Ok(token.trim().to_string());
             }
         }
+        if !url.is_empty()
+            && let Some(entry) = crate::credentials::find(url)?
+            && !entry.token.trim().is_empty()
+        {
+            return Ok(entry.token.trim().to_string());
+        }
         Err(Error::Invalid(
-            "cloud mode requires LOCKYARD_TOKEN or LOCKYARD_TOKEN_FILE".into(),
+            "no token for the cloud: run `lockyard cloud login`, or set LOCKYARD_TOKEN \
+             or LOCKYARD_TOKEN_FILE"
+                .into(),
         ))
     }
 }

@@ -578,3 +578,52 @@ fn a_composite_tool_claims_and_finishes_a_whole_piece_of_work() {
     let after: Value = serde_json::from_slice(&after.stdout).unwrap();
     assert_eq!(after["result"]["isError"], false, "the release frees it");
 }
+
+#[test]
+fn logout_forgets_one_server_and_login_refuses_a_plain_http_one() {
+    let dir = project();
+    let credentials = dir.path().join("credentials.toml");
+    let run = |args: &[&str]| -> Output {
+        Command::new(env!("CARGO_BIN_EXE_lockyard"))
+            .args(args)
+            .current_dir(dir.path())
+            .env("LOCKYARD_AGENT", "a")
+            .env("LOCKYARD_CREDENTIALS", &credentials)
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .output()
+            .unwrap()
+    };
+
+    let empty = run(&["--json", "cloud", "logout", "--url", "https://cloud.test"]);
+    assert!(empty.status.success());
+    let empty: Value = serde_json::from_slice(&empty.stdout).unwrap();
+    assert_eq!(empty["removed"], false);
+
+    std::fs::write(
+        &credentials,
+        "[servers.\"https://cloud.test\"]\ntoken = \"lk_1\"\nworkspace_name = \"Team\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let gone = run(&["--json", "cloud", "logout", "--url", "https://cloud.test/"]);
+    let gone: Value = serde_json::from_slice(&gone.stdout).unwrap();
+    assert_eq!(gone["removed"], true);
+    assert!(
+        !credentials.exists(),
+        "the last login takes the file with it"
+    );
+
+    // A token must never travel over plain HTTP, and that is decided before anything is sent.
+    let insecure = run(&["cloud", "login", "--url", "http://cloud.test"]);
+    assert!(!insecure.status.success());
+    assert!(String::from_utf8_lossy(&insecure.stderr).contains("HTTPS"));
+
+    // Without a URL and outside cloud mode there is nothing to log in to, and saying so beats
+    // guessing a server.
+    let guessing = run(&["cloud", "login"]);
+    assert!(!guessing.status.success());
+}

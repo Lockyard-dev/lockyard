@@ -754,6 +754,21 @@ enum AgentCommand {
 enum CloudCommand {
     /// Trust a server URL before sending a user token to it.
     Trust { url: String },
+    /// Sign in to a cloud workspace from the browser and store the token for this machine.
+    Login {
+        /// The server to sign in to. Taken from this project's config when left out.
+        #[arg(long)]
+        url: Option<String>,
+        /// Print the code and URL instead of opening a browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Forget the token stored for a server on this machine.
+    Logout {
+        /// The server to forget. Taken from this project's config when left out.
+        #[arg(long)]
+        url: Option<String>,
+    },
     /// Dump coordination state. Needs the owner or exporter role.
     Export,
     /// Freeze or unfreeze coordination writes. Needs the owner role.
@@ -1812,7 +1827,9 @@ fn run_cloud(mut opened: Opened, command: CloudCommand, agent: Option<&String>) 
         .or_else(env_agent)
         .unwrap_or_else(|| "lockyard-cli".to_string());
     let answer = match command {
-        CloudCommand::Trust { .. } => unreachable!("trust is handled before opening the project"),
+        CloudCommand::Trust { .. } | CloudCommand::Login { .. } | CloudCommand::Logout { .. } => {
+            unreachable!("these are handled before opening the project")
+        }
         CloudCommand::Export => backend.export()?,
         CloudCommand::Freeze { state, reason } => {
             backend.freeze(&agent, &Freeze { on: state, reason })?
@@ -1871,6 +1888,130 @@ fn agent_client(client: lockyard_cloud_client::Client) -> Result<lockyard_cloud_
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// The server a cloud command works on: the one asked for, or this project's.
+///
+/// A URL typed on the command line is an explicit decision and is trusted once the login
+/// succeeds. A URL that only came out of a project file is not: that file can arrive with a
+/// clone, so it still has to be named in `lockyard cloud trust` first.
+fn cloud_server(cwd: &Path, asked: Option<String>) -> Result<(String, bool)> {
+    if let Some(url) = asked {
+        return Ok((url.trim_end_matches('/').to_string(), true));
+    }
+    let root = lockyard_core::paths::find_root(cwd).ok_or(Error::NoProject)?;
+    let config = lockyard_core::config::Config::load(&root)?;
+    let (url, _) = open::endpoint(&config)?;
+    open::trusted_url(&url)?;
+    Ok((url.trim_end_matches('/').to_string(), false))
+}
+
+fn run_cloud_login(cwd: &Path, url: Option<String>, no_browser: bool) -> Result<Output> {
+    use lockyard_cloud_client::device;
+    let (url, typed) = cloud_server(cwd, url)?;
+    let machine = machine_name();
+    let post = device::HttpDevice::new(&url)?;
+    let mut announce = |start: &device::Start| {
+        let link = start
+            .verification_uri_complete
+            .as_deref()
+            .unwrap_or(&start.verification_uri);
+        // Printed to stderr so `--json` output stays one JSON document on stdout.
+        eprintln!("code {}\nopen {link}", start.user_code);
+        if !no_browser && !open_browser(link) {
+            eprintln!("open that page in a browser to finish signing in");
+        }
+    };
+    let granted = device::login(&post, &machine, &url, &mut announce, &mut |wait| {
+        std::thread::sleep(wait);
+    })?;
+    if typed {
+        open::trust_url(&granted.server_url)?;
+    }
+    lockyard_core::credentials::save_in(
+        &lockyard_core::credentials::path()?,
+        &lockyard_core::credentials::Entry {
+            url: granted.server_url.clone(),
+            token: granted.token.clone(),
+            workspace_id: granted.workspace_id.clone(),
+            workspace_name: granted.workspace_name.clone(),
+            role: granted.role.clone(),
+        },
+    )?;
+    // The token itself is never printed: it is in a 0600 file and nowhere else.
+    output(
+        &json!({
+            "server": granted.server_url,
+            "workspace": granted.workspace_name,
+            "workspace_id": granted.workspace_id,
+            "role": granted.role,
+        }),
+        format!(
+            "signed in to {} as {} on {}",
+            granted.workspace_name, granted.role, granted.server_url
+        ),
+    )
+}
+
+fn run_cloud_logout(cwd: &Path, url: Option<String>) -> Result<Output> {
+    let (url, _) = cloud_server(cwd, url)?;
+    let path = lockyard_core::credentials::path()?;
+    let had = lockyard_core::credentials::forget_in(&path, &url)?;
+    let text = if had {
+        format!("signed out of {url}")
+    } else {
+        format!("no token was stored for {url}")
+    };
+    output(&json!({"server": url, "removed": had}), text)
+}
+
+/// What the panel calls this machine in the token list. Only a label.
+fn machine_name() -> String {
+    if let Ok(name) = std::env::var("LOCKYARD_MACHINE")
+        && !name.trim().is_empty()
+    {
+        return name.trim().to_string();
+    }
+    #[cfg(unix)]
+    {
+        let mut buffer = [0_i8; 256];
+        // SAFETY: the buffer and its length are handed over together and the result is only
+        // read up to the first NUL that gethostname wrote.
+        if unsafe { libc::gethostname(buffer.as_mut_ptr(), buffer.len() - 1) } == 0 {
+            let bytes: Vec<u8> = buffer
+                .iter()
+                .take_while(|byte| **byte != 0)
+                .map(|byte| *byte as u8)
+                .collect();
+            if let Ok(name) = String::from_utf8(bytes)
+                && !name.is_empty()
+            {
+                return name;
+            }
+        }
+    }
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into())
+}
+
+/// Asks the desktop to open a link. Answers whether the request could be handed over at all.
+fn open_browser(link: &str) -> bool {
+    let (program, first) = if cfg!(target_os = "macos") {
+        ("open", None)
+    } else if cfg!(target_os = "windows") {
+        ("cmd", Some("/c"))
+    } else {
+        ("xdg-open", None)
+    };
+    let mut command = std::process::Command::new(program);
+    if let Some(first) = first {
+        command.arg(first).arg("start").arg("");
+    }
+    command
+        .arg(link)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn run_cloud_key(cwd: &Path, command: KeyCommand) -> Result<Output> {
@@ -2255,7 +2396,7 @@ fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
             let (_, config) = project()?;
             let (url, workspace) = open::endpoint(&config)?;
             open::trusted_url(&url)?;
-            let token = Config::token()?;
+            let token = Config::token_for(&url)?;
             let token_id = lockyard_cloud_client::token_id(&token);
             let client = agent_client(Client::new(&url, token)?)?;
             let settings = AgentConfig {
@@ -2381,6 +2522,10 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             open::trust_url(&url)?;
             output(&json!({"trusted": url}), format!("trusted {url}"))
         }
+        Command::Cloud(CloudCommand::Login { url, no_browser }) => {
+            run_cloud_login(cwd, url, no_browser)
+        }
+        Command::Cloud(CloudCommand::Logout { url }) => run_cloud_logout(cwd, url),
         Command::Cloud(CloudCommand::Key(command)) => run_cloud_key(cwd, command),
         Command::Cloud(CloudCommand::Encryption(command)) => run_cloud_encryption(cwd, command),
         Command::Cloud(command) => run_cloud(open()?, command, agent.as_ref()),

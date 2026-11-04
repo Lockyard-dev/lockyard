@@ -9,6 +9,7 @@ mod backend;
 pub mod bus;
 pub mod config;
 pub mod coordination;
+pub mod credentials;
 mod error;
 pub mod machine;
 pub mod paths;

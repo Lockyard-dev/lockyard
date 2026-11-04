@@ -7,6 +7,7 @@
 
 mod backend;
 mod crypto;
+pub mod device;
 #[cfg(test)]
 mod fake;
 

@@ -129,14 +129,15 @@ pub fn open(cwd: &Path, agent: Option<&str>) -> Result<Opened> {
 
 fn direct(url: &str, session: &str) -> Result<Box<dyn Backend>> {
     trusted_url(url)?;
-    let client = Client::new(url, Config::token()?)?.configure_content_encryption(session)?;
+    let client =
+        Client::new(url, Config::token_for(url)?)?.configure_content_encryption(session)?;
     Ok(Box::new(CloudBackend::new(client, session)))
 }
 
 /// A trusted direct client for workspace administration commands.
 pub(crate) fn direct_client(url: &str) -> Result<Client> {
     trusted_url(url)?;
-    Ok(Client::new(url, Config::token()?)?)
+    Ok(Client::new(url, Config::token_for(url)?)?)
 }
 
 #[cfg(unix)]
@@ -147,7 +148,7 @@ fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
     const CLI_TIMEOUT: Duration = Duration::from_secs(40);
     let (url, workspace) = endpoint(config)?;
     let socket = AgentSocket::connect(&crate::agent::socket_path(), &url, &workspace, CLI_TIMEOUT);
-    let token = Config::token().ok();
+    let token = Config::token_for(&url).ok();
     match socket {
         // An agent running under another token would act with that token's role.
         Some(socket)
