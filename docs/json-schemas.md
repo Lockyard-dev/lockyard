@@ -1,0 +1,40 @@
+<!-- Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0. -->
+
+# `--json` output schemas
+
+Every CLI command that prints a result accepts global `--json`. On success the process writes one
+JSON value to stdout (plus a trailing newline) and nothing else. On failure it writes
+
+```json
+{"error": {"kind": "<stable>", "message": "<human text with a next step>"}}
+```
+
+to stderr and exits non-zero. `kind` values are stable: `no_project`, `invalid`, `not_found`,
+`denied`, `conflict`, `stale_fence`, `frozen`, `unavailable`, `protocol`, `needs_cloud`,
+`needs_local`, `io`, `database`.
+
+## Common success shapes
+
+| Command | Top-level fields |
+|---|---|
+| `about` | `version` |
+| `init` | `root` |
+| `who` | array of `{id, last_seen, …}` |
+| `status` | `unread`, `claims`, `tasks`, `machine_level`, `unannounced` (and `work` in cloud) |
+| `doctor` | `ok` (bool), `checks` (`[{check, ok, detail}]`) |
+| `monitor` (on stop) | `delivered`, `unannounced`, `rounds`, `backend` (`native` \| `poll` \| `none` \| `off`) |
+| `zone claim` / list | claim objects with `id`, `session`, `paths`, `fence`, `expires_at`, … |
+| `zone check` | path check with `status` (`free` \| `own` \| `held` \| `unknown`) |
+| `msg inbox` | `{messages: [...], skipped?}` |
+| `msg send` | the sent message (`id`, `to`, `body`, …) |
+| `msg sent` | receipts with `status` (`sent` \| `delivered` \| `read` \| `replied` \| `failed`) |
+
+Monitor **events** while running (also under `--json`) are one object per line:
+
+```json
+{"event":"mail","id":1,"from":"bob","body":"…"}
+{"event":"unannounced","path":"src/a.rs","holder":"alice","claim":7,"hits":1}
+```
+
+Field names and `kind` strings are part of the 0.1 contract; additive fields may appear, removals
+need a major version.

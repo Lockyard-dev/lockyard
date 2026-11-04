@@ -7,6 +7,22 @@ All notable changes to Lockyard are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `lockyard monitor`: event-driven mail delivery and detection of writes outside the hook
+  (`notify` + 10 s reconcile). `status` / `doctor` surface unannounced writes.
+- Cloud zone mirror fail-closed guarantee documented in `docs/cloud-mirror.md`; a stale or
+  missing mirror refuses edits.
+- CI performance budget (`perf_budget`): hook decision p95 ≤ 15 ms, msg send p95 ≤ 20 ms.
+- Supply chain: Sigstore cosign keyless signatures, CycloneDX SBOM, `cargo deny`, npm/PyPI
+  Trusted Publishing; `install.sh` verifies signatures when `cosign` is present.
+- `SECURITY.md`, `docs/threat-model.md`, `docs/privacy.md`, `docs/json-schemas.md`.
+
+### Changed
+
+- Hook announces allowed edits; outside-hook writes are detection-only (README limits).
+- Errors include a next step; credentials and journals use crash-safe replace/fsync.
+
 ## [0.1.0] - 2026-11-04
 
 First release published to crates.io, npm, PyPI and GitHub Releases.

@@ -20,9 +20,10 @@ python3 -m pip install lockyard                                                 
 ```
 
 The one-line installer downloads the release archive for your operating system and processor, checks it against the
-`SHA256SUMS` published with the release, and puts a single executable in `~/.local/bin`. It needs no `sudo`, sends
-nothing anywhere and reports nothing back. Set `LOCKYARD_INSTALL_DIR` to put it elsewhere, or `LOCKYARD_VERSION` to
-install a particular release. On Windows, use npm or `cargo install`.
+`SHA256SUMS` published with the release, and — when [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/)
+is on `PATH` — verifies the Sigstore signature too. It puts a single executable in `~/.local/bin`, needs no `sudo`,
+sends nothing anywhere and reports nothing back. Set `LOCKYARD_INSTALL_DIR` to put it elsewhere, or `LOCKYARD_VERSION`
+to install a particular release. On Windows, use npm or `cargo install`. Release assets also include a CycloneDX SBOM.
 
 The npm and pip packages are thin wrappers: they pull in one prebuilt binary for the current platform
 (macOS arm64 and x64, Linux x64 and arm64, Windows x64) and run it. `cargo install` builds from source and so works
@@ -49,11 +50,11 @@ Lockyard does three things for an agent, and not every tool supports all three.
 
 | Tool | MCP tools | Blocks an edit of a held path | Mail delivery |
 |---|---|---|---|
-| Claude Code | yes, `.mcp.json` | **yes** — `PreToolUse` hook, answered with a deny | at the next tool use or prompt, through the same hook |
-| Codex CLI | yes, `~/.codex/config.toml` | no hook installed | on the next turn, when the agent calls `check` or `msg inbox` |
-| Cursor | yes, `.cursor/mcp.json` | no hook installed | on the next turn, as above |
-| Gemini CLI | yes, `.gemini/settings.json` | no hook installed | on the next turn, as above |
-| GitHub Copilot CLI | yes, `~/.copilot/mcp-config.json` | no hook installed | on the next turn, as above |
+| Claude Code | yes, `.mcp.json` | **yes** — `PreToolUse` hook, answered with a deny | immediately with `lockyard monitor`, else at the next tool use or prompt |
+| Codex CLI | yes, `~/.codex/config.toml` | no hook installed | immediately with `lockyard monitor`, else on the next turn |
+| Cursor | yes, `.cursor/mcp.json` | no hook installed | immediately with `lockyard monitor`, else on the next turn |
+| Gemini CLI | yes, `.gemini/settings.json` | no hook installed | immediately with `lockyard monitor`, else on the next turn |
+| GitHub Copilot CLI | yes, `~/.copilot/mcp-config.json` | no hook installed | immediately with `lockyard monitor`, else on the next turn |
 
 "Blocks an edit" means Lockyard can refuse a write to a path another agent holds, before it happens. Only Claude Code
 documents a pre-edit hook whose answer can deny the call, so only there does `lockyard setup` wire one: a hook that
@@ -64,9 +65,11 @@ Without a blocking hook, coordination rests on the agent asking — which is wha
 `lockyard setup` adds tells it to do, and what the MCP tools make cheap. The lock model is the same either way: a
 claim conflict is refused, with exit code 3 on the command line and an error from the MCP tool.
 
-"Mail delivery" is honest about waking an agent up: no tool here offers a documented way for an outside process to
-interrupt a running turn. Mail arrives the next time the agent does anything — which, with the Claude Code hook
-installed, is its next tool call.
+"Mail delivery" without a monitor is honest about waking an agent up: no tool here offers a documented way for an
+outside process to interrupt a running turn. Run `lockyard monitor` in the project (or as a background agent job) to
+print new mail and unannounced writes as the store changes; the file-system events are an accelerator, and a 10-second
+reconcile still runs because FSEvents and inotify can drop events. Without the monitor, mail arrives the next time the
+agent does anything — which, with the Claude Code hook installed, is its next tool call.
 
 ## MCP
 
@@ -250,11 +253,22 @@ The suite starts and stops that server itself. Without the URL it skips, and wit
 
 - Lockyard prevents accidents between cooperating agents. Agent names are not authenticated, and an agent can pretend to
   be another one.
-- The hook sees file edit tools only. A file changed by a shell command is not checked.
+- The hook sees file edit tools only. A file changed by a shell command (`sed -i`, an editor, a build script) is **not
+  refused**. `lockyard monitor` can notice it, mail the holder and show it in `status` / `doctor` — that is detection,
+  not prevention. By the time the event arrives the write has already happened.
 - Subagents of one Claude Code session share its session id, so they count as one agent.
 - On macOS and Windows, path comparisons fold ASCII case to match their usual case-insensitive file systems. Other
   platforms compare paths exactly.
 - In local mode all agents must run on one machine.
+- Cloud edit checks answer from a local mirror (see [docs/cloud-mirror.md](docs/cloud-mirror.md)); a stale or missing
+  mirror refuses the edit rather than guess.
+
+## Security and privacy
+
+- [SECURITY.md](SECURITY.md) — private disclosure to hello@lockyard.dev
+- [docs/threat-model.md](docs/threat-model.md) — what the lock does and does not stop
+- [docs/privacy.md](docs/privacy.md) — local mode sends nothing; cloud data inventory; no telemetry
+- [docs/json-schemas.md](docs/json-schemas.md) — stable `--json` shapes
 
 ## License
 

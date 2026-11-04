@@ -57,3 +57,40 @@ check-versions 10. Both new gates were watched failing: `if false` in `check-ver
   client refuses a grant whose `server_url` is not the server it asked, and reads a missing one as that server.
 - Credentials: `~/.config/lockyard/credentials.toml` (or `$XDG_CONFIG_HOME`), keyed by server URL, mode 0600. The
   contract says "where `lockyard cloud` already keeps credentials"; there was no such file, so this defines it.
+
+---
+
+# Wave 2 — speed by events, supply chain, product hardening (04.11.2026)
+
+`cargo fmt --check` and `clippy --all-targets -D warnings` clean. Builds on wave 1 + the prior `watch`/`outside`/`fsio`
+commit.
+
+| # | Item | Status |
+|---|---|---|
+| 1 | Event-driven mail (`notify` + 10 s reconcile) | **done** — `lockyard monitor`; FSEvents/inotify/ReadDirectoryChangesW via `notify`; `LOCKYARD_WATCH=off` keeps timer-only |
+| 2 | Cloud local-fast mirror + fencing | **done** — agent view already answered from memory; hook now **fail-closed** on stale/missing mirror; guarantee in `docs/cloud-mirror.md` |
+| 3 | Edits outside the hook | **done** — detection only; announce on allow; mail holder; `status`/`doctor` warn; README limits say so |
+| 4 | Dirty tracking by events | **done** — monitor reports dirty on FS ticks; rescan on reconcile |
+| 5 | Perf budget in CI | **done** — `tests/perf_budget.rs`; job `perf-budget`; p95 hook ≤ 15 ms, msg send ≤ 20 ms |
+| 6 | Supply chain | **done** — cosign keyless + SBOM on release; npm `--provenance`; PyPI Trusted Publishing; `cargo deny`; `install.sh` verifies sig when cosign present (16 installer checks) |
+| 7 | Product hardening | **done** — `SECURITY.md`, threat-model, privacy, json-schemas; credentials/journal fsync+atomic rename; errors with next steps |
+
+## Measured
+
+| Path | Before (owner baseline / field) | After (this machine, debug tests) |
+|---|---|---|
+| Hook decision (local) | 3.8 ms p50 / 4.4 ms p95 (release 0.0.1) | CI budget p95 ≤ 15 ms (process-spawn path); in-agent fresh view already asserts p95 < 5 ms |
+| `msg send` (local) | 3.9 ms | CI budget p95 ≤ 20 ms — green |
+| Mail send → visible | next tool call / ~10 s reconcile if watching nothing | **~351 ms** via `poll` in sandbox (`send_to_visible_latency_under_event_watch`); native FSEvents expected lower on a real Mac |
+| Cloud hook via server | ~1 s field | mirror + fail-closed; no HTTP on fresh view |
+
+## Tests added (on top of wave 1)
+
+- `monitor` unit: 11 (mail, unannounced, reconcile rescan, latency, watch-off)
+- `watch` / `outside` / `fsio` (prior commit) + `detect()`
+- hook: announce on free; Unknown → deny
+- `perf_budget`: 2
+- install.sh: +4 signature-path checks (16 total)
+- doctor/status surface unannounced + file-watch backend name
+
+**Still sandbox-blocked:** AF_UNIX agent daemon / socket / recovery tests (~35) — same as wave 1; need unsandboxed run before release.
