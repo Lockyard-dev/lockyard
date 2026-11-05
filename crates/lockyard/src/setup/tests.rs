@@ -370,6 +370,24 @@ fn inspect_reports_each_part_before_and_after_a_run() {
 }
 
 #[test]
+fn inspect_recognizes_claude_project_local_mcp_registration() {
+    let (_dir, site) = site();
+    let root = site.root.to_string_lossy().to_string();
+    fs::write(
+        site.home.join(".claude.json"),
+        serde_json::to_vec(&json!({
+            "projects": {
+                root: {"mcpServers": {"lockyard": {"command": "lockyard"}}}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let findings = inspect(Client::Claude, &site).unwrap();
+    assert!(findings[0].ok, "{}", findings[0].detail);
+}
+
+#[test]
 fn the_printed_snippet_names_the_same_files_the_run_writes() {
     let (_dir, site) = site();
     for client in ALL {

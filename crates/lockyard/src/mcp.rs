@@ -6,13 +6,13 @@
 use crate::After;
 use crate::open::{Opened, open};
 use lockyard_core::proto::{
-    AccessAnswer, AccessRequest, ActivityRequest, BoardWrite, CheckStatus, ClaimMode, ClaimQuery,
-    ClaimRequest, DirtyPath, EventQuery, Freeze, InboxQuery, PresenceBeat, Purpose, QueueRequest,
-    ReleaseRequest, RenewRequest, SendRequest, SessionActivity, SessionState, Stamp, Stream,
-    WorkAction, WorkOffer, WorkStep, expand_zones,
+    AccessAnswer, AccessRequest, ActivityRequest, BoardWrite, CheckStatus, Claim, ClaimMode,
+    ClaimQuery, ClaimRequest, DirtyPath, EventQuery, Freeze, InboxQuery, PresenceBeat, Purpose,
+    QueueRequest, ReleaseRequest, RenewRequest, SendRequest, SessionActivity, SessionState, Stamp,
+    Stream, WorkAction, WorkOffer, WorkStep, expand_zones,
 };
 use lockyard_core::tasks::{Status, TaskPlan, TaskSpec};
-use lockyard_core::zones::DEFAULT_TTL_MINUTES;
+use lockyard_core::zones::{DEFAULT_TTL_MINUTES, validate_claim_path_count};
 use lockyard_core::{Error, Result};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -194,6 +194,25 @@ fn error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
+/// A claim still held by someone else, returned in this agent's claim query, is a handover offer.
+fn split_handover_offers(agent: &str, claims: Vec<Claim>) -> (Vec<Claim>, Vec<Value>) {
+    let mut own = Vec::new();
+    let mut offers = Vec::new();
+    for claim in claims {
+        if claim.session == agent {
+            own.push(claim);
+        } else {
+            offers.push(json!({
+                "id": claim.id,
+                "from": claim.session,
+                "paths": claim.paths,
+                "note": claim.note,
+            }));
+        }
+    }
+    (own, offers)
+}
+
 fn tool_def(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
         "name": name,
@@ -222,11 +241,18 @@ fn compact_tools() -> Vec<Value> {
     let text = json!({"type": "string"});
     let flag = json!({"type": "boolean"});
     let names = json!({"type": "array", "items": {"type": "string"}});
+    // The unit lives on the field. A sentence in the tool description is not enough.
+    let ttl_minutes = json!({
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 240,
+        "description": "Lease length in minutes, from 1 through 240."
+    });
     vec![
         tool_def(
             "start_work",
             "Claim paths before editing; ttl is in minutes. Accept an offered zone with handover_id, or take a task.",
-            json!({"paths": names, "note": text, "ttl": int, "shared": flag, "zones": names, "task": text, "handover_id": int}),
+            json!({"paths": names, "note": text, "ttl": ttl_minutes, "shared": flag, "zones": names, "task": text, "handover_id": int}),
             &[],
         ),
         tool_def(
@@ -924,6 +950,39 @@ fn encode(value: &impl Serialize) -> Result<Value> {
     serde_json::to_value(value).map_err(|error| Error::Invalid(format!("cannot encode: {error}")))
 }
 
+fn escape_bidi_controls(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if matches!(
+                ch as u32,
+                0x061c | 0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069
+            ) {
+                format!("\\u{{{:x}}}", ch as u32)
+            } else {
+                ch.to_string()
+            }
+        })
+        .collect()
+}
+
+fn safe_messages(
+    mut messages: Vec<lockyard_core::proto::Message>,
+) -> Vec<lockyard_core::proto::Message> {
+    for message in &mut messages {
+        message.body = escape_bidi_controls(&message.body);
+    }
+    messages
+}
+
+fn safe_receipts(
+    mut receipts: Vec<lockyard_core::bus::Receipt>,
+) -> Vec<lockyard_core::bus::Receipt> {
+    for receipt in &mut receipts {
+        receipt.body = escape_bidi_controls(&receipt.body);
+    }
+    receipts
+}
+
 /// Paths of a tool call, plus those of the zones it names.
 fn claim_paths(opened: &Opened, args: Args<'_>, cwd: &Path) -> Result<(Vec<String>, Vec<String>)> {
     let zones = args.strings("zones")?;
@@ -958,6 +1017,7 @@ fn claim_paths(opened: &Opened, args: Args<'_>, cwd: &Path) -> Result<(Vec<Strin
             }
         }
     }
+    validate_claim_path_count(paths.len())?;
     Ok((paths, zones))
 }
 
@@ -1395,34 +1455,9 @@ fn run_tool(
                     .into_iter()
                     .map(|item| json!({"id": item.id, "title": item.title, "status": item.status, "assignee": item.assignee, "to": item.to}))
                     .collect();
-                let offers = if let Some(name) = agent {
-                    backend
-                        .inbox(
-                            name,
-                            InboxQuery {
-                                all: true,
-                                limit: INBOX_LIMIT,
-                            },
-                            now,
-                        )?
-                        .messages
-                        .into_iter()
-                        .filter(|message| {
-                            message.body.contains("zone offered to you")
-                                && message.body.contains(name)
-                        })
-                        .take(10)
-                        .map(|message| {
-                            json!({
-                                "id": message.id,
-                                "from": message.from,
-                                "kind": message.kind,
-                                "body": message.body.chars().take(160).collect::<String>()
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
+                let (claims, offers) = match agent {
+                    Some(name) => split_handover_offers(name, claims),
+                    None => (claims, Vec::new()),
                 };
                 return Ok(
                     json!({"unread": unread, "claims": claims, "work": work, "offers": offers}),
@@ -1616,7 +1651,7 @@ fn run_tool(
                 }
                 Some(check) if check.status == CheckStatus::Unknown => Ok(json!({"unknown": true})),
                 Some(check) if check.status == CheckStatus::Own => {
-                    Ok(json!({"free": true, "own": true, "holder": "you"}))
+                    Ok(json!({"free": false, "own": true, "holder": "you"}))
                 }
                 Some(check) if check.status == CheckStatus::Free => {
                     let own = opened.backend.claims(
@@ -1635,15 +1670,19 @@ fn run_tool(
                     if !held_by_me {
                         Ok(json!({"free": true}))
                     } else {
-                        Ok(json!({"free": true, "own": true, "holder": "you"}))
+                        Ok(json!({"free": false, "own": true, "holder": "you"}))
                     }
                 }
                 _ => Ok(json!({"free": true})),
             }
         }
         "msg_send" => {
+            let to = resolve_target(cwd, agent, args.text("to")?)?;
+            if me()? == to {
+                return Err(Error::Invalid("cannot send a message to yourself".into()));
+            }
             let request = SendRequest {
-                to: resolve_target(cwd, agent, args.text("to")?)?,
+                to,
                 body: args.text("body")?.to_string(),
                 from_client: client.map(str::to_string),
                 kind: args.some_text("kind")?,
@@ -1653,13 +1692,17 @@ fn run_tool(
                 key: args.some_text("key")?,
                 ttl_minutes: args.some_int("ttl")?,
             };
-            encode(&opened.backend.send(me()?, &request, now)?)
+            let mut message = opened.backend.send(me()?, &request, now)?;
+            message.body = escape_bidi_controls(&message.body);
+            encode(&message)
         }
-        "msg_reply" => encode(
-            &opened
+        "msg_reply" => {
+            let mut message = opened
                 .backend
-                .reply(me()?, args.id()?, args.text("body")?, now)?,
-        ),
+                .reply(me()?, args.id()?, args.text("body")?, now)?;
+            message.body = escape_bidi_controls(&message.body);
+            encode(&message)
+        }
         "msg_inbox" => {
             let (all, peek) = (args.flag("all")?, args.flag("peek")?);
             let reader = me()?.to_string();
@@ -1672,7 +1715,7 @@ fn run_tool(
                 now,
             )?;
             let ids: Vec<i64> = page.messages.iter().map(|message| message.id).collect();
-            let answer = encode(&page.messages)?;
+            let answer = encode(&safe_messages(page.messages))?;
             if !peek && !ids.is_empty() {
                 let mut backend = opened.backend;
                 *after = Some(Box::new(move || {
@@ -1689,8 +1732,8 @@ fn run_tool(
             opened.backend.ack(me()?, id)?;
             Ok(json!({"acked": id}))
         }
-        "msg_thread" => encode(&opened.backend.thread(me()?, args.id()?)?),
-        "msg_overdue" => encode(&opened.backend.overdue(me()?)?),
+        "msg_thread" => encode(&safe_messages(opened.backend.thread(me()?, args.id()?)?)),
+        "msg_overdue" => encode(&safe_messages(opened.backend.overdue(me()?)?)),
         "msg_undelivered" => encode(
             &opened
                 .backend
@@ -1698,7 +1741,7 @@ fn run_tool(
         ),
         "msg_sent" => {
             let limit = args.some_int("limit")?.unwrap_or(20).clamp(1, 200);
-            encode(&opened.backend.sent(me()?, limit as usize)?)
+            encode(&safe_receipts(opened.backend.sent(me()?, limit as usize)?))
         }
         "task_add" => {
             let spec = TaskSpec {
@@ -2368,12 +2411,13 @@ mod tests {
             .into_iter()
             .find(|tool| tool["name"] == "start_work")
             .unwrap();
-        assert!(
-            definition["description"]
-                .as_str()
-                .unwrap()
-                .contains("minutes")
-        );
+        let ttl = &definition["inputSchema"]["properties"]["ttl"];
+        let description = ttl["description"].as_str().unwrap();
+        assert!(description.contains("minutes"), "{description}");
+        assert!(description.contains('1'), "{description}");
+        assert!(description.contains("240"), "{description}");
+        assert_eq!(ttl["minimum"], json!(1));
+        assert_eq!(ttl["maximum"], json!(240));
     }
 
     #[test]
@@ -2423,6 +2467,21 @@ mod tests {
         assert!(text(&call(&dir, "b", "msg_unread", json!({}))).contains("\"unread\":0"));
         let half = call(&dir, "b", "update", json!({"to": "a"}));
         assert_eq!(half["isError"], true);
+    }
+
+    #[test]
+    fn mail_tools_escape_bidi_controls_in_message_bodies() {
+        let dir = project();
+        call(&dir, "b", "msg_inbox", json!({}));
+        call(
+            &dir,
+            "a",
+            "msg_send",
+            json!({"to": "b", "body": "safe\u{202e}hidden"}),
+        );
+        let inbox = call(&dir, "b", "msg_inbox", json!({}));
+        assert!(!text(&inbox).contains('\u{202e}'));
+        assert!(text(&inbox).contains("\\u{202e}"));
     }
 
     #[test]
@@ -2487,9 +2546,33 @@ mod tests {
         let result = call(&dir, "a", "check", json!({"path": "src/file.rs"}));
         assert_eq!(result["isError"], false);
         let answer: Value = serde_json::from_str(text(&result)).unwrap();
-        assert_eq!(answer["free"], true);
+        assert_eq!(answer["free"], false);
         assert_eq!(answer["own"], true);
         assert_eq!(answer["holder"], "you");
+    }
+
+    #[test]
+    fn a_pending_handover_is_an_offer_and_not_the_receivers_claim() {
+        let offered: Claim = serde_json::from_value(json!({
+            "id": 414,
+            "session": "sender",
+            "paths": ["src/Auth"],
+            "note": "pass"
+        }))
+        .unwrap();
+        let mine: Claim = serde_json::from_value(json!({
+            "id": 7,
+            "session": "receiver",
+            "paths": ["docs"]
+        }))
+        .unwrap();
+        let (claims, offers) = split_handover_offers("receiver", vec![offered, mine]);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].id, 7);
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0]["id"], 414);
+        assert_eq!(offers[0]["from"], "sender");
+        assert_eq!(offers[0]["paths"], json!(["src/Auth"]));
     }
 
     #[test]

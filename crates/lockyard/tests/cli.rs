@@ -748,7 +748,7 @@ fn a_sender_can_see_whether_mail_was_delivered_read_or_answered() {
     let sent: Value = serde_json::from_str(&ok(
         root,
         "a",
-        &["--json", "msg", "send", "b", "take src/api"],
+        &["--json", "msg", "send", "b", "take src/api\u{202e}spoof"],
     ))
     .unwrap();
     let id = sent["id"].as_i64().unwrap();
@@ -774,4 +774,6 @@ fn a_sender_can_see_whether_mail_was_delivered_read_or_answered() {
 
     let text = ok(root, "a", &["msg", "sent"]);
     assert!(text.contains("replied"), "{text}");
+    assert!(text.contains("\\u{202e}"), "{text}");
+    assert!(!text.contains('\u{202e}'), "{text}");
 }

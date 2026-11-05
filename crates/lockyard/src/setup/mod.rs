@@ -558,16 +558,23 @@ pub fn inspect(client: Client, site: &Site) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
     let mcp = client.mcp(site);
     let text = read(mcp.path())?.unwrap_or_default();
-    let registered = match &mcp {
+    let project_registered = match &mcp {
         McpSite::Json(_) => merge::mcp_present(&text),
         McpSite::Toml(_) => merge::toml_table_present(&text, CODEX_TABLE),
+    };
+    let local_claude_registered = client == Client::Claude && claude_project_mcp_present(site)?;
+    let registered = project_registered || local_claude_registered;
+    let registered_path = if local_claude_registered {
+        site.home.join(".claude.json")
+    } else {
+        mcp.path().to_path_buf()
     };
     findings.push(Finding::new(
         format!("{} MCP server", client.label()),
         registered,
         format!(
             "{} {}",
-            mcp.path().display(),
+            registered_path.display(),
             if registered {
                 "registers lockyard"
             } else {
@@ -609,6 +616,26 @@ pub fn inspect(client: Client, site: &Site) -> Result<Vec<Finding>> {
         ),
     ));
     Ok(findings)
+}
+
+fn claude_project_mcp_present(site: &Site) -> Result<bool> {
+    let Some(text) = read(&site.home.join(".claude.json"))? else {
+        return Ok(false);
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(false);
+    };
+    let root = site.root.to_string_lossy();
+    Ok(value
+        .pointer(&format!(
+            "/projects/{}/mcpServers/lockyard",
+            json_pointer_escape(&root)
+        ))
+        .is_some())
+}
+
+fn json_pointer_escape(text: &str) -> String {
+    text.replace('~', "~0").replace('/', "~1")
 }
 
 /// Renders a plan or a report as the lines `lockyard setup` prints.

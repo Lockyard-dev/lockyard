@@ -18,7 +18,7 @@ use lockyard_core::proto::{
     WorkTask, expand_zones, rfc3339,
 };
 use lockyard_core::tasks::{Status, Task, TaskPlan, TaskSpec};
-use lockyard_core::zones::DEFAULT_TTL_MINUTES;
+use lockyard_core::zones::{DEFAULT_TTL_MINUTES, validate_claim_path_count};
 use lockyard_core::{Backend, Error, Result, Store};
 use open::Opened;
 use serde::Serialize;
@@ -270,6 +270,7 @@ enum ZoneCommand {
         id: i64,
         #[arg(long)]
         reply: Option<String>,
+        /// ISO 8601 timestamp, for example 2026-11-05T15:00:00Z.
         #[arg(long)]
         eta: Option<String>,
     },
@@ -1058,10 +1059,17 @@ fn escape_controls(text: &str) -> String {
             '\n' => "\\n".to_string(),
             '\r' => "\\r".to_string(),
             '\t' => "\\t".to_string(),
-            ch if ch.is_control() => format!("\\u{{{:x}}}", ch as u32),
+            ch if ch.is_control() || is_bidi_control(ch) => format!("\\u{{{:x}}}", ch as u32),
             ch => ch.to_string(),
         })
         .collect()
+}
+
+fn is_bidi_control(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x061c | 0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069
+    )
 }
 
 #[cfg(test)]
@@ -1071,6 +1079,14 @@ mod output_escape_tests {
         assert_eq!(
             super::escape_controls("Почта 😀\nready"),
             "Почта 😀\\nready"
+        );
+    }
+
+    #[test]
+    fn escapes_bidi_controls_in_mail() {
+        assert_eq!(
+            super::escape_controls("safe\u{202e}hidden\u{2069}"),
+            "safe\\u{202e}hidden\\u{2069}"
         );
     }
 }
@@ -1133,6 +1149,7 @@ fn with_zones(
             }
         }
     }
+    validate_claim_path_count(paths.len())?;
     Ok(paths)
 }
 
@@ -1510,6 +1527,9 @@ fn run_msg(opened: Opened, command: MsgCommand, agent: Option<&String>) -> Resul
             key,
             ttl,
         } => {
+            if to == agent {
+                return Err(Error::Invalid("cannot send a message to yourself".into()));
+            }
             let request = SendRequest {
                 to,
                 body,
@@ -1575,7 +1595,7 @@ fn run_msg(opened: Opened, command: MsgCommand, agent: Option<&String>) -> Resul
                     receipt.id,
                     receipt.to,
                     receipt.status.as_str(),
-                    first
+                    escape_controls(first)
                 )
             };
             let text = join(&receipts, line, "nothing sent yet");
@@ -2913,6 +2933,19 @@ mod tests {
     #[test]
     fn the_command_line_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn zone_answer_help_states_the_eta_format() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("zone")
+            .unwrap()
+            .find_subcommand_mut("answer")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("ISO 8601"));
     }
 
     #[test]

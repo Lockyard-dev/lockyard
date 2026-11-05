@@ -81,6 +81,9 @@ impl Store {
         if to != BROADCAST {
             validate_agent(to)?;
         }
+        if to == from {
+            return Err(Error::Invalid("cannot send a message to yourself".into()));
+        }
         self.touch(from, now)?;
         if to != BROADCAST && !self.agent_exists(to)? {
             return Err(Error::NotFound(format!(

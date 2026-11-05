@@ -201,6 +201,16 @@ impl From<ClientError> for CoreError {
             ClientError::Denied(error) => Self::Denied(error.to_string()),
             ClientError::NotFound(error) => Self::NotFound(error.to_string()),
             ClientError::Conflict(error) => {
+                if error
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("message key was reused")
+                {
+                    return Self::Invalid(
+                        "message key was reused with a different body; use a new message key"
+                            .into(),
+                    );
+                }
                 let conflicts = holders(&error);
                 if conflicts.is_empty() {
                     Self::Contended(contended_text(&error))
@@ -1046,6 +1056,19 @@ mod tests {
             CoreError::from(ClientError::Transport("x".into())),
             CoreError::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn a_reused_message_key_gets_mail_specific_guidance() {
+        let error = ApiError {
+            status: 409,
+            message: "Message key was reused with another body.".into(),
+            ..ApiError::default()
+        };
+        let text = CoreError::from(ClientError::Conflict(error)).to_string();
+        assert!(text.contains("use a new message key"));
+        assert!(!text.contains("zone list"));
+        assert!(!text.contains(".."));
     }
 
     #[test]

@@ -13,6 +13,18 @@ use std::fmt;
 pub const DEFAULT_TTL_MINUTES: i64 = 30;
 /// Longest lease. A longer job renews.
 pub const MAX_TTL_MINUTES: i64 = 240;
+/// Maximum number of paths in one claim request.
+pub const MAX_CLAIM_PATHS: usize = 256;
+
+/// Refuses oversized claims before they reach local storage or a cloud request.
+pub fn validate_claim_path_count(count: usize) -> Result<()> {
+    if count > MAX_CLAIM_PATHS {
+        return Err(Error::Invalid(format!(
+            "a claim can include at most {MAX_CLAIM_PATHS} paths (got {count})"
+        )));
+    }
+    Ok(())
+}
 
 const MINUTE_MS: i64 = 60_000;
 
@@ -73,6 +85,7 @@ impl Store {
         if paths.is_empty() {
             return Err(Error::Invalid("a claim needs at least one path".into()));
         }
+        validate_claim_path_count(paths.len())?;
         let lease = lease_ms(ttl_minutes)?;
         self.touch(agent, now)?;
         let transaction = self.write()?;
@@ -257,6 +270,28 @@ mod tests {
         assert_eq!(conflicts[0].agent, "a");
         assert_eq!(conflicts[0].held_path, "src");
         assert_eq!(conflicts[0].note, "refactor");
+    }
+
+    #[test]
+    fn claims_reject_more_than_the_path_limit() {
+        let (_dir, mut store) = test_store();
+        let paths: Vec<ZonePath> = (0..257)
+            .map(|index| path(&format!("src/{index}.rs")))
+            .collect();
+        let error = store.claim("a", &paths, "", TTL, 0).unwrap_err();
+        assert!(error.to_string().contains("at most 256 paths"));
+    }
+
+    #[test]
+    fn an_agent_cannot_send_mail_to_itself() {
+        let (_dir, mut store) = test_store();
+        store.touch("a", 0).unwrap();
+        let error = store.send("a", "a", "hello", 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot send a message to yourself")
+        );
     }
 
     #[test]
