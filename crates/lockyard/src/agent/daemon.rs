@@ -1518,6 +1518,21 @@ impl<T: Transport + 'static> Daemon<T> {
             let _ = thread.join();
         }
     }
+
+    /// Stops the workers and waits for their current bounded transport operations to finish.
+    fn shutdown(&mut self) {
+        self.shared.stop();
+        // Wake the accept loop, which sits in a blocking call. If the socket file is already gone (its folder
+        // was removed), nothing can wake it: leave that one thread behind rather than wait for it forever.
+        let woke = UnixStream::connect(&self.shared.config.socket).is_ok();
+        let _ = fs::remove_file(&self.shared.config.socket);
+        for thread in self.threads.drain(..) {
+            if !woke && thread.thread().name() == Some("accept") {
+                continue;
+            }
+            let _ = thread.join();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1531,10 +1546,7 @@ impl<T: Transport + 'static> Daemon<T> {
 
 impl<T: Transport + 'static> Drop for Daemon<T> {
     fn drop(&mut self) {
-        self.shared.stop();
-        // Wake the accept loop, which sits in a blocking call.
-        let _ = UnixStream::connect(&self.shared.config.socket);
-        let _ = fs::remove_file(&self.shared.config.socket);
+        self.shutdown();
     }
 }
 
@@ -1709,10 +1721,11 @@ mod tests {
         }
     }
 
+    // Fields drop in order: the daemon stops while its socket folder still exists.
     struct Rig {
-        dir: tempfile::TempDir,
-        server: Arc<FakeServer>,
         daemon: Daemon<Arc<FakeServer>>,
+        server: Arc<FakeServer>,
+        dir: tempfile::TempDir,
     }
 
     fn config(dir: &Path, timing: Timing) -> AgentConfig {
@@ -1951,7 +1964,8 @@ mod tests {
     fn zone_snapshot_never_calls_the_backend_when_down_or_blocked() {
         let rig = start_with(timing(), |_| {});
         view_ready(&rig);
-        rig.daemon.shared.stop();
+        let mut rig = rig;
+        rig.daemon.shutdown();
         let before = rig.server.calls.lock().unwrap().len();
         let ask = || Request::ZoneSnapshot {
             session: "me".into(),
@@ -2042,7 +2056,9 @@ mod tests {
     fn a_stale_view_makes_one_server_call_and_never_answers_from_memory() {
         let rig = start_with(timing(), |server| server.claim(1, "bob", "src"));
         view_ready(&rig);
-        rig.daemon.shared.stop();
+        // Stop and wait for the workers, so none of them touches the view or the server under the test.
+        let mut rig = rig;
+        rig.daemon.shutdown();
         // The upkeep threads are gone, so the view can only age.
         wait_for("the view to go stale", || {
             !rig.daemon.shared.read_view().fresh(timing().fresh)
@@ -2115,7 +2131,9 @@ mod tests {
     fn a_hung_server_gives_unknown_at_the_deadline() {
         let rig = start_with(timing(), |_| {});
         view_ready(&rig);
-        rig.daemon.shared.stop();
+        // Stop and wait for the workers, so none of them touches the view or the server under the test.
+        let mut rig = rig;
+        rig.daemon.shutdown();
         wait_for("the view to go stale", || {
             !rig.daemon.shared.read_view().fresh(timing().fresh)
         });
@@ -2359,7 +2377,9 @@ mod tests {
         wait_for("mail to be reserved", || {
             rig.daemon.shared.read_view().mail.contains_key("me")
         });
-        rig.daemon.shared.stop();
+        // Stop and wait for the workers, so none of them touches the view or the server under the test.
+        let mut rig = rig;
+        rig.daemon.shutdown();
         let before = rig.server.calls.lock().unwrap().len();
         rig.server.down.store(true, Ordering::SeqCst);
         let taken = rig.daemon.handle(Request::TakeMail {
@@ -2386,7 +2406,9 @@ mod tests {
     #[test]
     fn take_mail_is_atomic_across_two_hundred_concurrent_rounds() {
         let rig = start_with(timing(), |_| {});
-        rig.daemon.shared.stop();
+        // Stop and wait for the workers, so none of them touches the view or the server under the test.
+        let mut rig = rig;
+        rig.daemon.shutdown();
         for id in 1..=200 {
             {
                 let mut view = rig.daemon.shared.write_view();
@@ -2441,7 +2463,9 @@ mod tests {
     #[test]
     fn a_mail_buffer_with_less_than_ten_seconds_of_lease_is_dropped() {
         let rig = start_with(timing(), |_| {});
-        rig.daemon.shared.stop();
+        // Stop and wait for the workers, so none of them touches the view or the server under the test.
+        let mut rig = rig;
+        rig.daemon.shutdown();
         let mut view = rig.daemon.shared.write_view();
         let reserved_at = Instant::now();
         view.unread.insert(
@@ -2480,7 +2504,9 @@ mod tests {
     #[test]
     fn upkeep_reserves_mail_for_each_session_even_if_another_session_fails() {
         let rig = start_with(timing(), |server| *server.unread.lock().unwrap() = 1);
-        rig.daemon.shared.stop();
+        // Stop and wait for the workers, so none of them touches the view or the server under the test.
+        let mut rig = rig;
+        rig.daemon.shutdown();
         rig.daemon.shared.hear("fails");
         rig.daemon.shared.hear("works");
         rig.daemon.shared.store_unread("fails", 0, 1);
@@ -2560,20 +2586,33 @@ mod tests {
             dirty[0].body.as_ref().unwrap()["paths"][0]["owner_session"],
             "me"
         );
-        wait_for("both batches", || {
-            rig.server.writes_to("/activity").len() == 2
+        // A busy machine may flush between src/b and src/c, so the later writes can arrive in one batch or
+        // two: what must hold is that every claimed path arrives, from this session, and nothing unclaimed.
+        let later = || -> String {
+            rig.server.writes_to("/activity")[1..]
+                .iter()
+                .map(|batch| batch.body.as_ref().unwrap()["paths"].to_string())
+                .collect()
+        };
+        wait_for("the later batches", || {
+            rig.server.writes_to("/activity").len() >= 2
+                && later().contains("src/b")
+                && later().contains("src/c")
         });
         let batches = rig.server.writes_to("/activity");
         assert_eq!(batches[0].body.as_ref().unwrap()["paths"], json!(["src/a"]));
-        // Activity keeps counting repeated writes of src/a, which only the dirty report folds.
-        let second = batches[1].body.as_ref().unwrap()["paths"].to_string();
         assert!(
-            second.contains("src/b") && second.contains("src/c"),
-            "{second}"
+            batches.len() <= 3,
+            "writes are batched, not sent one by one"
         );
-        assert_eq!(batches[1].session, "me");
+        assert!(batches.iter().all(|batch| batch.session == "me"));
+        assert!(!later().contains("elsewhere"), "{}", later());
+        // Activity keeps counting repeated writes of src/a, which only the dirty report folds.
+        let before = batches.len();
         rig.daemon.handle(write("src/a"));
-        thread::sleep(Duration::from_millis(30));
+        wait_for("the next activity batch", || {
+            rig.server.writes_to("/activity").len() == before + 1
+        });
         assert_eq!(rig.server.writes_to("/zones/dirty").len(), 3);
     }
 

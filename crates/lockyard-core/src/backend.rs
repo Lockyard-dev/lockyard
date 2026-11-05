@@ -226,6 +226,10 @@ pub trait Backend {
     fn freeze(&mut self, _agent: &str, _freeze: &Freeze) -> Result<Value> {
         cloud("freeze")
     }
+    /// Frees a session name bound to an old token, e.g. after the token was reissued (D-3124).
+    fn release_session(&mut self, _agent: &str, _session: &str) -> Result<Value> {
+        cloud("session release")
+    }
     fn import_zones(&mut self, _agent: &str, _catalog: &Value) -> Result<Value> {
         cloud("import")
     }

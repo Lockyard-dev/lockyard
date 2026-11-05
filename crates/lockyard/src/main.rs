@@ -806,6 +806,9 @@ enum CloudCommand {
         #[arg(long, default_value = "")]
         reason: String,
     },
+    /// Free a session name still bound to an old token, e.g. after the agent's token was reissued.
+    /// Needs the owner or lead role. A name also frees itself after seven silent days with no mail left.
+    ReleaseSession { session: String },
     /// Store the zone catalog from a JSON file. Needs the importer role.
     ImportZones { file: PathBuf },
     /// Import threads, the board and tasks from a JSON file. Needs the importer role.
@@ -1877,6 +1880,7 @@ fn run_cloud(mut opened: Opened, command: CloudCommand, agent: Option<&String>) 
         CloudCommand::Freeze { state, reason } => {
             backend.freeze(&agent, &Freeze { on: state, reason })?
         }
+        CloudCommand::ReleaseSession { session } => backend.release_session(&agent, &session)?,
         CloudCommand::ImportZones { file } => backend.import_zones(&agent, &read_json(&file)?)?,
         CloudCommand::ImportBus { file } => backend.import_bus(&agent, &read_json(&file)?)?,
         CloudCommand::ImportRegistry { file } => {

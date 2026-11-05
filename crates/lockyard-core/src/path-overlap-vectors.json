@@ -1,0 +1,20 @@
+{
+  "about": "Shared zone-path vectors (D-3124). The Rust client and the C# server must agree on every row. Default rule: NFC, case ignored. Keep byte-identical with cloud/contracts/path-overlap-vectors.json.",
+  "normalize": [
+    { "raw": "src/café.rs", "stored": "src/café.rs" },
+    { "raw": "src/Auth", "stored": "src/Auth" },
+    { "raw": "Docs/CAFÉ", "stored": "Docs/CAFÉ" }
+  ],
+  "overlap": [
+    { "a": "src/Auth", "b": "src/auth", "overlap": true },
+    { "a": "src/Auth", "b": "SRC/AUTH/login.rs", "overlap": true },
+    { "a": "SRC", "b": "src/file.rs", "overlap": true },
+    { "a": "src/É", "b": "src/é/file", "overlap": true },
+    { "a": "src/café", "b": "src/CAFÉ/a.rs", "overlap": true },
+    { "a": "src/café", "b": "src/café/a.rs", "overlap": true },
+    { "a": ".", "b": "anything", "overlap": true },
+    { "a": "src", "b": "src2/a.rs", "overlap": false },
+    { "a": "src/a", "b": "src/b", "overlap": false },
+    { "a": "src/Auth", "b": "src/Authz", "overlap": false }
+  ]
+}

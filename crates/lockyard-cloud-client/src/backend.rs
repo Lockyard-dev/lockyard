@@ -1094,6 +1094,14 @@ impl<T: Transport> Backend for CloudBackend<T> {
         self.post(agent, "/api/v1/admin/freeze".into(), freeze)
     }
 
+    fn release_session(&mut self, agent: &str, session: &str) -> Result<Value> {
+        self.post(
+            agent,
+            format!("/api/v1/admin/sessions/{}/release", encode(session)),
+            &json!({}),
+        )
+    }
+
     fn import_zones(&mut self, agent: &str, catalog: &Value) -> Result<Value> {
         self.post(
             agent,
@@ -1895,6 +1903,14 @@ mod tests {
         };
         assert!(matches!(cloud.events(&query), Err(Error::Invalid(_))));
         assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn release_session_posts_to_the_encoded_name() {
+        let (server, mut cloud) = backend(vec![json!({"session": "a/b", "released": true})]);
+        let answer = cloud.release_session("me", "a/b").unwrap();
+        assert_eq!(answer["released"], json!(true));
+        sees(&server, &[("POST", "/api/v1/admin/sessions/a%2Fb/release")]);
     }
 
     #[test]

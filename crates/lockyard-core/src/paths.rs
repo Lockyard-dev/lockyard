@@ -6,7 +6,6 @@
 use crate::store::DIR_NAME;
 use crate::{Error, Result};
 use std::path::{Component, Path, PathBuf};
-#[cfg(target_os = "macos")]
 use unicode_normalization::UnicodeNormalization;
 
 /// The project root in zone form.
@@ -34,10 +33,9 @@ impl ZonePath {
             let Some(part) = component.as_os_str().to_str() else {
                 return Err(Error::Invalid(format!("path is not UTF-8: {raw:?}")));
             };
-            #[cfg(target_os = "macos")]
-            parts.push(part.nfd().collect::<String>().to_lowercase());
-            #[cfg(not(target_os = "macos"))]
-            parts.push(part.to_string());
+            // One stored form on every OS and on the server (D-3124): NFC, original case kept.
+            // Case is folded only when comparing, so a Mac and a Linux client name `src/Auth` alike.
+            parts.push(part.nfc().collect::<String>());
         }
         if parts.is_empty() {
             return Ok(Some(Self(ROOT.into())));
@@ -57,27 +55,26 @@ impl ZonePath {
 
     /// True when one path is the other or contains it.
     pub fn overlaps(&self, other: &Self) -> bool {
-        overlaps(
-            self.as_str(),
-            other.as_str(),
-            cfg!(any(target_os = "macos", windows)),
-        )
+        // Always case-insensitive, on every OS, like the server's default (D-3124): one workspace can mix
+        // a Mac with a Linux host, and a lock that misses `src/Auth` vs `src/auth` is worse than a spare
+        // conflict between two names that differ only in case.
+        overlaps(self.as_str(), other.as_str(), true)
     }
 }
 
-fn overlaps(a: &str, b: &str, fold_ascii_case: bool) -> bool {
-    if fold_ascii_case {
-        #[cfg(target_os = "macos")]
-        let a = a.nfd().collect::<String>().to_lowercase();
-        #[cfg(not(target_os = "macos"))]
-        let a = a.to_lowercase();
-        #[cfg(target_os = "macos")]
-        let b = b.nfd().collect::<String>().to_lowercase();
-        #[cfg(not(target_os = "macos"))]
-        let b = b.to_lowercase();
-        return overlaps_exact(&a, &b);
+fn overlaps(a: &str, b: &str, fold_case: bool) -> bool {
+    overlaps_exact(&comparable(a, fold_case), &comparable(b, fold_case))
+}
+
+/// The form two zones are compared in: NFC, and lower case when the file system ignores case.
+/// NFC here also matches zones stored by older clients in NFD.
+fn comparable(path: &str, fold_case: bool) -> String {
+    let composed = path.nfc().collect::<String>();
+    if fold_case {
+        composed.to_lowercase()
+    } else {
+        composed
     }
-    overlaps_exact(a, b)
 }
 
 fn overlaps_exact(a: &str, b: &str) -> bool {
@@ -212,7 +209,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(composed, decomposed);
-        assert_eq!(composed, case_alias);
+        assert!(composed.overlaps(&case_alias));
+    }
+
+    #[test]
+    fn a_zone_is_stored_in_nfc_with_its_case_kept() {
+        let (_dir, root) = project();
+        assert_eq!(
+            zone(&root, &root, "src/Cafe\u{0301}.rs"),
+            "src/Caf\u{00e9}.rs"
+        );
+        assert_eq!(zone(&root, &root, "src/Auth"), "src/Auth");
+    }
+
+    #[test]
+    fn shared_vectors_agree_with_the_server() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("path-overlap-vectors.json")).unwrap();
+        let (_dir, root) = project();
+        for row in vectors["normalize"].as_array().unwrap() {
+            let (raw, stored) = (
+                row["raw"].as_str().unwrap(),
+                row["stored"].as_str().unwrap(),
+            );
+            assert_eq!(zone(&root, &root, raw), stored, "normalize {raw:?}");
+        }
+        for row in vectors["overlap"].as_array().unwrap() {
+            let (a, b) = (row["a"].as_str().unwrap(), row["b"].as_str().unwrap());
+            let expected = row["overlap"].as_bool().unwrap();
+            let path = |text: &str| ZonePath::stored(text.into());
+            assert_eq!(path(a).overlaps(&path(b)), expected, "{a:?} vs {b:?}");
+            assert_eq!(path(b).overlaps(&path(a)), expected, "{b:?} vs {a:?}");
+        }
+    }
+
+    #[test]
+    fn overlap_matches_zones_stored_in_nfd_by_older_clients() {
+        assert!(overlaps("src/cafe\u{0301}", "src/caf\u{00e9}/a.rs", false));
+        assert!(overlaps("src/cafe\u{0301}", "src/CAF\u{00c9}/a.rs", true));
     }
 
     #[test]
