@@ -304,19 +304,54 @@ impl Store {
     }
 
     /// Returns a submitted task to its assignee with a reason and a fresh lease.
-    pub fn reject_task(&mut self, agent: &str, id: i64, reason: &str, now: i64) -> Result<Task> {
+    pub fn reject_task(
+        &mut self,
+        agent: &str,
+        id: i64,
+        reason: &str,
+        evidence: &str,
+        now: i64,
+    ) -> Result<Task> {
         if reason.trim().is_empty() {
             return Err(Error::Invalid("rejecting a task needs a reason".into()));
         }
         self.touch(agent, now)?;
         let transaction = self.write()?;
         let task = load(&transaction, id)?;
-        require_reviewer(&task, agent)?;
-        transaction.execute(
-            "UPDATE tasks SET status = 'claimed', lease_until = ?1, updated_at = ?2 WHERE id = ?3",
-            params![now + DEFAULT_TTL_MINUTES * MINUTE_MS, now, id],
-        )?;
-        log(&transaction, id, agent, "reject", reason, now)?;
+        if task.assignee.as_deref() == Some(agent) {
+            return Err(Error::Denied(format!(
+                "only a reviewer other than the assignee {agent} can accept or reject T-{id}"
+            )));
+        }
+        if task.status == Status::Accepted {
+            if evidence.trim().is_empty() {
+                return Err(Error::Invalid(
+                    "revoking accepted work needs new evidence".into(),
+                ));
+            }
+            let previous = task.evidence.unwrap_or_default();
+            transaction.execute(
+                "UPDATE tasks SET status = 'claimed', evidence = ?1, lease_until = ?2, updated_at = ?3
+                 WHERE id = ?4",
+                params![evidence, now + DEFAULT_TTL_MINUTES * MINUTE_MS, now, id],
+            )?;
+            // The submit row still holds `previous`. This row records the reason and the new proof.
+            log(
+                &transaction,
+                id,
+                agent,
+                "reject",
+                &format!("{reason}\n{previous}\n{evidence}"),
+                now,
+            )?;
+        } else {
+            require_reviewer(&task, agent)?;
+            transaction.execute(
+                "UPDATE tasks SET status = 'claimed', lease_until = ?1, updated_at = ?2 WHERE id = ?3",
+                params![now + DEFAULT_TTL_MINUTES * MINUTE_MS, now, id],
+            )?;
+            log(&transaction, id, agent, "reject", reason, now)?;
+        }
         let task = load(&transaction, id)?;
         transaction.commit()?;
         Ok(task)
@@ -487,7 +522,7 @@ mod tests {
                 .to_string()
                 .contains("reviewer other than the assignee")
         );
-        let cannot_reject = store.reject_task("worker", id, "no", 3).unwrap_err();
+        let cannot_reject = store.reject_task("worker", id, "no", "", 3).unwrap_err();
         assert!(
             cannot_reject
                 .to_string()
@@ -539,7 +574,7 @@ mod tests {
     fn a_rejected_task_returns_to_its_assignee_with_a_lease_and_the_reason_on_record() {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
-        let task = store.reject_task("lead", id, "test is empty", 3).unwrap();
+        let task = store.reject_task("lead", id, "test is empty", "", 3).unwrap();
         assert_eq!(task.status, Status::Claimed);
         assert_eq!(task.assignee.as_deref(), Some("worker"));
         assert_eq!(task.lease_until, Some(3 + DEFAULT_TTL_MINUTES * MINUTE_MS));
@@ -557,7 +592,35 @@ mod tests {
     fn rejecting_needs_a_reason() {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
-        assert!(store.reject_task("lead", id, " ", 3).is_err());
+        assert!(store.reject_task("lead", id, " ", "", 3).is_err());
+    }
+
+    #[test]
+    fn accepted_work_can_be_revoked_with_a_reason_and_new_evidence() {
+        let (_dir, mut store) = test_store();
+        let id = task_in_review(&mut store);
+        store.accept_task("lead", id, "good", 3).unwrap();
+        assert!(store
+            .reject_task("lead", id, "empty delivery", "", 4)
+            .is_err());
+        assert!(store
+            .reject_task("worker", id, "empty delivery", "48bbf9a:src/Game.cs", 4)
+            .is_err());
+        let task = store
+            .reject_task("lead", id, "empty delivery", "48bbf9a:src/Game.cs", 4)
+            .unwrap();
+        assert_eq!(task.status, Status::Claimed);
+        assert_eq!(task.evidence.as_deref(), Some("48bbf9a:src/Game.cs"));
+        let notes: Vec<_> = store
+            .task_history(id)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.note)
+            .collect();
+        assert!(notes.iter().any(|note| note == "tests pass"));
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("empty delivery") && note.contains("48bbf9a:src/Game.cs")));
     }
 
     #[test]

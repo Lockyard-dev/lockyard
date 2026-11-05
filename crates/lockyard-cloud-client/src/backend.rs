@@ -353,6 +353,30 @@ fn validate_title(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// `<7-64 hex>:<relative/path>`. A bare object id is not a file in that commit.
+fn commit_names_file(value: &str) -> bool {
+    let Some((revision, path)) = value.split_once(':') else {
+        return false;
+    };
+    if !(7..=64).contains(&revision.len()) || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    if path.is_empty() || path.starts_with('/') || path.ends_with('/') || path.contains('\\') {
+        return false;
+    }
+    path.split('/')
+        .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn require_commit_file(target: &str, value: &str) -> Result<()> {
+    if target != "ci_passed" && !commit_names_file(value) {
+        return Err(Error::Invalid(
+            "commit evidence must name a file in git as <rev>:<path>".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_evidence(values: &[String]) -> Result<()> {
     if values.len() > MAX_EVIDENCE_COUNT {
         return Err(Error::Invalid(format!(
@@ -985,6 +1009,11 @@ impl<T: Transport> Backend for CloudBackend<T> {
                 "task target {target:?} needs evidence this client cannot provide; use code_accepted or ci_passed"
             )));
         }
+        if target != "ci_passed" {
+            if let Some(value) = spec.evidence.as_deref() {
+                require_commit_file(target, value)?;
+            }
+        }
         let evidence: Vec<Value> = spec
             .evidence
             .iter()
@@ -1054,6 +1083,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
         validate_evidence(&[evidence.to_string()])?;
         let item = self.item(agent, id)?;
         let target = item["target"].as_str().unwrap_or(DEFAULT_TARGET);
+        require_commit_file(target, evidence)?;
         let body = evidence_body(agent, target, evidence, now);
         let proved = self.item_step(agent, id, "evidence", body, &item);
         proved?;
@@ -1074,10 +1104,21 @@ impl<T: Transport> Backend for CloudBackend<T> {
         agent: &str,
         id: &str,
         reason: &str,
-        _now: i64,
+        evidence: &str,
+        now: i64,
     ) -> Result<tasks::Task> {
         let item = self.item(agent, id)?;
-        let body = json!({"to": "ready", "reason": reason_or(reason, "rejected")});
+        let mut body = json!({"to": "ready", "reason": reason_or(reason, "rejected")});
+        if item["status"].as_str() == Some("done") {
+            if evidence.trim().is_empty() {
+                return Err(Error::Invalid(
+                    "revoking accepted work needs new evidence".into(),
+                ));
+            }
+            let target = item["target"].as_str().unwrap_or(DEFAULT_TARGET);
+            require_commit_file(target, evidence)?;
+            body["evidence"] = evidence_body(agent, target, evidence, now);
+        }
         self.item_step(agent, id, "transition", body, &item)
     }
 
@@ -2227,6 +2268,12 @@ mod tests {
         assert_eq!(seen[0].header("x-lockyard-session"), Some("me"));
     }
 
+    fn item_target(status: &str, version: i64, target: &str) -> Value {
+        let mut value = item(status, version);
+        value["target"] = json!(target);
+        value
+    }
+
     fn item(status: &str, version: i64) -> Value {
         json!({
             "id": "G-SG-0012", "title": "t", "body": "b", "status": status, "priority": "P1", "version": version,
@@ -2534,6 +2581,45 @@ mod tests {
             seen[3].body,
             json!({"to": "review", "reason": "submitted for review", "expected_version": 4})
         );
+    }
+
+    #[test]
+    fn a_bare_commit_is_refused_before_accept_and_revoking_done_sends_the_new_file() {
+        let (server, mut cloud) = backend(vec![item_target("active", 3, "code_accepted")]);
+        assert!(matches!(
+            cloud.submit_task("me", "G-SG-0012", "25fb94b", 0),
+            Err(Error::Invalid(_))
+        ));
+        assert!(server.requests().iter().all(|call| call.method == "GET"));
+
+        let (server, mut cloud) = backend(vec![item_target("done", 7, "code_accepted")]);
+        assert!(cloud
+            .reject_task("me", "G-SG-0012", "empty commit", "", 0)
+            .is_err());
+        assert!(server.requests().iter().all(|call| call.method == "GET"));
+
+        let (server, mut cloud) = backend(vec![
+            item_target("done", 7, "code_accepted"),
+            item_target("ready", 8, "code_accepted"),
+        ]);
+        cloud
+            .reject_task(
+                "me",
+                "G-SG-0012",
+                "empty commit",
+                "48bbf9a:src/Game.cs",
+                0,
+            )
+            .unwrap();
+        let seen = server.requests();
+        let transition = seen
+            .iter()
+            .find(|call| call.method == "POST" && call.path.ends_with("/transition"))
+            .expect("revoke posts a transition");
+        assert_eq!(transition.body["to"], "ready");
+        assert_eq!(transition.body["reason"], "empty commit");
+        assert_eq!(transition.body["evidence"]["value"], "48bbf9a:src/Game.cs");
+        assert_eq!(transition.body["evidence"]["kind"], "commit");
     }
 
     #[test]

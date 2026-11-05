@@ -573,6 +573,9 @@ enum TaskCommand {
         id: String,
         #[arg(long)]
         reason: String,
+        /// Required when the work is already accepted. Appended; older proof stays in the history.
+        #[arg(long, default_value = "")]
+        evidence: String,
     },
     /// Cancel a task you wrote.
     Cancel {
@@ -1759,8 +1762,8 @@ fn run_task(mut opened: Opened, command: TaskCommand, agent: Option<&String>) ->
         TaskCommand::Accept { id, note } => {
             store.accept_task(&resolve_agent(agent)?, &id, &note, now)?
         }
-        TaskCommand::Reject { id, reason } => {
-            store.reject_task(&resolve_agent(agent)?, &id, &reason, now)?
+        TaskCommand::Reject { id, reason, evidence } => {
+            store.reject_task(&resolve_agent(agent)?, &id, &reason, &evidence, now)?
         }
         TaskCommand::Cancel { id, note } => {
             store.cancel_task(&resolve_agent(agent)?, &id, &note, now)?
@@ -3165,7 +3168,7 @@ mod tests {
         fn accept_task(&mut self, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
             unreachable!()
         }
-        fn reject_task(&mut self, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
+        fn reject_task(&mut self, _: &str, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
             unreachable!()
         }
         fn cancel_task(&mut self, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {

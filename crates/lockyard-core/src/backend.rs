@@ -208,8 +208,14 @@ pub trait Backend {
         now: i64,
     ) -> Result<tasks::Task>;
     fn accept_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task>;
-    fn reject_task(&mut self, agent: &str, id: &str, reason: &str, now: i64)
-    -> Result<tasks::Task>;
+    fn reject_task(
+        &mut self,
+        agent: &str,
+        id: &str,
+        reason: &str,
+        evidence: &str,
+        now: i64,
+    ) -> Result<tasks::Task>;
     fn cancel_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task>;
     fn batch_close_tasks(
         &mut self,
@@ -643,9 +649,10 @@ impl Backend for Store {
         agent: &str,
         id: &str,
         reason: &str,
+        evidence: &str,
         now: i64,
     ) -> Result<tasks::Task> {
-        Store::reject_task(self, agent, task_number(id)?, reason, now)
+        Store::reject_task(self, agent, task_number(id)?, reason, evidence, now)
     }
 
     fn cancel_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task> {

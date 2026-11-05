@@ -221,6 +221,11 @@ impl Client {
             self.instructions(site).display(),
             self.block().trim_end()
         ));
+        if self == Self::Cursor {
+            text.push_str(
+                "\n\nCursor does not start this MCP server until you enable lockyard in Settings → MCP (the approval card). Reload without that approval leaves it off. Lockyard cannot approve itself.",
+            );
+        }
         text.push_str("\n\nSet LOCKYARD_AGENT to a unique name for each agent.");
         text
     }
@@ -569,18 +574,24 @@ pub fn inspect(client: Client, site: &Site) -> Result<Vec<Finding>> {
     } else {
         mcp.path().to_path_buf()
     };
+    let mut detail = format!(
+        "{} {}",
+        registered_path.display(),
+        if registered {
+            "registers lockyard"
+        } else {
+            "has no lockyard entry; run `lockyard setup`"
+        }
+    );
+    if client == Client::Cursor {
+        detail.push_str(
+            " Cursor starts an MCP server only after you enable it in Settings → MCP. Reload without that approval does not start it; Lockyard cannot approve itself.",
+        );
+    }
     findings.push(Finding::new(
         format!("{} MCP server", client.label()),
         registered,
-        format!(
-            "{} {}",
-            registered_path.display(),
-            if registered {
-                "registers lockyard"
-            } else {
-                "has no lockyard entry; run `lockyard setup`"
-            }
-        ),
+        detail,
     ));
     if let Some(path) = client.hook(site) {
         let text = read(&path)?.unwrap_or_default();

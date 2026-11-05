@@ -545,8 +545,8 @@ fn full_tools() -> Vec<Value> {
         ),
         tool_def(
             "task_reject",
-            "Return submitted work with a reason",
-            json!({"id": text, "reason": text}),
+            "Return submitted work with a reason. Accepted work also needs evidence; it is appended.",
+            json!({"id": text, "reason": text, "evidence": text}),
             &["id", "reason"],
         ),
         tool_def(
@@ -1409,6 +1409,7 @@ fn run_tool(
                     me()?,
                     &args.task_id()?,
                     args.text("reason")?,
+                    args.optional_text("evidence")?,
                     now,
                 )?),
                 "cancel" | "close" => encode(&backend.cancel_task(
@@ -1869,10 +1870,11 @@ fn run_tool(
         }
         "task_reject" => {
             let reason = args.text("reason")?;
+            let evidence = args.optional_text("evidence")?;
             encode(
                 &opened
                     .backend
-                    .reject_task(me()?, &args.task_id()?, reason, now)?,
+                    .reject_task(me()?, &args.task_id()?, reason, evidence, now)?,
             )
         }
         "task_cancel" => {

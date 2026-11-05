@@ -358,6 +358,18 @@ fn detection_answers_from_folders_and_from_the_search_path() {
 }
 
 #[test]
+fn cursor_doctor_says_the_server_stays_off_until_it_is_approved() {
+    let (_dir, site) = site();
+    let finding = &inspect(Client::Cursor, &site).unwrap()[0];
+    assert!(
+        finding.detail.contains("Settings → MCP"),
+        "{}",
+        finding.detail
+    );
+    assert!(!finding.ok);
+}
+
+#[test]
 fn inspect_reports_each_part_before_and_after_a_run() {
     let (_dir, site) = site();
     let before = inspect(Client::Claude, &site).unwrap();
@@ -403,6 +415,12 @@ fn the_printed_snippet_names_the_same_files_the_run_writes() {
             assert!(
                 snippet.contains("No blocking pre-edit hook"),
                 "{client} must say plainly that edits are not blocked"
+            );
+        }
+        if client == Client::Cursor {
+            assert!(
+                snippet.contains("Settings → MCP"),
+                "cursor snippet must say that reload does not start an unapproved server"
             );
         }
     }
