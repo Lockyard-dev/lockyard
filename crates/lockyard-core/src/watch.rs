@@ -227,6 +227,23 @@ mod tests {
         vec![dir.to_path_buf()]
     }
 
+    /// A controlled, silent event source: native watchers may emit startup events even when no
+    /// test writes a file. Keep the sender alive so timer tests exercise recv_timeout, rather than
+    /// the disconnected-backend fallback. Native writes are covered by the tests below.
+    fn no_event_source(reconcile: Duration) -> (Watcher, std::sync::mpsc::Sender<Vec<PathBuf>>) {
+        let (sender, events) = channel();
+        (
+            Watcher {
+                events,
+                _inner: None,
+                backend: Backend::None,
+                reconcile,
+                next_reconcile: Instant::now() + reconcile,
+            },
+            sender,
+        )
+    }
+
     #[test]
     fn a_write_is_reported_before_the_reconcile_interval() {
         let dir = tempfile::tempdir().unwrap();
@@ -264,8 +281,7 @@ mod tests {
 
     #[test]
     fn the_reconcile_arrives_with_no_file_system_event_at_all() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut watcher = Watcher::new(&roots(dir.path()), Duration::from_millis(50));
+        let (mut watcher, _source) = no_event_source(Duration::from_millis(50));
         assert_eq!(watcher.wait(Duration::from_secs(5)), Tick::Reconcile);
         // And it keeps coming, so a long-running monitor never stops checking.
         assert_eq!(watcher.wait(Duration::from_secs(5)), Tick::Reconcile);
@@ -273,8 +289,7 @@ mod tests {
 
     #[test]
     fn a_deadline_shorter_than_the_interval_returns_idle() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut watcher = Watcher::new(&roots(dir.path()), Duration::from_secs(600));
+        let (mut watcher, _source) = no_event_source(Duration::from_secs(600));
         let started = Instant::now();
         assert_eq!(watcher.wait(Duration::from_millis(50)), Tick::Idle);
         assert!(started.elapsed() < Duration::from_secs(2));
