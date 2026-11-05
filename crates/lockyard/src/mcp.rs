@@ -576,7 +576,7 @@ fn full_tools() -> Vec<Value> {
         ),
         tool_def(
             "board_set",
-            "Set a board value",
+            "Set a board value (requires the lead or owner role in cloud mode)",
             json!({"key": text, "value": text, "zone": text, "ttl": int}),
             &["key", "value"],
         ),
@@ -588,7 +588,7 @@ fn full_tools() -> Vec<Value> {
         ),
         tool_def(
             "board_remove",
-            "Remove a board value",
+            "Remove a board value (requires the lead or owner role in cloud mode)",
             json!({"key": text}),
             &["key"],
         ),
@@ -2153,6 +2153,22 @@ mod tests {
         assert!(text(&call(&dir, "a", "board_get", json!({"key": "k"}))).contains("\"v\""));
         call(&dir, "a", "presence_beat", json!({}));
         assert!(text(&call(&dir, "a", "presence", json!({}))).contains("mcp"));
+    }
+
+    #[test]
+    fn board_write_tool_descriptions_name_the_required_cloud_roles() {
+        for name in ["board_set", "board_remove"] {
+            let tool = full_tools()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert!(
+                tool["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("lead or owner")
+            );
+        }
     }
 
     #[test]
