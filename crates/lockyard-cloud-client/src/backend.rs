@@ -426,6 +426,27 @@ fn task_status(status: &str) -> tasks::Status {
     }
 }
 
+fn priority_rank(priority: Option<&str>) -> u8 {
+    match priority.unwrap_or_default().to_ascii_uppercase().as_str() {
+        "P0" => 0,
+        "P1" => 1,
+        "P2" => 2,
+        "P3" => 3,
+        _ => 4,
+    }
+}
+
+fn stage_rank(stage: Option<&str>) -> u8 {
+    match stage.unwrap_or_default() {
+        "ready" => 0,
+        "intake" => 1,
+        "active" => 2,
+        "blocked" => 3,
+        "review" => 4,
+        _ => 5,
+    }
+}
+
 /// A backlog item in the shape of a task. Open covers `ready`, `blocked` and `intake`.
 fn task_from(item: &Value) -> Result<tasks::Task> {
     let id = text(item, "id");
@@ -465,6 +486,28 @@ fn task_from(item: &Value) -> Result<tasks::Task> {
             .get("priority")
             .and_then(Value::as_str)
             .map(str::to_string),
+        acceptance: item
+            .get("acceptance")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        stage: item
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        target: item
+            .get("target")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        links: item
+            .get("links")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        registry_evidence: item
+            .get("evidence")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
     })
 }
 
@@ -869,6 +912,36 @@ impl<T: Transport> Backend for CloudBackend<T> {
         Ok(found)
     }
 
+    fn ready_tasks(&self, area: Option<&str>) -> Result<Vec<tasks::Task>> {
+        let tail = query(&[
+            ("area", area.map(str::to_string)),
+            ("limit", Some("100".into())),
+        ]);
+        let value = self.get(&self.session, format!("/api/v1/registry/ready{tail}"))?;
+        let rows: Vec<Value> = list(value, &["items", "tasks"])?;
+        let mut found: Vec<tasks::Task> = rows.iter().map(task_from).collect::<Result<_>>()?;
+        found.sort_by(|a, b| {
+            priority_rank(a.priority.as_deref())
+                .cmp(&priority_rank(b.priority.as_deref()))
+                .then_with(|| stage_rank(a.stage.as_deref()).cmp(&stage_rank(b.stage.as_deref())))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(found)
+    }
+
+    fn block_task(
+        &mut self,
+        agent: &str,
+        id: &str,
+        blocked: bool,
+        reason: &str,
+        _now: i64,
+    ) -> Result<tasks::Task> {
+        let item = self.item(agent, id)?;
+        let body = json!({"to": if blocked {"blocked"} else {"ready"}, "reason": reason_or(reason, if blocked {"blocked"} else {"unblocked"})});
+        self.item_step(agent, id, "transition", body, &item)
+    }
+
     fn task(&self, id: &str) -> Result<tasks::Task> {
         task_from(&self.item(&self.session, id)?)
     }
@@ -1007,6 +1080,76 @@ impl<T: Transport> Backend for CloudBackend<T> {
         self.item_step(agent, id, "transition", body, &item)
     }
 
+    fn batch_close_tasks(
+        &mut self,
+        agent: &str,
+        ids: &[String],
+        evidence: &str,
+        now: i64,
+    ) -> Result<Value> {
+        if ids.is_empty() || ids.len() > 100 {
+            return Err(Error::Invalid(
+                "batch close requires 1 to 100 task ids".into(),
+            ));
+        }
+        let mut results = Vec::with_capacity(ids.len());
+        let mut pending = Vec::new();
+        let mut targets = Vec::new();
+        for id in ids {
+            match self.task(id) {
+                Ok(task)
+                    if matches!(
+                        task.status,
+                        tasks::Status::Accepted | tasks::Status::Cancelled
+                    ) =>
+                {
+                    results.push(json!({"id": id, "changed": false, "error": null, "item": task}));
+                }
+                Ok(task) => {
+                    targets.push(task.target);
+                    pending.push(id.clone());
+                }
+                Err(error) => results.push(
+                    json!({"id": id, "changed": false, "error": error.to_string(), "item": null}),
+                ),
+            }
+        }
+        if pending.is_empty() {
+            return Ok(json!({"results": results}));
+        }
+        let evidence_kind = if targets
+            .iter()
+            .all(|target| target.as_deref() == Some("ci_passed"))
+        {
+            "ci_run"
+        } else {
+            "commit"
+        };
+        let payload = json!({
+            "ids": pending,
+            "to": "done",
+            "resolution": "completed",
+            "reason": reason_or(evidence, "owner decision"),
+            "evidence": {
+                "kind": evidence_kind,
+                "environment": "local",
+                "value": evidence,
+                "observed_at": rfc3339(now),
+                "verifier": agent,
+                "expected_version": null
+            }
+        });
+        let response = self.post(agent, format!("{ITEMS}/batch-transition"), &payload)?;
+        results.extend(
+            response
+                .get("results")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        Ok(json!({"results": results}))
+    }
+
     fn board_set(&mut self, agent: &str, write: &BoardWrite, _now: i64) -> Result<BoardEntry> {
         let mut write = write.clone();
         write.ttl_minutes.get_or_insert(DEFAULT_BOARD_MINUTES);
@@ -1137,7 +1280,60 @@ impl<T: Transport> Backend for CloudBackend<T> {
 
     fn registry_import(&mut self, agent: &str, dump: &Value) -> Result<Value> {
         validate_registry_import(dump)?;
-        self.post(agent, "/api/v1/registry/import".into(), dump)
+        const CHUNK_BYTES: usize = 900 * 1024;
+        let Some(items) = dump.get("items").and_then(Value::as_array) else {
+            return self.post(agent, "/api/v1/registry/import".into(), dump);
+        };
+        if serde_json::to_vec(dump).map_or(0, |bytes| bytes.len()) <= CHUNK_BYTES {
+            return self.post(agent, "/api/v1/registry/import".into(), dump);
+        }
+        let mut chunks: Vec<Vec<Value>> = Vec::new();
+        let mut current = Vec::new();
+        let mut size = 32usize;
+        for item in items {
+            let item_size = serde_json::to_vec(item)
+                .map_err(|error| Error::Invalid(error.to_string()))?
+                .len();
+            if !current.is_empty() && size + item_size > CHUNK_BYTES {
+                chunks.push(std::mem::take(&mut current));
+                size = 32;
+            }
+            current.push(item.clone());
+            size += item_size;
+        }
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+        let mut results = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let mut payload = dump.clone();
+            payload["items"] = json!(chunk);
+            results.push(self.post(agent, "/api/v1/registry/import".into(), &payload)?);
+        }
+        Ok(json!({"chunks": results.len(), "results": results}))
+    }
+
+    fn area_list(&self, agent: &str) -> Result<Value> {
+        self.get(agent, AREAS.into())
+    }
+
+    fn area_create(&mut self, agent: &str, request: &Value) -> Result<Value> {
+        self.post(agent, AREAS.into(), request)
+    }
+
+    fn area_update(&mut self, agent: &str, key: &str, request: &Value) -> Result<Value> {
+        let areas: Vec<Value> = list(self.get(agent, AREAS.into())?, &["areas", "items"])?;
+        let area = areas
+            .iter()
+            .find(|area| text(area, "key").eq_ignore_ascii_case(key))
+            .ok_or_else(|| Error::NotFound(format!("no area {key:?}")))?;
+        let body = json!({
+            "key": key,
+            "name": request.get("name").and_then(Value::as_str).unwrap_or_else(|| text(area, "name")),
+            "prefix": request.get("prefix").and_then(Value::as_str).unwrap_or_else(|| text(area, "prefix")),
+            "pad": request.get("pad").and_then(Value::as_u64).unwrap_or_else(|| area.get("pad").and_then(Value::as_u64).unwrap_or(4)),
+        });
+        self.post(agent, AREAS.into(), &body)
     }
 
     fn tokens(&self) -> Result<Value> {
@@ -2028,6 +2224,109 @@ mod tests {
             "assignment": {"executor": "token:ab:s:1", "lease_expires_at": "2026-11-02T12:00:00+00:00"},
             "evidence": [{"value": "run 5"}],
         })
+    }
+
+    #[test]
+    fn ready_registry_listing_filters_by_area_and_preserves_details_in_priority_stage_order() {
+        let mut ready = item("ready", 1);
+        ready["acceptance"] = json!("tests pass");
+        ready["links"] = json!([{"kind": "blocks", "to": "FE-0002"}]);
+        ready["evidence"] = json!([{"kind": "ci_run", "value": "green"}]);
+        let (server, cloud) = backend(vec![json!([ready])]);
+        let tasks = cloud.ready_tasks(Some("flexengine")).unwrap();
+        assert_eq!(tasks[0].acceptance.as_deref(), Some("tests pass"));
+        assert_eq!(tasks[0].links[0]["to"], "FE-0002");
+        assert_eq!(tasks[0].registry_evidence[0]["value"], "green");
+        sees(
+            &server,
+            &[("GET", "/api/v1/registry/ready?area=flexengine&limit=100")],
+        );
+    }
+
+    #[test]
+    fn registry_batch_close_uses_the_server_batch_route_and_shared_evidence() {
+        let (server, mut cloud) = backend(vec![
+            item("ready", 1),
+            item("ready", 1),
+            json!({"results": [{"id": "FE-1", "changed": true}, {"id": "FE-2", "changed": true}]}),
+        ]);
+        cloud
+            .batch_close_tasks("me", &["FE-1".into(), "FE-2".into()], "owner decision", 0)
+            .unwrap();
+        let seen = sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/items/FE-1"),
+                ("GET", "/api/v1/registry/items/FE-2"),
+                ("POST", "/api/v1/registry/items/batch-transition"),
+            ],
+        );
+        assert_eq!(seen[2].body["ids"], json!(["FE-1", "FE-2"]));
+        assert_eq!(seen[2].body["to"], "done");
+        assert_eq!(seen[2].body["evidence"]["value"], "owner decision");
+        assert_eq!(seen[2].body["evidence"]["expected_version"], Value::Null);
+    }
+
+    #[test]
+    fn repeating_a_registry_batch_close_reports_final_items_without_a_second_transition() {
+        let mut done = item("done", 5);
+        done["id"] = json!("FE-1");
+        let (server, mut cloud) = backend(vec![done]);
+        let result = cloud
+            .batch_close_tasks("me", &["FE-1".into()], "already completed", 0)
+            .unwrap();
+        assert_eq!(result["results"][0]["changed"], false);
+        assert_eq!(result["results"][0]["id"], "FE-1");
+        sees(&server, &[("GET", "/api/v1/registry/items/FE-1")]);
+    }
+
+    #[test]
+    fn registry_block_and_unblock_use_versioned_transition_routes() {
+        let (server, mut cloud) = backend(vec![
+            item("active", 3),
+            item("blocked", 4),
+            item("blocked", 4),
+            item("ready", 5),
+        ]);
+        cloud
+            .block_task("me", "G-SG-0012", true, "waiting", 0)
+            .unwrap();
+        cloud
+            .block_task("me", "G-SG-0012", false, "resolved", 0)
+            .unwrap();
+        let seen = sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/items/G-SG-0012"),
+                ("POST", "/api/v1/registry/items/G-SG-0012/transition"),
+                ("GET", "/api/v1/registry/items/G-SG-0012"),
+                ("POST", "/api/v1/registry/items/G-SG-0012/transition"),
+            ],
+        );
+        assert_eq!(seen[1].body["to"], "blocked");
+        assert_eq!(seen[1].body["expected_version"], 3);
+        assert_eq!(seen[3].body["to"], "ready");
+        assert_eq!(seen[3].body["expected_version"], 4);
+    }
+
+    #[test]
+    fn area_update_uses_the_existing_post_upsert_route() {
+        let (server, mut cloud) = backend(vec![
+            json!([{"id": "a1", "key": "flexengine", "name": "Flex", "prefix": "FE", "pad": 4}]),
+            json!({"key": "flexengine", "name": "FLEX Engine", "prefix": "FE", "pad": 4}),
+        ]);
+        cloud
+            .area_update("me", "flexengine", &json!({"name": "FLEX Engine"}))
+            .unwrap();
+        let seen = sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/areas"),
+                ("POST", "/api/v1/registry/areas"),
+            ],
+        );
+        assert_eq!(seen[1].body["name"], "FLEX Engine");
+        assert_eq!(seen[1].body["prefix"], "FE");
     }
 
     #[test]

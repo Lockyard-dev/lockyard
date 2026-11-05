@@ -486,7 +486,13 @@ fn mcp_stdio_initializes_lists_claims_and_reports_conflicts_and_parse_errors() {
             "update",
             "handover",
             "finish_work",
-            "status"
+            "status",
+            "tasks",
+            "task_bulk",
+            "registry_import",
+            "area_list",
+            "area_create",
+            "area_update"
         ],
         "the default surface is the short one"
     );
@@ -535,7 +541,10 @@ fn the_full_tool_surface_is_a_flag_or_an_environment_variable_away() {
         &[("LOCKYARD_MCP_TOOLS", "full")],
         list,
     ));
-    assert_eq!(compact, 6);
+    assert_eq!(
+        compact, 12,
+        "the compact registry surface intentionally adds six tools"
+    );
     assert!(by_flag > 50, "the full surface keeps every tool: {by_flag}");
     assert_eq!(by_flag, by_env, "the flag and the variable agree");
     // The flag wins, so a client can ask for the short surface on a machine set to full.
@@ -547,7 +556,7 @@ fn the_full_tool_surface_is_a_flag_or_an_environment_variable_away() {
             &[("LOCKYARD_MCP_TOOLS", "full")],
             list,
         )),
-        6
+        12
     );
     let bad = mcp_with(dir.path(), "a", &["--tools", "nope"], &[], list);
     assert!(!bad.status.success());

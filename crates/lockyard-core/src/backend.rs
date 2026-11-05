@@ -172,6 +172,19 @@ pub trait Backend {
 
     fn tasks(&self, status: Option<tasks::Status>, include_final: bool)
     -> Result<Vec<tasks::Task>>;
+    fn ready_tasks(&self, _area: Option<&str>) -> Result<Vec<tasks::Task>> {
+        self.tasks(Some(tasks::Status::Open), false)
+    }
+    fn block_task(
+        &mut self,
+        _agent: &str,
+        _id: &str,
+        _blocked: bool,
+        _reason: &str,
+        _now: i64,
+    ) -> Result<tasks::Task> {
+        cloud("registry block")
+    }
     fn task(&self, id: &str) -> Result<tasks::Task>;
     fn task_history(&self, id: &str) -> Result<Vec<tasks::TaskEvent>>;
     fn add_task(&mut self, author: &str, spec: &tasks::TaskSpec, now: i64) -> Result<tasks::Task>;
@@ -198,6 +211,36 @@ pub trait Backend {
     fn reject_task(&mut self, agent: &str, id: &str, reason: &str, now: i64)
     -> Result<tasks::Task>;
     fn cancel_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task>;
+    fn batch_close_tasks(
+        &mut self,
+        agent: &str,
+        ids: &[String],
+        evidence: &str,
+        now: i64,
+    ) -> Result<Value> {
+        let mut results = Vec::with_capacity(ids.len());
+        for id in ids {
+            let mut changed = true;
+            let result = match self.task(id) {
+                Ok(task)
+                    if task.status == tasks::Status::Cancelled
+                        || task.status == tasks::Status::Accepted =>
+                {
+                    changed = false;
+                    Ok(task)
+                }
+                Ok(_) => self.cancel_task(agent, id, evidence, now),
+                Err(error) => Err(error),
+            };
+            results.push(match result {
+                Ok(task) => serde_json::json!({"id": id, "changed": changed, "item": task}),
+                Err(error) => {
+                    serde_json::json!({"id": id, "changed": false, "error": error.to_string()})
+                }
+            });
+        }
+        Ok(serde_json::json!({"results": results}))
+    }
 
     fn board_set(&mut self, agent: &str, write: &BoardWrite, now: i64) -> Result<BoardEntry>;
     fn board_get(&self, key: &str, now: i64) -> Result<Option<BoardEntry>>;
@@ -247,6 +290,15 @@ pub trait Backend {
     }
     fn registry_import(&mut self, _agent: &str, _dump: &Value) -> Result<Value> {
         cloud("registry import")
+    }
+    fn area_list(&self, _agent: &str) -> Result<Value> {
+        cloud("registry areas")
+    }
+    fn area_create(&mut self, _agent: &str, _request: &Value) -> Result<Value> {
+        cloud("registry areas")
+    }
+    fn area_update(&mut self, _agent: &str, _key: &str, _request: &Value) -> Result<Value> {
+        cloud("registry areas")
     }
     fn tokens(&self) -> Result<Value> {
         cloud("cloud token")

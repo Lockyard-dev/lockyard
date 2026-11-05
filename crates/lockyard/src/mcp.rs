@@ -26,6 +26,15 @@ const DEFAULT_QUEUE_MINUTES: i64 = 60;
 const DEFAULT_WAIT_SECONDS: i64 = 60;
 const DEFAULT_ACTIVE_SECONDS: i64 = 900;
 
+fn executor_evidence(evidence: &str) -> String {
+    match std::env::var("LOCKYARD_ON_BEHALF") {
+        Ok(lead_task) if !lead_task.trim().is_empty() => {
+            format!("On behalf of {}: {evidence}", lead_task.trim())
+        }
+        _ => evidence.to_string(),
+    }
+}
+
 /// How many tools the server lists.
 ///
 /// A model pays for every tool description on every turn, so the default is six composites that
@@ -214,6 +223,37 @@ fn compact_tools() -> Vec<Value> {
             json!({}),
             &[],
         ),
+        tool_def(
+            "tasks",
+            "Compact registry workflow: list, show, claim, submit, accept, reject, block, unblock, or cancel tasks.",
+            json!({"action": text, "id": text, "area": text, "prefix": text, "evidence": text, "reason": text, "note": text, "status": text}),
+            &["action"],
+        ),
+        tool_def(
+            "task_bulk",
+            "Close multiple registry tasks with the same owner decision; reports each result.",
+            json!({"ids": names, "note": text, "evidence": text}),
+            &["ids"],
+        ),
+        tool_def(
+            "registry_import",
+            "Import registry items with this session's configured cloud role.",
+            json!({"dump": {"type": "object"}}),
+            &["dump"],
+        ),
+        tool_def("area_list", "List registry areas.", json!({}), &[]),
+        tool_def(
+            "area_create",
+            "Create a registry area.",
+            json!({"key": text, "name": text, "prefix": text, "pad": int}),
+            &["key", "name", "prefix"],
+        ),
+        tool_def(
+            "area_update",
+            "Update a registry area.",
+            json!({"key": text, "name": text, "prefix": text, "pad": int}),
+            &["key"],
+        ),
     ]
 }
 
@@ -226,6 +266,8 @@ fn full_tools() -> Vec<Value> {
     let names = json!({"type": "array", "items": {"type": "string"}});
     let id_only =
         |name: &str, description: &str| tool_def(name, description, json!({"id": int}), &["id"]);
+    let task_id_only =
+        |name: &str, description: &str| tool_def(name, description, json!({"id": text}), &["id"]);
     let step = || json!({"id": int, "if_version": int, "reason": text});
     vec![
         tool_def("who", "List agents seen in this project", json!({}), &[]),
@@ -408,7 +450,7 @@ fn full_tools() -> Vec<Value> {
             json!({"all": flag, "status": text}),
             &[],
         ),
-        id_only("task_show", "Show a task and its history"),
+        task_id_only("task_show", "Show a task and its history"),
         tool_def(
             "task_claim",
             "Claim a task",
@@ -450,6 +492,25 @@ fn full_tools() -> Vec<Value> {
             "Cancel a task you authored",
             json!({"id": text, "note": text}),
             &["id"],
+        ),
+        tool_def(
+            "registry_import",
+            "Import registry items with this session's configured cloud role.",
+            json!({"dump": object}),
+            &["dump"],
+        ),
+        tool_def("area_list", "List registry areas.", json!({}), &[]),
+        tool_def(
+            "area_create",
+            "Create a registry area.",
+            json!({"key": text, "name": text, "prefix": text, "pad": int}),
+            &["key", "name", "prefix"],
+        ),
+        tool_def(
+            "area_update",
+            "Update a registry area.",
+            json!({"key": text, "name": text, "prefix": text, "pad": int}),
+            &["key"],
         ),
         tool_def(
             "board_set",
@@ -657,6 +718,13 @@ impl<'a> Args<'a> {
             .transpose()
     }
 
+    fn required_object(self, key: &str) -> Result<Value> {
+        self.get(key)
+            .filter(|value| value.is_object())
+            .cloned()
+            .ok_or_else(|| wrong_type(key, "an object"))
+    }
+
     fn flag(self, key: &str) -> Result<bool> {
         self.get(key).map_or(Ok(false), |value| {
             value.as_bool().ok_or_else(|| wrong_type(key, "a boolean"))
@@ -680,9 +748,23 @@ impl<'a> Args<'a> {
     fn task_id(self) -> Result<String> {
         match self.get("id") {
             Some(Value::String(id)) => Ok(id.clone()),
-            Some(Value::Number(id)) => Ok(id.to_string()),
-            _ => Err(wrong_type("id", "a task id string")),
+            Some(Value::Number(_)) => Err(Error::Invalid(
+                "id must be a task id string such as FE-0001; integers are not accepted".into(),
+            )),
+            _ => Err(wrong_type("id", "a task id string such as FE-0001")),
         }
+    }
+
+    fn some_task_id(self, key: &str) -> Result<Option<String>> {
+        self.get(key)
+            .map(|value| match value {
+                Value::String(id) => Ok(id.clone()),
+                Value::Number(_) => Err(Error::Invalid(format!(
+                    "{key} must be a task id string such as FE-0001; integers are not accepted"
+                ))),
+                _ => Err(wrong_type(key, "a task id string such as FE-0001")),
+            })
+            .transpose()
     }
 
     fn optional_id(self) -> Result<Option<i64>> {
@@ -848,6 +930,11 @@ fn run_composite(
             if let Some(id) = args.some_int("handover_id")? {
                 return Ok(json!({"accepted": step("zone_accept", json!({"id": id}), after)?}));
             }
+            if args.get("task").is_some() && paths.is_empty() && args.strings("zones")?.is_empty() {
+                // A registry task claim does not need a path claim.
+                let id = args.some_task_id("task")?.expect("checked above");
+                return Ok(json!({"task": step("task_claim", json!({"id": id}), after)?}));
+            }
             let zones = args.strings("zones")?;
             if paths.is_empty() && zones.is_empty() {
                 return Err(Error::Invalid(
@@ -870,7 +957,7 @@ fn run_composite(
                 )?
             };
             let mut answer = json!({"claim": claim});
-            if let Some(id) = args.some_int("task")? {
+            if let Some(id) = args.some_task_id("task")? {
                 match step("task_claim", json!({"id": id}), after) {
                     Ok(task) => answer["task"] = task,
                     Err(failure) => {
@@ -890,6 +977,7 @@ fn run_composite(
         "update" => {
             let mut answer = json!({});
             if let (Some(to), Some(body)) = (args.some_text("to")?, args.some_text("body")?) {
+                let to = resolve_target(cwd, agent, &to)?;
                 answer["sent"] = step("msg_send", json!({"to": to, "body": body}), after)?;
             } else if args.get("to").is_some() || args.get("body").is_some() {
                 return Err(Error::Invalid(
@@ -904,7 +992,7 @@ fn run_composite(
             Ok(answer)
         }
         "handover" => {
-            let to = args.text("to")?;
+            let to = resolve_target(cwd, agent, args.text("to")?)?;
             let note = args.optional_text("note")?;
             // Only the cloud can offer a claim to a named agent; locally the honest move is to
             // let it go and say so, rather than pretend the other agent now holds it.
@@ -978,10 +1066,11 @@ fn run_composite(
         }
         "finish_work" => {
             let mut answer = json!({});
-            if let Some(id) = args.some_int("task")? {
+            if let Some(id) = args.some_task_id("task")? {
                 let evidence = args.some_text("evidence")?.ok_or_else(|| {
                     Error::Invalid("finishing a task needs evidence of the work".into())
                 })?;
+                let evidence = executor_evidence(&evidence);
                 answer["task"] = step(
                     "task_submit",
                     json!({"id": id, "evidence": evidence}),
@@ -1011,6 +1100,41 @@ fn run_composite(
             Ok(answer)
         }
         _ => Err(Error::Invalid(format!("unknown tool {name:?}"))),
+    }
+}
+
+fn resolve_target(cwd: &Path, agent: Option<&str>, target: &str) -> Result<String> {
+    let backend = open(cwd, agent)?;
+    let presence = backend.backend.presence(24 * 60 * 60, crate::now_ms())?;
+    if presence.iter().any(|person| person.session == target) {
+        return Ok(target.to_string());
+    }
+    if let Some(person) = presence.iter().find(|person| person.client == target) {
+        return Ok(person.session.clone());
+    }
+    let names: Vec<&str> = presence
+        .iter()
+        .filter(|person| {
+            !target.is_empty()
+                && (person.session.contains(target)
+                    || person.client.contains(target)
+                    || target.contains(&person.client))
+        })
+        .map(|person| person.client.as_str())
+        .filter(|name| !name.is_empty())
+        .take(3)
+        .collect();
+    let suggestion = if names.is_empty() {
+        String::new()
+    } else {
+        format!("; closest presence names: {}", names.join(", "))
+    };
+    if names.is_empty() {
+        Ok(target.to_string())
+    } else {
+        Err(Error::NotFound(format!(
+            "agent {target:?} is not in the workspace{suggestion}"
+        )))
     }
 }
 
@@ -1047,6 +1171,96 @@ fn run_tool(
         )
     };
     match name {
+        "tasks" => {
+            let backend = &mut opened.backend;
+            match args.text("action")? {
+                "list" => {
+                    let area = args.some_text("area")?;
+                    let prefix = args.some_text("prefix")?;
+                    let selector = area.as_deref().or(prefix.as_deref());
+                    let tasks = backend.ready_tasks(selector)?;
+                    encode(&tasks)
+                }
+                "show" => {
+                    let id = args.task_id()?;
+                    Ok(json!({"task": backend.task(&id)?, "history": backend.task_history(&id)?}))
+                }
+                "claim" => {
+                    encode(&backend.claim_task(me()?, &args.task_id()?, args.ttl()?, now)?)
+                }
+                "submit" => {
+                    let evidence = executor_evidence(args.text("evidence")?);
+                    encode(&backend.submit_task(me()?, &args.task_id()?, &evidence, now)?)
+                }
+                "block" | "unblock" => encode(&backend.block_task(
+                    me()?,
+                    &args.task_id()?,
+                    args.text("action")? == "block",
+                    args.optional_text("reason")?,
+                    now,
+                )?),
+                "accept" => encode(&backend.accept_task(
+                    me()?,
+                    &args.task_id()?,
+                    args.optional_text("note")?,
+                    now,
+                )?),
+                "reject" => encode(&backend.reject_task(
+                    me()?,
+                    &args.task_id()?,
+                    args.text("reason")?,
+                    now,
+                )?),
+                "cancel" | "close" => encode(&backend.cancel_task(
+                    me()?,
+                    &args.task_id()?,
+                    args.optional_text("note")?,
+                    now,
+                )?),
+                other => Err(Error::Invalid(format!("unknown tasks action {other:?}"))),
+            }
+        }
+        "task_bulk" => {
+            let ids = args.strings("ids")?;
+            let evidence = args.optional_text("evidence")?;
+            let note = if evidence.is_empty() {
+                args.optional_text("note")?
+            } else {
+                evidence
+            };
+            if note.trim().is_empty() {
+                return Err(Error::Invalid(
+                    "bulk close needs evidence of the owner decision".into(),
+                ));
+            }
+            opened.backend.batch_close_tasks(me()?, &ids, note, now)
+        }
+        "registry_import" => opened
+            .backend
+            .registry_import(me()?, &args.required_object("dump")?),
+        "area_list" => opened.backend.area_list(agent.unwrap_or("lockyard-cli")),
+        "area_create" => {
+            let request = json!({
+                "key": args.text("key")?,
+                "name": args.text("name")?,
+                "prefix": args.text("prefix")?,
+                "pad": args.some_int("pad")?,
+            });
+            opened.backend.area_create(me()?, &request)
+        }
+        "area_update" => {
+            let key = args.text("key")?;
+            let mut request = json!({});
+            for field in ["name", "prefix"] {
+                if let Some(value) = args.some_text(field)? {
+                    request[field] = json!(value);
+                }
+            }
+            if let Some(pad) = args.some_int("pad")? {
+                request["pad"] = json!(pad);
+            }
+            opened.backend.area_update(me()?, key, &request)
+        }
         "who" => encode(&opened.backend.agents()?),
         "status" => {
             let backend = opened.backend.as_mut();
@@ -1059,7 +1273,12 @@ fn run_tool(
                 now,
             )?;
             if backend.is_cloud() {
-                let work = backend.work_list(agent.unwrap_or("lockyard-cli"))?;
+                let mut work = backend.work_list(agent.unwrap_or("lockyard-cli"))?;
+                work.truncate(10);
+                let work: Vec<Value> = work
+                    .into_iter()
+                    .map(|item| json!({"id": item.id, "title": item.title, "status": item.status, "assignee": item.assignee, "to": item.to}))
+                    .collect();
                 let offers = if let Some(name) = agent {
                     backend
                         .inbox(
@@ -1076,6 +1295,15 @@ fn run_tool(
                             message.body.contains("zone offered to you")
                                 && message.body.contains(name)
                         })
+                        .take(10)
+                        .map(|message| {
+                            json!({
+                                "id": message.id,
+                                "from": message.from,
+                                "kind": message.kind,
+                                "body": message.body.chars().take(160).collect::<String>()
+                            })
+                        })
                         .collect::<Vec<_>>()
                 } else {
                     Vec::new()
@@ -1084,7 +1312,18 @@ fn run_tool(
                     json!({"unread": unread, "claims": claims, "work": work, "offers": offers}),
                 );
             }
-            let tasks = backend.tasks(None, false)?;
+            let mut tasks = backend.tasks(None, false)?;
+            tasks.retain(|task| task.assignee.as_deref() == agent);
+            tasks.truncate(20);
+            let tasks: Vec<Value> = tasks
+                .into_iter()
+                .map(|task| {
+                    json!({
+                        "id": task.id, "title": task.title, "status": task.status,
+                        "priority": task.priority, "assignee": task.assignee
+                    })
+                })
+                .collect();
             Ok(json!({"unread": unread, "claims": claims, "tasks": tasks}))
         }
         "zone_claim" => {
@@ -1264,7 +1503,7 @@ fn run_tool(
         }
         "msg_send" => {
             let request = SendRequest {
-                to: args.text("to")?.to_string(),
+                to: resolve_target(cwd, agent, args.text("to")?)?,
                 body: args.text("body")?.to_string(),
                 from_client: client.map(str::to_string),
                 kind: args.some_text("kind")?,
@@ -1391,11 +1630,11 @@ fn run_tool(
             )
         }
         "task_submit" => {
-            let evidence = args.text("evidence")?;
+            let evidence = executor_evidence(args.text("evidence")?);
             encode(
                 &opened
                     .backend
-                    .submit_task(me()?, &args.task_id()?, evidence, now)?,
+                    .submit_task(me()?, &args.task_id()?, &evidence, now)?,
             )
         }
         "task_accept" => {
@@ -1731,7 +1970,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_surface_lists_six_tools_and_full_lists_them_all() {
+    fn the_default_surface_lists_compact_tools_and_full_lists_them_all() {
         let dir = project();
         let compact = listed(Surface::Compact, &dir);
         assert_eq!(
@@ -1742,7 +1981,13 @@ mod tests {
                 "update",
                 "handover",
                 "finish_work",
-                "status"
+                "status",
+                "tasks",
+                "task_bulk",
+                "registry_import",
+                "area_list",
+                "area_create",
+                "area_update"
             ]
         );
         let full = listed(Surface::Full, &dir);
@@ -1828,6 +2073,50 @@ mod tests {
     }
 
     #[test]
+    fn registry_task_ids_are_strings_and_integer_ids_are_refused() {
+        let dir = project();
+        let error = call(&dir, "lead", "task_show", json!({"id": 12}));
+        assert!(text(&error).contains("integers are not accepted"));
+        let compact = compact_tools();
+        let start = compact
+            .iter()
+            .find(|tool| tool["name"] == "start_work")
+            .unwrap();
+        assert_eq!(start["inputSchema"]["properties"]["task"]["type"], "string");
+        let finish = compact
+            .iter()
+            .find(|tool| tool["name"] == "finish_work")
+            .unwrap();
+        assert_eq!(
+            finish["inputSchema"]["properties"]["task"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn compact_registry_list_and_bulk_close_use_string_ids_idempotently() {
+        let dir = project();
+        call(&dir, "lead", "task_add", json!({"title": "ship"}));
+        let listed = call(&dir, "worker", "tasks", json!({"action": "list"}));
+        assert!(text(&listed).contains("\"id\":\"D-1\""));
+        let first = call(
+            &dir,
+            "lead",
+            "task_bulk",
+            json!({"ids": ["D-1"], "evidence": "owner decision"}),
+        );
+        let second = call(
+            &dir,
+            "lead",
+            "task_bulk",
+            json!({"ids": ["D-1"], "evidence": "owner decision"}),
+        );
+        assert_eq!(first["isError"], false);
+        assert_eq!(second["isError"], false);
+        assert!(text(&second).contains("cancelled"));
+    }
+
+    #[test]
     fn compact_handover_schema_allows_implicit_claim_selection() {
         let definition = compact_tools()
             .into_iter()
@@ -1858,12 +2147,12 @@ mod tests {
     fn start_work_gives_the_zone_back_when_the_task_it_was_asked_for_is_taken() {
         let dir = project();
         call(&dir, "lead", "task_add", json!({"title": "ship"}));
-        call(&dir, "first", "task_claim", json!({"id": 1}));
+        call(&dir, "first", "task_claim", json!({"id": "1"}));
         let refused = call(
             &dir,
             "second",
             "start_work",
-            json!({"paths": ["src"], "task": 1}),
+            json!({"paths": ["src"], "task": "1"}),
         );
         assert_eq!(refused["isError"], true);
         let free = call(&dir, "third", "zone_claim", json!({"paths": ["src"]}));
@@ -1910,15 +2199,15 @@ mod tests {
             &dir,
             "w",
             "start_work",
-            json!({"paths": ["src"], "task": 1}),
+            json!({"paths": ["src"], "task": "1"}),
         );
-        let without = call(&dir, "w", "finish_work", json!({"task": 1}));
+        let without = call(&dir, "w", "finish_work", json!({"task": "1"}));
         assert_eq!(without["isError"], true, "evidence is not optional");
         let done = call(
             &dir,
             "w",
             "finish_work",
-            json!({"task": 1, "evidence": "abc1234, 9/9 tests"}),
+            json!({"task": "1", "evidence": "abc1234, 9/9 tests"}),
         );
         assert!(text(&done).contains("\"review\""));
         assert!(text(&done).contains("\"released\":1"));
@@ -1938,16 +2227,16 @@ mod tests {
     fn a_full_task_cycle_works_and_the_worker_cannot_accept() {
         let dir = project();
         call(&dir, "lead", "task_add", json!({"title": "ship"}));
-        call(&dir, "worker", "task_claim", json!({"id": 1}));
+        call(&dir, "worker", "task_claim", json!({"id": "1"}));
         call(
             &dir,
             "worker",
             "task_submit",
-            json!({"id": 1, "evidence": "tests"}),
+            json!({"id": "1", "evidence": "tests"}),
         );
-        let own = call(&dir, "worker", "task_accept", json!({"id": 1}));
+        let own = call(&dir, "worker", "task_accept", json!({"id": "1"}));
         assert_eq!(own["isError"], true);
-        let accepted = call(&dir, "lead", "task_accept", json!({"id": 1}));
+        let accepted = call(&dir, "lead", "task_accept", json!({"id": "1"}));
         assert!(text(&accepted).contains("\"accepted\""));
         let unknown = call(&dir, "lead", "task_list", json!({"status": "nope"}));
         assert_eq!(unknown["isError"], true);

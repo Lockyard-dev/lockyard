@@ -67,6 +67,12 @@ pub struct Task {
     pub id: String,
     pub title: String,
     pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     pub status: Status,
     pub author: String,
     pub assignee: Option<String>,
@@ -77,6 +83,11 @@ pub struct Task {
     /// Urgency of a backlog item. Local tasks have none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
+    /// Registry links and structured evidence are available for cloud registry items.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub registry_evidence: Vec<serde_json::Value>,
 }
 
 /// A new task. Everything past `body` belongs to the cloud backlog, where the agent that writes an
@@ -375,6 +386,11 @@ fn read_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
         priority: None,
+        acceptance: None,
+        stage: None,
+        target: None,
+        links: Vec::new(),
+        registry_evidence: Vec::new(),
     })
 }
 

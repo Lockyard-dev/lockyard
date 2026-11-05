@@ -821,6 +821,9 @@ enum CloudCommand {
     ImportBus { file: PathBuf },
     /// Import registry items. Needs the importer role.
     ImportRegistry { file: PathBuf },
+    /// Manage registry areas.
+    #[command(subcommand)]
+    Area(CloudAreaCommand),
     /// Service tokens of the workspace. Needs the owner role.
     #[command(subcommand)]
     Token(TokenCommand),
@@ -830,6 +833,27 @@ enum CloudCommand {
     /// View or change workspace content encryption. Changes need the owner role.
     #[command(subcommand)]
     Encryption(EncryptionCommand),
+}
+
+#[derive(Subcommand)]
+enum CloudAreaCommand {
+    List,
+    Create {
+        key: String,
+        name: String,
+        prefix: String,
+        #[arg(long, default_value_t = 4)]
+        pad: u8,
+    },
+    Update {
+        key: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long)]
+        pad: Option<u8>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -872,6 +896,11 @@ enum TokenCommand {
 
 #[derive(Subcommand)]
 enum HookCommand {
+    /// Refuse a path claimed by another session.
+    Check {
+        #[arg(long)]
+        path: String,
+    },
     /// Handle a Claude Code hook event from stdin.
     Claude,
     /// Handle a Codex hook event from stdin.
@@ -1917,6 +1946,34 @@ fn run_cloud(mut opened: Opened, command: CloudCommand, agent: Option<&String>) 
         CloudCommand::ImportRegistry { file } => {
             backend.registry_import(&agent, &read_json(&file)?)?
         }
+        CloudCommand::Area(CloudAreaCommand::List) => backend.area_list(&agent)?,
+        CloudCommand::Area(CloudAreaCommand::Create {
+            key,
+            name,
+            prefix,
+            pad,
+        }) => backend.area_create(
+            &agent,
+            &json!({"key": key, "name": name, "prefix": prefix, "pad": pad}),
+        )?,
+        CloudCommand::Area(CloudAreaCommand::Update {
+            key,
+            name,
+            prefix,
+            pad,
+        }) => {
+            let mut request = json!({});
+            if let Some(name) = name {
+                request["name"] = json!(name);
+            }
+            if let Some(prefix) = prefix {
+                request["prefix"] = json!(prefix);
+            }
+            if let Some(pad) = pad {
+                request["pad"] = json!(pad);
+            }
+            backend.area_update(&agent, &key, &request)?
+        }
         CloudCommand::Token(command) => return run_token(backend, command, &agent),
         CloudCommand::Key(_) => {
             unreachable!("local key commands are handled before opening the cloud backend")
@@ -2239,8 +2296,15 @@ fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
     let now = now_ms();
     let lease = clock(opened);
     let backend = opened.backend.as_ref();
-    let claims = backend.claims(&ClaimQuery::default(), now)?;
     let agent = agent.cloned().or_else(env_agent);
+    let session = agent.as_deref().unwrap_or("lockyard-cli");
+    let claims = backend.claims(
+        &ClaimQuery {
+            session: Some(session.to_string()),
+            path: None,
+        },
+        now,
+    )?;
     let unread = agent
         .as_deref()
         .map(|name| backend.unread(name))
@@ -2287,10 +2351,11 @@ fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
         }
     }
     if backend.is_cloud() {
-        let session = agent.as_deref().unwrap_or("lockyard-cli");
         let work = backend.work_list(session)?;
         lines.push(join(&work, work_line, "no work tasks"));
-        let tasks = backend.tasks(None, false)?;
+        let mut tasks = backend.tasks(None, false)?;
+        tasks.retain(|task| task.assignee.as_deref() == Some(session));
+        tasks.truncate(20);
         lines.push(join(&tasks, task_line, "no tasks"));
         let data = json!({
             "unread": unread,
@@ -2302,7 +2367,9 @@ fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
         });
         return output(&data, lines.join("\n"));
     }
-    let tasks = backend.tasks(None, false)?;
+    let mut tasks = backend.tasks(None, false)?;
+    tasks.retain(|task| task.assignee.as_deref() == Some(session));
+    tasks.truncate(20);
     lines.push(join(&tasks, task_line, "no tasks"));
     let data = json!({
         "unread": unread,
@@ -2364,11 +2431,28 @@ fn run_monitor(
     )
 }
 
-fn run_hook(command: HookCommand, agent: Option<String>, cwd: &Path) {
+fn run_hook(command: HookCommand, agent: Option<String>, cwd: &Path) -> Result<Output> {
+    if let HookCommand::Check { path } = &command {
+        let agent = resolve_agent(agent.as_ref())?;
+        let opened = open::open(cwd, Some(&agent))?;
+        let path = opened.zone_path(cwd, path)?;
+        let mut checks =
+            opened
+                .backend
+                .check(&agent, std::slice::from_ref(&path), None, now_ms())?;
+        if let Some(check) = checks.pop()
+            && check.status == CheckStatus::Held
+            && let Some(holder) = check.holder
+        {
+            return Err(Error::Conflict(vec![holder]));
+        }
+        return output(&json!({"free": true}), "free");
+    }
     let tool = match command {
         HookCommand::Claude => hook::Tool::Claude,
         HookCommand::Codex => hook::Tool::Codex,
         HookCommand::Cursor => hook::Tool::Cursor,
+        HookCommand::Check { .. } => unreachable!(),
     };
     let mut input = String::new();
     let read = std::io::stdin().read_to_string(&mut input);
@@ -2383,9 +2467,12 @@ fn run_hook(command: HookCommand, agent: Option<String>, cwd: &Path) {
             &mut out,
         )
     });
+    // Hooks are advisory integrations: a damaged or unavailable Lockyard database must never
+    // prevent the agent from continuing its work. Keep the diagnostic for troubleshooting.
     if let Err(error) = answer {
         eprintln!("lockyard hook: {error}");
     }
+    output(&Value::Null, "")
 }
 
 /// The clients a run covers: the named ones, or every one found in this project and home.
@@ -2721,10 +2808,7 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
         Command::Cloud(CloudCommand::Key(command)) => run_cloud_key(cwd, command),
         Command::Cloud(CloudCommand::Encryption(command)) => run_cloud_encryption(cwd, command),
         Command::Cloud(command) => run_cloud(open()?, command, agent.as_ref()),
-        Command::Hook(command) => {
-            run_hook(command, agent, cwd);
-            output(&Value::Null, "")
-        }
+        Command::Hook(command) => run_hook(command, agent, cwd),
         Command::Monitor(args) => run_monitor(args, agent.as_ref(), cwd, json),
         Command::Setup(args) => run_setup(args, cwd),
         Command::Doctor => run_doctor(cwd, agent.as_ref()),
