@@ -175,7 +175,8 @@ impl<T: Transport> CloudBackend<T> {
         task_from(&self.post(agent, route, &body)?)
     }
 
-    /// The area named by key. Without a key, the first one, created on first use where the role allows.
+    /// Select by explicit area, then prefix. With neither, use the first area; an empty registry
+    /// gets its default area on first use where the role allows.
     fn area_id(
         &self,
         agent: &str,
@@ -190,9 +191,16 @@ impl<T: Transport> CloudBackend<T> {
                 text(area, "key").eq_ignore_ascii_case(key)
                     || text(area, "prefix").eq_ignore_ascii_case(key)
             }),
-            None => areas.first(),
+            None => match prefix {
+                Some(prefix) => areas
+                    .iter()
+                    .find(|area| text(area, "prefix").eq_ignore_ascii_case(prefix)),
+                None => areas.first(),
+            },
         };
-        match (found, wanted) {
+        // A prefix can configure the default area in an empty registry. In an existing registry,
+        // it must select a matching area rather than silently writing into the first one.
+        match (found, wanted.or(prefix.filter(|_| !areas.is_empty()))) {
             (Some(area), _) => Ok(text(area, "id").to_string()),
             (None, Some(key)) => Err(Error::NotFound(format!("no area {key:?}"))),
             (None, None) => {
@@ -2389,6 +2397,62 @@ mod tests {
             2,
             "an existing area should not be created again"
         );
+    }
+
+    #[test]
+    fn a_new_item_with_only_prefix_selects_the_matching_area_not_the_first() {
+        let (server, mut cloud) = backend(vec![
+            json!([{"id":"a1", "key":"flexengine", "prefix":"FE"},
+                {"id":"a2", "key":"platform", "prefix":"PA"}]),
+            item("ready", 1),
+        ]);
+        let spec = tasks::TaskSpec {
+            title: "t".into(),
+            prefix: Some("pa".into()),
+            ..tasks::TaskSpec::default()
+        };
+        cloud.add_task("me", &spec, 0).unwrap();
+        let seen = server.requests();
+        assert_eq!(seen.len(), 2, "an existing area must not be created again");
+        assert_eq!(seen[1].body["area_id"], "a2");
+    }
+
+    #[test]
+    fn a_new_item_with_unknown_prefix_does_not_fall_back_to_another_area() {
+        let (server, mut cloud) = backend(vec![
+            json!([{"id":"a1", "key":"flexengine", "prefix":"FE"}]),
+        ]);
+        let spec = tasks::TaskSpec {
+            title: "t".into(),
+            prefix: Some("PA".into()),
+            ..tasks::TaskSpec::default()
+        };
+        assert!(matches!(
+            cloud.add_task("me", &spec, 0),
+            Err(Error::NotFound(_))
+        ));
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "an unknown prefix must not create a task in another area"
+        );
+    }
+
+    #[test]
+    fn a_new_item_explicit_area_takes_precedence_over_prefix() {
+        let (server, mut cloud) = backend(vec![
+            json!([{"id":"a1", "key":"flexengine", "prefix":"FE"},
+                {"id":"a2", "key":"platform", "prefix":"PA"}]),
+            item("ready", 1),
+        ]);
+        let spec = tasks::TaskSpec {
+            title: "t".into(),
+            area: Some("flexengine".into()),
+            prefix: Some("PA".into()),
+            ..tasks::TaskSpec::default()
+        };
+        cloud.add_task("me", &spec, 0).unwrap();
+        assert_eq!(server.requests()[1].body["area_id"], "a1");
     }
 
     #[test]

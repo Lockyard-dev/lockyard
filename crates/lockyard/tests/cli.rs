@@ -188,6 +188,137 @@ fn status_only_shows_the_current_agents_claims_and_tasks() {
     assert!(status["unannounced"].as_array().unwrap().is_empty());
 }
 
+/// Exercise the cloud CLI against actual HTTP responses, without an agent or live credentials.
+fn cloud_status(claims: Value, work: Value, json_output: bool) -> String {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let path = first.split_whitespace().nth(1).unwrap();
+            let answer = match path.split('?').next().unwrap() {
+                "/api/v1/workspace/encryption" => json!({"encryption":"off", "key_id":null,
+                    "workspace_id":"00000000-0000-0000-0000-000000000001"}),
+                "/api/v1/zones/claims" => claims.clone(),
+                "/api/v1/bus/inbox" => json!({"messages":[], "skipped":0}),
+                "/api/v1/bus/tasks" => work.clone(),
+                "/api/v1/registry/items" => json!({"items":[], "cursor":null}),
+                other => panic!("unexpected status route: {other}"),
+            };
+            let body = answer.to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".lockyard")).unwrap();
+    std::fs::write(
+        dir.path().join(".lockyard/config.toml"),
+        format!("mode = 'cloud'\nurl = '{url}'\nworkspace = 'team'\n"),
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lockyard"));
+    if json_output {
+        command.arg("--json");
+    }
+    let result = command
+        .arg("status")
+        .current_dir(dir.path())
+        .env("LOCKYARD_AGENT", "alice")
+        .env("LOCKYARD_TOKEN", "test-token")
+        .env("LOCKYARD_URL", url)
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_STATE_HOME", runtime.path().join("state"))
+        .env_remove("LOCKYARD_TOKEN_FILE")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    String::from_utf8(result.stdout).unwrap()
+}
+
+#[test]
+fn cloud_status_only_lists_active_relevant_work_in_json_and_text() {
+    let task = |id, status, to, assignee| {
+        json!({"id":id, "title":format!("work-{id}"),
+        "status":status, "to":to, "assignee":assignee, "version":1})
+    };
+    let work = json!([
+        task(1, "claimed", "*", "alice"), task(2, "offered", "alice", ""),
+        task(3, "claimed", "bob", "bob"), task(4, "accepted", "alice", "alice"),
+        task(5, "offered", "*", ""), task(6, "failed", "alice", "alice"),
+        task(7, "expired", "alice", "alice"), task(8, "cancelled", "alice", "alice"),
+        {"id":9, "title":"work-9", "status":"review", "to":"bob", "lead":"alice", "version":1},
+        {"id":10, "title":"work-10", "status":"claimed", "to":"*", "executor":"alice", "version":1}
+    ]);
+    let status: Value = serde_json::from_str(&cloud_status(json!([]), work.clone(), true)).unwrap();
+    let ids: Vec<_> = status["work"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![1, 2, 9, 10]);
+    let text = cloud_status(json!([]), work, false);
+    for id in [1, 2, 9, 10] {
+        assert!(text.contains(&format!("work-{id}")), "{text}");
+    }
+    for id in [3, 4, 5, 6, 7, 8] {
+        assert!(!text.contains(&format!("work-{id}")), "{text}");
+    }
+}
+
+#[test]
+fn cloud_status_bounds_work_after_filtering() {
+    let mut work =
+        vec![json!({"id":1, "title":"foreign-final", "status":"accepted", "to":"*", "version":1})];
+    work.extend((2..17).map(|id| {
+        json!({"id":id, "title":format!("work-{id}"),
+        "status":"offered", "to":"alice", "version":1})
+    }));
+    let status: Value = serde_json::from_str(&cloud_status(json!([]), json!(work), true)).unwrap();
+    let work = status["work"].as_array().unwrap();
+    assert_eq!(work.len(), 10);
+    assert_eq!(work[0]["id"], 2);
+    assert_eq!(work[9]["id"], 11);
+}
+
+#[test]
+fn cloud_status_separates_incoming_handover_offers_from_owned_claims() {
+    let claims = json!([
+        {"id":41, "session":"bob", "paths":["incoming/path"], "note":"please take over", "handover_to":"alice", "offered_to_you":true},
+        {"id":42, "session":"alice", "paths":["owned/path"]}
+    ]);
+    let status: Value =
+        serde_json::from_str(&cloud_status(claims.clone(), json!([]), true)).unwrap();
+    assert_eq!(status["claims"].as_array().unwrap().len(), 1);
+    assert_eq!(status["claims"][0]["id"], 42);
+    assert_eq!(status["offers"].as_array().unwrap().len(), 1);
+    assert_eq!(status["offers"][0]["id"], 41);
+    assert_eq!(status["offers"][0]["from"], "bob");
+    assert_eq!(status["offers"][0]["paths"], json!(["incoming/path"]));
+    let text = cloud_status(claims, json!([]), false);
+    assert!(text.contains("Z-41 offered to you by bob"), "{text}");
+    assert!(text.contains("incoming/path"), "{text}");
+    assert!(text.contains("Z-42  alice  owned/path"), "{text}");
+    assert!(!text.contains("Z-41  bob"), "{text}");
+}
+
 #[test]
 fn task_commands_print_the_registry_identifier_once() {
     let dir = project();

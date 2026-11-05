@@ -656,6 +656,9 @@ pub struct Presence {
     pub session: String,
     #[serde(default)]
     pub client: String,
+    /// Display name published by the session; the client remains its actual tool type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
@@ -821,6 +824,20 @@ mod tests {
         }))
         .unwrap();
         assert_eq!((message.from.as_str(), message.reply_to), ("a", Some(9)));
+    }
+
+    #[test]
+    fn presence_preserves_optional_display_alias_without_replacing_client() {
+        let presence: Presence = serde_json::from_value(json!({
+            "session": "session-one", "client": "codex", "alias": "codex-real-bus-name"
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(&presence).unwrap();
+        assert_eq!(wire["client"], "codex");
+        assert_eq!(wire["alias"], "codex-real-bus-name");
+        let legacy: Presence =
+            serde_json::from_value(json!({"session": "legacy", "client": "codex"})).unwrap();
+        assert!(serde_json::to_value(legacy).unwrap().get("alias").is_none());
     }
 
     #[test]

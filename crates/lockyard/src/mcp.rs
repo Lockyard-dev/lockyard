@@ -26,7 +26,7 @@ const DEFAULT_QUEUE_MINUTES: i64 = 60;
 const DEFAULT_WAIT_SECONDS: i64 = 60;
 const DEFAULT_ACTIVE_SECONDS: i64 = 900;
 
-fn visible_work(
+pub(crate) fn visible_work(
     agent: Option<&str>,
     work: Vec<lockyard_core::proto::WorkTask>,
 ) -> Vec<lockyard_core::proto::WorkTask> {
@@ -508,8 +508,8 @@ fn full_tools() -> Vec<Value> {
         ),
         tool_def(
             "task_list",
-            "List tasks",
-            json!({"all": flag, "status": text}),
+            "List tasks. Use status ready and area or prefix to list ready registry work; without filters, list unfinished tasks",
+            json!({"all": flag, "status": text, "area": text, "prefix": text}),
             &[],
         ),
         task_id_only("task_show", "Show a task and its history"),
@@ -1249,18 +1249,16 @@ fn run_composite(
             let id = args.optional_claim_id()?;
             let released_ids = match id {
                 Some(id) => vec![id],
-                None => open(cwd, agent)?
-                    .backend
-                    .claims(
+                None => owned_claim_ids(
+                    agent,
+                    open(cwd, agent)?.backend.claims(
                         &ClaimQuery {
                             session: agent.map(str::to_string),
                             path: None,
                         },
                         crate::now_ms(),
-                    )?
-                    .into_iter()
-                    .map(|claim| claim.id)
-                    .collect::<Vec<_>>(),
+                    )?,
+                ),
             };
             let release = match id {
                 Some(id) => json!({"id": id, "note": args.optional_text("note")?}),
@@ -1275,41 +1273,65 @@ fn run_composite(
     }
 }
 
+fn owned_claim_ids(agent: Option<&str>, claims: Vec<Claim>) -> Vec<i64> {
+    claims
+        .into_iter()
+        .filter(|claim| Some(claim.session.as_str()) == agent)
+        .map(|claim| claim.id)
+        .collect()
+}
+
 fn resolve_target(cwd: &Path, agent: Option<&str>, target: &str) -> Result<String> {
     let backend = open(cwd, agent)?;
     let presence = backend.backend.presence(24 * 60 * 60, crate::now_ms())?;
+    resolve_presence_target(&presence, target)
+}
+
+fn resolve_presence_target(
+    presence: &[lockyard_core::proto::Presence],
+    target: &str,
+) -> Result<String> {
     if presence.iter().any(|person| person.session == target) {
         return Ok(target.to_string());
     }
-    if let Some(person) = presence.iter().find(|person| {
-        person.client == target
-            || person.session.starts_with(target)
-            || person.client.starts_with(target)
-    }) {
-        return Ok(person.session.clone());
+    if target.is_empty() {
+        return Err(Error::Invalid("an agent name must not be empty".into()));
     }
-    let names: Vec<&str> = presence
+    let exact_aliases: Vec<_> = presence
         .iter()
         .filter(|person| {
-            !target.is_empty()
-                && (person.session.starts_with(target)
-                    || person.client.contains(target)
-                    || target.contains(&person.client))
+            person
+                .alias
+                .as_deref()
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(target))
         })
-        .map(|person| person.session.as_str())
-        .take(3)
         .collect();
-    let suggestion = if names.is_empty() {
-        String::new()
+    let candidates = if exact_aliases.is_empty() {
+        presence
+            .iter()
+            .filter(|person| {
+                person.session.starts_with(target)
+                    || person.alias.as_deref().is_some_and(|alias| {
+                        alias.to_lowercase().starts_with(&target.to_lowercase())
+                    })
+                    || person.client == target
+                    || person.client.starts_with(target)
+            })
+            .collect::<Vec<_>>()
     } else {
-        format!("; closest presence names: {}", names.join(", "))
+        exact_aliases
     };
-    if names.is_empty() {
-        Ok(target.to_string())
-    } else {
-        Err(Error::NotFound(format!(
-            "agent {target:?} is not in the workspace{suggestion}"
-        )))
+    let sessions: std::collections::BTreeSet<_> = candidates
+        .iter()
+        .map(|person| person.session.as_str())
+        .collect();
+    match sessions.len() {
+        0 => Ok(target.to_string()), // The server also resolves aliases outside this presence snapshot.
+        1 => Ok(sessions.into_iter().next().unwrap().to_string()),
+        _ => Err(Error::Invalid(format!(
+            "agent {target:?} is ambiguous; use an exact session name or alias: {}",
+            sessions.into_iter().collect::<Vec<_>>().join(", ")
+        ))),
     }
 }
 
@@ -1779,6 +1801,20 @@ fn run_tool(
             encode(&opened.backend.plan_task(me()?, &args.task_id()?, &plan)?)
         }
         "task_list" => {
+            let area = args.some_text("area")?;
+            let prefix = args.some_text("prefix")?;
+            let selector = area.as_deref().or(prefix.as_deref());
+            let requested_status = args.some_text("status")?;
+            if requested_status.as_deref() == Some("ready")
+                || (selector.is_some() && requested_status.is_none())
+            {
+                return encode(&opened.backend.ready_tasks(selector)?);
+            }
+            if selector.is_some() {
+                return Err(Error::Invalid(
+                    "area and prefix filters require status ready (or no status)".into(),
+                ));
+            }
             let status = args
                 .get("status")
                 .map(|_| {
@@ -1980,6 +2016,86 @@ mod tests {
 
     fn text(result: &Value) -> &str {
         result["content"][0]["text"].as_str().unwrap()
+    }
+
+    #[test]
+    fn full_task_list_accepts_ready_and_exposes_area_selectors() {
+        let dir = project();
+        call(&dir, "lead", "task_add", json!({"title": "ready task"}));
+        call(&dir, "lead", "task_add", json!({"title": "taken task"}));
+        call(&dir, "worker", "task_claim", json!({"id": "D-2"}));
+        let listed = call(
+            &dir,
+            "worker",
+            "task_list",
+            json!({"status": "ready", "area": "PA"}),
+        );
+        assert_ne!(listed["isError"], true, "{}", text(&listed));
+        let tasks: Value = serde_json::from_str(text(&listed)).unwrap();
+        assert_eq!(tasks.as_array().unwrap().len(), 1);
+        assert_eq!(tasks[0]["title"], "ready task");
+        let schema = tools(Surface::Full)
+            .into_iter()
+            .find(|tool| tool["name"] == "task_list")
+            .unwrap();
+        assert_eq!(
+            schema["inputSchema"]["properties"]["area"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schema["inputSchema"]["properties"]["prefix"]["type"],
+            "string"
+        );
+        let claimed = call(&dir, "worker", "task_list", json!({"status": "claimed"}));
+        let tasks: Value = serde_json::from_str(text(&claimed)).unwrap();
+        assert_eq!(tasks[0]["title"], "taken task");
+    }
+
+    #[test]
+    fn finish_work_ids_exclude_incoming_handover_offers() {
+        let claim = |id, session| {
+            serde_json::from_value(json!({"id": id, "session": session, "paths": ["src"]})).unwrap()
+        };
+        assert_eq!(
+            owned_claim_ids(
+                Some("receiver"),
+                vec![claim(10, "sender"), claim(11, "receiver")]
+            ),
+            vec![11]
+        );
+        assert!(owned_claim_ids(Some("receiver"), vec![claim(10, "sender")]).is_empty());
+    }
+
+    #[test]
+    fn target_resolution_uses_wire_alias_and_rejects_ambiguous_prefixes() {
+        let person = |session, alias| {
+            serde_json::from_value(json!({"session": session, "client": "codex", "alias": alias}))
+                .unwrap()
+        };
+        let presence = vec![
+            person("session-one", "codex-real-bus-name"),
+            person("session-two", "codex-reviewer"),
+        ];
+        assert_eq!(
+            resolve_presence_target(&presence, "codex-real-bus-name").unwrap(),
+            "session-one"
+        );
+        assert_eq!(
+            resolve_presence_target(&presence, "CODEX-REAL").unwrap(),
+            "session-one"
+        );
+        assert_eq!(
+            resolve_presence_target(&presence, "session-one").unwrap(),
+            "session-one"
+        );
+        let ambiguous = resolve_presence_target(&presence, "codex")
+            .unwrap_err()
+            .to_string();
+        assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+        assert!(
+            ambiguous.contains("session-one") && ambiguous.contains("session-two"),
+            "{ambiguous}"
+        );
     }
 
     #[test]

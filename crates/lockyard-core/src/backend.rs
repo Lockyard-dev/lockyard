@@ -710,6 +710,7 @@ impl Backend for Store {
             .map(|entry| Presence {
                 session: entry.agent,
                 client: entry.client,
+                alias: None,
                 role: entry.role,
                 version: entry.version,
                 cwd: entry.cwd,

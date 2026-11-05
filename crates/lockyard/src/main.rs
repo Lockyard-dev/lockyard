@@ -2378,6 +2378,16 @@ fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
         },
         now,
     )?;
+    let (claims, incoming): (Vec<Claim>, Vec<Claim>) = claims
+        .into_iter()
+        .partition(|claim| claim.session == session);
+    let offers: Vec<Value> = incoming
+        .iter()
+        .map(|claim| {
+            json!({"id": claim.id, "from": claim.session,
+            "paths": claim.paths, "note": claim.note})
+        })
+        .collect();
     let unread = agent
         .as_deref()
         .map(|name| backend.unread(name))
@@ -2402,6 +2412,15 @@ fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
         |claim| claim_line(claim, lease),
         "no active claims",
     ));
+    for claim in &incoming {
+        lines.push(format!(
+            "Z-{} offered to you by {}: {}  {}",
+            claim.id,
+            claim.session,
+            claim.paths.join(" "),
+            claim.note
+        ));
+    }
     // Outside-hook writes live in the local store in both modes; they are detection, not a lock.
     let unannounced = Store::open(&opened.root)
         .ok()
@@ -2427,8 +2446,16 @@ fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
         }
     }
     if backend.is_cloud() {
-        let work = backend.work_list(session)?;
+        let mut work = mcp::visible_work(Some(session), backend.work_list(session)?);
+        work.truncate(10);
         lines.push(join(&work, work_line, "no work tasks"));
+        let work: Vec<Value> = work
+            .into_iter()
+            .map(|item| {
+                json!({"id": item.id, "title": item.title, "status": item.status,
+                "assignee": item.assignee, "to": item.to})
+            })
+            .collect();
         let mut tasks = backend.tasks(None, false)?;
         tasks.retain(|task| task.assignee.as_deref() == Some(session));
         tasks.truncate(20);
@@ -2436,6 +2463,7 @@ fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
         let data = json!({
             "unread": unread,
             "claims": claims,
+            "offers": offers,
             "work": work,
             "tasks": tasks,
             "machine_level": machine_level,
