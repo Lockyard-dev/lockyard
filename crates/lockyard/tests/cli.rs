@@ -150,7 +150,7 @@ fn a_full_conversation_and_task_cycle_over_json() {
     );
     let added: Value = serde_json::from_str(&added).unwrap();
     assert_eq!(added["status"], "open");
-    let id = added["id"].to_string();
+    let id = added["id"].as_str().unwrap().to_string();
 
     ok(root, "worker", &["task", "claim", &id]);
     ok(

@@ -181,7 +181,7 @@ fn compact_tools() -> Vec<Value> {
         tool_def(
             "start_work",
             "Claim paths before editing; accept an offered zone with handover_id, or take a task.",
-            json!({"paths": names, "note": text, "ttl": int, "shared": flag, "zones": names, "task": int, "handover_id": int}),
+            json!({"paths": names, "note": text, "ttl": int, "shared": flag, "zones": names, "task": text, "handover_id": int}),
             &[],
         ),
         tool_def(
@@ -205,7 +205,7 @@ fn compact_tools() -> Vec<Value> {
         tool_def(
             "finish_work",
             "Submit evidence; without id or task, releases all your claims.",
-            json!({"task": int, "evidence": text, "id": int, "note": text}),
+            json!({"task": text, "evidence": text, "id": text, "note": text}),
             &[],
         ),
         tool_def(
@@ -391,14 +391,15 @@ fn full_tools() -> Vec<Value> {
             "Add a task. In cloud mode the writer sets its urgency",
             json!({
                 "title": text, "body": text, "acceptance": text, "priority": text, "p0_category": text,
-                "type": text, "target": text, "verification": text, "area": text, "due": text, "evidence": text
+                "type": text, "target": text, "verification": text, "area": text, "prefix": text,
+                "pad": int, "due": text, "evidence": text
             }),
             &["title"],
         ),
         tool_def(
             "task_plan",
             "Change the urgency of a task",
-            json!({"id": int, "priority": text, "p0_category": text, "due": text}),
+            json!({"id": text, "priority": text, "p0_category": text, "due": text}),
             &["id"],
         ),
         tool_def(
@@ -411,43 +412,43 @@ fn full_tools() -> Vec<Value> {
         tool_def(
             "task_claim",
             "Claim a task",
-            json!({"id": int, "ttl": int}),
+            json!({"id": text, "ttl": int}),
             &["id"],
         ),
         tool_def(
             "task_renew",
             "Renew a task lease",
-            json!({"id": int, "ttl": int}),
+            json!({"id": text, "ttl": int}),
             &["id"],
         ),
         tool_def(
             "task_release",
             "Give a held task back",
-            json!({"id": int, "note": text}),
+            json!({"id": text, "note": text}),
             &["id"],
         ),
         tool_def(
             "task_submit",
             "Submit a task for review with evidence",
-            json!({"id": int, "evidence": text}),
+            json!({"id": text, "evidence": text}),
             &["id", "evidence"],
         ),
         tool_def(
             "task_accept",
             "Accept another agent's submitted work",
-            json!({"id": int, "note": text}),
+            json!({"id": text, "note": text}),
             &["id"],
         ),
         tool_def(
             "task_reject",
             "Return submitted work with a reason",
-            json!({"id": int, "reason": text}),
+            json!({"id": text, "reason": text}),
             &["id", "reason"],
         ),
         tool_def(
             "task_cancel",
             "Cancel a task you authored",
-            json!({"id": int, "note": text}),
+            json!({"id": text, "note": text}),
             &["id"],
         ),
         tool_def(
@@ -674,6 +675,14 @@ impl<'a> Args<'a> {
 
     fn id(self) -> Result<i64> {
         self.int("id")
+    }
+
+    fn task_id(self) -> Result<String> {
+        match self.get("id") {
+            Some(Value::String(id)) => Ok(id.clone()),
+            Some(Value::Number(id)) => Ok(id.to_string()),
+            _ => Err(wrong_type("id", "a task id string")),
+        }
     }
 
     fn optional_id(self) -> Result<Option<i64>> {
@@ -1323,6 +1332,14 @@ fn run_tool(
                 target: args.some_text("target")?,
                 verification: args.some_text("verification")?,
                 area: args.some_text("area")?,
+                prefix: args.some_text("prefix")?,
+                pad: args
+                    .some_int("pad")?
+                    .map(|value| {
+                        u8::try_from(value)
+                            .map_err(|_| Error::Invalid("pad must be 0 to 255".into()))
+                    })
+                    .transpose()?,
                 due_at: args.some_text("due")?,
                 evidence: args.some_text("evidence")?,
             };
@@ -1334,7 +1351,7 @@ fn run_tool(
                 p0_category: args.some_text("p0_category")?,
                 due_at: args.some_text("due")?,
             };
-            encode(&opened.backend.plan_task(me()?, args.id()?, &plan)?)
+            encode(&opened.backend.plan_task(me()?, &args.task_id()?, &plan)?)
         }
         "task_list" => {
             let status = args
@@ -1348,44 +1365,62 @@ fn run_tool(
             encode(&opened.backend.tasks(status, args.flag("all")?)?)
         }
         "task_show" => {
-            let id = args.id()?;
-            let task = opened.backend.task(id)?;
-            let history = opened.backend.task_history(id)?;
+            let id = args.task_id()?;
+            let task = opened.backend.task(&id)?;
+            let history = opened.backend.task_history(&id)?;
             Ok(json!({"task": task, "history": history}))
         }
-        "task_claim" => encode(
-            &opened
-                .backend
-                .claim_task(me()?, args.id()?, args.ttl()?, now)?,
-        ),
-        "task_renew" => encode(
-            &opened
-                .backend
-                .renew_task(me()?, args.id()?, args.ttl()?, now)?,
-        ),
+        "task_claim" => encode(&opened.backend.claim_task(
+            me()?,
+            &args.task_id()?,
+            args.ttl()?,
+            now,
+        )?),
+        "task_renew" => encode(&opened.backend.renew_task(
+            me()?,
+            &args.task_id()?,
+            args.ttl()?,
+            now,
+        )?),
         "task_release" => {
             let note = args.optional_text("note")?;
-            encode(&opened.backend.release_task(me()?, args.id()?, note, now)?)
+            encode(
+                &opened
+                    .backend
+                    .release_task(me()?, &args.task_id()?, note, now)?,
+            )
         }
         "task_submit" => {
             let evidence = args.text("evidence")?;
             encode(
                 &opened
                     .backend
-                    .submit_task(me()?, args.id()?, evidence, now)?,
+                    .submit_task(me()?, &args.task_id()?, evidence, now)?,
             )
         }
         "task_accept" => {
             let note = args.optional_text("note")?;
-            encode(&opened.backend.accept_task(me()?, args.id()?, note, now)?)
+            encode(
+                &opened
+                    .backend
+                    .accept_task(me()?, &args.task_id()?, note, now)?,
+            )
         }
         "task_reject" => {
             let reason = args.text("reason")?;
-            encode(&opened.backend.reject_task(me()?, args.id()?, reason, now)?)
+            encode(
+                &opened
+                    .backend
+                    .reject_task(me()?, &args.task_id()?, reason, now)?,
+            )
         }
         "task_cancel" => {
             let note = args.optional_text("note")?;
-            encode(&opened.backend.cancel_task(me()?, args.id()?, note, now)?)
+            encode(
+                &opened
+                    .backend
+                    .cancel_task(me()?, &args.task_id()?, note, now)?,
+            )
         }
         "board_set" => {
             let write = BoardWrite {

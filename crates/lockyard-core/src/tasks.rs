@@ -64,7 +64,7 @@ impl fmt::Display for Status {
 /// One task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Task {
-    pub id: i64,
+    pub id: String,
     pub title: String,
     pub body: String,
     pub status: Status,
@@ -92,6 +92,8 @@ pub struct TaskSpec {
     pub target: Option<String>,
     pub verification: Option<String>,
     pub area: Option<String>,
+    pub prefix: Option<String>,
+    pub pad: Option<u8>,
     pub due_at: Option<String>,
     pub evidence: Option<String>,
 }
@@ -107,11 +109,13 @@ impl TaskSpec {
             &self.target,
             &self.verification,
             &self.area,
+            &self.prefix,
             &self.due_at,
             &self.evidence,
         ]
         .iter()
         .any(|field| field.is_some())
+            || self.pad.is_some()
     }
 }
 
@@ -354,7 +358,7 @@ fn log(conn: &Connection, id: i64, agent: &str, action: &str, note: &str, at: i6
 fn read_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let status: String = row.get(3)?;
     Ok(Task {
-        id: row.get(0)?,
+        id: format!("D-{}", row.get::<_, i64>(0)?),
         title: row.get(1)?,
         body: row.get(2)?,
         status: Status::parse(&status).ok_or_else(|| {
@@ -427,7 +431,15 @@ mod tests {
     const TTL_MS: i64 = TTL * MINUTE_MS;
 
     fn task_in_review(store: &mut Store) -> i64 {
-        let id = store.add_task("lead", "ship", "", 0).unwrap().id;
+        let id = store
+            .add_task("lead", "ship", "", 0)
+            .unwrap()
+            .id
+            .rsplit_once('-')
+            .unwrap()
+            .1
+            .parse()
+            .unwrap();
         store.claim_task("worker", id, TTL, 1).unwrap();
         store.submit_task("worker", id, "tests pass", 2).unwrap();
         id
@@ -467,7 +479,15 @@ mod tests {
     #[test]
     fn submitting_needs_evidence() {
         let (_dir, mut store) = test_store();
-        let id = store.add_task("lead", "x", "", 0).unwrap().id;
+        let id = store
+            .add_task("lead", "x", "", 0)
+            .unwrap()
+            .id
+            .rsplit_once('-')
+            .unwrap()
+            .1
+            .parse()
+            .unwrap();
         store.claim_task("worker", id, TTL, 1).unwrap();
         assert!(store.submit_task("worker", id, "  ", 2).is_err());
         assert_eq!(store.task(id).unwrap().status, Status::Claimed);
@@ -476,7 +496,15 @@ mod tests {
     #[test]
     fn a_living_lease_keeps_others_out_and_an_expired_one_does_not() {
         let (_dir, mut store) = test_store();
-        let id = store.add_task("lead", "x", "", 0).unwrap().id;
+        let id = store
+            .add_task("lead", "x", "", 0)
+            .unwrap()
+            .id
+            .rsplit_once('-')
+            .unwrap()
+            .1
+            .parse()
+            .unwrap();
         store.claim_task("a", id, TTL, 0).unwrap();
         assert!(matches!(
             store.claim_task("b", id, TTL, TTL_MS - 1),
@@ -515,7 +543,15 @@ mod tests {
     #[test]
     fn only_the_assignee_renews_or_releases() {
         let (_dir, mut store) = test_store();
-        let id = store.add_task("lead", "x", "", 0).unwrap().id;
+        let id = store
+            .add_task("lead", "x", "", 0)
+            .unwrap()
+            .id
+            .rsplit_once('-')
+            .unwrap()
+            .1
+            .parse()
+            .unwrap();
         store.claim_task("a", id, TTL, 0).unwrap();
         assert!(store.renew_task("b", id, TTL, 1).is_err());
         assert!(store.release_task("b", id, "", 1).is_err());
@@ -530,7 +566,15 @@ mod tests {
     #[test]
     fn cancel_belongs_to_the_author_and_stops_at_a_final_state() {
         let (_dir, mut store) = test_store();
-        let id = store.add_task("lead", "x", "", 0).unwrap().id;
+        let id = store
+            .add_task("lead", "x", "", 0)
+            .unwrap()
+            .id
+            .rsplit_once('-')
+            .unwrap()
+            .1
+            .parse()
+            .unwrap();
         assert!(store.cancel_task("other", id, "", 1).is_err());
         store.cancel_task("lead", id, "dropped", 1).unwrap();
         assert!(store.cancel_task("lead", id, "", 2).is_err());
@@ -544,10 +588,23 @@ mod tests {
     #[test]
     fn the_list_hides_finished_tasks_unless_asked() {
         let (_dir, mut store) = test_store();
-        let open = store.add_task("lead", "open", "", 0).unwrap().id;
+        let open = store
+            .add_task("lead", "open", "", 0)
+            .unwrap()
+            .id
+            .rsplit_once('-')
+            .unwrap()
+            .1
+            .parse()
+            .unwrap();
         let done = task_in_review(&mut store);
         store.accept_task("lead", done, "", 3).unwrap();
-        let ids = |tasks: Vec<Task>| tasks.into_iter().map(|t| t.id).collect::<Vec<_>>();
+        let ids = |tasks: Vec<Task>| {
+            tasks
+                .into_iter()
+                .map(|t| t.id.rsplit_once('-').unwrap().1.parse::<i64>().unwrap())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(ids(store.tasks(None, false).unwrap()), [open]);
         assert_eq!(ids(store.tasks(None, true).unwrap()), [open, done]);
         assert_eq!(
@@ -570,7 +627,15 @@ mod tests {
     #[test]
     fn only_one_of_many_racing_connections_takes_a_task() {
         let (dir, mut store) = test_store();
-        let id = store.add_task("lead", "x", "", 0).unwrap().id;
+        let id = store
+            .add_task("lead", "x", "", 0)
+            .unwrap()
+            .id
+            .rsplit_once('-')
+            .unwrap()
+            .1
+            .parse()
+            .unwrap();
         let racers: Vec<_> = (0..16)
             .map(|index| {
                 let root = dir.path().to_path_buf();

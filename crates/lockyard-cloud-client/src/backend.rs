@@ -138,7 +138,7 @@ impl<T: Transport> CloudBackend<T> {
         self.write(session, "POST", path, body)
     }
 
-    fn item(&self, session: &str, id: i64) -> Result<Value> {
+    fn item(&self, session: &str, id: &str) -> Result<Value> {
         self.get(session, format!("{ITEMS}/{}", item_id(id)))
     }
 
@@ -165,7 +165,7 @@ impl<T: Transport> CloudBackend<T> {
     fn item_step(
         &self,
         agent: &str,
-        id: i64,
+        id: &str,
         operation: &str,
         mut body: Value,
         item: &Value,
@@ -176,7 +176,13 @@ impl<T: Transport> CloudBackend<T> {
     }
 
     /// The area named by key. Without a key, the first one, created on first use where the role allows.
-    fn area_id(&self, agent: &str, wanted: Option<&str>) -> Result<String> {
+    fn area_id(
+        &self,
+        agent: &str,
+        wanted: Option<&str>,
+        prefix: Option<&str>,
+        pad: Option<u8>,
+    ) -> Result<String> {
         let value = self.get(agent, AREAS.into())?;
         let areas: Vec<Value> = list(value, &["areas", "items"])?;
         let found = match wanted {
@@ -187,7 +193,13 @@ impl<T: Transport> CloudBackend<T> {
             (Some(area), _) => Ok(text(area, "id").to_string()),
             (None, Some(key)) => Err(Error::NotFound(format!("no area {key:?}"))),
             (None, None) => {
-                let body = json!({"key": DEFAULT_AREA, "name": "General"});
+                let mut body = json!({"key": DEFAULT_AREA, "name": "General"});
+                if let Some(prefix) = prefix {
+                    body["prefix"] = json!(prefix);
+                }
+                if let Some(pad) = pad {
+                    body["pad"] = json!(pad);
+                }
                 Ok(text(&self.post(agent, AREAS.into(), &body)?, "id").to_string())
             }
         }
@@ -300,8 +312,8 @@ fn message(value: Value) -> Result<Message> {
     Ok(one(value, "message")?)
 }
 
-fn item_id(id: i64) -> String {
-    format!("D-{id}")
+fn item_id(id: &str) -> String {
+    id.to_string()
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -417,10 +429,19 @@ fn task_status(status: &str) -> tasks::Status {
 /// A backlog item in the shape of a task. Open covers `ready`, `blocked` and `intake`.
 fn task_from(item: &Value) -> Result<tasks::Task> {
     let id = text(item, "id");
-    let number = id
-        .strip_prefix("D-")
-        .and_then(|digits| digits.parse().ok())
-        .ok_or_else(|| Error::Protocol(format!("{id:?} is not a backlog id")))?;
+    let valid_id = id.rsplit_once('-').is_some_and(|(prefix, number)| {
+        !prefix.is_empty()
+            && prefix.split('-').all(|part| {
+                let mut chars = part.chars();
+                chars.next().is_some_and(|ch| ch.is_ascii_uppercase())
+                    && chars.all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+            })
+            && !number.is_empty()
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    if !valid_id {
+        return Err(Error::Protocol(format!("{id:?} is not a backlog id")));
+    }
     let assignment = item.get("assignment").filter(|found| found.is_object());
     let evidence: Vec<&str> = item
         .get("evidence")
@@ -430,7 +451,7 @@ fn task_from(item: &Value) -> Result<tasks::Task> {
         .map(|entry| text(entry, "value"))
         .collect();
     Ok(tasks::Task {
-        id: number,
+        id: id.to_string(),
         title: text(item, "title").to_string(),
         body: text(item, "body").to_string(),
         status: task_status(text(item, "status")),
@@ -848,11 +869,11 @@ impl<T: Transport> Backend for CloudBackend<T> {
         Ok(found)
     }
 
-    fn task(&self, id: i64) -> Result<tasks::Task> {
+    fn task(&self, id: &str) -> Result<tasks::Task> {
         task_from(&self.item(&self.session, id)?)
     }
 
-    fn task_history(&self, id: i64) -> Result<Vec<tasks::TaskEvent>> {
+    fn task_history(&self, id: &str) -> Result<Vec<tasks::TaskEvent>> {
         let value = self.get(&self.session, format!("{ITEMS}/{}/history", item_id(id)))?;
         let rows: Vec<Value> = list(value, &["events", "items"])?;
         Ok(rows
@@ -892,7 +913,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
             "acceptance": spec.acceptance.as_deref().unwrap_or(&spec.title),
             "type": spec.kind.as_deref().unwrap_or("code"),
             "actor": "agent",
-            "area_id": self.area_id(author, spec.area.as_deref())?,
+            "area_id": self.area_id(author, spec.area.as_deref(), spec.prefix.as_deref(), spec.pad)?,
             "priority": spec.priority.as_deref().unwrap_or(DEFAULT_PRIORITY),
             "p0_category": spec.p0_category,
             "due_at": spec.due_at,
@@ -904,7 +925,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
         task_from(&self.post(author, ITEMS.into(), &body)?)
     }
 
-    fn plan_task(&mut self, agent: &str, id: i64, plan: &tasks::TaskPlan) -> Result<tasks::Task> {
+    fn plan_task(&mut self, agent: &str, id: &str, plan: &tasks::TaskPlan) -> Result<tasks::Task> {
         let item = self.item(agent, id)?;
         let body = json!({
             "priority": plan.priority.as_deref().map_or(item["priority"].clone(), |p| json!(p)),
@@ -918,12 +939,12 @@ impl<T: Transport> Backend for CloudBackend<T> {
     }
 
     /// The registry leases an item for two hours, so `ttl` has no meaning here.
-    fn claim_task(&mut self, agent: &str, id: i64, _ttl: i64, _now: i64) -> Result<tasks::Task> {
+    fn claim_task(&mut self, agent: &str, id: &str, _ttl: i64, _now: i64) -> Result<tasks::Task> {
         let item = self.item(agent, id)?;
         self.item_step(agent, id, "claim", json!({"session": agent}), &item)
     }
 
-    fn renew_task(&mut self, agent: &str, id: i64, _ttl: i64, _now: i64) -> Result<tasks::Task> {
+    fn renew_task(&mut self, agent: &str, id: &str, _ttl: i64, _now: i64) -> Result<tasks::Task> {
         let item = self.item(agent, id)?;
         self.item_step(agent, id, "heartbeat", json!({}), &item)
     }
@@ -931,7 +952,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
     fn release_task(
         &mut self,
         agent: &str,
-        id: i64,
+        id: &str,
         _note: &str,
         _now: i64,
     ) -> Result<tasks::Task> {
@@ -942,7 +963,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
     fn submit_task(
         &mut self,
         agent: &str,
-        id: i64,
+        id: &str,
         evidence: &str,
         now: i64,
     ) -> Result<tasks::Task> {
@@ -957,7 +978,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
         self.item_step(agent, id, "transition", body, &item)
     }
 
-    fn accept_task(&mut self, agent: &str, id: i64, note: &str, _now: i64) -> Result<tasks::Task> {
+    fn accept_task(&mut self, agent: &str, id: &str, note: &str, _now: i64) -> Result<tasks::Task> {
         let item = self.item(agent, id)?;
         let body =
             json!({"to": "done", "resolution": "completed", "reason": reason_or(note, "accepted")});
@@ -967,7 +988,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
     fn reject_task(
         &mut self,
         agent: &str,
-        id: i64,
+        id: &str,
         reason: &str,
         _now: i64,
     ) -> Result<tasks::Task> {
@@ -976,7 +997,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
         self.item_step(agent, id, "transition", body, &item)
     }
 
-    fn cancel_task(&mut self, agent: &str, id: i64, note: &str, _now: i64) -> Result<tasks::Task> {
+    fn cancel_task(&mut self, agent: &str, id: &str, note: &str, _now: i64) -> Result<tasks::Task> {
         let item = self.item(agent, id)?;
         let body = json!({
             "to": "cancelled",
@@ -2001,7 +2022,7 @@ mod tests {
 
     fn item(status: &str, version: i64) -> Value {
         json!({
-            "id": "D-7", "title": "t", "body": "b", "status": status, "priority": "P1", "version": version,
+            "id": "G-SG-0012", "title": "t", "body": "b", "status": status, "priority": "P1", "version": version,
             "target": "ci_passed", "created_by": "token:ab:writer",
             "created_at": "2026-11-02T10:00:00+00:00", "updated_at": "2026-11-02T10:00:00+00:00",
             "assignment": {"executor": "token:ab:s:1", "lease_expires_at": "2026-11-02T12:00:00+00:00"},
@@ -2022,7 +2043,10 @@ mod tests {
             ..tasks::TaskSpec::default()
         };
         let task = cloud.add_task("me", &spec, 0).unwrap();
-        assert_eq!((task.id, task.priority.as_deref()), (7, Some("P1")));
+        assert_eq!(
+            (task.id, task.priority.as_deref()),
+            ("G-SG-0012".to_string(), Some("P1"))
+        );
         assert_eq!(task.status, tasks::Status::Open);
         assert_eq!(task.author, "writer");
         assert_eq!(task.assignee.as_deref(), Some("s:1"));
@@ -2085,11 +2109,15 @@ mod tests {
         let (server, mut cloud) = backend(vec![json!([]), json!({"id": "new"}), item("ready", 1)]);
         let plain = tasks::TaskSpec {
             title: "t".into(),
+            prefix: Some("FE".into()),
+            pad: Some(4),
             ..tasks::TaskSpec::default()
         };
         cloud.add_task("me", &plain, 0).unwrap();
         let seen = server.requests();
         assert_eq!(seen[1].body["key"], "general");
+        assert_eq!(seen[1].body["prefix"], "FE");
+        assert_eq!(seen[1].body["pad"], 4);
         assert_eq!(seen[2].body["area_id"], "new");
     }
 
@@ -2101,14 +2129,14 @@ mod tests {
             item("active", 4),
             item("review", 5),
         ]);
-        cloud.submit_task("me", 7, "run 5", 0).unwrap();
+        cloud.submit_task("me", "G-SG-0012", "run 5", 0).unwrap();
         let seen = sees(
             &server,
             &[
-                ("GET", "/api/v1/registry/items/D-7"),
-                ("POST", "/api/v1/registry/items/D-7/evidence"),
-                ("GET", "/api/v1/registry/items/D-7"),
-                ("POST", "/api/v1/registry/items/D-7/transition"),
+                ("GET", "/api/v1/registry/items/G-SG-0012"),
+                ("POST", "/api/v1/registry/items/G-SG-0012/evidence"),
+                ("GET", "/api/v1/registry/items/G-SG-0012"),
+                ("POST", "/api/v1/registry/items/G-SG-0012/transition"),
             ],
         );
         assert_eq!(seen[1].body["expected_version"], 3);
@@ -2135,7 +2163,7 @@ mod tests {
         let (_server, cloud) = backend(vec![json!([
             {"actor": "token:ab:bob", "op": "claimed", "reason": null, "at": "2026-11-02T10:00:00+00:00"}
         ])]);
-        let history = cloud.task_history(7).unwrap();
+        let history = cloud.task_history("G-SG-0012").unwrap();
         assert_eq!(
             (history[0].agent.as_str(), history[0].action.as_str()),
             ("bob", "claimed")

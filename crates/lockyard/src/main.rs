@@ -492,6 +492,12 @@ enum TaskCommand {
         /// Key of the area. Cloud mode; the first area by default.
         #[arg(long)]
         area: Option<String>,
+        /// Prefix to use when creating the default area.
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Number padding to use when creating the default area.
+        #[arg(long)]
+        pad: Option<u8>,
         /// Due date as RFC 3339 text. Cloud mode.
         #[arg(long)]
         due: Option<String>,
@@ -501,8 +507,8 @@ enum TaskCommand {
     },
     /// Change the urgency of a task. Needs cloud mode.
     Plan {
-        #[arg(value_parser = parse_id)]
-        id: i64,
+        #[arg(value_parser = parse_task_id)]
+        id: String,
         #[arg(long)]
         priority: Option<String>,
         #[arg(long)]
@@ -521,56 +527,56 @@ enum TaskCommand {
     },
     /// Show a task and its history.
     Show {
-        #[arg(value_parser = parse_id)]
-        id: i64,
+        #[arg(value_parser = parse_task_id)]
+        id: String,
     },
     /// Take a task.
     Claim {
-        #[arg(value_parser = parse_id)]
-        id: i64,
+        #[arg(value_parser = parse_task_id)]
+        id: String,
         #[command(flatten)]
         ttl: Ttl,
     },
     /// Extend the lease on a held task.
     Renew {
-        #[arg(value_parser = parse_id)]
-        id: i64,
+        #[arg(value_parser = parse_task_id)]
+        id: String,
         #[command(flatten)]
         ttl: Ttl,
     },
     /// Give a held task back.
     Release {
-        #[arg(value_parser = parse_id)]
-        id: i64,
+        #[arg(value_parser = parse_task_id)]
+        id: String,
         #[arg(long, default_value = "")]
         note: String,
     },
     /// Hand a held task to review.
     Submit {
-        #[arg(value_parser = parse_id)]
-        id: i64,
+        #[arg(value_parser = parse_task_id)]
+        id: String,
         /// What proves the work is done.
         #[arg(long)]
         evidence: String,
     },
     /// Accept another agent's submitted work.
     Accept {
-        #[arg(value_parser = parse_id)]
-        id: i64,
+        #[arg(value_parser = parse_task_id)]
+        id: String,
         #[arg(long, default_value = "")]
         note: String,
     },
     /// Return submitted work to its assignee.
     Reject {
-        #[arg(value_parser = parse_id)]
-        id: i64,
+        #[arg(value_parser = parse_task_id)]
+        id: String,
         #[arg(long)]
         reason: String,
     },
     /// Cancel a task you wrote.
     Cancel {
-        #[arg(value_parser = parse_id)]
-        id: i64,
+        #[arg(value_parser = parse_task_id)]
+        id: String,
         #[arg(long, default_value = "")]
         note: String,
     },
@@ -883,6 +889,26 @@ fn parse_id(text: &str) -> std::result::Result<i64, String> {
     digits
         .parse()
         .map_err(|_| format!("{text:?} is not an id, expected a number such as 12 or T-12"))
+}
+
+fn parse_task_id(text: &str) -> std::result::Result<String, String> {
+    let valid = text.rsplit_once('-').is_some_and(|(prefix, number)| {
+        !prefix.is_empty()
+            && prefix.split('-').all(|part| {
+                let mut chars = part.chars();
+                chars.next().is_some_and(|c| c.is_ascii_uppercase())
+                    && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            })
+            && !number.is_empty()
+            && number.bytes().all(|c| c.is_ascii_digit())
+    });
+    if valid || (!text.is_empty() && text.bytes().all(|c| c.is_ascii_digit())) {
+        Ok(text.to_string())
+    } else {
+        Err(format!(
+            "{text:?} is not an id, expected PREFIX-number such as FE-0001"
+        ))
+    }
 }
 
 fn parse_status(text: &str) -> std::result::Result<Status, String> {
@@ -1552,8 +1578,8 @@ fn run_task(mut opened: Opened, command: TaskCommand, agent: Option<&String>) ->
             return output(&tasks, text);
         }
         TaskCommand::Show { id } => {
-            let task = store.task(id)?;
-            let history = store.task_history(id)?;
+            let task = store.task(&id)?;
+            let history = store.task_history(&id)?;
             let mut lines = vec![task_line(&task)];
             if !task.body.is_empty() {
                 lines.push(task.body.clone());
@@ -1579,6 +1605,8 @@ fn run_task(mut opened: Opened, command: TaskCommand, agent: Option<&String>) ->
             target,
             verification,
             area,
+            prefix,
+            pad,
             due,
             evidence,
         } => store.add_task(
@@ -1593,6 +1621,8 @@ fn run_task(mut opened: Opened, command: TaskCommand, agent: Option<&String>) ->
                 target,
                 verification,
                 area,
+                prefix,
+                pad,
                 due_at: due,
                 evidence,
             },
@@ -1605,7 +1635,7 @@ fn run_task(mut opened: Opened, command: TaskCommand, agent: Option<&String>) ->
             due,
         } => store.plan_task(
             &resolve_agent(agent)?,
-            id,
+            &id,
             &TaskPlan {
                 priority,
                 p0_category,
@@ -1613,25 +1643,25 @@ fn run_task(mut opened: Opened, command: TaskCommand, agent: Option<&String>) ->
             },
         )?,
         TaskCommand::Claim { id, ttl } => {
-            store.claim_task(&resolve_agent(agent)?, id, ttl.ttl, now)?
+            store.claim_task(&resolve_agent(agent)?, &id, ttl.ttl, now)?
         }
         TaskCommand::Renew { id, ttl } => {
-            store.renew_task(&resolve_agent(agent)?, id, ttl.ttl, now)?
+            store.renew_task(&resolve_agent(agent)?, &id, ttl.ttl, now)?
         }
         TaskCommand::Release { id, note } => {
-            store.release_task(&resolve_agent(agent)?, id, &note, now)?
+            store.release_task(&resolve_agent(agent)?, &id, &note, now)?
         }
         TaskCommand::Submit { id, evidence } => {
-            store.submit_task(&resolve_agent(agent)?, id, &evidence, now)?
+            store.submit_task(&resolve_agent(agent)?, &id, &evidence, now)?
         }
         TaskCommand::Accept { id, note } => {
-            store.accept_task(&resolve_agent(agent)?, id, &note, now)?
+            store.accept_task(&resolve_agent(agent)?, &id, &note, now)?
         }
         TaskCommand::Reject { id, reason } => {
-            store.reject_task(&resolve_agent(agent)?, id, &reason, now)?
+            store.reject_task(&resolve_agent(agent)?, &id, &reason, now)?
         }
         TaskCommand::Cancel { id, note } => {
-            store.cancel_task(&resolve_agent(agent)?, id, &note, now)?
+            store.cancel_task(&resolve_agent(agent)?, &id, &note, now)?
         }
     };
     output(&changed, task_line(&changed))
@@ -2802,6 +2832,16 @@ mod tests {
     }
 
     #[test]
+    fn registry_task_ids_keep_area_prefixes() {
+        for id in ["FE-0001", "G-SG-0012", "D-3176"] {
+            assert_eq!(parse_task_id(id).unwrap(), id);
+        }
+        for id in ["fe-1", "FE-", "-1"] {
+            assert!(parse_task_id(id).is_err(), "{id}");
+        }
+    }
+
+    #[test]
     fn minutes_round_up_and_stop_at_zero() {
         assert_eq!(minutes_left(60_001, 0), 2);
         assert_eq!(minutes_left(60_000, 0), 1);
@@ -2884,34 +2924,34 @@ mod tests {
         fn tasks(&self, _: Option<Status>, _: bool) -> Result<Vec<Task>> {
             unreachable!()
         }
-        fn task(&self, _: i64) -> Result<Task> {
+        fn task(&self, _: &str) -> Result<Task> {
             unreachable!()
         }
-        fn task_history(&self, _: i64) -> Result<Vec<lockyard_core::tasks::TaskEvent>> {
+        fn task_history(&self, _: &str) -> Result<Vec<lockyard_core::tasks::TaskEvent>> {
             unreachable!()
         }
         fn add_task(&mut self, _: &str, _: &TaskSpec, _: i64) -> Result<Task> {
             unreachable!()
         }
-        fn claim_task(&mut self, _: &str, _: i64, _: i64, _: i64) -> Result<Task> {
+        fn claim_task(&mut self, _: &str, _: &str, _: i64, _: i64) -> Result<Task> {
             unreachable!()
         }
-        fn renew_task(&mut self, _: &str, _: i64, _: i64, _: i64) -> Result<Task> {
+        fn renew_task(&mut self, _: &str, _: &str, _: i64, _: i64) -> Result<Task> {
             unreachable!()
         }
-        fn release_task(&mut self, _: &str, _: i64, _: &str, _: i64) -> Result<Task> {
+        fn release_task(&mut self, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
             unreachable!()
         }
-        fn submit_task(&mut self, _: &str, _: i64, _: &str, _: i64) -> Result<Task> {
+        fn submit_task(&mut self, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
             unreachable!()
         }
-        fn accept_task(&mut self, _: &str, _: i64, _: &str, _: i64) -> Result<Task> {
+        fn accept_task(&mut self, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
             unreachable!()
         }
-        fn reject_task(&mut self, _: &str, _: i64, _: &str, _: i64) -> Result<Task> {
+        fn reject_task(&mut self, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
             unreachable!()
         }
-        fn cancel_task(&mut self, _: &str, _: i64, _: &str, _: i64) -> Result<Task> {
+        fn cancel_task(&mut self, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
             unreachable!()
         }
         fn board_set(&mut self, _: &str, _: &BoardWrite, _: i64) -> Result<BoardEntry> {

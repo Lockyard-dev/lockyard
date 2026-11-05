@@ -15,6 +15,14 @@ use crate::proto::{
 use crate::{Error, Result, Store, ZonePath, bus, coordination, tasks, zones};
 use serde_json::Value;
 
+fn task_number(id: &str) -> Result<i64> {
+    id.rsplit_once('-')
+        .map(|(_, number)| number)
+        .unwrap_or(id)
+        .parse()
+        .map_err(|_| Error::Invalid(format!("{id:?} is not a task id")))
+}
+
 fn cloud<T>(feature: &str) -> Result<T> {
     Err(Error::needs_cloud(feature))
 }
@@ -164,31 +172,32 @@ pub trait Backend {
 
     fn tasks(&self, status: Option<tasks::Status>, include_final: bool)
     -> Result<Vec<tasks::Task>>;
-    fn task(&self, id: i64) -> Result<tasks::Task>;
-    fn task_history(&self, id: i64) -> Result<Vec<tasks::TaskEvent>>;
+    fn task(&self, id: &str) -> Result<tasks::Task>;
+    fn task_history(&self, id: &str) -> Result<Vec<tasks::TaskEvent>>;
     fn add_task(&mut self, author: &str, spec: &tasks::TaskSpec, now: i64) -> Result<tasks::Task>;
     /// Changes the urgency of a task.
     fn plan_task(
         &mut self,
         _agent: &str,
-        _id: i64,
+        _id: &str,
         _plan: &tasks::TaskPlan,
     ) -> Result<tasks::Task> {
         cloud("task plan")
     }
-    fn claim_task(&mut self, agent: &str, id: i64, ttl: i64, now: i64) -> Result<tasks::Task>;
-    fn renew_task(&mut self, agent: &str, id: i64, ttl: i64, now: i64) -> Result<tasks::Task>;
-    fn release_task(&mut self, agent: &str, id: i64, note: &str, now: i64) -> Result<tasks::Task>;
+    fn claim_task(&mut self, agent: &str, id: &str, ttl: i64, now: i64) -> Result<tasks::Task>;
+    fn renew_task(&mut self, agent: &str, id: &str, ttl: i64, now: i64) -> Result<tasks::Task>;
+    fn release_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task>;
     fn submit_task(
         &mut self,
         agent: &str,
-        id: i64,
+        id: &str,
         evidence: &str,
         now: i64,
     ) -> Result<tasks::Task>;
-    fn accept_task(&mut self, agent: &str, id: i64, note: &str, now: i64) -> Result<tasks::Task>;
-    fn reject_task(&mut self, agent: &str, id: i64, reason: &str, now: i64) -> Result<tasks::Task>;
-    fn cancel_task(&mut self, agent: &str, id: i64, note: &str, now: i64) -> Result<tasks::Task>;
+    fn accept_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task>;
+    fn reject_task(&mut self, agent: &str, id: &str, reason: &str, now: i64)
+    -> Result<tasks::Task>;
+    fn cancel_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task>;
 
     fn board_set(&mut self, agent: &str, write: &BoardWrite, now: i64) -> Result<BoardEntry>;
     fn board_get(&self, key: &str, now: i64) -> Result<Option<BoardEntry>>;
@@ -505,12 +514,12 @@ impl Backend for Store {
         Store::tasks(self, status, include_final)
     }
 
-    fn task(&self, id: i64) -> Result<tasks::Task> {
-        Store::task(self, id)
+    fn task(&self, id: &str) -> Result<tasks::Task> {
+        Store::task(self, task_number(id)?)
     }
 
-    fn task_history(&self, id: i64) -> Result<Vec<tasks::TaskEvent>> {
-        Store::task_history(self, id)
+    fn task_history(&self, id: &str) -> Result<Vec<tasks::TaskEvent>> {
+        Store::task_history(self, task_number(id)?)
     }
 
     fn add_task(&mut self, author: &str, spec: &tasks::TaskSpec, now: i64) -> Result<tasks::Task> {
@@ -520,38 +529,44 @@ impl Backend for Store {
         Store::add_task(self, author, &spec.title, &spec.body, now)
     }
 
-    fn claim_task(&mut self, agent: &str, id: i64, ttl: i64, now: i64) -> Result<tasks::Task> {
-        Store::claim_task(self, agent, id, ttl, now)
+    fn claim_task(&mut self, agent: &str, id: &str, ttl: i64, now: i64) -> Result<tasks::Task> {
+        Store::claim_task(self, agent, task_number(id)?, ttl, now)
     }
 
-    fn renew_task(&mut self, agent: &str, id: i64, ttl: i64, now: i64) -> Result<tasks::Task> {
-        Store::renew_task(self, agent, id, ttl, now)
+    fn renew_task(&mut self, agent: &str, id: &str, ttl: i64, now: i64) -> Result<tasks::Task> {
+        Store::renew_task(self, agent, task_number(id)?, ttl, now)
     }
 
-    fn release_task(&mut self, agent: &str, id: i64, note: &str, now: i64) -> Result<tasks::Task> {
-        Store::release_task(self, agent, id, note, now)
+    fn release_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task> {
+        Store::release_task(self, agent, task_number(id)?, note, now)
     }
 
     fn submit_task(
         &mut self,
         agent: &str,
-        id: i64,
+        id: &str,
         evidence: &str,
         now: i64,
     ) -> Result<tasks::Task> {
-        Store::submit_task(self, agent, id, evidence, now)
+        Store::submit_task(self, agent, task_number(id)?, evidence, now)
     }
 
-    fn accept_task(&mut self, agent: &str, id: i64, note: &str, now: i64) -> Result<tasks::Task> {
-        Store::accept_task(self, agent, id, note, now)
+    fn accept_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task> {
+        Store::accept_task(self, agent, task_number(id)?, note, now)
     }
 
-    fn reject_task(&mut self, agent: &str, id: i64, reason: &str, now: i64) -> Result<tasks::Task> {
-        Store::reject_task(self, agent, id, reason, now)
+    fn reject_task(
+        &mut self,
+        agent: &str,
+        id: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<tasks::Task> {
+        Store::reject_task(self, agent, task_number(id)?, reason, now)
     }
 
-    fn cancel_task(&mut self, agent: &str, id: i64, note: &str, now: i64) -> Result<tasks::Task> {
-        Store::cancel_task(self, agent, id, note, now)
+    fn cancel_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task> {
+        Store::cancel_task(self, agent, task_number(id)?, note, now)
     }
 
     fn board_set(&mut self, _agent: &str, write: &BoardWrite, now: i64) -> Result<BoardEntry> {
@@ -685,7 +700,7 @@ mod tests {
                 .map(|_| ()),
             backend.token_revoke("a", "x").map(|_| ()),
             backend
-                .plan_task("a", 1, &tasks::TaskPlan::default())
+                .plan_task("a", "D-1", &tasks::TaskPlan::default())
                 .map(|_| ()),
             backend
                 .add_task(
