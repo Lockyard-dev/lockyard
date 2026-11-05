@@ -166,6 +166,95 @@ fn a_full_conversation_and_task_cycle_over_json() {
 }
 
 #[test]
+fn status_only_shows_the_current_agents_claims_and_tasks() {
+    let dir = project();
+    let root = dir.path();
+    ok(root, "alice", &["zone", "claim", "src"]);
+    ok(root, "bob", &["zone", "claim", "docs"]);
+    ok(root, "alice", &["task", "add", "alice task"]);
+    ok(root, "bob", &["task", "add", "bob task"]);
+    ok(root, "alice", &["task", "claim", "D-1"]);
+    ok(root, "bob", &["task", "claim", "D-2"]);
+    lockyard_core::Store::open(root)
+        .unwrap()
+        .record_unannounced("docs/outside.rs", "bob", 99, 1_000)
+        .unwrap();
+    let status = ok(root, "alice", &["--json", "status"]);
+    let status: Value = serde_json::from_str(&status).unwrap();
+    assert_eq!(status["claims"].as_array().unwrap().len(), 1);
+    assert_eq!(status["claims"][0]["agent"], "alice");
+    assert_eq!(status["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(status["tasks"][0]["title"], "alice task");
+    assert!(status["unannounced"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn task_commands_print_the_registry_identifier_once() {
+    let dir = project();
+    let added = ok(dir.path(), "lead", &["task", "add", "ship"]);
+    assert!(added.starts_with("D-1  "), "{added}");
+    assert!(!added.starts_with("T-D-1"));
+}
+
+#[test]
+fn task_lookup_errors_include_the_requested_identifier() {
+    let dir = project();
+    let output = lockyard(dir.path(), "lead", &["task", "show", "ZZ-9999"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("ZZ-9999"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_closed_status_pipe_exits_quietly() {
+    let dir = project();
+    for index in 0..80 {
+        let path = format!("src/long-path-{index:03}-with-some-extra-content.rs");
+        ok(dir.path(), "alice", &["zone", "claim", &path]);
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lockyard"))
+        .args(["status"])
+        .current_dir(dir.path())
+        .env("LOCKYARD_AGENT", "alice")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{:?}", output.status);
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn repeated_case_insensitive_claims_reuse_one_claim() {
+    let dir = project();
+    let first: Value = serde_json::from_str(&ok(
+        dir.path(),
+        "alice",
+        &["--json", "zone", "claim", "Auth/a.cs"],
+    ))
+    .unwrap();
+    let second: Value = serde_json::from_str(&ok(
+        dir.path(),
+        "alice",
+        &["--json", "zone", "claim", "auth/a.cs"],
+    ))
+    .unwrap();
+    assert_eq!(first["id"], second["id"]);
+    let claims: Value =
+        serde_json::from_str(&ok(dir.path(), "alice", &["--json", "zone", "list"])).unwrap();
+    assert_eq!(claims.as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn mail_needs_a_known_addressee_and_reads_once() {
     let dir = project();
     let root = dir.path();

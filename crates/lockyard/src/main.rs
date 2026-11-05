@@ -1085,10 +1085,7 @@ fn sent_line(message: &Message) -> String {
 
 fn task_line(task: &Task) -> String {
     let assignee = task.assignee.as_deref().unwrap_or("-");
-    format!(
-        "T-{}  {}  {}  {}",
-        task.id, task.status, assignee, task.title
-    )
+    format!("{}  {}  {}  {}", task.id, task.status, assignee, task.title)
 }
 
 fn work_line(task: &WorkTask) -> String {
@@ -1212,7 +1209,8 @@ fn run_zone(
             let mut request = claim_request(paths, note, ttl.ttl, &style);
             request.lazy = lazy;
             request.meta = meta;
-            let claim = opened.backend.claim(&agent, &request, now)?;
+            let claim =
+                lockyard_core::claim_or_reuse(opened.backend.as_mut(), &agent, &request, now)?;
             let text = claim_line(&claim, lease);
             output(&claim, text)
         }
@@ -1607,7 +1605,13 @@ fn run_task(mut opened: Opened, command: TaskCommand, agent: Option<&String>) ->
             return output(&tasks, text);
         }
         TaskCommand::Show { id } => {
-            let task = store.task(&id)?;
+            let task = store.task(&id).map_err(|error| {
+                if error.kind() == "not_found" {
+                    Error::NotFound(format!("task {id:?} was not found"))
+                } else {
+                    error
+                }
+            })?;
             let history = store.task_history(&id)?;
             let mut lines = vec![task_line(&task)];
             if !task.body.is_empty() {
@@ -2337,7 +2341,10 @@ fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
                 .unannounced(now.saturating_sub(24 * 60 * 60 * 1000))
                 .ok()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|record| record.holder == session)
+        .collect::<Vec<_>>();
     if !unannounced.is_empty() {
         lines.push(format!(
             "writes outside the hook: {} (detection only — Lockyard cannot refuse a shell write)",
@@ -2873,6 +2880,9 @@ fn main() -> ExitCode {
         Ok(_) if is_hook => ExitCode::SUCCESS,
         Ok(mut out) => {
             if let Err(error) = deliver(&out, json) {
+                if error.kind() == std::io::ErrorKind::BrokenPipe {
+                    return ExitCode::SUCCESS;
+                }
                 report(&Error::Io(error), json);
                 return ExitCode::from(EXIT_FAILURE);
             }
@@ -2923,6 +2933,19 @@ mod tests {
         for id in ["fe-1", "FE-", "-1"] {
             assert!(parse_task_id(id).is_err(), "{id}");
         }
+    }
+
+    #[test]
+    fn a_task_lookup_error_names_the_requested_identifier() {
+        let dir = tempfile::tempdir().unwrap();
+        lockyard_core::Store::init(dir.path()).unwrap();
+        let error = run(
+            Cli::try_parse_from(["lockyard", "task", "show", "ZZ-9999"]).unwrap(),
+            dir.path(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("ZZ-9999"));
     }
 
     #[test]

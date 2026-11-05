@@ -186,7 +186,10 @@ impl<T: Transport> CloudBackend<T> {
         let value = self.get(agent, AREAS.into())?;
         let areas: Vec<Value> = list(value, &["areas", "items"])?;
         let found = match wanted {
-            Some(key) => areas.iter().find(|area| text(area, "key") == key),
+            Some(key) => areas.iter().find(|area| {
+                text(area, "key").eq_ignore_ascii_case(key)
+                    || text(area, "prefix").eq_ignore_ascii_case(key)
+            }),
             None => areas.first(),
         };
         match (found, wanted) {
@@ -2363,6 +2366,29 @@ mod tests {
         assert_eq!(body["type"], "code");
         assert_eq!(body["target"], "code_accepted");
         assert_eq!(body["client_key"].as_str().unwrap().len(), 26);
+    }
+
+    #[test]
+    fn a_new_item_can_select_an_existing_area_by_prefix() {
+        let (server, mut cloud) = backend(vec![
+            json!([{"id": "a1", "key": "flexengine", "prefix": "FE"},
+                  {"id": "a2", "key": "platform", "prefix": "PA"}]),
+            item("ready", 1),
+        ]);
+        let spec = tasks::TaskSpec {
+            title: "t".into(),
+            area: Some("PA".into()),
+            prefix: Some("PA".into()),
+            ..tasks::TaskSpec::default()
+        };
+        cloud.add_task("me", &spec, 0).unwrap();
+        let seen = server.requests();
+        assert_eq!(seen[1].body["area_id"], "a2");
+        assert_eq!(
+            seen.len(),
+            2,
+            "an existing area should not be created again"
+        );
     }
 
     #[test]

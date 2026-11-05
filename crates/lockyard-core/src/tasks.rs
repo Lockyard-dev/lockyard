@@ -413,8 +413,8 @@ fn require_reviewer(task: &Task, agent: &str) -> Result<()> {
     }
     if task.assignee.as_deref() == Some(agent) {
         return Err(Error::Denied(format!(
-            "T-{} needs a review by another agent",
-            task.id
+            "only a reviewer other than the assignee {} can accept or reject T-{}",
+            agent, task.id
         )));
     }
     Ok(())
@@ -481,14 +481,18 @@ mod tests {
     fn the_worker_cannot_accept_its_own_work() {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
-        assert!(matches!(
-            store.accept_task("worker", id, "", 3),
-            Err(Error::Denied(_))
-        ));
-        assert!(matches!(
-            store.reject_task("worker", id, "no", 3),
-            Err(Error::Denied(_))
-        ));
+        let cannot_accept = store.accept_task("worker", id, "", 3).unwrap_err();
+        assert!(
+            cannot_accept
+                .to_string()
+                .contains("reviewer other than the assignee")
+        );
+        let cannot_reject = store.reject_task("worker", id, "no", 3).unwrap_err();
+        assert!(
+            cannot_reject
+                .to_string()
+                .contains("reviewer other than the assignee")
+        );
         assert_eq!(store.task(id).unwrap().status, Status::Review);
     }
 

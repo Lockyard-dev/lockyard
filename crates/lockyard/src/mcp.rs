@@ -195,7 +195,7 @@ fn compact_tools() -> Vec<Value> {
         ),
         tool_def(
             "check",
-            "Is this path free to edit? Errors when another agent holds it.",
+            "Is this path free to edit? Reports when you or another agent holds it.",
             json!({"path": text}),
             &["path"],
         ),
@@ -655,8 +655,10 @@ fn call_tool(
         Ok(result) => tool_result(result.to_string(), false),
         Err(error) => {
             let raw = error.to_string();
-            let message = if raw == "Resource not found." {
-                let args = params.get("arguments").unwrap_or(&empty);
+            let args = params.get("arguments").unwrap_or(&empty);
+            let missing_resource =
+                matches!(raw.as_str(), "Resource not found." | "Item not found.");
+            let message = if missing_resource {
                 match name {
                     "update" | "msg_send" | "handover" => args
                         .get("to")
@@ -668,8 +670,16 @@ fn call_tool(
                         .and_then(Value::as_i64)
                         .map(|id| format!("claim Z-{id} is not yours or does not exist"))
                         .unwrap_or(raw),
+                    "task_show" | "tasks" if args.get("id").and_then(Value::as_str).is_some() => {
+                        format!("task {:?} was not found", args["id"].as_str().unwrap())
+                    }
                     _ => raw,
                 }
+            } else if name == "task_show" && error.kind() == "not_found" {
+                args.get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| format!("task {id:?} was not found"))
+                    .unwrap_or(raw)
             } else {
                 raw
             };
@@ -769,6 +779,25 @@ impl<'a> Args<'a> {
 
     fn optional_id(self) -> Result<Option<i64>> {
         self.some_int("id")
+    }
+
+    fn optional_claim_id(self) -> Result<Option<i64>> {
+        self.get("id")
+            .map(|value| {
+                let raw = match value {
+                    Value::Number(number) => number.to_string(),
+                    Value::String(text) => text
+                        .strip_prefix("Z-")
+                        .or_else(|| text.strip_prefix("z-"))
+                        .unwrap_or(text)
+                        .to_string(),
+                    _ => return Err(wrong_type("id", "a claim id such as Z-392 or 392")),
+                };
+                raw.parse::<i64>().map_err(|_| {
+                    Error::Invalid("id must be a claim id such as Z-392 or 392".into())
+                })
+            })
+            .transpose()
     }
 
     fn ttl(self) -> Result<i64> {
@@ -1077,7 +1106,7 @@ fn run_composite(
                     after,
                 )?;
             }
-            let id = args.optional_id()?;
+            let id = args.optional_claim_id()?;
             let released_ids = if id.is_none() {
                 let claims = open(cwd, agent)?.backend.claims(
                     &ClaimQuery {
@@ -1328,7 +1357,9 @@ fn run_tool(
         }
         "zone_claim" => {
             let request = claim_request(&opened, args, cwd)?;
-            encode(&opened.backend.claim(me()?, &request, now)?)
+            let claim =
+                lockyard_core::claim_or_reuse(opened.backend.as_mut(), me()?, &request, now)?;
+            encode(&claim)
         }
         "zone_wait" => {
             let request = claim_request(&opened, args, cwd)?;
@@ -1498,6 +1529,29 @@ fn run_tool(
                     None => Err(Error::Contended(format!("{path} is held"))),
                 },
                 Some(check) if check.status == CheckStatus::Unknown => Ok(json!({"unknown": true})),
+                Some(check) if check.status == CheckStatus::Own => {
+                    Ok(json!({"free": true, "own": true, "holder": "you"}))
+                }
+                Some(check) if check.status == CheckStatus::Free => {
+                    let own = opened.backend.claims(
+                        &ClaimQuery {
+                            session: Some(me()?.to_string()),
+                            path: Some(path.clone()),
+                        },
+                        now,
+                    )?;
+                    let held_by_me = own.iter().any(|claim| {
+                        claim.paths.iter().any(|held| {
+                            lockyard_core::ZonePath::stored(held.clone())
+                                .contains(&lockyard_core::ZonePath::stored(path.clone()))
+                        })
+                    });
+                    if !held_by_me {
+                        Ok(json!({"free": true}))
+                    } else {
+                        Ok(json!({"free": true, "own": true, "holder": "you"}))
+                    }
+                }
                 _ => Ok(json!({"free": true})),
             }
         }
@@ -2057,6 +2111,15 @@ mod tests {
     }
 
     #[test]
+    fn compact_start_work_can_claim_a_task_without_paths() {
+        let dir = project();
+        call(&dir, "lead", "task_add", json!({"title": "ship"}));
+        let started = call(&dir, "worker", "start_work", json!({"task": "D-1"}));
+        assert_eq!(started["isError"], false);
+        assert!(text(&started).contains("\"status\":\"claimed\""));
+    }
+
+    #[test]
     fn status_only_returns_the_callers_claims() {
         let dir = project();
         call(&dir, "a", "start_work", json!({"paths": ["src"]}));
@@ -2133,6 +2196,17 @@ mod tests {
         let answer: Value = serde_json::from_str(text(&finished)).unwrap();
         assert_eq!(answer["released"], 1);
         assert_eq!(answer["released_ids"], json!([1]));
+    }
+
+    #[test]
+    fn finish_work_accepts_claim_ids_with_or_without_the_zone_prefix() {
+        let dir = project();
+        call(&dir, "a", "zone_claim", json!({"paths": ["src"]}));
+        let finished = call(&dir, "a", "finish_work", json!({"id": "Z-1"}));
+        assert_eq!(finished["isError"], false, "{}", text(&finished));
+        call(&dir, "a", "zone_claim", json!({"paths": ["docs"]}));
+        let finished = call(&dir, "a", "finish_work", json!({"id": "2"}));
+        assert_eq!(finished["isError"], false, "{}", text(&finished));
     }
 
     #[test]
@@ -2221,6 +2295,66 @@ mod tests {
         let held = call(&dir, "b", "check", json!({"path": "src/x.rs"}));
         assert_eq!(held["isError"], true);
         assert!(text(&call(&dir, "b", "check", json!({"path": "docs"}))).contains("free"));
+    }
+
+    #[test]
+    fn check_identifies_a_path_held_by_the_calling_agent() {
+        let dir = project();
+        call(&dir, "a", "zone_claim", json!({"paths": ["src"]}));
+        let failed_finish = call(&dir, "a", "finish_work", json!({"id": 999}));
+        assert_eq!(failed_finish["isError"], true);
+        let result = call(&dir, "a", "check", json!({"path": "src/file.rs"}));
+        assert_eq!(result["isError"], false);
+        let answer: Value = serde_json::from_str(text(&result)).unwrap();
+        assert_eq!(answer["free"], true);
+        assert_eq!(answer["own"], true);
+        assert_eq!(answer["holder"], "you");
+    }
+
+    #[test]
+    fn equivalent_reclaims_reuse_the_existing_claim() {
+        let dir = project();
+        let first = call(&dir, "a", "zone_claim", json!({"paths": ["Auth/a.cs"]}));
+        let first: Value = serde_json::from_str(text(&first)).unwrap();
+        let again = call(&dir, "a", "zone_claim", json!({"paths": ["auth/a.cs"]}));
+        let again: Value = serde_json::from_str(text(&again)).unwrap();
+        assert_eq!(first["id"], again["id"]);
+        let claims = call(&dir, "a", "zone_list", json!({}));
+        assert_eq!(
+            serde_json::from_str::<Value>(text(&claims))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unicode_normalized_reclaims_reuse_the_existing_claim() {
+        let dir = project();
+        let first = call(
+            &dir,
+            "a",
+            "zone_claim",
+            json!({"paths": ["caf\u{e9}/menu"]}),
+        );
+        let first: Value = serde_json::from_str(text(&first)).unwrap();
+        let again = call(
+            &dir,
+            "a",
+            "zone_claim",
+            json!({"paths": ["cafe\u{301}/menu"]}),
+        );
+        let again: Value = serde_json::from_str(text(&again)).unwrap();
+        assert_eq!(first["id"], again["id"]);
+    }
+
+    #[test]
+    fn compact_task_id_errors_name_the_requested_id() {
+        let dir = project();
+        let result = call(&dir, "a", "task_show", json!({"id": "ZZ-9999"}));
+        assert!(text(&result).contains("ZZ-9999"), "{}", text(&result));
     }
 
     #[test]

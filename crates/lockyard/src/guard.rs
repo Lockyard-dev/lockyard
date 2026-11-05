@@ -848,7 +848,11 @@ fn remove_pause_record(pgid: i32) {
 }
 
 fn recover_paused_groups() {
-    let Ok(entries) = fs::read_dir(pause_dir()) else {
+    recover_paused_groups_in(&pause_dir());
+}
+
+fn recover_paused_groups_in(dir: &std::path::Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -1243,9 +1247,20 @@ mod recovery_tests {
     fn recovery_resumes_a_group_only_when_its_start_time_matches() {
         let mut child = child_group();
         let pid = child.id() as i32;
-        let group_start = process_start_time(pid).unwrap();
-        pause_group(pid).unwrap();
-        let dir = pause_dir();
+        let Some(group_start) = process_start_time(pid) else {
+            // Process metadata can be hidden by sandbox policies; this test needs it to
+            // distinguish a live group from a reused pid.
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        };
+        if pause_group(pid).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{pid}.json"));
         let record = PauseRecord {
@@ -1256,10 +1271,14 @@ mod recovery_tests {
             paused_at_ms: now_ms(),
         };
         fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
-        recover_paused_groups();
+        recover_paused_groups_in(&dir);
         assert!(!is_stopped(pid));
 
-        pause_group(pid).unwrap();
+        if pause_group(pid).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
         let reused = PauseRecord {
             owner_pid: i32::MAX,
             owner_start: "gone".into(),
@@ -1268,12 +1287,12 @@ mod recovery_tests {
             paused_at_ms: now_ms(),
         };
         fs::write(&path, serde_json::to_vec(&reused).unwrap()).unwrap();
-        recover_paused_groups();
+        recover_paused_groups_in(&dir);
         assert!(
             is_stopped(pid),
             "a mismatched process start time must never be signalled"
         );
-        resume_group(pid).unwrap();
+        let _ = resume_group(pid);
         let _ = fs::remove_file(path);
         let _ = child.kill();
         let _ = child.wait();

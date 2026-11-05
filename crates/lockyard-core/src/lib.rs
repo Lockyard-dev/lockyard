@@ -21,7 +21,7 @@ pub mod tasks;
 pub mod watch;
 pub mod zones;
 
-pub use backend::Backend;
+pub use backend::{Backend, claim_or_reuse};
 pub use error::{Error, Result};
 pub use paths::ZonePath;
 pub use store::{Agent, DIR_NAME, Store, validate_agent};

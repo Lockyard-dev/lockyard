@@ -311,6 +311,37 @@ pub trait Backend {
     }
 }
 
+/// Reuses an agent's existing claim when it already covers every requested path.
+/// This makes equivalent case and Unicode spellings idempotent across backends.
+pub fn claim_or_reuse(
+    backend: &mut dyn Backend,
+    agent: &str,
+    request: &ClaimRequest,
+    now: i64,
+) -> Result<Claim> {
+    if !request.paths.is_empty() {
+        let existing = backend.claims(
+            &ClaimQuery {
+                session: Some(agent.to_string()),
+                path: None,
+            },
+            now,
+        )?;
+        if let Some(claim) = existing.into_iter().find(|claim| {
+            claim.mode == request.mode
+                && request.paths.iter().all(|requested| {
+                    let requested = crate::paths::ZonePath::stored(requested.clone());
+                    claim.paths.iter().any(|held| {
+                        crate::paths::ZonePath::stored(held.clone()).contains(&requested)
+                    })
+                })
+        }) {
+            return Ok(claim);
+        }
+    }
+    backend.claim(agent, request, now)
+}
+
 fn claim_record(claim: zones::Claim) -> Claim {
     Claim {
         id: claim.id,

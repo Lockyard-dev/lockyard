@@ -60,6 +60,13 @@ impl ZonePath {
         // conflict between two names that differ only in case.
         overlaps(self.as_str(), other.as_str(), true)
     }
+
+    /// True when this path is the requested path or one of its parent directories.
+    pub fn contains(&self, other: &Self) -> bool {
+        let outer = comparable(self.as_str(), true);
+        let inner = comparable(other.as_str(), true);
+        outer == ROOT || inner == outer || is_inside(&inner, &outer)
+    }
 }
 
 fn overlaps(a: &str, b: &str, fold_case: bool) -> bool {
@@ -258,6 +265,14 @@ mod tests {
         assert!(path(".").overlaps(&path("anything")));
         assert!(!path("src").overlaps(&path("src2/a.rs")));
         assert!(!path("src/a").overlaps(&path("src/b")));
+    }
+
+    #[test]
+    fn contains_requires_the_existing_claim_to_cover_the_requested_path() {
+        let directory = ZonePath::stored("Auth".into());
+        let file = ZonePath::stored("auth/a.cs".into());
+        assert!(directory.contains(&file));
+        assert!(!file.contains(&directory));
     }
 
     #[test]

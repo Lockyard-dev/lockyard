@@ -75,7 +75,8 @@ impl fmt::Display for Error {
             Self::Invalid(text) | Self::NotFound(text) | Self::Denied(text) => f.write_str(text),
             Self::Contended(text) => write!(
                 f,
-                "{text}. Next: refresh with `lockyard zone list`, then retry with the current fence."
+                "{}. Next: refresh with `lockyard zone list`, then retry with the current fence.",
+                text.trim_end_matches('.')
             ),
             Self::Protocol(text) => write!(
                 f,
@@ -150,5 +151,13 @@ mod tests {
         let text = Error::needs_cloud("zone queue").to_string();
         assert!(text.contains("zone queue needs cloud mode"));
         assert_eq!(Error::needs_cloud("x").kind(), "needs_cloud");
+    }
+
+    #[test]
+    fn contention_hints_have_one_period_and_point_to_the_zone_list() {
+        let text = Error::Contended("Only an active item has a lease.".into()).to_string();
+        assert_eq!(text.matches("..").count(), 0);
+        assert!(text.contains("Only an active item has a lease. Next:"));
+        assert!(text.contains("lockyard zone list"));
     }
 }
