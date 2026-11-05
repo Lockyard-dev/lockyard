@@ -2740,7 +2740,9 @@ fn main() -> ExitCode {
                 return ExitCode::from(EXIT_FAILURE);
             }
         };
-        let agent = cli.agent.clone().or_else(env_lockyard_agent);
+        // As --help promises: LOCKYARD_AGENT, then CLAUDE_CODE_SESSION_ID. Without the fallback a Claude Code
+        // session spoke under the shared anonymous name (D-3178 bug hunt, item 1).
+        let agent = cli.agent.clone().or_else(env_agent);
         return match current_dir()
             .and_then(|cwd| mcp::serve(agent, &cwd, surface).map_err(Error::Io))
         {
@@ -2776,12 +2778,6 @@ fn main() -> ExitCode {
             ExitCode::from(EXIT_FAILURE)
         }
     }
-}
-
-fn env_lockyard_agent() -> Option<String> {
-    std::env::var("LOCKYARD_AGENT")
-        .ok()
-        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
