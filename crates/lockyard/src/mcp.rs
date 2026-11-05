@@ -26,6 +26,42 @@ const DEFAULT_QUEUE_MINUTES: i64 = 60;
 const DEFAULT_WAIT_SECONDS: i64 = 60;
 const DEFAULT_ACTIVE_SECONDS: i64 = 900;
 
+fn visible_work(
+    agent: Option<&str>,
+    work: Vec<lockyard_core::proto::WorkTask>,
+) -> Vec<lockyard_core::proto::WorkTask> {
+    work.into_iter()
+        .filter(|item| {
+            !matches!(
+                item.status,
+                lockyard_core::proto::WorkStatus::Accepted
+                    | lockyard_core::proto::WorkStatus::Failed
+                    | lockyard_core::proto::WorkStatus::Expired
+                    | lockyard_core::proto::WorkStatus::Cancelled
+            ) && agent.is_some_and(|agent| {
+                item.to.as_deref() == Some(agent)
+                    || item.assignee.as_deref() == Some(agent)
+                    || item.lead.as_deref() == Some(agent)
+                    || item.executor.as_deref() == Some(agent)
+            })
+        })
+        .collect()
+}
+
+fn needs_presence(agent: Option<&str>, is_cloud: bool, present: bool) -> bool {
+    agent.is_some() && is_cloud && !present
+}
+
+fn validate_handover_claim(id: i64, claims: &[lockyard_core::proto::Claim]) -> Result<()> {
+    if claims.iter().any(|claim| claim.id == id) {
+        Ok(())
+    } else {
+        Err(Error::NotFound(format!(
+            "claim Z-{id} does not exist or is not yours"
+        )))
+    }
+}
+
 fn executor_evidence(evidence: &str) -> String {
     match std::env::var("LOCKYARD_ON_BEHALF") {
         Ok(lead_task) if !lead_task.trim().is_empty() => {
@@ -189,7 +225,7 @@ fn compact_tools() -> Vec<Value> {
     vec![
         tool_def(
             "start_work",
-            "Claim paths before editing; accept an offered zone with handover_id, or take a task.",
+            "Claim paths before editing; ttl is in minutes. Accept an offered zone with handover_id, or take a task.",
             json!({"paths": names, "note": text, "ttl": int, "shared": flag, "zones": names, "task": text, "handover_id": int}),
             &[],
         ),
@@ -279,7 +315,7 @@ fn full_tools() -> Vec<Value> {
         ),
         tool_def(
             "zone_claim",
-            "Claim project paths, all of them or none",
+            "Claim project paths, all of them or none; ttl is in minutes",
             json!({"paths": names, "note": text, "ttl": int, "lazy": flag, "shared": flag, "deploy": flag, "zones": names, "meta": object}),
             &[],
         ),
@@ -638,7 +674,8 @@ fn call_tool(
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").unwrap_or(&empty);
     let mut after = None;
-    let answer = run_tool(name, Args(args), agent, cwd, client, &mut after);
+    let answer = ensure_first_presence(agent, cwd, client)
+        .and_then(|()| run_tool(name, Args(args), agent, cwd, client, &mut after));
     let result = match answer {
         Ok(result)
             if [
@@ -696,6 +733,36 @@ fn call_tool(
         }
     };
     (result, after)
+}
+
+/// Cloud presence is established on an agent's first MCP call, including read-only checks.
+fn ensure_first_presence(agent: Option<&str>, cwd: &Path, client: Option<&str>) -> Result<()> {
+    let Some(agent) = agent else {
+        return Ok(());
+    };
+    let mut opened = open(cwd, Some(agent))?;
+    let is_cloud = opened.backend.is_cloud();
+    if !is_cloud {
+        return Ok(());
+    }
+    let present = opened
+        .backend
+        .presence(DEFAULT_ACTIVE_SECONDS, crate::now_ms())?
+        .iter()
+        .any(|person| person.session == agent);
+    if !needs_presence(Some(agent), true, present) {
+        return Ok(());
+    }
+    let beat = PresenceBeat {
+        client: client.unwrap_or("mcp").to_string(),
+        model: None,
+        role: None,
+        version: Some(lockyard_core::VERSION.to_string()),
+        cwd: cwd.to_str().map(str::to_string),
+        dnd_until: None,
+        activity: None,
+    };
+    opened.backend.heartbeat(agent, &beat, crate::now_ms())
 }
 
 fn tool_result(text: String, is_error: bool) -> Value {
@@ -1021,14 +1088,23 @@ fn run_composite(
             Ok(answer)
         }
         "handover" => {
-            let to = resolve_target(cwd, agent, args.text("to")?)?;
             let note = args.optional_text("note")?;
             // Only the cloud can offer a claim to a named agent; locally the honest move is to
             // let it go and say so, rather than pretend the other agent now holds it.
             let cloud = open(cwd, agent)?.backend.is_cloud();
             let id = if cloud {
                 match args.optional_id()? {
-                    Some(id) => id,
+                    Some(id) => {
+                        let claims = open(cwd, agent)?.backend.claims(
+                            &ClaimQuery {
+                                session: agent.map(str::to_string),
+                                path: None,
+                            },
+                            crate::now_ms(),
+                        )?;
+                        validate_handover_claim(id, &claims)?;
+                        id
+                    }
                     None => {
                         let claims = open(cwd, agent)?.backend.claims(
                             &ClaimQuery {
@@ -1059,6 +1135,7 @@ fn run_composite(
             } else {
                 args.optional_id()?.unwrap_or_default()
             };
+            let to = resolve_target(cwd, agent, args.text("to")?)?;
             let body = if cloud {
                 // The sender is this agent; `to` is the receiver reading the letter.
                 format!(
@@ -1107,17 +1184,20 @@ fn run_composite(
                 )?;
             }
             let id = args.optional_claim_id()?;
-            let released_ids = if id.is_none() {
-                let claims = open(cwd, agent)?.backend.claims(
-                    &ClaimQuery {
-                        session: agent.map(str::to_string),
-                        path: None,
-                    },
-                    crate::now_ms(),
-                )?;
-                claims.into_iter().map(|claim| claim.id).collect::<Vec<_>>()
-            } else {
-                vec![]
+            let released_ids = match id {
+                Some(id) => vec![id],
+                None => open(cwd, agent)?
+                    .backend
+                    .claims(
+                        &ClaimQuery {
+                            session: agent.map(str::to_string),
+                            path: None,
+                        },
+                        crate::now_ms(),
+                    )?
+                    .into_iter()
+                    .map(|claim| claim.id)
+                    .collect::<Vec<_>>(),
             };
             let release = match id {
                 Some(id) => json!({"id": id, "note": args.optional_text("note")?}),
@@ -1138,19 +1218,22 @@ fn resolve_target(cwd: &Path, agent: Option<&str>, target: &str) -> Result<Strin
     if presence.iter().any(|person| person.session == target) {
         return Ok(target.to_string());
     }
-    if let Some(person) = presence.iter().find(|person| person.client == target) {
+    if let Some(person) = presence.iter().find(|person| {
+        person.client == target
+            || person.session.starts_with(target)
+            || person.client.starts_with(target)
+    }) {
         return Ok(person.session.clone());
     }
     let names: Vec<&str> = presence
         .iter()
         .filter(|person| {
             !target.is_empty()
-                && (person.session.contains(target)
+                && (person.session.starts_with(target)
                     || person.client.contains(target)
                     || target.contains(&person.client))
         })
-        .map(|person| person.client.as_str())
-        .filter(|name| !name.is_empty())
+        .map(|person| person.session.as_str())
         .take(3)
         .collect();
     let suggestion = if names.is_empty() {
@@ -1202,7 +1285,10 @@ fn run_tool(
     match name {
         "tasks" => {
             let backend = &mut opened.backend;
-            match args.text("action")? {
+            let action = args.some_text("action")?.ok_or_else(|| Error::Invalid(
+                "action must be a string; allowed actions: list, show, claim, submit, block, unblock, accept, reject, cancel, close".into(),
+            ))?;
+            match action.as_str() {
                 "list" => {
                     let area = args.some_text("area")?;
                     let prefix = args.some_text("prefix")?;
@@ -1302,7 +1388,8 @@ fn run_tool(
                 now,
             )?;
             if backend.is_cloud() {
-                let mut work = backend.work_list(agent.unwrap_or("lockyard-cli"))?;
+                let work = visible_work(agent, backend.work_list(agent.unwrap_or("lockyard-cli"))?);
+                let mut work = work;
                 work.truncate(10);
                 let work: Vec<Value> = work
                     .into_iter()
@@ -1524,10 +1611,9 @@ fn run_tool(
                 .check(me()?, std::slice::from_ref(&path), None, now)?;
             let found = (!checks.is_empty()).then(|| checks.remove(0));
             match found {
-                Some(check) if check.status == CheckStatus::Held => match check.holder {
-                    Some(holder) => Err(Error::Conflict(vec![holder])),
-                    None => Err(Error::Contended(format!("{path} is held"))),
-                },
+                Some(check) if check.status == CheckStatus::Held => {
+                    Ok(json!({"free": false, "holder": check.holder}))
+                }
                 Some(check) if check.status == CheckStatus::Unknown => Ok(json!({"unknown": true})),
                 Some(check) if check.status == CheckStatus::Own => {
                     Ok(json!({"free": true, "own": true, "holder": "you"}))
@@ -1848,6 +1934,75 @@ mod tests {
 
     fn text(result: &Value) -> &str {
         result["content"][0]["text"].as_str().unwrap()
+    }
+
+    #[test]
+    fn cloud_status_work_is_only_active_and_relevant_to_the_agent() {
+        let make = |id, status: &str, to: &str| {
+            serde_json::from_value(json!({
+                "id": id, "title": "work", "to": to, "accept": "", "status": status,
+                "version": 1
+            }))
+            .unwrap()
+        };
+        let visible = visible_work(
+            Some("me"),
+            vec![
+                make(1, "offered", "me"),
+                make(2, "accepted", "me"),
+                make(3, "claimed", "someone-else"),
+                make(4, "claimed", "*"),
+            ],
+        );
+        assert_eq!(
+            visible.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn first_cloud_call_registers_an_agent_but_local_and_present_agents_are_untouched() {
+        assert!(needs_presence(Some("new-agent"), true, false));
+        assert!(!needs_presence(Some("known-agent"), true, true));
+        assert!(!needs_presence(Some("local-agent"), false, false));
+        assert!(!needs_presence(None, true, false));
+    }
+
+    #[test]
+    fn handover_reports_a_missing_claim_before_target_resolution() {
+        assert!(
+            validate_handover_claim(999_999, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("claim Z-999999")
+        );
+    }
+
+    #[test]
+    fn target_resolution_accepts_bus_names_and_session_prefixes() {
+        let dir = project();
+        call(
+            &dir,
+            "43ed9726-ba41-session",
+            "presence_beat",
+            json!({"client":"codex-d3176-slot-handover"}),
+        );
+        assert_eq!(
+            resolve_target(dir.path(), Some("sender"), "codex-d3176-slot-handover").unwrap(),
+            "43ed9726-ba41-session"
+        );
+        assert_eq!(
+            resolve_target(dir.path(), Some("sender"), "43ed9726").unwrap(),
+            "43ed9726-ba41-session"
+        );
+    }
+
+    #[test]
+    fn tasks_without_action_explain_the_allowed_actions() {
+        let dir = project();
+        let result = call(&dir, "agent", "tasks", json!({}));
+        assert_eq!(result["isError"], true);
+        assert!(text(&result).contains("list, show, claim, submit"));
     }
 
     #[test]
@@ -2199,6 +2354,29 @@ mod tests {
     }
 
     #[test]
+    fn finish_with_an_id_reports_the_released_id() {
+        let dir = project();
+        call(&dir, "a", "zone_claim", json!({"paths": ["src"]}));
+        let finished = call(&dir, "a", "finish_work", json!({"id": "Z-1"}));
+        let answer: Value = serde_json::from_str(text(&finished)).unwrap();
+        assert_eq!(answer["released_ids"], json!([1]));
+    }
+
+    #[test]
+    fn start_work_ttl_schema_names_minutes() {
+        let definition = compact_tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "start_work")
+            .unwrap();
+        assert!(
+            definition["description"]
+                .as_str()
+                .unwrap()
+                .contains("minutes")
+        );
+    }
+
+    #[test]
     fn finish_work_accepts_claim_ids_with_or_without_the_zone_prefix() {
         let dir = project();
         call(&dir, "a", "zone_claim", json!({"paths": ["src"]}));
@@ -2293,7 +2471,10 @@ mod tests {
         let dir = project();
         call(&dir, "a", "zone_claim", json!({"paths": ["src"]}));
         let held = call(&dir, "b", "check", json!({"path": "src/x.rs"}));
-        assert_eq!(held["isError"], true);
+        assert_eq!(held["isError"], false);
+        let answer: Value = serde_json::from_str(text(&held)).unwrap();
+        assert_eq!(answer["free"], false);
+        assert_eq!(answer["holder"]["agent"], "a");
         assert!(text(&call(&dir, "b", "check", json!({"path": "docs"}))).contains("free"));
     }
 
