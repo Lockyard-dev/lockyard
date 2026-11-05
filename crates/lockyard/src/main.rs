@@ -1904,7 +1904,7 @@ fn run_cloud(mut opened: Opened, command: CloudCommand, agent: Option<&String>) 
 fn agent_client(client: lockyard_cloud_client::Client) -> Result<lockyard_cloud_client::Client> {
     use lockyard_cloud_client::{ClientError, WorkspaceEncryption};
     let cache = agent::state_root()?.join("encryption.json");
-    let session = format!("lockyard-agent-{}", agent::uid());
+    let session = client.service_session(&format!("lockyard-agent-{}", agent::uid()));
     match client.workspace_encryption(&session) {
         Ok(setting) => {
             if let Ok(text) = serde_json::to_string(&setting) {

@@ -1435,7 +1435,13 @@ impl<T: Transport + 'static> Daemon<T> {
         let outbox = Outbox::open(&state_dir)?;
         let shared = Arc::new(Shared {
             transport: Arc::new(transport),
-            session: format!("lockyard-agent-{}", super::uid()),
+            // One name per token, not per machine: another key on this machine must not find it taken (D-3178).
+            // Same rule as Client::service_session (first 8 hex of the token id).
+            session: format!(
+                "lockyard-agent-{}-{}",
+                super::uid(),
+                config.token_id.get(..8).unwrap_or(&config.token_id)
+            ),
             coordination_seq: AtomicI64::new(load_seq(&state_dir, "coordination")),
             registry_seq: AtomicI64::new(load_seq(&state_dir, "registry")),
             session_event_cursors: Mutex::new(HashMap::new()),

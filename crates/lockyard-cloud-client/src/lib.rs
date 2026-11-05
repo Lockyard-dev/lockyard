@@ -333,6 +333,13 @@ pub struct Client {
 }
 
 impl Client {
+    /// A session name for this machine's own service calls, unique per token (D-3178). The server binds a
+    /// session name to the first token that uses it, so a name shared by every token on the machine (agent,
+    /// lead, owner, a reissued key) made the second one fail with «already bound to another token».
+    pub fn service_session(&self, base: &str) -> String {
+        format!("{base}-{}", &token_id(&self.token)[..8])
+    }
+
     pub fn new(base_url: &str, token: String) -> Result<Self, ClientError> {
         let base_url = base_url.trim_end_matches('/');
         if !allowed_url(base_url) {
@@ -472,9 +479,16 @@ impl Client {
                 ))));
             }
         };
+        // A call without an agent name speaks as this token's own CLI session, never as one name shared by
+        // every token on the machine (D-3178).
+        let session = if call.session == ANONYMOUS_SESSION {
+            self.service_session(ANONYMOUS_SESSION)
+        } else {
+            call.session.clone()
+        };
         request = request
             .set("Authorization", &format!("Bearer {}", self.token))
-            .set("X-Lockyard-Session", &call.session)
+            .set("X-Lockyard-Session", &session)
             .set(
                 "User-Agent",
                 concat!("lockyard/", env!("CARGO_PKG_VERSION")),
@@ -665,6 +679,9 @@ fn allowed_url(url: &str) -> bool {
     };
     matches!(host, "localhost" | "127.0.0.1")
 }
+
+/// The session name the CLI and MCP fall back to when no agent is named.
+pub const ANONYMOUS_SESSION: &str = "lockyard-cli";
 
 /// A short name for a token, so that a client can tell whether the agent process runs under the same one.
 /// It identifies, it does not protect: the socket is private to this user already.
@@ -1270,6 +1287,32 @@ mod tests {
     fn a_token_id_is_stable_and_tells_tokens_apart() {
         assert_eq!(token_id("a"), token_id("a"));
         assert_ne!(token_id("a"), token_id("b"));
+    }
+
+    #[test]
+    fn two_tokens_on_one_machine_get_different_service_sessions() {
+        // D-3178: one name per machine was bound by the first token and refused every other one.
+        let agent = Client::new("https://example.test", "agent-token".into()).unwrap();
+        let lead = Client::new("https://example.test", "lead-token".into()).unwrap();
+        let again = Client::new("https://example.test", "agent-token".into()).unwrap();
+        assert_ne!(
+            agent.service_session("lockyard-agent-501"),
+            lead.service_session("lockyard-agent-501")
+        );
+        assert_eq!(
+            agent.service_session("lockyard-agent-501"),
+            again.service_session("lockyard-agent-501")
+        );
+        assert!(
+            agent
+                .service_session("lockyard-cli")
+                .starts_with("lockyard-cli-")
+        );
+        assert!(
+            !agent
+                .service_session("lockyard-cli")
+                .contains("agent-token")
+        );
     }
 
     #[test]
