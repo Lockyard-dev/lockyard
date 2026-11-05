@@ -1072,6 +1072,27 @@ fn is_bidi_control(ch: char) -> bool {
     )
 }
 
+fn safe_message(mut message: Message) -> Message {
+    message.body = escape_controls(&message.body);
+    message
+}
+
+fn safe_messages(mut messages: Vec<Message>) -> Vec<Message> {
+    for message in &mut messages {
+        message.body = escape_controls(&message.body);
+    }
+    messages
+}
+
+fn safe_receipts(
+    mut receipts: Vec<lockyard_core::bus::Receipt>,
+) -> Vec<lockyard_core::bus::Receipt> {
+    for receipt in &mut receipts {
+        receipt.body = escape_controls(&receipt.body);
+    }
+    receipts
+}
+
 #[cfg(test)]
 mod output_escape_tests {
     #[test]
@@ -1088,6 +1109,32 @@ mod output_escape_tests {
             super::escape_controls("safe\u{202e}hidden\u{2069}"),
             "safe\\u{202e}hidden\\u{2069}"
         );
+    }
+
+    #[test]
+    fn json_mail_body_helpers_escape_messages_and_receipts() {
+        let message: super::Message = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "from": "a",
+            "to": "b",
+            "body": "safe\u{202e}hidden"
+        }))
+        .unwrap();
+        let messages = super::safe_messages(vec![message]);
+        assert_eq!(messages[0].body, "safe\\u{202e}hidden");
+
+        let receipt = lockyard_core::bus::Receipt {
+            id: 1,
+            to: "b".into(),
+            body: "safe\u{202e}hidden".into(),
+            created_at: 0,
+            status: lockyard_core::bus::Delivery::Sent,
+            delivered_at: None,
+            read_at: None,
+            replied_at: None,
+        };
+        let receipts = super::safe_receipts(vec![receipt]);
+        assert_eq!(receipts[0].body, "safe\\u{202e}hidden");
     }
 }
 
@@ -1542,11 +1589,13 @@ fn run_msg(opened: Opened, command: MsgCommand, agent: Option<&String>) -> Resul
                 from_client: None,
             };
             let message = backend.send(&agent, &request, now)?;
-            output(&message, sent_line(&message))
+            let text = sent_line(&message);
+            output(&safe_message(message), text)
         }
         MsgCommand::Reply { id, body } => {
             let message = backend.reply(&agent, id, &body, now)?;
-            output(&message, sent_line(&message))
+            let text = sent_line(&message);
+            output(&safe_message(message), text)
         }
         MsgCommand::Inbox { all, peek } => {
             let page = backend.inbox(
@@ -1559,7 +1608,7 @@ fn run_msg(opened: Opened, command: MsgCommand, agent: Option<&String>) -> Resul
             )?;
             let text = inbox_text(&page);
             let ids: Vec<i64> = page.messages.iter().map(|message| message.id).collect();
-            let mut out = output(&page.messages, text)?;
+            let mut out = output(&safe_messages(page.messages.clone()), text)?;
             if !peek && !ids.is_empty() {
                 // Marked only after the mail is on screen: a duplicate over a loss.
                 out.after = Some(Box::new(move || {
@@ -1579,12 +1628,12 @@ fn run_msg(opened: Opened, command: MsgCommand, agent: Option<&String>) -> Resul
         MsgCommand::Thread { id } => {
             let messages = backend.thread(&agent, id)?;
             let text = join(&messages, message_line, "empty thread");
-            output(&messages, text)
+            output(&safe_messages(messages), text)
         }
         MsgCommand::Overdue => {
             let messages = backend.overdue(&agent)?;
             let text = join(&messages, message_line, "nothing overdue");
-            output(&messages, text)
+            output(&safe_messages(messages), text)
         }
         MsgCommand::Sent { limit } => {
             let receipts = backend.sent(&agent, limit)?;
@@ -1599,7 +1648,7 @@ fn run_msg(opened: Opened, command: MsgCommand, agent: Option<&String>) -> Resul
                 )
             };
             let text = join(&receipts, line, "nothing sent yet");
-            output(&receipts, text)
+            output(&safe_receipts(receipts), text)
         }
         MsgCommand::Undelivered { older_than } => {
             let list = backend.undelivered(&agent, older_than)?;

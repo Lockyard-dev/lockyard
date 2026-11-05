@@ -772,16 +772,20 @@ fn a_sender_can_see_whether_mail_was_delivered_read_or_answered() {
     let dir = project();
     let root = dir.path();
     ok(root, "b", &["msg", "inbox"]);
-    let sent: Value = serde_json::from_str(&ok(
+    let sent_output = ok(
         root,
         "a",
         &["--json", "msg", "send", "b", "take src/api\u{202e}spoof"],
-    ))
-    .unwrap();
+    );
+    assert!(!sent_output.contains('\u{202e}'), "{sent_output}");
+    let sent: Value = serde_json::from_str(&sent_output).unwrap();
+    assert_eq!(sent["body"], "take src/api\\u{202e}spoof");
     let id = sent["id"].as_i64().unwrap();
 
     let status = |expected: &str| {
-        let list: Value = serde_json::from_str(&ok(root, "a", &["--json", "msg", "sent"])).unwrap();
+        let stdout = ok(root, "a", &["--json", "msg", "sent"]);
+        assert!(!stdout.contains('\u{202e}'), "{stdout}");
+        let list: Value = serde_json::from_str(&stdout).unwrap();
         let line = list
             .as_array()
             .unwrap()
@@ -790,6 +794,7 @@ fn a_sender_can_see_whether_mail_was_delivered_read_or_answered() {
             .unwrap_or_else(|| panic!("M-{id} is missing from msg sent"))
             .clone();
         assert_eq!(line["status"], expected, "{line}");
+        assert_eq!(line["body"], "take src/api\\u{202e}spoof");
     };
     status("sent");
     ok(root, "b", &["msg", "inbox", "--peek"]);
@@ -803,4 +808,28 @@ fn a_sender_can_see_whether_mail_was_delivered_read_or_answered() {
     assert!(text.contains("replied"), "{text}");
     assert!(text.contains("\\u{202e}"), "{text}");
     assert!(!text.contains('\u{202e}'), "{text}");
+}
+
+#[test]
+fn json_mailbox_outputs_escape_bidi_controls_and_remain_valid_json() {
+    let dir = project();
+    let root = dir.path();
+    ok(root, "b", &["msg", "inbox", "--peek"]);
+    let sent: Value = serde_json::from_str(&ok(
+        root,
+        "a",
+        &["--json", "msg", "send", "b", "safe\u{202e}hidden"],
+    ))
+    .unwrap();
+    assert_eq!(sent["body"], "safe\\u{202e}hidden");
+
+    let inbox = ok(root, "b", &["--json", "msg", "inbox", "--peek"]);
+    assert!(!inbox.contains('\u{202e}'), "{inbox}");
+    let messages: Value = serde_json::from_str(&inbox).unwrap();
+    assert_eq!(messages[0]["body"], "safe\\u{202e}hidden");
+
+    let receipts = ok(root, "a", &["--json", "msg", "sent"]);
+    assert!(!receipts.contains('\u{202e}'), "{receipts}");
+    let receipts: Value = serde_json::from_str(&receipts).unwrap();
+    assert_eq!(receipts[0]["body"], "safe\\u{202e}hidden");
 }
