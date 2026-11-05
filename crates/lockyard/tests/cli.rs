@@ -197,6 +197,13 @@ fn task_commands_print_the_registry_identifier_once() {
 }
 
 #[test]
+fn task_cancel_help_matches_author_permissions() {
+    let dir = project();
+    let help = ok(dir.path(), "lead", &["task", "cancel", "--help"]);
+    assert!(help.contains("Cancel a task you wrote"), "{help}");
+}
+
+#[test]
 fn task_lookup_errors_include_the_requested_identifier() {
     let dir = project();
     let output = lockyard(dir.path(), "lead", &["task", "show", "ZZ-9999"]);
@@ -258,18 +265,38 @@ fn repeated_case_insensitive_claims_reuse_one_claim() {
 fn mail_needs_a_known_addressee_and_reads_once() {
     let dir = project();
     let root = dir.path();
-    assert_eq!(
-        lockyard(root, "a", &["msg", "send", "ghost", "hi"])
-            .status
-            .code(),
-        Some(1)
-    );
+    let unknown = lockyard(root, "a", &["msg", "send", "ghost", "hi"]);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("ghost"));
     ok(root, "b", &["msg", "inbox"]);
     ok(root, "a", &["msg", "send", "b", "hi there"]);
     assert!(ok(root, "b", &["msg", "inbox", "--peek"]).contains("hi there"));
     assert!(ok(root, "b", &["status"]).contains("unread mail: 1"));
     assert!(ok(root, "b", &["msg", "inbox"]).contains("hi there"));
     assert_eq!(ok(root, "b", &["msg", "inbox"]).trim(), "no new mail");
+}
+
+#[test]
+fn zone_release_errors_name_the_missing_claim_and_keep_live_claims() {
+    let dir = project();
+    let root = dir.path();
+    let claim: Value =
+        serde_json::from_str(&ok(root, "alice", &["--json", "zone", "claim", "src"])).unwrap();
+    let actual_id = claim["id"].as_i64().unwrap();
+
+    let missing = lockyard(root, "alice", &["zone", "release", "999999"]);
+
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("Z-999999"));
+    let claims: Value =
+        serde_json::from_str(&ok(root, "alice", &["--json", "zone", "list"])).unwrap();
+    assert!(
+        claims
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == actual_id)
+    );
 }
 
 #[test]

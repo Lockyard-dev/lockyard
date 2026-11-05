@@ -717,48 +717,51 @@ fn call_tool(
         }
         Ok(result) => tool_result(result.to_string(), false),
         Err(error) => {
-            let raw = error.to_string();
             let args = params.get("arguments").unwrap_or(&empty);
-            let missing_resource =
-                matches!(raw.as_str(), "Resource not found." | "Item not found.");
-            let message = if missing_resource {
-                match name {
-                    "update" | "msg_send" | "handover" => args
-                        .get("to")
-                        .and_then(Value::as_str)
-                        .map(|to| format!("agent {to:?} is not in the workspace"))
-                        .unwrap_or(raw),
-                    "finish_work" | "zone_release" | "zone_renew" | "zone_handover" => args
-                        .get("id")
-                        .and_then(Value::as_i64)
-                        .map(|id| format!("claim Z-{id} is not yours or does not exist"))
-                        .unwrap_or(raw),
-                    "task_show" | "tasks" if args.get("id").and_then(Value::as_str).is_some() => {
-                        format!("task {:?} was not found", args["id"].as_str().unwrap())
-                    }
-                    _ => raw,
-                }
-            } else if name == "task_show" && error.kind() == "not_found" {
-                args.get("id")
-                    .and_then(Value::as_str)
-                    .map(|id| format!("task {id:?} was not found"))
-                    .unwrap_or(raw)
-            } else {
-                raw
-            };
-            let message = message
-                .replace(
-                    "ask the holder with `lockyard msg send <agent> \"...\"`",
-                    "ask the holder with the update tool",
-                )
-                .replace("`lockyard zone list`", "the zone_list tool")
-                .replace("`lockyard doctor`", "check Lockyard connectivity")
-                .replace("`lockyard cloud login`", "configure cloud authentication")
-                .replace("`lockyard init`", "initialize a Lockyard project");
+            let message = tool_error_message(name, args, &error);
             tool_result(message, true)
         }
     };
     (result, after)
+}
+
+fn tool_error_message(name: &str, args: &Value, error: &Error) -> String {
+    let raw = error.to_string();
+    let missing_resource = matches!(raw.as_str(), "Resource not found." | "Item not found.");
+    let message = if missing_resource {
+        match name {
+            "update" | "msg_send" | "handover" => args
+                .get("to")
+                .and_then(Value::as_str)
+                .map(|to| format!("agent {to:?} is not in the workspace"))
+                .unwrap_or(raw),
+            "finish_work" | "zone_release" | "zone_renew" | "zone_handover" => args
+                .get("id")
+                .and_then(Value::as_i64)
+                .map(|id| format!("claim Z-{id} is not yours or does not exist"))
+                .unwrap_or(raw),
+            "task_show" | "tasks" if args.get("id").and_then(Value::as_str).is_some() => {
+                format!("task {:?} was not found", args["id"].as_str().unwrap())
+            }
+            _ => raw,
+        }
+    } else if name == "task_show" && error.kind() == "not_found" {
+        args.get("id")
+            .and_then(Value::as_str)
+            .map(|id| format!("task {id:?} was not found"))
+            .unwrap_or(raw)
+    } else {
+        raw
+    };
+    message
+        .replace(
+            "ask the holder with `lockyard msg send <agent> \"...\"`",
+            "ask the holder with the update tool",
+        )
+        .replace("`lockyard zone list`", "the zone_list tool")
+        .replace("`lockyard doctor`", "check Lockyard connectivity")
+        .replace("`lockyard cloud login`", "configure cloud authentication")
+        .replace("`lockyard init`", "initialize a Lockyard project")
 }
 
 /// Cloud presence is established on an agent's first MCP call, including read-only checks.
@@ -2638,6 +2641,34 @@ mod tests {
     }
 
     #[test]
+    fn unknown_message_target_and_claim_errors_name_the_requested_object() {
+        let dir = project();
+        let unknown = call(&dir, "a", "msg_send", json!({"to": "ghost", "body": "hi"}));
+        assert_eq!(unknown["isError"], true);
+        assert!(text(&unknown).contains("ghost"), "{}", text(&unknown));
+
+        call(&dir, "a", "zone_claim", json!({"paths": ["src"]}));
+        let missing = call(&dir, "a", "zone_release", json!({"id": 999999}));
+        assert_eq!(missing["isError"], true);
+        assert!(text(&missing).contains("Z-999999"), "{}", text(&missing));
+        let claims = call(&dir, "a", "zone_list", json!({}));
+        assert!(text(&claims).contains("\"id\":1"), "{}", text(&claims));
+    }
+
+    #[test]
+    fn contention_error_uses_the_mcp_zone_tool_hint_once() {
+        let message = tool_error_message(
+            "task_release",
+            &json!({"id": "1"}),
+            &Error::Contended("Only an active item has a lease.".into()),
+        );
+        assert!(message.contains("Only an active item has a lease. Next:"));
+        assert!(message.contains("the zone_list tool"));
+        assert!(!message.contains("lockyard zone list"));
+        assert!(!message.contains(".."));
+    }
+
+    #[test]
     fn a_full_task_cycle_works_and_the_worker_cannot_accept() {
         let dir = project();
         call(&dir, "lead", "task_add", json!({"title": "ship"}));
@@ -2650,6 +2681,10 @@ mod tests {
         );
         let own = call(&dir, "worker", "task_accept", json!({"id": "1"}));
         assert_eq!(own["isError"], true);
+        assert!(text(&own).contains("reviewer other than the assignee"));
+        let self_cancel = call(&dir, "worker", "task_cancel", json!({"id": "1"}));
+        assert_eq!(self_cancel["isError"], true);
+        assert!(text(&self_cancel).contains("only lead can cancel T-1"));
         let accepted = call(&dir, "lead", "task_accept", json!({"id": "1"}));
         assert!(text(&accepted).contains("\"accepted\""));
         let unknown = call(&dir, "lead", "task_list", json!({"status": "nope"}));
