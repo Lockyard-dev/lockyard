@@ -95,7 +95,12 @@ fn read_token_file(path: &Path) -> Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let metadata = fs::metadata(path)?;
+        let metadata = fs::metadata(path).map_err(|error| {
+            Error::Invalid(format!(
+                "cannot read token file {} (LOCKYARD_TOKEN_FILE): {error}",
+                path.display()
+            ))
+        })?;
         // The token is sent as a bearer credential. Refuse files readable by another user or
         // owned by someone else, matching the private agent-state directory policy.
         if metadata.mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
@@ -105,7 +110,12 @@ fn read_token_file(path: &Path) -> Result<String> {
             )));
         }
     }
-    Ok(fs::read_to_string(path)?)
+    fs::read_to_string(path).map_err(|error| {
+        Error::Invalid(format!(
+            "cannot read token file {} (LOCKYARD_TOKEN_FILE): {error}",
+            path.display()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -143,6 +153,14 @@ mod tests {
         assert!(read_token_file(&path).is_err());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(read_token_file(&path).unwrap(), "secret");
+    }
+
+    #[test]
+    fn missing_token_file_error_names_path_and_environment_variable() {
+        let path = std::env::temp_dir().join("lockyard-token-file-that-does-not-exist");
+        let error = read_token_file(&path).unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("LOCKYARD_TOKEN_FILE"));
     }
 
     #[test]

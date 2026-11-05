@@ -58,13 +58,22 @@ impl Surface {
 pub fn serve(agent: Option<String>, cwd: &Path, surface: Surface) -> io::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());
+    let mut client: Option<String> = None;
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
         let (response, after) = match serde_json::from_str::<Value>(&line) {
-            Ok(request) => respond(&request, agent.as_deref(), cwd, surface),
+            Ok(request) => {
+                if request.get("method").and_then(Value::as_str) == Some("initialize") {
+                    client = request
+                        .pointer("/params/clientInfo/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+                respond(&request, agent.as_deref(), cwd, surface, client.as_deref())
+            }
             Err(_) => (Some(error(Value::Null, -32700, "Parse error")), None),
         };
         if let Some(response) = response {
@@ -85,7 +94,7 @@ pub fn serve(agent: Option<String>, cwd: &Path, surface: Surface) -> io::Result<
 /// Handles one decoded JSON-RPC message and runs its follow-up at once.
 #[cfg(test)]
 pub fn handle(request: &Value, agent: Option<&str>, cwd: &Path, surface: Surface) -> Option<Value> {
-    let (response, after) = respond(request, agent, cwd, surface);
+    let (response, after) = respond(request, agent, cwd, surface, None);
     if let Some(after) = after {
         after().unwrap();
     }
@@ -98,6 +107,7 @@ fn respond(
     agent: Option<&str>,
     cwd: &Path,
     surface: Surface,
+    client: Option<&str>,
 ) -> (Option<Value>, Option<After>) {
     let id = request.get("id").cloned();
     let method = request.get("method").and_then(Value::as_str);
@@ -123,7 +133,7 @@ fn respond(
         "ping" => json!({}),
         "tools/list" => json!({"tools": tools(surface)}),
         "tools/call" => {
-            let (result, follow_up) = call_tool(params, agent, cwd);
+            let (result, follow_up) = call_tool(params, agent, cwd, client);
             after = follow_up;
             result
         }
@@ -170,8 +180,8 @@ fn compact_tools() -> Vec<Value> {
     vec![
         tool_def(
             "start_work",
-            "Claim paths before editing them, and optionally take a task. Refused when another agent holds a path.",
-            json!({"paths": names, "note": text, "ttl": int, "shared": flag, "zones": names, "task": int}),
+            "Claim paths before editing; accept an offered zone with handover_id, or take a task.",
+            json!({"paths": names, "note": text, "ttl": int, "shared": flag, "zones": names, "task": int, "handover_id": int}),
             &[],
         ),
         tool_def(
@@ -188,13 +198,13 @@ fn compact_tools() -> Vec<Value> {
         ),
         tool_def(
             "handover",
-            "Give your claim to another agent and tell them why.",
+            "Offer your claim to another agent and tell them why.",
             json!({"to": text, "id": int, "note": text}),
             &["to"],
         ),
         tool_def(
             "finish_work",
-            "Submit a task with evidence and release your claims.",
+            "Submit evidence; without id or task, releases all your claims.",
             json!({"task": int, "evidence": text, "id": int, "note": text}),
             &[],
         ),
@@ -556,12 +566,17 @@ fn full_tools() -> Vec<Value> {
 }
 
 /// A failed call is a tool result the agent can read, never a protocol error.
-fn call_tool(params: &Value, agent: Option<&str>, cwd: &Path) -> (Value, Option<After>) {
+fn call_tool(
+    params: &Value,
+    agent: Option<&str>,
+    cwd: &Path,
+    client: Option<&str>,
+) -> (Value, Option<After>) {
     let empty = json!({});
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").unwrap_or(&empty);
     let mut after = None;
-    let answer = run_tool(name, Args(args), agent, cwd, &mut after);
+    let answer = run_tool(name, Args(args), agent, cwd, client, &mut after);
     let result = match answer {
         Ok(result)
             if [
@@ -576,7 +591,37 @@ fn call_tool(params: &Value, agent: Option<&str>, cwd: &Path) -> (Value, Option<
             tool_result(format!("{MAIL_WARNING}\n{result}"), false)
         }
         Ok(result) => tool_result(result.to_string(), false),
-        Err(error) => tool_result(error.to_string(), true),
+        Err(error) => {
+            let raw = error.to_string();
+            let message = if raw == "Resource not found." {
+                let args = params.get("arguments").unwrap_or(&empty);
+                match name {
+                    "update" | "msg_send" | "handover" => args
+                        .get("to")
+                        .and_then(Value::as_str)
+                        .map(|to| format!("agent {to:?} is not in the workspace"))
+                        .unwrap_or(raw),
+                    "finish_work" | "zone_release" | "zone_renew" | "zone_handover" => args
+                        .get("id")
+                        .and_then(Value::as_i64)
+                        .map(|id| format!("claim Z-{id} is not yours or does not exist"))
+                        .unwrap_or(raw),
+                    _ => raw,
+                }
+            } else {
+                raw
+            };
+            let message = message
+                .replace(
+                    "ask the holder with `lockyard msg send <agent> \"...\"`",
+                    "ask the holder with the update tool",
+                )
+                .replace("`lockyard zone list`", "the zone_list tool")
+                .replace("`lockyard doctor`", "check Lockyard connectivity")
+                .replace("`lockyard cloud login`", "configure cloud authentication")
+                .replace("`lockyard init`", "initialize a Lockyard project");
+            tool_result(message, true)
+        }
     };
     (result, after)
 }
@@ -697,7 +742,30 @@ fn claim_paths(opened: &Opened, args: Args<'_>, cwd: &Path) -> Result<(Vec<Strin
     let zones = args.strings("zones")?;
     let mut paths = opened.zone_paths(cwd, &args.strings("paths")?)?;
     if !zones.is_empty() {
-        for path in expand_zones(&opened.backend.catalog()?, &zones)? {
+        let catalog = opened.backend.catalog().map_err(|error| match error {
+            Error::NeedsCloud(_) => Error::Invalid(format!(
+                "unknown zone {}; catalog: unavailable in local mode",
+                zones.join(", ")
+            )),
+            other => other,
+        })?;
+        let expanded = expand_zones(&catalog, &zones).map_err(|error| {
+            if let Error::NotFound(_) = error {
+                let names = catalog
+                    .get("zones")
+                    .and_then(Value::as_object)
+                    .map(|zones| zones.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                Error::Invalid(format!(
+                    "unknown zone {}; catalog: {}",
+                    zones.join(", "),
+                    names.join(", ")
+                ))
+            } else {
+                error
+            }
+        })?;
+        for path in expanded {
             if !paths.contains(&path) {
                 paths.push(path);
             }
@@ -759,15 +827,25 @@ fn run_composite(
     args: Args<'_>,
     agent: Option<&str>,
     cwd: &Path,
+    client: Option<&str>,
     after: &mut Option<After>,
 ) -> Result<Value> {
     let step = |tool: &str, arguments: Value, after: &mut Option<After>| {
-        run_tool(tool, Args(&arguments), agent, cwd, after)
+        run_tool(tool, Args(&arguments), agent, cwd, client, after)
     };
     match name {
         "start_work" => {
             let paths = args.strings("paths")?;
-            let claim = if paths.is_empty() {
+            if let Some(id) = args.some_int("handover_id")? {
+                return Ok(json!({"accepted": step("zone_accept", json!({"id": id}), after)?}));
+            }
+            let zones = args.strings("zones")?;
+            if paths.is_empty() && zones.is_empty() {
+                return Err(Error::Invalid(
+                    "start_work needs paths or zones (or handover_id to accept an offer)".into(),
+                ));
+            }
+            let claim = if paths.is_empty() && zones.is_empty() {
                 Value::Null
             } else {
                 step(
@@ -777,7 +855,7 @@ fn run_composite(
                         "note": args.optional_text("note")?,
                         "ttl": args.get("ttl").cloned(),
                         "shared": args.flag("shared")?,
-                        "zones": args.strings("zones")?,
+                        "zones": zones,
                     }),
                     after,
                 )?
@@ -819,16 +897,53 @@ fn run_composite(
         "handover" => {
             let to = args.text("to")?;
             let note = args.optional_text("note")?;
-            let body = if note.is_empty() {
-                format!("Lockyard: the zone is yours, {to}.")
-            } else {
-                format!("Lockyard: the zone is yours, {to}. {note}")
-            };
             // Only the cloud can offer a claim to a named agent; locally the honest move is to
             // let it go and say so, rather than pretend the other agent now holds it.
             let cloud = open(cwd, agent)?.backend.is_cloud();
+            let id = if cloud {
+                match args.optional_id()? {
+                    Some(id) => id,
+                    None => {
+                        let claims = open(cwd, agent)?.backend.claims(
+                            &ClaimQuery {
+                                session: agent.map(str::to_string),
+                                path: None,
+                            },
+                            crate::now_ms(),
+                        )?;
+                        match claims.as_slice() {
+                            [claim] => claim.id,
+                            [] => {
+                                return Err(Error::Invalid(
+                                    "you have no claim to hand over".into(),
+                                ));
+                            }
+                            many => {
+                                return Err(Error::Invalid(format!(
+                                    "choose a claim id: {}",
+                                    many.iter()
+                                        .map(|c| c.id.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )));
+                            }
+                        }
+                    }
+                }
+            } else {
+                args.optional_id()?.unwrap_or_default()
+            };
+            let body = if cloud {
+                // The sender is this agent; `to` is the receiver reading the letter.
+                format!(
+                    "Lockyard: zone Z-{id} offered to you by {}; accept it with start_work({{\"handover_id\": {id}}}). {}",
+                    agent.unwrap_or("another agent"),
+                    note
+                )
+            } else {
+                format!("Lockyard: claim released for you to take. {}", note)
+            };
             let mut answer = if cloud {
-                let id = args.id()?;
                 json!({"mode": "offered", "claim": step("zone_handover", json!({"id": id, "to": to}), after)?})
             } else {
                 let released = step(
@@ -841,7 +956,15 @@ fn run_composite(
                 )?;
                 json!({"mode": "released", "released": released["released"].clone()})
             };
-            answer["message"] = step("msg_send", json!({"to": to, "body": body}), after)?;
+            answer["message"] = if cloud {
+                step(
+                    "msg_send",
+                    json!({"to": to, "body": body, "kind": "ask", "needs": "reply", "zone": format!("Z-{id}")}),
+                    after,
+                )?
+            } else {
+                step("msg_send", json!({"to": to, "body": body}), after)?
+            };
             Ok(answer)
         }
         "finish_work" => {
@@ -856,11 +979,26 @@ fn run_composite(
                     after,
                 )?;
             }
-            let release = match args.optional_id()? {
+            let id = args.optional_id()?;
+            let released_ids = if id.is_none() {
+                let claims = open(cwd, agent)?.backend.claims(
+                    &ClaimQuery {
+                        session: agent.map(str::to_string),
+                        path: None,
+                    },
+                    crate::now_ms(),
+                )?;
+                claims.into_iter().map(|claim| claim.id).collect::<Vec<_>>()
+            } else {
+                vec![]
+            };
+            let release = match id {
                 Some(id) => json!({"id": id, "note": args.optional_text("note")?}),
                 None => json!({"note": args.optional_text("note")?}),
             };
-            answer["released"] = step("zone_release", release, after)?["released"].clone();
+            let released = step("zone_release", release, after)?["released"].clone();
+            answer["released"] = released.clone();
+            answer["released_ids"] = json!(released_ids);
             Ok(answer)
         }
         _ => Err(Error::Invalid(format!("unknown tool {name:?}"))),
@@ -872,10 +1010,11 @@ fn run_tool(
     args: Args<'_>,
     agent: Option<&str>,
     cwd: &Path,
+    client: Option<&str>,
     after: &mut Option<After>,
 ) -> Result<Value> {
     if COMPOSITES.contains(&name) {
-        return run_composite(name, args, agent, cwd, after);
+        return run_composite(name, args, agent, cwd, client, after);
     }
     // The compact surface's short names for tools that need no composing.
     let name = match name {
@@ -901,12 +1040,40 @@ fn run_tool(
     match name {
         "who" => encode(&opened.backend.agents()?),
         "status" => {
-            let backend = opened.backend.as_ref();
+            let backend = opened.backend.as_mut();
             let unread = agent.map(|name| backend.unread(name)).transpose()?;
-            let claims = backend.claims(&ClaimQuery::default(), now)?;
+            let claims = backend.claims(
+                &ClaimQuery {
+                    session: agent.map(str::to_string),
+                    path: None,
+                },
+                now,
+            )?;
             if backend.is_cloud() {
                 let work = backend.work_list(agent.unwrap_or("lockyard-cli"))?;
-                return Ok(json!({"unread": unread, "claims": claims, "work": work}));
+                let offers = if let Some(name) = agent {
+                    backend
+                        .inbox(
+                            name,
+                            InboxQuery {
+                                all: true,
+                                limit: INBOX_LIMIT,
+                            },
+                            now,
+                        )?
+                        .messages
+                        .into_iter()
+                        .filter(|message| {
+                            message.body.contains("zone offered to you")
+                                && message.body.contains(name)
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                return Ok(
+                    json!({"unread": unread, "claims": claims, "work": work, "offers": offers}),
+                );
             }
             let tasks = backend.tasks(None, false)?;
             Ok(json!({"unread": unread, "claims": claims, "tasks": tasks}))
@@ -1090,6 +1257,7 @@ fn run_tool(
             let request = SendRequest {
                 to: args.text("to")?.to_string(),
                 body: args.text("body")?.to_string(),
+                from_client: client.map(str::to_string),
                 kind: args.some_text("kind")?,
                 needs: args.some_text("needs")?,
                 zone: args.some_text("zone")?,
@@ -1519,7 +1687,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "msg_inbox", "arguments": {}}
         });
-        let (_, after) = respond(&request, Some("b"), dir.path(), Surface::Full);
+        let (_, after) = respond(&request, Some("b"), dir.path(), Surface::Full, None);
         let unread =
             |dir: &tempfile::TempDir| text(&call(dir, "b", "msg_unread", json!({}))).to_string();
         assert!(unread(&dir).contains('1'), "the answer has not left yet");
@@ -1589,6 +1757,66 @@ mod tests {
         let refused = call(&dir, "b", "start_work", json!({"paths": ["src/api"]}));
         assert_eq!(refused["isError"], true);
         assert!(text(&refused).contains("held by a"));
+    }
+
+    #[test]
+    fn compact_start_work_accepts_handover_and_requires_a_target() {
+        let dir = project();
+        let no_args = call(&dir, "a", "start_work", json!({}));
+        assert_eq!(no_args["isError"], true);
+        assert!(text(&no_args).contains("needs paths or zones"));
+        let opened = call(&dir, "a", "start_work", json!({"paths": ["src"]}));
+        let id: i64 = serde_json::from_str::<Value>(text(&opened)).unwrap()["claim"]["id"]
+            .as_i64()
+            .unwrap();
+        let accepted = call(&dir, "b", "start_work", json!({"handover_id": id}));
+        assert_eq!(
+            accepted["isError"], true,
+            "local mode has no handover offers"
+        );
+    }
+
+    #[test]
+    fn status_only_returns_the_callers_claims() {
+        let dir = project();
+        call(&dir, "a", "start_work", json!({"paths": ["src"]}));
+        call(&dir, "b", "start_work", json!({"paths": ["docs"]}));
+        let status = call(&dir, "a", "status", json!({}));
+        let parsed: Value = serde_json::from_str(text(&status)).unwrap();
+        assert!(
+            parsed["claims"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["agent"] == "a")
+        );
+    }
+
+    #[test]
+    fn compact_handover_schema_allows_implicit_claim_selection() {
+        let definition = compact_tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "handover")
+            .unwrap();
+        assert_eq!(definition["inputSchema"]["required"], json!(["to"]));
+    }
+
+    #[test]
+    fn finish_without_id_reports_the_claim_ids_it_releases() {
+        let dir = project();
+        call(&dir, "a", "start_work", json!({"paths": ["src"]}));
+        let finished = call(&dir, "a", "finish_work", json!({}));
+        let answer: Value = serde_json::from_str(text(&finished)).unwrap();
+        assert_eq!(answer["released"], 1);
+        assert_eq!(answer["released_ids"], json!([1]));
+    }
+
+    #[test]
+    fn start_work_rejects_unknown_zone_with_catalog_hint() {
+        let dir = project();
+        let result = call(&dir, "a", "start_work", json!({"zones": ["not-a-zone"]}));
+        assert_eq!(result["isError"], true);
+        assert!(text(&result).contains("unknown zone"));
     }
 
     #[test]

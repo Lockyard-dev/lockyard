@@ -1466,6 +1466,7 @@ fn run_msg(opened: Opened, command: MsgCommand, agent: Option<&String>) -> Resul
                 re,
                 key,
                 ttl_minutes: ttl,
+                from_client: None,
             };
             let message = backend.send(&agent, &request, now)?;
             output(&message, sent_line(&message))

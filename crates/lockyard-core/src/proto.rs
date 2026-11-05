@@ -422,6 +422,8 @@ pub struct SendRequest {
     pub to: String,
     pub body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_client: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needs: Option<String>,
