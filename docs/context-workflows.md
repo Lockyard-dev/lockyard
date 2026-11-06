@@ -67,7 +67,7 @@ Save a JSON plan with allowlisted steps:
 ```
 
 ```sh
-lockyard workflow run start-api-12 plan.json --json
+lockyard workflow run start-api-12 --plan plan.json --json
 lockyard workflow inspect start-api-12 --json
 ```
 
@@ -79,10 +79,14 @@ agent, project, backend configuration or credential cannot reuse a saved operati
 An operation records each step as `not_started`, `in_flight`, `completed`, `failed`
 or `unknown`. Completed steps are not repeated. Before a partial operation continues,
 completed task and zone claims are checked for current ownership. Expired,
-reassigned, changed or unreadable ownership returns `needs_reconciliation` and
-performs no later writes. Cloud task checks use the server's `lease_active` value
-and the saved assignment identity and epoch; older servers without this field
-cannot establish that ownership is current.
+changed or unreadable ownership returns `needs_reconciliation` and performs no
+later writes. Cloud task checks use the server's `lease_active` value and the
+assignment identity and epoch returned by the claim mutation. A different Cloud
+assignment requires reconciliation, including one held by the same session.
+Older servers without `lease_active`, and older receipts that saved a later
+assignment read-back, cannot establish that ownership is current. Local tasks
+require a current unexpired claim held by the same agent; local receipts do not
+distinguish a replacement claim later obtained by that agent.
 
 Steps are not one transaction. A failure after a completed claim does not roll it
 back. A crash or uncertain response never establishes a safe retry: inspect the

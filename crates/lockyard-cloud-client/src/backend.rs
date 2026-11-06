@@ -150,12 +150,24 @@ impl<T: Transport> CloudBackend<T> {
         agent: &str,
         id: i64,
         operation: &str,
-        mut body: Value,
+        body: Value,
         item: &Value,
     ) -> Result<tasks::Task> {
+        task_from(&self.item_step_response(agent, id, operation, body, item)?)
+    }
+
+    /// Preserve the exact mutation response when callers need its authoritative assignment.
+    fn item_step_response(
+        &self,
+        agent: &str,
+        id: i64,
+        operation: &str,
+        mut body: Value,
+        item: &Value,
+    ) -> Result<Value> {
         body["expected_version"] = item["version"].clone();
         let route = format!("{ITEMS}/{}/{operation}", item_id(id));
-        task_from(&self.post(agent, route, &body)?)
+        self.post(agent, route, &body)
     }
 
     /// The area named by key. Without a key, the first one, created on first use where the role allows.
@@ -898,6 +910,17 @@ impl<T: Transport> Backend for CloudBackend<T> {
     fn claim_task(&mut self, agent: &str, id: i64, _ttl: i64, _now: i64) -> Result<tasks::Task> {
         let item = self.item(agent, id)?;
         self.item_step(agent, id, "claim", json!({"session": agent}), &item)
+    }
+
+    fn claim_task_receipt(&mut self, agent: &str, id: i64, _ttl: i64, _now: i64) -> Result<Value> {
+        let item = self.item(agent, id)?;
+        let claimed =
+            self.item_step_response(agent, id, "claim", json!({"session": agent}), &item)?;
+        let mut result = serde_json::to_value(task_from(&claimed)?)
+            .map_err(|error| Error::Protocol(error.to_string()))?;
+        result["registry_assignment"] = claimed["assignment"].clone();
+        result["registry_assignment_source"] = json!("claim_response");
+        Ok(result)
     }
 
     fn renew_task(&mut self, agent: &str, id: i64, _ttl: i64, _now: i64) -> Result<tasks::Task> {

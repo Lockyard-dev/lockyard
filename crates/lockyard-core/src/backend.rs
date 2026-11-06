@@ -206,6 +206,13 @@ pub trait Backend {
         cloud("task plan")
     }
     fn claim_task(&mut self, agent: &str, id: i64, ttl: i64, now: i64) -> Result<tasks::Task>;
+    /// A workflow claim result, preserving ownership evidence from the mutation response itself.
+    /// Cloud implementations must retain the assignment identity; a later read cannot establish
+    /// which assignment this write created. Local tasks use their current-owner policy on resume.
+    fn claim_task_receipt(&mut self, agent: &str, id: i64, ttl: i64, now: i64) -> Result<Value> {
+        serde_json::to_value(self.claim_task(agent, id, ttl, now)?)
+            .map_err(|error| Error::Protocol(error.to_string()))
+    }
     fn renew_task(&mut self, agent: &str, id: i64, ttl: i64, now: i64) -> Result<tasks::Task>;
     fn release_task(&mut self, agent: &str, id: i64, note: &str, now: i64) -> Result<tasks::Task>;
     fn submit_task(

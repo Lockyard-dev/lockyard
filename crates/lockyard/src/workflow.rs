@@ -91,13 +91,18 @@ impl Step {
         }
         match self {
             Self::TaskClaim { id, ttl } => {
-                let mut result = encode(backend.claim_task(agent, *id, *ttl, now)?)?;
-                if backend.is_cloud() {
-                    // Preserve the assignment epoch and credential identity for later recovery.
-                    // A failed read after the write is an uncertain outcome, never a safe retry.
-                    let item = backend.registry_item(*id).map_err(|_| Error::Unavailable(
-                        "Task claim succeeded but assignment read-back failed; inspect the operation before retrying.".into()))?;
-                    result["registry_assignment"] = item["assignment"].clone();
+                let result = backend.claim_task_receipt(agent, *id, *ttl, now)?;
+                if backend.is_cloud()
+                    && (result["id"] != *id
+                        || result["raw_status"] != "active"
+                        || result["registry_assignment_source"] != "claim_response"
+                        || !assignment_identity(&result["registry_assignment"], agent))
+                {
+                    // The write already happened. Missing or unrelated evidence cannot establish
+                    // its outcome, and must never turn into an automatically retryable failure.
+                    return Err(Error::Protocol(
+                        "Task claim response lacks the workflow agent's authoritative assignment; reconcile before retrying.".into(),
+                    ));
                 }
                 Ok(result)
             }
@@ -140,6 +145,16 @@ impl Step {
             )?),
         }
     }
+}
+
+fn assignment_identity(assignment: &Value, agent: &str) -> bool {
+    assignment["executor"]
+        .as_str()
+        .is_some_and(|executor| !executor.trim().is_empty())
+        && assignment["session"] == agent
+        && assignment["claimed_at"]
+            .as_str()
+            .is_some_and(|epoch| !epoch.trim().is_empty())
 }
 
 /// Execute explicitly supplied steps, preserving completed and uncertain outcomes across retries.
@@ -306,7 +321,8 @@ pub fn run(
 }
 
 /// Completed effects are historical; before executing more steps, leases must still be held.
-/// Do not renew or reacquire anything automatically: a changed owner needs a new explicit plan.
+/// Cloud assignments retain their original identity and epoch; local tasks require current
+/// ownership by this agent. Do not renew or reacquire anything automatically.
 fn stale_completed_ownership(
     backend: &dyn Backend,
     agent: &str,
@@ -325,11 +341,11 @@ fn stale_completed_ownership(
                     let current = &item["assignment"];
                     let previous = &saved["registry_assignment"];
                     if !current["lease_active"].is_boolean()
-                        || !previous["executor"].is_string()
-                        || previous["claimed_at"].is_null()
+                        || saved["registry_assignment_source"] != "claim_response"
+                        || !assignment_identity(previous, agent)
                     {
                         return Some(
-                            json!({"step_index":index,"kind":"current_ownership_unverified","reason":"The server or saved receipt lacks an authoritative assignment lease check; reconcile this task before continuing."}),
+                            json!({"step_index":index,"kind":"current_ownership_unverified","reason":"The server or saved receipt lacks an authoritative claim response and assignment lease check for this agent; reconcile this task before continuing."}),
                         );
                     }
                     Ok(item["status"] == "active"
@@ -556,7 +572,7 @@ mod tests {
                 body: "continue".into(),
             },
         ];
-        let receipt = json!({"steps":[{"status":"completed","result":{"registry_assignment":{"executor":"token:owner:me","session":"me","claimed_at":epoch}}},{"status":"failed"}]});
+        let receipt = json!({"steps":[{"status":"completed","result":{"registry_assignment_source":"claim_response","registry_assignment":{"executor":"token:owner:me","session":"me","claimed_at":epoch}}},{"status":"failed"}]});
         let active = CloudBackend::new(
             AssignmentLease {
                 active: Some(true),
