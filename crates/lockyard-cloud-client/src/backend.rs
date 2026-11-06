@@ -374,7 +374,44 @@ fn require_commit_file(target: &str, value: &str) -> Result<()> {
             "commit evidence must name a file in git as <rev>:<path>".into(),
         ));
     }
+    if commit_names_file(value) {
+        if let Ok(cwd) = std::env::current_dir() {
+            refuse_if_file_missing(&cwd, value)?;
+        }
+    }
     Ok(())
+}
+
+/// When `revision` is an object in the git repository that contains `repo`, the path must be in
+/// that tree. A revision this repository does not have is not judged: the server has no checkout,
+/// and the proof may name another repository.
+pub(crate) fn refuse_if_file_missing(repo: &std::path::Path, value: &str) -> Result<()> {
+    let Some((revision, path)) = value.split_once(':') else {
+        return Ok(());
+    };
+    let object = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "-e", &format!("{revision}^{{commit}}")])
+        .output();
+    let Ok(object) = object else {
+        return Ok(());
+    };
+    if !object.status.success() {
+        return Ok(());
+    }
+    let file = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "-e", &format!("{revision}:{path}")])
+        .status();
+    match file {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(Error::Invalid(format!(
+            "file {path} is not in revision {revision}"
+        ))),
+        Err(_) => Ok(()),
+    }
 }
 
 fn validate_evidence(values: &[String]) -> Result<()> {
@@ -1097,6 +1134,19 @@ impl<T: Transport> Backend for CloudBackend<T> {
         let body =
             json!({"to": "done", "resolution": "completed", "reason": reason_or(note, "accepted")});
         self.item_step(agent, id, "transition", body, &item)
+    }
+
+    fn review_task(
+        &mut self,
+        agent: &str,
+        id: &str,
+        decision: &str,
+        reason: &str,
+        _now: i64,
+    ) -> Result<tasks::Task> {
+        let item = self.item(agent, id)?;
+        let body = json!({"decision": decision, "reason": reason});
+        self.item_step(agent, id, "review", body, &item)
     }
 
     fn reject_task(
@@ -2631,6 +2681,43 @@ mod tests {
         assert_eq!(cloud.tasks(None, false).unwrap().len(), 1);
         let seen = server.requests();
         assert_eq!(seen[1].path, "/api/v1/registry/items?limit=200&cursor=7");
+    }
+
+    #[test]
+    fn a_file_missing_from_a_known_revision_is_refused() {
+        let dir = std::env::temp_dir().join(format!("ly-evidence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "dev@example.com"]);
+        git(&["config", "user.name", "dev"]);
+        std::fs::write(dir.join("kept.txt"), "ok").unwrap();
+        git(&["add", "kept.txt"]);
+        git(&["commit", "-m", "keep"]);
+        let rev = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let short = &rev.trim()[..7];
+        assert!(refuse_if_file_missing(&dir, &format!("{short}:kept.txt")).is_ok());
+        let missing = refuse_if_file_missing(&dir, &format!("{short}:gone.txt")).unwrap_err();
+        assert!(missing.to_string().contains("not in revision"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

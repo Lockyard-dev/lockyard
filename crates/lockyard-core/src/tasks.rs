@@ -287,12 +287,65 @@ impl Store {
         Ok(task)
     }
 
-    /// Accepts a submitted task. The agent that did the work cannot accept it.
+    /// Records a Codex review. PASS leaves the task in review. REJECT returns it to the assignee.
+    pub fn review_task(
+        &mut self,
+        agent: &str,
+        id: i64,
+        decision: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<Task> {
+        let decision = decision.trim().to_ascii_lowercase();
+        self.touch(agent, now)?;
+        let transaction = self.write()?;
+        let task = load(&transaction, id)?;
+        if task.status != Status::Review {
+            return Err(Error::Denied(format!(
+                "T-{} is {}, not in review",
+                task.id, task.status
+            )));
+        }
+        let executor = task.assignee.clone().unwrap_or_default();
+        if let Some(message) = crate::admission::review_refusal(agent, &executor, "", &decision, reason)
+        {
+            let error = if message.contains("reason") || message.contains("decision") {
+                Error::Invalid(message)
+            } else {
+                Error::Denied(message)
+            };
+            return Err(error);
+        }
+        if decision == "pass" {
+            log(&transaction, id, agent, "review_pass", reason, now)?;
+        } else {
+            transaction.execute(
+                "UPDATE tasks SET status = 'claimed', lease_until = ?1, updated_at = ?2 WHERE id = ?3",
+                params![now + DEFAULT_TTL_MINUTES * MINUTE_MS, now, id],
+            )?;
+            log(&transaction, id, agent, "review_reject", reason, now)?;
+        }
+        let task = load(&transaction, id)?;
+        transaction.commit()?;
+        Ok(task)
+    }
+
+    /// Accepts a submitted task. Only Claude, and only after a Codex PASS.
     pub fn accept_task(&mut self, agent: &str, id: i64, note: &str, now: i64) -> Result<Task> {
         self.touch(agent, now)?;
         let transaction = self.write()?;
         let task = load(&transaction, id)?;
-        require_reviewer(&task, agent)?;
+        if task.status != Status::Review {
+            return Err(Error::Denied(format!(
+                "T-{} is {}, not in review",
+                task.id, task.status
+            )));
+        }
+        let executor = task.assignee.clone().unwrap_or_default();
+        let passed = codex_passed(&transaction, id, &executor)?;
+        if let Some(message) = crate::admission::accept_refusal(agent, &executor, "", passed) {
+            return Err(Error::Denied(message));
+        }
         transaction.execute(
             "UPDATE tasks SET status = 'accepted', updated_at = ?1 WHERE id = ?2",
             params![now, id],
@@ -322,6 +375,10 @@ impl Store {
             return Err(Error::Denied(format!(
                 "only a reviewer other than the assignee {agent} can accept or reject T-{id}"
             )));
+        }
+        if task.status == Status::Review {
+            drop(transaction);
+            return self.review_task(agent, id, "reject", reason, now);
         }
         if task.status == Status::Accepted {
             if evidence.trim().is_empty() {
@@ -429,6 +486,27 @@ fn read_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     })
 }
 
+/// A Codex PASS is current when it is the latest review-or-submit event and the reviewer is not the executor.
+fn codex_passed(conn: &Connection, id: i64, executor: &str) -> Result<bool> {
+    let found = conn
+        .query_row(
+            "SELECT agent, action FROM task_events
+             WHERE task_id = ?1 AND action IN ('submit', 'review_pass', 'review_reject')
+             ORDER BY id DESC LIMIT 1",
+            [id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(match found {
+        Some((agent, action)) => {
+            action == "review_pass"
+                && crate::admission::product(crate::admission::agent_name(&agent)) == "codex"
+                && !crate::admission::same_agent(&agent, executor)
+        }
+        None => false,
+    })
+}
+
 fn require_assignee(task: &Task, agent: &str) -> Result<()> {
     if task.status == Status::Claimed && task.assignee.as_deref() == Some(agent) {
         return Ok(());
@@ -496,11 +574,47 @@ mod tests {
         id
     }
 
+    fn pass_and_accept(store: &mut Store, id: i64, now: i64) -> Task {
+        store.review_task("codex", id, "pass", "", now).unwrap();
+        store.accept_task("claude", id, "good", now + 1).unwrap()
+    }
+
+    #[test]
+    fn only_claude_accepts_and_only_after_a_codex_pass() {
+        let (_dir, mut store) = test_store();
+        let id = store.add_task("lead", "ship", "", 0).unwrap().id;
+        let number = id.rsplit_once('-').unwrap().1.parse().unwrap();
+        store
+            .claim_task("cursor-grok-4.7-high", number, TTL, 1)
+            .unwrap();
+        store
+            .submit_task("cursor-grok-4.7-high", number, "tests pass", 2)
+            .unwrap();
+        assert!(matches!(
+            store.accept_task("cursor-grok-4.7-fast", number, "", 3),
+            Err(Error::Denied(message)) if message.contains("executor")
+        ));
+        assert!(matches!(
+            store.accept_task("codex-review", number, "", 3),
+            Err(Error::Denied(message)) if message.contains("Claude")
+        ));
+        assert!(matches!(
+            store.accept_task("claude", number, "", 3),
+            Err(Error::Denied(message)) if message.contains("PASS")
+        ));
+        assert!(matches!(
+            store.accept_task("owner-1", number, "", 3),
+            Err(Error::Denied(message)) if message.contains("Claude")
+        ));
+        let accepted = pass_and_accept(&mut store, number, 4);
+        assert_eq!(accepted.status, Status::Accepted);
+    }
+
     #[test]
     fn a_task_walks_from_open_to_accepted_and_keeps_its_history() {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
-        let task = store.accept_task("lead", id, "good", 3).unwrap();
+        let task = pass_and_accept(&mut store, id, 3);
         assert_eq!(task.status, Status::Accepted);
         assert_eq!(task.evidence.as_deref(), Some("tests pass"));
         let actions: Vec<_> = store
@@ -509,7 +623,10 @@ mod tests {
             .into_iter()
             .map(|event| event.action)
             .collect();
-        assert_eq!(actions, ["add", "claim", "submit", "accept"]);
+        assert_eq!(
+            actions,
+            ["add", "claim", "submit", "review_pass", "accept"]
+        );
     }
 
     #[test]
@@ -517,11 +634,7 @@ mod tests {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
         let cannot_accept = store.accept_task("worker", id, "", 3).unwrap_err();
-        assert!(
-            cannot_accept
-                .to_string()
-                .contains("reviewer other than the assignee")
-        );
+        assert!(cannot_accept.to_string().contains("own work"));
         let cannot_reject = store.reject_task("worker", id, "no", "", 3).unwrap_err();
         assert!(
             cannot_reject
@@ -574,7 +687,9 @@ mod tests {
     fn a_rejected_task_returns_to_its_assignee_with_a_lease_and_the_reason_on_record() {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
-        let task = store.reject_task("lead", id, "test is empty", "", 3).unwrap();
+        let task = store
+            .reject_task("codex", id, "test is empty", "", 3)
+            .unwrap();
         assert_eq!(task.status, Status::Claimed);
         assert_eq!(task.assignee.as_deref(), Some("worker"));
         assert_eq!(task.lease_until, Some(3 + DEFAULT_TTL_MINUTES * MINUTE_MS));
@@ -592,14 +707,14 @@ mod tests {
     fn rejecting_needs_a_reason() {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
-        assert!(store.reject_task("lead", id, " ", "", 3).is_err());
+        assert!(store.reject_task("codex", id, " ", "", 3).is_err());
     }
 
     #[test]
     fn accepted_work_can_be_revoked_with_a_reason_and_new_evidence() {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
-        store.accept_task("lead", id, "good", 3).unwrap();
+        pass_and_accept(&mut store, id, 3);
         assert!(store
             .reject_task("lead", id, "empty delivery", "", 4)
             .is_err());
@@ -664,8 +779,8 @@ mod tests {
         assert!(store.claim_task("a", id, TTL, 2).is_err());
 
         let done = task_in_review(&mut store);
-        store.accept_task("lead", done, "", 3).unwrap();
-        assert!(store.cancel_task("lead", done, "", 4).is_err());
+        pass_and_accept(&mut store, done, 3);
+        assert!(store.cancel_task("lead", done, "", 5).is_err());
     }
 
     #[test]
@@ -681,7 +796,7 @@ mod tests {
             .parse()
             .unwrap();
         let done = task_in_review(&mut store);
-        store.accept_task("lead", done, "", 3).unwrap();
+        pass_and_accept(&mut store, done, 3);
         let ids = |tasks: Vec<Task>| {
             tasks
                 .into_iter()

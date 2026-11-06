@@ -160,7 +160,14 @@ fn a_full_conversation_and_task_cycle_over_json() {
     );
     let own = lockyard(root, "worker", &["task", "accept", &id]);
     assert_eq!(own.status.code(), Some(1));
-    ok(root, "lead", &["task", "accept", &format!("T-{id}")]);
+    let early = lockyard(root, "claude", &["task", "accept", &id]);
+    assert_eq!(early.status.code(), Some(1));
+    ok(
+        root,
+        "codex",
+        &["task", "review", &id, "--decision", "pass"],
+    );
+    ok(root, "claude", &["task", "accept", &format!("T-{id}")]);
     assert_eq!(ok(root, "lead", &["task", "list"]).trim(), "no tasks");
     assert!(ok(root, "lead", &["task", "show", &id]).contains("ran the tests"));
 }

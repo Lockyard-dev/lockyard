@@ -5,6 +5,7 @@
 //! Every write is one immediate transaction, so concurrent agents on one machine see a single order of
 //! events. Time is passed in as milliseconds since the epoch, which keeps leases testable.
 
+mod admission;
 mod backend;
 pub mod bus;
 pub mod config;

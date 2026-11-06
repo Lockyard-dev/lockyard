@@ -538,8 +538,14 @@ fn full_tools() -> Vec<Value> {
             &["id", "evidence"],
         ),
         tool_def(
+            "task_review",
+            "Record a Codex review. PASS stays in review. REJECT returns the task.",
+            json!({"id": text, "decision": text, "reason": text}),
+            &["id", "decision"],
+        ),
+        tool_def(
             "task_accept",
-            "Accept another agent's submitted work",
+            "Accept submitted work. Only Claude, after a Codex PASS.",
             json!({"id": text, "note": text}),
             &["id"],
         ),
@@ -1371,7 +1377,7 @@ fn run_tool(
         "tasks" => {
             let backend = &mut opened.backend;
             let action = args.some_text("action")?.ok_or_else(|| Error::Invalid(
-                "action must be a string; allowed actions: list, show, claim, submit, block, unblock, accept, reject, cancel, close".into(),
+                "action must be a string; allowed actions: list, show, claim, submit, block, unblock, review, accept, reject, cancel, close".into(),
             ))?;
             match action.as_str() {
                 "list" => {
@@ -1396,6 +1402,13 @@ fn run_tool(
                     me()?,
                     &args.task_id()?,
                     args.text("action")? == "block",
+                    args.optional_text("reason")?,
+                    now,
+                )?),
+                "review" => encode(&backend.review_task(
+                    me()?,
+                    &args.task_id()?,
+                    args.text("decision")?,
                     args.optional_text("reason")?,
                     now,
                 )?),
@@ -1858,6 +1871,17 @@ fn run_tool(
                 &opened
                     .backend
                     .submit_task(me()?, &args.task_id()?, &evidence, now)?,
+            )
+        }
+        "task_review" => {
+            encode(
+                &opened.backend.review_task(
+                    me()?,
+                    &args.task_id()?,
+                    args.text("decision")?,
+                    args.optional_text("reason")?,
+                    now,
+                )?,
             )
         }
         "task_accept" => {
@@ -2799,11 +2823,19 @@ mod tests {
         );
         let own = call(&dir, "worker", "task_accept", json!({"id": "1"}));
         assert_eq!(own["isError"], true);
-        assert!(text(&own).contains("reviewer other than the assignee"));
+        assert!(text(&own).contains("own work"));
         let self_cancel = call(&dir, "worker", "task_cancel", json!({"id": "1"}));
         assert_eq!(self_cancel["isError"], true);
         assert!(text(&self_cancel).contains("only lead can cancel T-1"));
-        let accepted = call(&dir, "lead", "task_accept", json!({"id": "1"}));
+        let early = call(&dir, "claude", "task_accept", json!({"id": "1"}));
+        assert_eq!(early["isError"], true);
+        call(
+            &dir,
+            "codex",
+            "task_review",
+            json!({"id": "1", "decision": "pass"}),
+        );
+        let accepted = call(&dir, "claude", "task_accept", json!({"id": "1"}));
         assert!(text(&accepted).contains("\"accepted\""));
         let unknown = call(&dir, "lead", "task_list", json!({"status": "nope"}));
         assert_eq!(unknown["isError"], true);

@@ -208,6 +208,16 @@ pub trait Backend {
         now: i64,
     ) -> Result<tasks::Task>;
     fn accept_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task>;
+    fn review_task(
+        &mut self,
+        _agent: &str,
+        _id: &str,
+        _decision: &str,
+        _reason: &str,
+        _now: i64,
+    ) -> Result<tasks::Task> {
+        Err(Error::Invalid("this backend does not review tasks".into()))
+    }
     fn reject_task(
         &mut self,
         agent: &str,
@@ -642,6 +652,17 @@ impl Backend for Store {
 
     fn accept_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task> {
         Store::accept_task(self, agent, task_number(id)?, note, now)
+    }
+
+    fn review_task(
+        &mut self,
+        agent: &str,
+        id: &str,
+        decision: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<tasks::Task> {
+        Store::review_task(self, agent, task_number(id)?, decision, reason, now)
     }
 
     fn reject_task(

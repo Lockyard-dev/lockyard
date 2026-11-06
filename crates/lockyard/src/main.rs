@@ -525,6 +525,10 @@ enum TaskCommand {
         /// Only this status: open, claimed, review, accepted or cancelled.
         #[arg(long, value_parser = parse_status)]
         status: Option<Status>,
+        /// Work that can be taken now: open, predecessors closed, no live lease.
+        /// On the server this is the ready queue. Locally it is the open list.
+        #[arg(long)]
+        ready: bool,
     },
     /// Show a task and its history.
     Show {
@@ -560,7 +564,17 @@ enum TaskCommand {
         #[arg(long)]
         evidence: String,
     },
-    /// Accept another agent's submitted work.
+    /// Record a Codex review. PASS stays in review. REJECT returns the task.
+    Review {
+        #[arg(value_parser = parse_task_id)]
+        id: String,
+        /// `pass` or `reject`.
+        #[arg(long)]
+        decision: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Accept another agent's submitted work. Only Claude, after a Codex PASS.
     Accept {
         #[arg(value_parser = parse_task_id)]
         id: String,
@@ -1671,8 +1685,17 @@ fn run_task(mut opened: Opened, command: TaskCommand, agent: Option<&String>) ->
     let now = now_ms();
     let store = opened.backend.as_mut();
     let changed = match command {
-        TaskCommand::List { all, status } => {
-            let tasks = store.tasks(status, all)?;
+        TaskCommand::List { all, status, ready } => {
+            if ready && (all || status.is_some()) {
+                return Err(Error::Invalid(
+                    "task list --ready does not take --all or --status".into(),
+                ));
+            }
+            let tasks = if ready {
+                store.ready_tasks(None)?
+            } else {
+                store.tasks(status, all)?
+            };
             let text = join(&tasks, task_line, "no tasks");
             return output(&tasks, text);
         }
@@ -1759,6 +1782,11 @@ fn run_task(mut opened: Opened, command: TaskCommand, agent: Option<&String>) ->
         TaskCommand::Submit { id, evidence } => {
             store.submit_task(&resolve_agent(agent)?, &id, &evidence, now)?
         }
+        TaskCommand::Review {
+            id,
+            decision,
+            reason,
+        } => store.review_task(&resolve_agent(agent)?, &id, &decision, &reason, now)?,
         TaskCommand::Accept { id, note } => {
             store.accept_task(&resolve_agent(agent)?, &id, &note, now)?
         }
