@@ -332,9 +332,17 @@ fn system_sample() -> std::io::Result<Sample> {
         } == 0
         {
             let s = unsafe { s.assume_init() };
+            // libc's statvfs field widths vary by target. Keep the calculation in u64 even
+            // where a conversion is currently redundant (as on 64-bit Linux).
+            #[allow(clippy::unnecessary_cast)]
+            let available = s.f_bavail as u64;
+            #[allow(clippy::unnecessary_cast)]
+            let blocks = s.f_blocks as u64;
+            #[allow(clippy::unnecessary_cast)]
+            let fragment_size = s.f_frsize as u64;
             (
-                Some((s.f_bavail as u64).saturating_mul(s.f_frsize)),
-                (s.f_blocks as u64).saturating_mul(s.f_frsize),
+                Some(available.saturating_mul(fragment_size)),
+                blocks.saturating_mul(fragment_size),
             )
         } else {
             (None, 0)

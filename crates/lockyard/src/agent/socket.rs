@@ -164,9 +164,10 @@ fn connect_bounded(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     };
     if result < 0 {
         let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EINPROGRESS)
-            && error.raw_os_error() != Some(libc::EAGAIN)
-        {
+        // AF_UNIX EAGAIN means the listener queue is full and this socket did not start
+        // connecting. POLLOUT/SO_ERROR=0 can still be reported on that unconnected socket;
+        // only EINPROGRESS represents a connection whose completion we can poll.
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
             return Err(error);
         }
         let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
@@ -254,7 +255,13 @@ mod tests {
         let mut bounded = false;
         for _ in 0..5000 {
             match connect_bounded(&path, Duration::from_millis(20)) {
-                Ok(stream) => connected.push(stream),
+                Ok(stream) => {
+                    assert!(
+                        stream.peer_addr().is_ok(),
+                        "connect returned an unconnected socket"
+                    );
+                    connected.push(stream);
+                }
                 Err(error)
                     if matches!(
                         error.kind(),

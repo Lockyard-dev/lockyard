@@ -9,9 +9,12 @@ mod backend;
 mod crypto;
 #[cfg(test)]
 mod fake;
+mod registry;
+mod repository;
 
 pub use backend::CloudBackend;
 pub use crypto::{CONTENT_FIELDS, FieldRule, WorkspaceKey, route_matches, transform_fields};
+pub use repository::RepositoryTransport;
 
 const ENCRYPTION_PATH: &str = "/api/v1/workspace/encryption";
 
@@ -237,6 +240,9 @@ pub struct Call {
     pub session: String,
     pub method: String,
     pub path: String,
+    /// Repository scope for zone operations. Empty means the legacy namespace; absent is aggregate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<Value>,
     /// Idempotency key. Required on every write.
@@ -481,6 +487,16 @@ impl Client {
         if let Some(key) = &call.key {
             request = request.set("Idempotency-Key", key);
         }
+        if let Some(repository) = &call.repository {
+            request = request.set(
+                "X-Lockyard-Repository",
+                if repository.is_empty() {
+                    "-"
+                } else {
+                    repository
+                },
+            );
+        }
         // The caller's remaining wait decides whether a retry fits; it never cuts a request short.
         // A short per-request timeout broke TLS handshakes on macOS ("Resource temporarily
         // unavailable"), so only the outbox's own attempt limit bounds a single request.
@@ -501,6 +517,10 @@ impl Client {
                     "the server redirected with status {}",
                     response.status()
                 ))))
+            }
+            Ok(response) if call.repository.as_deref().is_some_and(|repository| !repository.is_empty()
+                && response.header("X-Lockyard-Repository") != Some(repository)) => {
+                Err(Failure::Final(ClientError::Invalid("this server does not confirm repository namespace support; upgrade the server before using repository-scoped coordination".into())))
             }
             Ok(response) => decode(response).map_err(Failure::Retry),
             Err(ureq::Error::Status(status, response)) => {
@@ -536,7 +556,8 @@ impl Transport for Client {
                 "writes require an Idempotency-Key".into(),
             ));
         }
-        if !call.path.starts_with('/') || call.path.contains("..") {
+        let route = call.path.split('?').next().unwrap_or(&call.path);
+        if !route.starts_with('/') || route.split('/').any(|part| matches!(part, "." | "..")) {
             return Err(ClientError::Invalid(
                 "request path must be an absolute API path".into(),
             ));
@@ -672,6 +693,16 @@ pub fn token_id(token: &str) -> String {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     });
     format!("{hash:016x}")
+}
+
+/// Bind durable operation receipts to a credential without storing its value.
+/// This fingerprint is not an authentication token and must never replace authorization.
+pub fn credential_fingerprint(token: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, token.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn decode(response: ureq::Response) -> Result<Value, ClientError> {

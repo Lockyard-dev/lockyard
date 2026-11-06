@@ -2,7 +2,7 @@
 
 //! Picks the one backend of a project from `.lockyard/config.toml`.
 
-use lockyard_cloud_client::{Client, CloudBackend, token_id};
+use lockyard_cloud_client::{Client, CloudBackend, RepositoryTransport, token_id};
 use lockyard_core::config::{Config, Mode};
 use lockyard_core::paths::find_root;
 use lockyard_core::{Backend, Error, Result, Store, ZonePath};
@@ -127,10 +127,13 @@ pub fn open(cwd: &Path, agent: Option<&str>) -> Result<Opened> {
     Ok(Opened { backend, root })
 }
 
-fn direct(url: &str, session: &str) -> Result<Box<dyn Backend>> {
+fn direct(url: &str, session: &str, repository: Option<&str>) -> Result<Box<dyn Backend>> {
     trusted_url(url)?;
     let client = Client::new(url, Config::token()?)?.configure_content_encryption(session)?;
-    Ok(Box::new(CloudBackend::new(client, session)))
+    Ok(Box::new(CloudBackend::new(
+        RepositoryTransport::new(client, repository)?,
+        session,
+    )))
 }
 
 /// A trusted direct client for workspace administration commands.
@@ -155,9 +158,12 @@ fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
                 .as_deref()
                 .is_none_or(|token| socket.token_id().is_ok_and(|id| id == token_id(token))) =>
         {
-            Ok(Box::new(CloudBackend::new(socket, session)))
+            Ok(Box::new(CloudBackend::new(
+                RepositoryTransport::new(socket, config.repository.as_deref())?,
+                session,
+            )))
         }
-        _ => direct(&url, session),
+        _ => direct(&url, session, config.repository.as_deref()),
     }
 }
 
@@ -176,5 +182,5 @@ mod tests {
 #[cfg(not(unix))]
 fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
     let (url, _) = endpoint(config)?;
-    direct(&url, session)
+    direct(&url, session, config.repository.as_deref())
 }

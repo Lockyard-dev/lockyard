@@ -226,7 +226,14 @@ impl View {
                     held_path: claim
                         .paths
                         .iter()
-                        .find(|held| ZonePath::stored((*held).clone()).overlaps(&path))
+                        .find(|held| {
+                            ZonePath::stored((*held).clone()).overlaps_with_case(
+                                &path,
+                                claim
+                                    .case_insensitive_paths
+                                    .unwrap_or(cfg!(any(target_os = "macos", windows))),
+                            )
+                        })
                         .cloned()
                         .unwrap_or_default(),
                     claim: claim.id,
@@ -249,13 +256,16 @@ impl View {
 }
 
 fn covers(claim: &Claim, path: &ZonePath) -> bool {
+    let fold = claim
+        .case_insensitive_paths
+        .unwrap_or(cfg!(any(target_os = "macos", windows)));
     let inside = |list: &[String]| {
         list.iter()
-            .any(|held| ZonePath::stored(held.clone()).overlaps(path))
+            .any(|held| ZonePath::stored(held.clone()).overlaps_with_case(path, fold))
     };
     let excluded = claim.excluded_paths.iter().any(|gap| {
         let gap = ZonePath::stored(gap.clone());
-        gap.overlaps(path) && gap.as_str().len() <= path.as_str().len()
+        gap.overlaps_with_case(path, fold) && gap.as_str().len() <= path.as_str().len()
     });
     inside(&claim.paths) && !excluded
 }
@@ -336,6 +346,8 @@ struct Shared<T: Transport + 'static> {
     registry_seq: AtomicI64,
     session_event_cursors: Mutex<HashMap<String, i64>>,
     session_events: Mutex<HashMap<String, SessionEvents>>,
+    /// Successful namespace negotiations live only as long as this daemon instance.
+    repository_capabilities: Mutex<HashSet<String>>,
 }
 
 fn now_ms() -> i64 {
@@ -891,6 +903,28 @@ impl<T: Transport + 'static> Shared<T> {
     }
 
     fn forward(&self, mut call: Call) -> Reply {
+        let repository_probe = call.method == "GET"
+            && call.path.starts_with("/api/v1/zones/claims?")
+            && call.path.ends_with("&namespace_probe=1")
+            && call
+                .repository
+                .as_deref()
+                .is_some_and(|repository| !repository.is_empty());
+        if repository_probe
+            && self
+                .repository_capabilities
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(call.repository.as_deref().unwrap_or_default())
+        {
+            return Reply {
+                value: Some(
+                    json!({"repository_namespace_supported":true,"repository":call.repository}),
+                ),
+                source: Some(Source::View),
+                ..Reply::default()
+            };
+        }
         if call.method == "GET" && call.path == "/api/v1/bus/board" {
             let view = self.read_view();
             if view.board_fresh(self.timing().fresh) {
@@ -910,6 +944,19 @@ impl<T: Transport + 'static> Shared<T> {
             let writes = call.is_write() && call.path.starts_with("/api/v1/zones/");
             return match self.transport.call(&call) {
                 Ok(value) => {
+                    if repository_probe {
+                        self.repository_capabilities
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(call.repository.clone().unwrap_or_default());
+                        return Reply {
+                            value: Some(
+                                json!({"repository_namespace_supported":true,"repository":call.repository}),
+                            ),
+                            source: Some(Source::Server),
+                            ..Reply::default()
+                        };
+                    }
                     if writes {
                         let mut view = self.write_view();
                         view.zones_generation += 1;
@@ -1436,6 +1483,7 @@ impl<T: Transport + 'static> Daemon<T> {
             registry_seq: AtomicI64::new(load_seq(&state_dir, "registry")),
             session_event_cursors: Mutex::new(HashMap::new()),
             session_events: Mutex::new(HashMap::new()),
+            repository_capabilities: Mutex::new(HashSet::new()),
             state_dir,
             config,
             view: RwLock::new(View {
@@ -1556,6 +1604,8 @@ mod tests {
         /// Every request that is not an event poll.
         calls: Mutex<Vec<String>>,
         event_calls: AtomicUsize,
+        namespace_probes: AtomicUsize,
+        namespace_unsupported: AtomicBool,
         refuse_with: Mutex<Option<u16>>,
         fail_queue: AtomicBool,
         fail_inbox_for: Mutex<Option<String>>,
@@ -1595,6 +1645,14 @@ mod tests {
 
     impl Transport for FakeServer {
         fn call(&self, call: &Call) -> Result<Value, ClientError> {
+            if call.path.ends_with("&namespace_probe=1") {
+                self.namespace_probes.fetch_add(1, Ordering::SeqCst);
+                if self.namespace_unsupported.load(Ordering::SeqCst) {
+                    return Err(ClientError::Invalid(
+                        "repository namespaces unsupported".into(),
+                    ));
+                }
+            }
             let route = call.path.split('?').next().unwrap_or_default().to_string();
             if call.long_poll || route.ends_with("/events") {
                 self.event_calls.fetch_add(1, Ordering::SeqCst);
@@ -1904,6 +1962,57 @@ mod tests {
             CheckStatus::Own,
             "a session that comes back still holds its own claim"
         );
+    }
+
+    #[test]
+    fn cache_checks_keep_repository_roots_separate_and_follow_the_server_case_policy() {
+        let view = View {
+            claims: vec![
+                serde_json::from_value(json!({"id": 1, "session": "bob", "paths": [".lockyard-repository/api/SRC"], "case_insensitive_paths": true})).unwrap(),
+                serde_json::from_value(json!({"id": 2, "session": "carol", "paths": ["."], "case_insensitive_paths": false})).unwrap(),
+            ],
+            ..View::default()
+        };
+        let status = |path: &str| view.check("alice", &[path.to_string()]).remove(0).status;
+        assert_eq!(
+            status(".lockyard-repository/api/src/file"),
+            CheckStatus::Held
+        );
+        assert_eq!(
+            status(".lockyard-repository/web/src/file"),
+            CheckStatus::Free
+        );
+        assert_eq!(status("src/file"), CheckStatus::Held);
+    }
+
+    #[test]
+    fn successful_namespace_probes_are_cached_per_daemon_but_failures_are_not() {
+        let rig = start_with(timing(), |_| {});
+        let probe = |repository: &str| {
+            let mut call = Call::get(
+                "me",
+                format!(
+                    "/api/v1/zones/claims?path={}&namespace_probe=1",
+                    lockyard_cloud_client::encode(&format!(".lockyard-repository/{repository}"))
+                ),
+            );
+            call.repository = Some(repository.to_string());
+            Request::Call { call }
+        };
+        let first = rig.daemon.handle(probe("api"));
+        assert_eq!(first.value.unwrap()["repository_namespace_supported"], true);
+        let cached = rig.daemon.handle(probe("api"));
+        assert_eq!(cached.source, Some(Source::View));
+        assert_eq!(rig.server.namespace_probes.load(Ordering::SeqCst), 1);
+        rig.server
+            .namespace_unsupported
+            .store(true, Ordering::SeqCst);
+        assert!(rig.daemon.handle(probe("web")).error.is_some());
+        rig.server
+            .namespace_unsupported
+            .store(false, Ordering::SeqCst);
+        assert!(rig.daemon.handle(probe("web")).error.is_none());
+        assert_eq!(rig.server.namespace_probes.load(Ordering::SeqCst), 3);
     }
 
     #[test]

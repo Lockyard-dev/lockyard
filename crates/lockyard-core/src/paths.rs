@@ -34,6 +34,11 @@ impl ZonePath {
             };
             parts.push(part);
         }
+        if parts.first() == Some(&".lockyard-repository") {
+            return Err(Error::Invalid(
+                ".lockyard-repository is reserved for repository protocol addresses".into(),
+            ));
+        }
         if parts.is_empty() {
             return Ok(Some(Self(ROOT.into())));
         }
@@ -58,9 +63,19 @@ impl ZonePath {
             cfg!(any(target_os = "macos", windows)),
         )
     }
+
+    /// Cloud caches use the repository policy returned by the server, rather than this machine's OS.
+    pub fn overlaps_with_case(&self, other: &Self, fold_ascii_case: bool) -> bool {
+        overlaps(self.as_str(), other.as_str(), fold_ascii_case)
+    }
 }
 
 fn overlaps(a: &str, b: &str, fold_ascii_case: bool) -> bool {
+    let (repository_a, a) = crate::repository::split(a);
+    let (repository_b, b) = crate::repository::split(b);
+    if repository_a != repository_b {
+        return false;
+    }
     if fold_ascii_case {
         let a = a.to_ascii_lowercase();
         let b = b.to_ascii_lowercase();
@@ -127,10 +142,43 @@ mod tests {
     }
 
     #[test]
+    fn physical_paths_cannot_impersonate_virtual_repository_addresses() {
+        let (_dir, root) = project();
+        fs::create_dir_all(root.join(".lockyard-repository/api/src")).unwrap();
+        assert!(matches!(
+            ZonePath::resolve(&root, &root, ".lockyard-repository/api/src"),
+            Err(Error::Invalid(_))
+        ));
+        // Wire records still need this representation in the aggregate daemon cache.
+        let stored = ZonePath::stored(".lockyard-repository/api/src".into());
+        assert_eq!(stored.as_str(), ".lockyard-repository/api/src");
+    }
+
+    #[test]
     fn path_overlap_can_fold_ascii_case_on_any_platform() {
         assert!(!overlaps("SRC", "src/file.rs", false));
         assert!(overlaps("SRC", "src/file.rs", true));
         assert!(!overlaps("Src", "src/file.rs", false));
+    }
+
+    #[test]
+    fn repository_roots_and_legacy_root_are_separate_even_when_comparing_without_case() {
+        let api = ".lockyard-repository/api";
+        let web = ".lockyard-repository/web";
+        assert!(overlaps(api, &format!("{api}/src/file"), false));
+        assert!(!overlaps(api, &format!("{web}/src/file"), false));
+        assert!(!overlaps(".", &format!("{api}/src/file"), false));
+        assert!(!overlaps(api, "src/file", true));
+        assert!(overlaps(
+            &format!("{api}/SRC"),
+            &format!("{api}/src/file"),
+            true
+        ));
+        assert!(!overlaps(
+            &format!("{api}/SRC"),
+            &format!("{api}/src/file"),
+            false
+        ));
     }
 
     fn zone(root: &Path, cwd: &Path, raw: &str) -> String {

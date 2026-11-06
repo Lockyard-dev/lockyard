@@ -95,6 +95,21 @@ impl Store {
         Ok(messages)
     }
 
+    /// Read without changing agent registration, presence or delivery state.
+    pub fn peek_inbox(&self, agent: &str, all: bool, limit: usize) -> Result<Vec<Message>> {
+        validate_agent(agent)?;
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM messages m
+             WHERE (m.to_agent = ?1 OR (m.to_agent = '*' AND m.from_agent <> ?1))
+               AND (?2 OR NOT EXISTS (SELECT 1 FROM receipts r WHERE r.message_id = m.id AND r.agent = ?1))
+             ORDER BY m.id LIMIT ?3"))?;
+        let rows = statement.query_map(
+            params![agent, all, i64::try_from(limit).unwrap_or(i64::MAX)],
+            read_message,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// How many messages `agent` has not read.
     pub fn unread(&self, agent: &str) -> Result<i64> {
         Ok(self.conn.query_row(

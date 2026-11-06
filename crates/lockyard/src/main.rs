@@ -1,10 +1,13 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
 mod agent;
+mod context;
 mod guard;
 mod hook;
 mod mcp;
+mod onboarding;
 mod open;
+mod workflow;
 
 use clap::{Args, Parser, Subcommand};
 use lockyard_core::bus::BROADCAST;
@@ -99,9 +102,52 @@ enum Command {
     #[command(subcommand)]
     Hook(HookCommand),
     /// Print setup snippets for agent tools.
-    Setup { client: SetupClient },
+    Setup {
+        client: SetupClient,
+        #[arg(long, conflicts_with_all=["check", "remove", "preview"])]
+        apply: bool,
+        #[arg(long, conflicts_with_all=["apply", "remove", "preview"])]
+        check: bool,
+        #[arg(long, conflicts_with_all=["apply", "check", "preview"])]
+        remove: bool,
+        #[arg(long, conflicts_with_all=["apply", "check", "remove"])]
+        preview: bool,
+    },
+    /// Check effective integration and project readiness without changing configuration.
+    Doctor {
+        #[arg(long)]
+        client: Option<String>,
+        #[arg(long)]
+        smoke: bool,
+    },
+    /// Read a bounded briefing without marking mail read or renewing leases.
+    Context {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 8192)]
+        max_bytes: usize,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Execute or inspect explicit resumable coordination steps.
+    #[command(subcommand)]
+    Workflow(WorkflowCommand),
     /// Run the MCP server over standard input and output.
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum WorkflowCommand {
+    /// Execute a JSON plan. Completed steps are not repeated; uncertain writes require reconciliation.
+    Run {
+        /// Stable operation identifier, retained for retries.
+        id: String,
+        /// JSON plan file, or - to read stdin. Paths in plans are project-relative.
+        #[arg(long)]
+        plan: PathBuf,
+    },
+    /// Inspect receipts without performing writes or retrying steps.
+    Inspect { id: String },
 }
 
 #[derive(Args)]
@@ -419,6 +465,59 @@ enum MsgCommand {
 
 #[derive(Subcommand)]
 enum TaskCommand {
+    /// Cloud registry items that are actionable, with raw states and dependency links.
+    Ready {
+        #[arg(long)]
+        actor: Option<String>,
+        #[arg(long)]
+        area: Option<String>,
+        #[arg(long = "type")]
+        kind: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u16,
+    },
+    /// Search cloud registry metadata. Encrypted content is not searched by the server.
+    Search {
+        query: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        actor: Option<String>,
+        #[arg(long)]
+        area: Option<String>,
+        #[arg(long = "type")]
+        kind: Option<String>,
+        #[arg(long)]
+        priority: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u16,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Explain dependency and scheduling blockers using the server's visibility rules.
+    WhyBlocked {
+        #[arg(value_parser=parse_id)]
+        id: i64,
+    },
+    /// Show full cloud registry dependency links, without reducing statuses.
+    Links {
+        #[arg(value_parser=parse_id)]
+        id: i64,
+    },
+    /// Add a typed dependency link at an explicitly observed version.
+    Link {
+        #[arg(value_parser=parse_id)]
+        id: i64,
+        #[arg(value_parser=parse_id)]
+        to: i64,
+        #[arg(long, default_value = "blocks")]
+        kind: String,
+        #[arg(long)]
+        if_version: i64,
+        /// ULID retained across retries. Generated if omitted and printed in the result.
+        #[arg(long)]
+        key: Option<String>,
+    },
     /// Add an open task.
     Add {
         title: String,
@@ -605,6 +704,12 @@ enum WorkCommand {
         task: WorkRef,
         #[arg(long)]
         to: String,
+        /// Context, checks, risks and next steps for the receiving agent.
+        #[arg(long)]
+        report: Option<String>,
+        /// A commit relevant to this handoff. Repeat for several.
+        #[arg(long = "commit")]
+        commits: Vec<String>,
     },
     /// Take a task handed to this agent. Needs the version.
     Take {
@@ -967,7 +1072,10 @@ fn task_line(task: &Task) -> String {
     let assignee = task.assignee.as_deref().unwrap_or("-");
     format!(
         "T-{}  {}  {}  {}",
-        task.id, task.status, assignee, task.title
+        task.id,
+        task.raw_status.as_deref().unwrap_or(task.status.as_str()),
+        assignee,
+        task.title
     )
 }
 
@@ -1465,6 +1573,66 @@ fn run_task(mut opened: Opened, command: TaskCommand, agent: Option<&String>) ->
     let now = now_ms();
     let store = opened.backend.as_mut();
     let changed = match command {
+        TaskCommand::Ready {
+            actor,
+            area,
+            kind,
+            limit,
+        } => {
+            let data = store
+                .registry_ready(&json!({"actor":actor,"area":area,"type":kind,"limit":limit}))?;
+            return output(
+                &data,
+                serde_json::to_string_pretty(&data).unwrap_or_default(),
+            );
+        }
+        TaskCommand::Search {
+            query,
+            status,
+            actor,
+            area,
+            kind,
+            priority,
+            limit,
+            cursor,
+        } => {
+            let data = store.registry_search(&json!({"q":query,"status":status,"actor":actor,"area":area,"type":kind,"priority":priority,"limit":limit,"cursor":cursor}))?;
+            return output(
+                &data,
+                serde_json::to_string_pretty(&data).unwrap_or_default(),
+            );
+        }
+        TaskCommand::WhyBlocked { id } => {
+            let data = store.registry_blockers(id)?;
+            return output(
+                &data,
+                serde_json::to_string_pretty(&data).unwrap_or_default(),
+            );
+        }
+        TaskCommand::Links { id } => {
+            let item = store.registry_item(id)?;
+            let data = json!({"id":item["id"],"status":item["status"],"version":item["version"],"links":item["links"]});
+            return output(
+                &data,
+                serde_json::to_string_pretty(&data).unwrap_or_default(),
+            );
+        }
+        TaskCommand::Link {
+            id,
+            to,
+            kind,
+            if_version,
+            key,
+        } => {
+            let key = key.unwrap_or_else(lockyard_cloud_client::ulid);
+            let item =
+                store.registry_link(&resolve_agent(agent)?, id, to, &kind, if_version, &key)?;
+            let data = json!({"idempotency_key":key,"item":item});
+            return output(
+                &data,
+                serde_json::to_string_pretty(&data).unwrap_or_default(),
+            );
+        }
         TaskCommand::List { all, status } => {
             let tasks = store.tasks(status, all)?;
             let text = join(&tasks, task_line, "no tasks");
@@ -1645,11 +1813,18 @@ fn run_work(mut opened: Opened, command: WorkCommand, agent: Option<&String>) ->
                 ..work_step(&task)
             },
         ),
-        WorkCommand::Handoff { task, to } => (
+        WorkCommand::Handoff {
+            task,
+            to,
+            report,
+            commits,
+        } => (
             task.id,
             WorkAction::Handoff,
             WorkStep {
                 to: Some(to),
+                report,
+                commits,
                 ..work_step(&task)
             },
         ),
@@ -2247,9 +2422,103 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             run_hook(command, agent, cwd);
             output(&Value::Null, "")
         }
-        Command::Setup { client } => {
-            let text = setup(client);
-            output(&json!({ "setup": text }), text)
+        Command::Setup {
+            client,
+            apply,
+            check,
+            remove,
+            preview,
+        } => {
+            if !(apply || check || remove || preview) {
+                let text = setup(client);
+                return output(&json!({ "setup": text }), text);
+            }
+            let client = match client {
+                SetupClient::Claude => "claude",
+                SetupClient::Codex => "codex",
+                SetupClient::Cursor => "cursor",
+            };
+            let action = if apply {
+                onboarding::SetupAction::Apply
+            } else if check {
+                onboarding::SetupAction::Check
+            } else if remove {
+                onboarding::SetupAction::Remove
+            } else {
+                onboarding::SetupAction::Preview
+            };
+            let data = onboarding::setup(cwd, client, action)?;
+            let mut result = output(&data, onboarding::text(&data))?;
+            if data["ok"] == false {
+                result.exit = EXIT_FAILURE;
+            }
+            Ok(result)
+        }
+        Command::Doctor { client, smoke } => {
+            let data = onboarding::doctor(cwd, agent.as_deref(), client.as_deref(), smoke)?;
+            let mut result = output(&data, onboarding::text(&data))?;
+            if data["ok"] == false {
+                result.exit = EXIT_FAILURE;
+            }
+            Ok(result)
+        }
+        Command::Context {
+            limit,
+            max_bytes,
+            cursor,
+        } => {
+            let mut opened = open()?;
+            let data = context::snapshot(
+                opened.backend.as_mut(),
+                &resolve_agent(agent.as_ref())?,
+                now_ms(),
+                &context::ContextOptions {
+                    limit,
+                    max_bytes,
+                    cursor,
+                },
+            )?;
+            output(&data, data.to_string())
+        }
+        Command::Workflow(WorkflowCommand::Inspect { id }) => {
+            let root = lockyard_core::paths::find_root(cwd).ok_or(Error::NoProject)?;
+            let data = workflow::inspect(&root, &id)?;
+            output(
+                &data,
+                serde_json::to_string_pretty(&data).unwrap_or_default(),
+            )
+        }
+        Command::Workflow(WorkflowCommand::Run { id, plan }) => {
+            let mut bytes = Vec::new();
+            if plan.as_os_str() == "-" {
+                std::io::stdin().take(65537).read_to_end(&mut bytes)?;
+            } else {
+                std::fs::File::open(plan)?
+                    .take(65537)
+                    .read_to_end(&mut bytes)?;
+            }
+            if bytes.len() > 65536 {
+                return Err(Error::Invalid("workflow plan exceeds 65536 bytes".into()));
+            }
+            let plan: Value = serde_json::from_slice(&bytes)
+                .map_err(|error| Error::Invalid(format!("invalid workflow JSON: {error}")))?;
+            let mut opened = open()?;
+            let data = workflow::run(
+                &opened.root,
+                opened.backend.as_mut(),
+                &resolve_agent(agent.as_ref())?,
+                now_ms(),
+                &id,
+                &plan,
+            )?;
+            let mut result = output(
+                &data,
+                serde_json::to_string_pretty(&data).unwrap_or_default(),
+            )?;
+            if data["ok"] != true {
+                result.exit = EXIT_FAILURE;
+            }
+            Ok(result)
         }
         Command::Mcp => output(&Value::Null, ""),
     }
@@ -2337,6 +2606,41 @@ mod tests {
     #[test]
     fn the_command_line_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn work_handoff_accepts_context_and_commit_references() {
+        let cli = Cli::try_parse_from([
+            "lockyard",
+            "work",
+            "handoff",
+            "W-12",
+            "--to",
+            "next",
+            "--if-version",
+            "3",
+            "--report",
+            "Tests passed; next verify staging",
+            "--commit",
+            "abc123",
+            "--commit",
+            "def456",
+        ])
+        .unwrap();
+        let Command::Work(WorkCommand::Handoff {
+            task,
+            to,
+            report,
+            commits,
+        }) = cli.command
+        else {
+            panic!("expected work handoff")
+        };
+        assert_eq!(task.id, 12);
+        assert_eq!(task.if_version, Some(3));
+        assert_eq!(to, "next");
+        assert_eq!(report.as_deref(), Some("Tests passed; next verify staging"));
+        assert_eq!(commits, ["abc123", "def456"]);
     }
 
     #[test]

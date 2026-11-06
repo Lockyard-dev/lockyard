@@ -562,12 +562,11 @@ fn process_start_time(pid: i32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        return stat
-            .rsplit_once(") ")?
+        stat.rsplit_once(") ")?
             .1
             .split_whitespace()
             .nth(19)
-            .map(str::to_owned);
+            .map(str::to_owned)
     }
     #[cfg(target_os = "macos")]
     {
@@ -712,7 +711,7 @@ fn process_memory(pid: i32) -> Option<u64> {
             found = true;
             let _ = member;
         }
-        return found.then_some(total.max(page));
+        found.then_some(total.max(page))
     }
     #[cfg(target_os = "macos")]
     {

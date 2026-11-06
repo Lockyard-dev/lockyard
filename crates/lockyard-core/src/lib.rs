@@ -13,6 +13,7 @@ mod error;
 pub mod machine;
 pub mod paths;
 pub mod proto;
+pub mod repository;
 mod store;
 pub mod tasks;
 pub mod zones;

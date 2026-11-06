@@ -68,6 +68,12 @@ pub struct Task {
     pub title: String,
     pub body: String,
     pub status: Status,
+    /// Exact registry status, when this is a projection of a cloud item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_status: Option<String>,
+    /// Dependency links are preserved for cloud task consumers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<serde_json::Value>,
     pub author: String,
     pub assignee: Option<String>,
     pub lease_until: Option<i64>,
@@ -371,6 +377,8 @@ fn read_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
         priority: None,
+        raw_status: None,
+        links: Vec::new(),
     })
 }
 

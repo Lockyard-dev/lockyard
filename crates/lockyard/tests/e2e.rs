@@ -1056,6 +1056,114 @@ fn tasks(w: &World) {
     );
 }
 
+fn repositories(w: &World) {
+    let (one, two) = (w.a("repository-one"), w.a("repository-two"));
+    let config_a = w.box_a.dir().join(".lockyard/config.toml");
+    let config_b = w.box_b.dir().join(".lockyard/config.toml");
+    let original_a = fs::read_to_string(&config_a).unwrap();
+    let original_b = fs::read_to_string(&config_b).unwrap();
+    let scoped =
+        |original: &str, repository: &str| format!("{original}\nrepository = \"{repository}\"\n");
+    fs::write(&config_a, scoped(&original_a, "e2e-api")).unwrap();
+    fs::write(&config_b, scoped(&original_b, "e2e-web")).unwrap();
+    let path = w.name("repository-same-path");
+    w.on(&w.box_a, &one, &["zone", "claim", &path]).ok();
+    w.on(&w.box_b, &two, &["zone", "claim", &path]).ok();
+    assert_eq!(
+        w.on(&w.box_b, &two, &["zone", "check", &path]).ok()["free"],
+        true
+    );
+    fs::write(&config_b, scoped(&original_b, "e2e-api")).unwrap();
+    w.on(&w.box_b, &two, &["zone", "check", &path])
+        .refused(3, &one.name);
+    w.on(&w.box_a, &one, &["zone", "release"]).ok();
+    assert_eq!(
+        w.on(&w.box_b, &two, &["zone", "check", &path]).ok()["free"],
+        true
+    );
+    fs::write(&config_b, scoped(&original_b, "e2e-web")).unwrap();
+    w.on(&w.box_b, &two, &["zone", "release"]).ok();
+    fs::write(&config_a, original_a).unwrap();
+    fs::write(&config_b, original_b).unwrap();
+}
+
+fn coordination_workflows(w: &World) {
+    let (one, two) = (w.a("workflow-one"), w.a("workflow-two"));
+    w.ly(&two, &["presence", "beat"]).ok();
+    let title = w.name("workflow-parent");
+    let acceptance = w.name("workflow-acceptance");
+    let parent = w
+        .ly(&one, &["task", "add", &title, "--acceptance", &acceptance])
+        .ok();
+    let child = w.ly(&one, &["task", "add", &w.name("workflow-child")]).ok();
+    let (parent_id, child_id) = (w.id(&parent), w.id(&child));
+    let raw_parent = format!("D-{}", parent["id"]);
+    let raw_child = format!("D-{}", child["id"]);
+    let found = w.ly(&one, &["task", "search", &title]).ok();
+    let item = found["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == raw_parent)
+        .unwrap();
+    assert_eq!(item["acceptance"], acceptance);
+    let version = item["version"].to_string();
+    w.ly(
+        &one,
+        &[
+            "task",
+            "link",
+            &parent_id,
+            &child_id,
+            "--if-version",
+            &version,
+        ],
+    )
+    .ok();
+    let links = w.ly(&one, &["task", "links", &parent_id]).ok();
+    assert!(links.to_string().contains(&raw_child), "{links}");
+    let blockers = w.ly(&one, &["task", "why-blocked", &child_id]).ok();
+    assert!(blockers.to_string().contains(&raw_parent), "{blockers}");
+    let ready = w.ly(&one, &["task", "ready"]).ok();
+    assert!(
+        !ready
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == raw_child),
+        "{ready}"
+    );
+    let context = w
+        .ly(&one, &["context", "--limit", "200", "--max-bytes", "65536"])
+        .ok();
+    assert!(context.to_string().contains(&acceptance), "{context}");
+    w.ly(&one, &["doctor", "--smoke"]).ok();
+
+    let operation = w.name("workflow-op");
+    let body = w.name("workflow-message");
+    let plan_path = w.box_a.dir().join(format!("{operation}.json"));
+    fs::write(
+        &plan_path,
+        json!({"steps":[{"kind":"message_send","to":two.name,"body":body}]}).to_string(),
+    )
+    .unwrap();
+    let arguments = [
+        "workflow",
+        "run",
+        &operation,
+        "--plan",
+        plan_path.to_str().unwrap(),
+    ];
+    assert_eq!(w.ly(&one, &arguments).ok()["ok"], true);
+    assert_eq!(w.ly(&one, &arguments).ok()["ok"], true);
+    assert_eq!(
+        w.ly(&one, &["workflow", "inspect", &operation]).ok()["steps"][0]["status"],
+        "completed"
+    );
+    let inbox = w.ly(&two, &["msg", "inbox", "--all", "--peek"]).ok();
+    assert_eq!(inbox.to_string().matches(&body).count(), 1, "{inbox}");
+}
+
 fn streams(w: &World) {
     let (one, two) = (w.a("stream-one"), w.a("stream-two"));
     let after = w.last_seq(&one, "coordination").to_string();
@@ -1819,6 +1927,42 @@ fn mcp(w: &World) {
     a.refused("zone_claim", json!({"paths": [w.name("no")]}), "frozen");
     boss.ok("cloud_freeze", json!({"on": false}));
 
+    let search = a.ok("task_search", json!({"q":"no"}));
+    assert!(search["items"].is_array());
+    assert!(a.ok("task_ready", json!({})).is_array());
+    let parent = a.ok(
+        "task_add",
+        json!({"title":"mcp dependency parent","acceptance":"keep the acceptance in raw context"}),
+    );
+    let child = a.ok("task_add", json!({"title":"mcp dependency child"}));
+    let raw = a.ok("task_links", json!({"id":parent["id"]}));
+    let linked = a.ok("task_link", json!({"id":parent["id"],"to":child["id"],"kind":"blocks","if_version":raw["version"],"key":lockyard_cloud_client::ulid()}));
+    assert!(linked.to_string().contains("blocks"));
+    assert!(
+        a.ok("task_why_blocked", json!({"id":child["id"]}))
+            .is_object()
+    );
+    assert!(
+        a.ok("context", json!({"max_bytes":65536,"limit":200}))
+            .is_object()
+    );
+    let operation = w.name("mcp-workflow");
+    let plan =
+        json!({"steps":[{"kind":"message_send","to":two.name,"body":"MCP workflow delivery"}]});
+    assert_eq!(
+        a.ok(
+            "workflow_run",
+            json!({"operation_id":operation,"plan":plan})
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        a.ok("workflow_inspect", json!({"operation_id":operation}))["steps"][0]["status"],
+        "completed"
+    );
+    let resources = a.rpc("resources/list", json!({}));
+    assert!(!resources["resources"].as_array().unwrap().is_empty());
+
     let listed = a.rpc("tools/list", json!({}));
     let all: HashSet<String> = listed["tools"]
         .as_array()
@@ -1977,7 +2121,7 @@ fn the_real_client_against_the_real_server() {
     w.server.start();
     tokens(&mut w);
     let w = &w;
-    let scenarios: [Scenario; 16] = [
+    let scenarios: [Scenario; 18] = [
         ("machine", machine),
         ("import", import),
         ("zones", zones),
@@ -1986,6 +2130,8 @@ fn the_real_client_against_the_real_server() {
         ("board", board),
         ("work", work),
         ("tasks", tasks),
+        ("repository namespaces", repositories),
+        ("coordination workflows", coordination_workflows),
         ("streams", streams),
         ("hooks", hooks),
         ("outage", outage),

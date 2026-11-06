@@ -117,8 +117,9 @@ fn check_item(item: Value) -> std::result::Result<PathCheck, ClientError> {
 
 /// [`Backend`] on a [`Transport`]. The `agent` of each call is its session.
 pub struct CloudBackend<T: Transport> {
-    transport: T,
-    session: String,
+    pub(crate) transport: T,
+    pub(crate) session: String,
+    write_idempotency_key: Option<String>,
 }
 
 impl<T: Transport> CloudBackend<T> {
@@ -127,6 +128,7 @@ impl<T: Transport> CloudBackend<T> {
         Self {
             transport,
             session: session.to_string(),
+            write_idempotency_key: None,
         }
     }
 
@@ -182,9 +184,11 @@ impl<T: Transport> CloudBackend<T> {
         body: &impl Serialize,
     ) -> Result<Value> {
         let body = serde_json::to_value(body).map_err(|error| Error::Invalid(error.to_string()))?;
-        Ok(self
-            .transport
-            .call(&Call::write(session, method, path, body))?)
+        let mut call = Call::write(session, method, path, body);
+        if let Some(key) = &self.write_idempotency_key {
+            call.key = Some(key.clone());
+        }
+        Ok(self.transport.call(&call)?)
     }
 }
 
@@ -382,6 +386,12 @@ fn task_from(item: &Value) -> Result<tasks::Task> {
         title: text(item, "title").to_string(),
         body: text(item, "body").to_string(),
         status: task_status(text(item, "status")),
+        raw_status: Some(text(item, "status").to_string()),
+        links: item
+            .get("links")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
         author: session_of(text(item, "created_by")),
         assignee: assignment.map(|found| session_of(text(found, "executor"))),
         lease_until: assignment.and_then(|found| millis(found, "lease_expires_at")),
@@ -396,6 +406,35 @@ fn task_from(item: &Value) -> Result<tasks::Task> {
 }
 
 impl<T: Transport> Backend for CloudBackend<T> {
+    fn set_write_idempotency_key(&mut self, key: Option<String>) {
+        self.write_idempotency_key = key;
+    }
+
+    fn registry_search(&self, query: &Value) -> Result<Value> {
+        crate::registry::search(self, query, false)
+    }
+    fn registry_ready(&self, query: &Value) -> Result<Value> {
+        crate::registry::search(self, query, true)
+    }
+    fn registry_item(&self, id: i64) -> Result<Value> {
+        crate::registry::item(self, id, false)
+    }
+    fn registry_blockers(&self, id: i64) -> Result<Value> {
+        crate::registry::item(self, id, true)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn registry_link(
+        &mut self,
+        agent: &str,
+        id: i64,
+        to: i64,
+        kind: &str,
+        version: i64,
+        key: &str,
+    ) -> Result<Value> {
+        crate::registry::link(self, agent, id, to, kind, version, key)
+    }
+
     fn is_cloud(&self) -> bool {
         true
     }
@@ -421,6 +460,9 @@ impl<T: Transport> Backend for CloudBackend<T> {
         let body =
             serde_json::to_value(request).map_err(|error| Error::Invalid(error.to_string()))?;
         let mut call = Call::write(agent, "POST", "/api/v1/zones/claims".into(), body);
+        if let Some(key) = &self.write_idempotency_key {
+            call.key = Some(key.clone());
+        }
         // With a short wait the server holds the answer until the zone frees up.
         call.long_poll = request
             .queue_wait_seconds
@@ -689,7 +731,11 @@ impl<T: Transport> Backend for CloudBackend<T> {
         Ok(())
     }
 
-    fn inbox(&mut self, agent: &str, filter: InboxQuery, _now: i64) -> Result<InboxPage> {
+    fn inbox(&mut self, agent: &str, filter: InboxQuery, now: i64) -> Result<InboxPage> {
+        self.peek_inbox(agent, filter, now)
+    }
+
+    fn peek_inbox(&self, agent: &str, filter: InboxQuery, _now: i64) -> Result<InboxPage> {
         let tail = query(&[
             ("all", filter.all.then(|| "true".to_string())),
             (

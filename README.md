@@ -83,6 +83,8 @@ Create `.lockyard/config.toml`:
 mode = "cloud"
 url = "https://your-server.example"
 workspace = "your-team"
+# Optional: the same stable repository ID in every checkout of this repository.
+# repository = "api"
 ```
 
 The workspace is a label: the server takes the real one from the token. The token comes from `LOCKYARD_TOKEN` or from
@@ -170,14 +172,31 @@ guarantee that a machine cannot hang.
 and `LOCKYARD_E2E_SERVER`, a shell command that runs the server in the foreground on a database that survives a restart.
 The suite starts and stops that server itself. Without the URL it skips, and with `LOCKYARD_E2E_REQUIRED=1` it fails instead.
 
+## Development workflows
+
+`lockyard task ready`, `task search`, `task links` and `task why-blocked` expose the cloud registry's
+native task states and dependency information. `lockyard context` builds a bounded briefing for a new
+session, and `work handoff --report ... --commit ...` carries context to the next agent.
+
+An explicit `lockyard workflow run <operation-id> --plan plan.json` records each coordination step.
+Retries preserve completed steps and stop on uncertain writes or stale ownership; the workflow is not
+an atomic transaction. See [context, handoff and workflows](docs/context-workflows.md).
+
+`lockyard doctor --smoke` verifies local coordination with two temporary agents. Client configuration
+changes are opt-in with `setup <client> --preview`, `--apply`, `--check` and `--remove`.
+See [managed client setup](docs/onboarding.md).
+
+For several repositories sharing cloud tasks and messages, configure distinct stable repository IDs.
+See [repository namespaces](docs/repositories.md) before changing an active project's identity.
+
 ## Limits
 
-- Lockyard prevents accidents between cooperating agents. Agent names are not authenticated, and an agent can pretend to
-  be another one.
+- Lockyard prevents accidents between cooperating agents. In local mode, agent names are cooperative identities rather
+  than authenticated users. Cloud sessions are bound to workspace tokens; a credential role is not proof of a physical human identity.
 - The hook sees file edit tools only. A file changed by a shell command is not checked.
 - Subagents of one Claude Code session share its session id, so they count as one agent.
-- On macOS and Windows, path comparisons fold ASCII case to match their usual case-insensitive file systems. Other
-  platforms compare paths exactly.
+- In local mode, macOS and Windows path comparisons fold ASCII case. Cloud path comparison follows the repository's
+  server catalog policy so different client operating systems agree.
 - In local mode all agents must run on one machine.
 
 ## License

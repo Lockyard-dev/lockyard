@@ -14,6 +14,8 @@ pub struct Config {
     pub mode: Mode,
     pub url: Option<String>,
     pub workspace: Option<String>,
+    /// Stable shared identity, identical in every checkout of this repository. Omission is legacy mode.
+    pub repository: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -34,12 +36,16 @@ impl Config {
                     mode: Mode::Local,
                     url: None,
                     workspace: None,
+                    repository: None,
                 });
             }
             Err(error) => return Err(error.into()),
         };
         let config: Self = toml::from_str(&content)
             .map_err(|error| Error::Invalid(format!("invalid .lockyard/config.toml: {error}")))?;
+        if let Some(repository) = config.repository.as_deref() {
+            crate::repository::validate_id(repository)?;
+        }
         if config.mode == Mode::Cloud
             && (config.url.as_deref().is_none_or(str::is_empty)
                 || config.workspace.as_deref().is_none_or(str::is_empty))

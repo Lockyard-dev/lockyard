@@ -21,6 +21,10 @@ fn cloud<T>(feature: &str) -> Result<T> {
 
 /// Every operation of Lockyard, in either mode.
 pub trait Backend {
+    /// Override the key for a workflow's single write step. Always clear after the step.
+    /// Local writes do not have a remote idempotency ledger; uncertain outcomes must be reconciled.
+    fn set_write_idempotency_key(&mut self, _key: Option<String>) {}
+
     /// True when state lives on the server, so local clocks must not be compared with leases.
     fn is_cloud(&self) -> bool {
         false
@@ -138,6 +142,10 @@ pub trait Backend {
     }
     /// Reads mail and marks nothing: the caller shows it first, then calls [`Backend::inbox_seen`].
     fn inbox(&mut self, agent: &str, query: InboxQuery, now: i64) -> Result<InboxPage>;
+    /// Observe mail without registering an agent, updating presence or marking receipts.
+    fn peek_inbox(&self, _agent: &str, _query: InboxQuery, _now: i64) -> Result<InboxPage> {
+        cloud("read-only inbox")
+    }
     fn unread(&self, agent: &str) -> Result<i64>;
     fn inbox_seen(&mut self, agent: &str, ids: &[i64], now: i64) -> Result<usize>;
     fn inbox_claim(
@@ -160,6 +168,31 @@ pub trait Backend {
 
     fn tasks(&self, status: Option<tasks::Status>, include_final: bool)
     -> Result<Vec<tasks::Task>>;
+    /// The full cloud registry protocol, without collapsing registry states into local task states.
+    fn registry_search(&self, _query: &Value) -> Result<Value> {
+        cloud("task search")
+    }
+    fn registry_ready(&self, _query: &Value) -> Result<Value> {
+        cloud("task ready")
+    }
+    fn registry_item(&self, _id: i64) -> Result<Value> {
+        cloud("task registry")
+    }
+    fn registry_blockers(&self, _id: i64) -> Result<Value> {
+        cloud("task why-blocked")
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn registry_link(
+        &mut self,
+        _agent: &str,
+        _id: i64,
+        _to: i64,
+        _kind: &str,
+        _version: i64,
+        _key: &str,
+    ) -> Result<Value> {
+        cloud("task link")
+    }
     fn task(&self, id: i64) -> Result<tasks::Task>;
     fn task_history(&self, id: i64) -> Result<Vec<tasks::TaskEvent>>;
     fn add_task(&mut self, author: &str, spec: &tasks::TaskSpec, now: i64) -> Result<tasks::Task>;
@@ -266,6 +299,7 @@ fn claim_record(claim: zones::Claim) -> Claim {
         meta: None,
         version: None,
         holder_available: None,
+        case_insensitive_paths: None,
         foreign_dirty_paths: Vec::new(),
     }
 }
@@ -462,6 +496,16 @@ impl Backend for Store {
         let messages = Store::inbox(self, agent, query.all, false, query.limit, now)?;
         Ok(InboxPage {
             messages: messages.into_iter().map(message_record).collect(),
+            skipped: 0,
+        })
+    }
+
+    fn peek_inbox(&self, agent: &str, query: InboxQuery, _now: i64) -> Result<InboxPage> {
+        Ok(InboxPage {
+            messages: Store::peek_inbox(self, agent, query.all, query.limit)?
+                .into_iter()
+                .map(message_record)
+                .collect(),
             skipped: 0,
         })
     }
