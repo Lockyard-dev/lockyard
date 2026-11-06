@@ -214,7 +214,19 @@ fn connect_bounded(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
 impl Transport for AgentSocket {
     fn call(&self, call: &Call) -> Result<Value, ClientError> {
         let reply = self.ask_for(&Request::Call { call: call.clone() })?;
-        Ok(reply.value.unwrap_or(Value::Null))
+        let value = reply.value.unwrap_or(Value::Null);
+        if let Some(repository) = call.repository.as_deref().filter(|id| !id.is_empty())
+            && call.method == "GET"
+            && call.path.starts_with("/api/v1/zones/claims?")
+            && call.path.ends_with("&namespace_probe=1")
+            && (value["repository_namespace_supported"] != true
+                || value["repository"] != repository)
+        {
+            return Err(ClientError::Invalid(
+                "this agent does not confirm repository namespace support; restart or upgrade the agent before using repository-scoped coordination".into(),
+            ));
+        }
+        Ok(value)
     }
 
     fn fast_check(
@@ -242,9 +254,72 @@ impl Transport for AgentSocket {
 
 #[cfg(test)]
 mod tests {
-    use super::connect_bounded;
+    use super::*;
+    use serde_json::json;
     use std::os::unix::net::UnixListener;
-    use std::time::Duration;
+
+    fn socket_reply(call: Call, value: Value) -> Result<Value, ClientError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let expected = call.clone();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let envelope: Envelope = serde_json::from_str(&line).unwrap();
+            let Request::Call { call } = envelope.request else {
+                panic!("expected a call")
+            };
+            assert_eq!(call.path, expected.path);
+            assert_eq!(call.repository, expected.repository);
+            serde_json::to_writer(
+                &mut stream,
+                &Reply {
+                    value: Some(value),
+                    ..Reply::default()
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+        let answer = AgentSocket {
+            path,
+            workspace: "test".into(),
+            timeout: Duration::from_secs(2),
+        }
+        .call(&call);
+        peer.join().unwrap();
+        answer
+    }
+
+    #[test]
+    fn repository_probe_requires_an_explicit_matching_capability_from_the_agent() {
+        let mut probe = Call::get(
+            "alice",
+            "/api/v1/zones/claims?path=.lockyard-repository%2Fapi&namespace_probe=1".into(),
+        );
+        probe.repository = Some("api".into());
+        for unsupported in [
+            json!([]),
+            json!({}),
+            json!({"repository_namespace_supported":true}),
+            json!({"repository_namespace_supported":false,"repository":"api"}),
+            json!({"repository_namespace_supported":true,"repository":"web"}),
+        ] {
+            let error = socket_reply(probe.clone(), unsupported).unwrap_err();
+            assert!(matches!(error, ClientError::Invalid(_)));
+            assert!(error.to_string().contains("namespace support"));
+        }
+        let supported = json!({"repository_namespace_supported":true,"repository":"api"});
+        assert_eq!(socket_reply(probe, supported.clone()).unwrap(), supported);
+        assert_eq!(
+            socket_reply(Call::get("alice", "/api/v1/zones/claims".into()), json!([])).unwrap(),
+            json!([])
+        );
+    }
 
     #[test]
     fn a_full_unix_listener_queue_does_not_block_connect() {

@@ -201,6 +201,30 @@ impl View {
 
     fn check_path(&self, session: &str, raw: &str) -> PathCheck {
         let path = ZonePath::stored(raw.to_string());
+        let repository = lockyard_core::repository::split(raw).0;
+        // The server uses .NET OrdinalIgnoreCase. ASCII folding cannot safely answer
+        // Unicode comparisons, including exclusions and Unicode holders of ASCII paths.
+        if self.claims.iter().any(|claim| {
+            claim
+                .case_insensitive_paths
+                .unwrap_or(cfg!(any(target_os = "macos", windows)))
+                && claim
+                    .paths
+                    .iter()
+                    .any(|held| lockyard_core::repository::split(held).0 == repository)
+                && (!raw.is_ascii()
+                    || claim
+                        .paths
+                        .iter()
+                        .chain(&claim.excluded_paths)
+                        .any(|held| !held.is_ascii()))
+        }) {
+            return PathCheck {
+                path: raw.to_string(),
+                status: CheckStatus::Unknown,
+                holder: None,
+            };
+        }
         // A claim of an unavailable session stops blocking, as it does on the server.
         let covering =
             |claim: &&Claim| claim.holder_available != Some(false) && covers(claim, &path);
@@ -438,11 +462,17 @@ impl<T: Transport + 'static> Shared<T> {
         {
             let view = self.read_view();
             if view.fresh(self.timing().fresh) {
-                return Reply {
-                    checks: Some(view.check(session, &paths)),
-                    source: Some(Source::View),
-                    ..Reply::default()
-                };
+                let checks = view.check(session, &paths);
+                if checks
+                    .iter()
+                    .all(|check| check.status != CheckStatus::Unknown)
+                {
+                    return Reply {
+                        checks: Some(checks),
+                        source: Some(Source::View),
+                        ..Reply::default()
+                    };
+                }
             }
         }
         let wanted = paths.clone();
@@ -1983,6 +2013,58 @@ mod tests {
             CheckStatus::Free
         );
         assert_eq!(status("src/file"), CheckStatus::Held);
+    }
+
+    #[test]
+    fn insensitive_unicode_comparisons_require_the_authoritative_server() {
+        for (held, requested, excluded) in [
+            ("Ä", "ä/file", ""),
+            ("Ж", "ж/file", ""),
+            ("Ä", "ascii", ""),
+            ("ascii", "Ä", ""),
+            ("ascii", "ascii/file", "ascii/Ä"),
+        ] {
+            let held = format!(".lockyard-repository/api/{held}");
+            let excluded =
+                (!excluded.is_empty()).then(|| format!(".lockyard-repository/api/{excluded}"));
+            let mut claim: Claim = serde_json::from_value(
+                json!({"id":1,"session":"bob","paths":[held],"case_insensitive_paths":true}),
+            )
+            .unwrap();
+            claim.excluded_paths = excluded.into_iter().collect();
+            let mut view = View {
+                claims: vec![claim],
+                ..View::default()
+            };
+            let requested = format!(".lockyard-repository/api/{requested}");
+            assert_eq!(
+                view.check("alice", std::slice::from_ref(&requested))[0].status,
+                CheckStatus::Unknown
+            );
+            assert_eq!(
+                view.check("alice", &[".lockyard-repository/web/ascii".into()])[0].status,
+                CheckStatus::Free
+            );
+            view.claims[0].case_insensitive_paths = Some(false);
+            assert_ne!(
+                view.check("alice", &[requested])[0].status,
+                CheckStatus::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn a_fresh_unicode_insensitive_view_falls_back_to_the_server() {
+        let rig = start_with(timing(), |server| {
+            server.claims.lock().unwrap().push(json!({"id":1,"session":"bob","paths":[".lockyard-repository/api/Ä"],"case_insensitive_paths":true}));
+        });
+        view_ready(&rig);
+        let before = rig.server.calls_to("/api/v1/zones/check");
+        let reply = rig
+            .daemon
+            .handle(check("alice", ".lockyard-repository/api/ä/file"));
+        assert_eq!(reply.source, Some(Source::Server));
+        assert_eq!(rig.server.calls_to("/api/v1/zones/check"), before + 1);
     }
 
     #[test]

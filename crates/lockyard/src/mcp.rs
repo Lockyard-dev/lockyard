@@ -825,7 +825,10 @@ fn run_tool(
             let claims = backend.claims(&ClaimQuery::default(), now)?;
             if backend.is_cloud() {
                 let work = backend.work_list(agent.unwrap_or("lockyard-cli"))?;
-                return Ok(json!({"unread": unread, "claims": claims, "work": work}));
+                let tasks = backend.tasks(None, false)?;
+                return Ok(
+                    json!({"unread": unread, "claims": claims, "work": work, "tasks": tasks}),
+                );
             }
             let tasks = backend.tasks(None, false)?;
             Ok(json!({"unread": unread, "claims": claims, "tasks": tasks}))

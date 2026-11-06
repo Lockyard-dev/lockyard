@@ -1935,9 +1935,30 @@ fn mcp(w: &World) {
         json!({"title":"mcp dependency parent","acceptance":"keep the acceptance in raw context"}),
     );
     let child = a.ok("task_add", json!({"title":"mcp dependency child"}));
+    let status = a.ok("status", json!({}));
+    let backlog = status["tasks"]
+        .as_array()
+        .expect("cloud status includes backlog");
+    for expected in [&parent, &child] {
+        assert!(
+            backlog.iter().any(|task| task["id"] == expected["id"]),
+            "{status}"
+        );
+    }
     let raw = a.ok("task_links", json!({"id":parent["id"]}));
     let linked = a.ok("task_link", json!({"id":parent["id"],"to":child["id"],"kind":"blocks","if_version":raw["version"],"key":lockyard_cloud_client::ulid()}));
     assert!(linked.to_string().contains("blocks"));
+    let mcp_status = a.ok("status", json!({}));
+    let cli_status = w.ly(&one, &["status"]).ok();
+    assert_eq!(mcp_status["tasks"], cli_status["tasks"]);
+    let parent_status = mcp_status["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == parent["id"])
+        .unwrap();
+    assert!(parent_status["raw_status"].is_string());
+    assert_eq!(parent_status["links"], linked["links"]);
     assert!(
         a.ok("task_why_blocked", json!({"id":child["id"]}))
             .is_object()

@@ -125,7 +125,10 @@ impl<T: Transport> Transport for RepositoryTransport<T> {
                 // Negotiate through a read before a write can acquire a zone on an older server.
                 let mut probe = Call::get(
                     &call.session,
-                    format!("/api/v1/zones/claims?path={}", encode(&self.path(".")?)),
+                    format!(
+                        "/api/v1/zones/claims?path={}&namespace_probe=1",
+                        encode(&self.path(".")?)
+                    ),
                 );
                 probe.repository = self.repository.clone();
                 self.inner.call(&probe)?;
