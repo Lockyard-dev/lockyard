@@ -1596,6 +1596,15 @@ impl<T: Transport + 'static> Daemon<T> {
 
 #[cfg(test)]
 impl<T: Transport + 'static> Daemon<T> {
+    /// Stop and join background workers before a test inspects or seeds a stationary view.
+    fn stop_workers(&mut self) {
+        self.shared.stop();
+        let _ = UnixStream::connect(&self.shared.config.socket);
+        for worker in self.threads.drain(..) {
+            worker.join().expect("agent worker panicked");
+        }
+    }
+
     /// Handles one request without a socket.
     fn handle(&self, request: Request) -> Reply {
         let workspace = self.shared.config.workspace.clone();
@@ -2136,9 +2145,9 @@ mod tests {
 
     #[test]
     fn zone_snapshot_never_calls_the_backend_when_down_or_blocked() {
-        let rig = start_with(timing(), |_| {});
+        let mut rig = start_with(timing(), |_| {});
         view_ready(&rig);
-        rig.daemon.shared.stop();
+        rig.daemon.stop_workers();
         let before = rig.server.calls.lock().unwrap().len();
         let ask = || Request::ZoneSnapshot {
             session: "me".into(),
@@ -2227,9 +2236,9 @@ mod tests {
 
     #[test]
     fn a_stale_view_makes_one_server_call_and_never_answers_from_memory() {
-        let rig = start_with(timing(), |server| server.claim(1, "bob", "src"));
+        let mut rig = start_with(timing(), |server| server.claim(1, "bob", "src"));
         view_ready(&rig);
-        rig.daemon.shared.stop();
+        rig.daemon.stop_workers();
         // The upkeep threads are gone, so the view can only age.
         wait_for("the view to go stale", || {
             !rig.daemon.shared.read_view().fresh(timing().fresh)
@@ -2300,9 +2309,9 @@ mod tests {
 
     #[test]
     fn a_hung_server_gives_unknown_at_the_deadline() {
-        let rig = start_with(timing(), |_| {});
+        let mut rig = start_with(timing(), |_| {});
         view_ready(&rig);
-        rig.daemon.shared.stop();
+        rig.daemon.stop_workers();
         wait_for("the view to go stale", || {
             !rig.daemon.shared.read_view().fresh(timing().fresh)
         });
@@ -2539,14 +2548,14 @@ mod tests {
 
     #[test]
     fn taking_mail_uses_no_backend_calls_when_down_or_hung() {
-        let rig = start_with(timing(), |server| *server.unread.lock().unwrap() = 1);
+        let mut rig = start_with(timing(), |server| *server.unread.lock().unwrap() = 1);
         rig.daemon.handle(Request::Unread {
             session: "me".into(),
         });
         wait_for("mail to be reserved", || {
             rig.daemon.shared.read_view().mail.contains_key("me")
         });
-        rig.daemon.shared.stop();
+        rig.daemon.stop_workers();
         let before = rig.server.calls.lock().unwrap().len();
         rig.server.down.store(true, Ordering::SeqCst);
         let taken = rig.daemon.handle(Request::TakeMail {
@@ -2572,8 +2581,8 @@ mod tests {
 
     #[test]
     fn take_mail_is_atomic_across_two_hundred_concurrent_rounds() {
-        let rig = start_with(timing(), |_| {});
-        rig.daemon.shared.stop();
+        let mut rig = start_with(timing(), |_| {});
+        rig.daemon.stop_workers();
         for id in 1..=200 {
             {
                 let mut view = rig.daemon.shared.write_view();
@@ -2627,8 +2636,8 @@ mod tests {
 
     #[test]
     fn a_mail_buffer_with_less_than_ten_seconds_of_lease_is_dropped() {
-        let rig = start_with(timing(), |_| {});
-        rig.daemon.shared.stop();
+        let mut rig = start_with(timing(), |_| {});
+        rig.daemon.stop_workers();
         let mut view = rig.daemon.shared.write_view();
         let reserved_at = Instant::now();
         view.unread.insert(
@@ -2666,8 +2675,8 @@ mod tests {
 
     #[test]
     fn upkeep_reserves_mail_for_each_session_even_if_another_session_fails() {
-        let rig = start_with(timing(), |server| *server.unread.lock().unwrap() = 1);
-        rig.daemon.shared.stop();
+        let mut rig = start_with(timing(), |server| *server.unread.lock().unwrap() = 1);
+        rig.daemon.stop_workers();
         rig.daemon.shared.hear("fails");
         rig.daemon.shared.hear("works");
         rig.daemon.shared.store_unread("fails", 0, 1);
