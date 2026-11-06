@@ -6,8 +6,11 @@
 //! Codex records PASS or REJECT. Only Claude accepts, and only after a Codex PASS.
 //! An owner flag does not skip this gate.
 
-/// Model and speed flags. They do not make a second agent.
-const FLAG_TOKENS: &[&str] = &["fast", "high", "ultra", "composer", "grok", "4", "7"];
+/// Speed and effort flags. They do not make a second agent. The model name and its version stay,
+/// so `cursor-grok-4.7-high` and `cursor-grok-4.7-medium` are one agent, and a different model is not.
+const FLAG_TOKENS: &[&str] = &[
+    "fast", "high", "xhigh", "ultra", "medium", "low", "max", "minimal", "thinking",
+];
 
 /// Product of an agent name: `claude`, `codex`, `cursor`, or `other`.
 pub fn product(name: &str) -> &'static str {
@@ -109,6 +112,24 @@ mod tests {
             "cursor-grok-4.7-fast"
         ));
         assert!(!same_agent("claude-a", "claude-b"));
+        assert!(same_agent("cursor-grok-4.7-high", "cursor-grok-4.7-xhigh"));
+        assert!(same_agent("cursor-grok-4.7-high", "cursor-grok-4.7-medium"));
+        assert!(same_agent(
+            "claude-opus-5-5-high",
+            "claude-opus-5-5-medium"
+        ));
+        assert!(same_agent(
+            "codex-gpt-5.6-sol-high",
+            "codex-gpt-5.6-sol-medium"
+        ));
+        assert!(!same_agent(
+            "cursor-grok-4.7-high",
+            "cursor-composer-2.5-fast"
+        ));
+        assert!(!same_agent(
+            "claude-opus-5-5-high",
+            "claude-sonnet-5-5-high"
+        ));
         assert_eq!(product("claude-accept"), "claude");
         assert_eq!(product("codex-review"), "codex");
     }
@@ -132,5 +153,21 @@ mod tests {
         assert!(review_refusal("codex-review", executor, "", "reject", " ").is_some());
         assert!(review_refusal("codex-review", executor, "", "pass", "").is_none());
         assert!(review_refusal("codex-worker", "codex-worker-fast", "", "pass", "").is_some());
+        assert!(accept_refusal(
+            "claude-opus-5-5-medium",
+            "claude-opus-5-5-high",
+            "",
+            true
+        )
+        .unwrap()
+        .contains("executor"));
+        assert!(review_refusal(
+            "codex-gpt-5.6-sol-medium",
+            "codex-gpt-5.6-sol-high",
+            "",
+            "pass",
+            ""
+        )
+        .is_some());
     }
 }

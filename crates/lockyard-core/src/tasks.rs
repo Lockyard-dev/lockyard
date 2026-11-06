@@ -611,6 +611,36 @@ mod tests {
     }
 
     #[test]
+    fn a_second_flag_of_the_same_model_cannot_review_or_accept_its_own_work() {
+        let (_dir, mut store) = test_store();
+        let id = store.add_task("lead", "ship", "", 0).unwrap().id;
+        let number = id.rsplit_once('-').unwrap().1.parse().unwrap();
+        let executor = "codex-gpt-5.6-sol-high";
+        store.claim_task(executor, number, TTL, 1).unwrap();
+        store
+            .submit_task(executor, number, "tests pass", 2)
+            .unwrap();
+        assert!(matches!(
+            store.review_task("codex-gpt-5.6-sol-medium", number, "pass", "", 3),
+            Err(Error::Denied(message)) if message.contains("own work")
+        ));
+
+        let (_dir, mut store) = test_store();
+        let id = store.add_task("lead", "ship", "", 0).unwrap().id;
+        let number = id.rsplit_once('-').unwrap().1.parse().unwrap();
+        let executor = "claude-opus-5-5-high";
+        store.claim_task(executor, number, TTL, 1).unwrap();
+        store
+            .submit_task(executor, number, "tests pass", 2)
+            .unwrap();
+        store.review_task("codex-review", number, "pass", "", 3).unwrap();
+        assert!(matches!(
+            store.accept_task("claude-opus-5-5-medium", number, "", 4),
+            Err(Error::Denied(message)) if message.contains("own work")
+        ));
+    }
+
+    #[test]
     fn a_task_walks_from_open_to_accepted_and_keeps_its_history() {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
