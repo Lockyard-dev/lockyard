@@ -971,6 +971,7 @@ fn mcp_stdio_initializes_lists_claims_and_reports_conflicts_and_parse_errors() {
     assert_eq!(
         names,
         [
+            "revoke_access",
             "start_work",
             "check",
             "update",
@@ -1032,8 +1033,8 @@ fn the_full_tool_surface_is_a_flag_or_an_environment_variable_away() {
         list,
     ));
     assert_eq!(
-        compact, 12,
-        "the compact registry surface intentionally adds six tools"
+        compact, 13,
+        "the compact surface includes the shared access revocation tool"
     );
     assert!(by_flag > 50, "the full surface keeps every tool: {by_flag}");
     assert_eq!(by_flag, by_env, "the flag and the variable agree");
@@ -1046,7 +1047,7 @@ fn the_full_tool_surface_is_a_flag_or_an_environment_variable_away() {
             &[("LOCKYARD_MCP_TOOLS", "full")],
             list,
         )),
-        12
+        13
     );
     let bad = mcp_with(dir.path(), "a", &["--tools", "nope"], &[], list);
     assert!(!bad.status.success());

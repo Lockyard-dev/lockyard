@@ -17,6 +17,7 @@ pub mod provenance;
 pub mod quic;
 pub mod relay;
 pub mod retention;
+pub mod revocations;
 pub mod rotation;
 pub mod rotation_install;
 pub mod scheduler;

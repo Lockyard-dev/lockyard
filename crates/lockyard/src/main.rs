@@ -10,6 +10,8 @@ mod monitor;
 mod node_cli;
 mod onboarding;
 mod open;
+#[cfg(unix)]
+mod revoke_access;
 mod setup;
 mod workflow;
 
@@ -234,6 +236,25 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
         Command::Cloud(CloudCommand::Key(command)) => run_cloud_key(cwd, command),
         Command::Cloud(CloudCommand::Encryption(command)) => run_cloud_encryption(cwd, command),
         Command::Cloud(command) => run_cloud(open()?, command, agent.as_ref()),
+        #[cfg(unix)]
+        Command::Revoke(command) => {
+            let (target, config) = command.parts();
+            let result = revoke_access::execute(cwd, target, config)?;
+            let exit = result.exit();
+            let summary = if let Some(hint) = result.hint.as_deref() {
+                format!(
+                    "{}: {hint}",
+                    result.code.as_deref().unwrap_or("revocation failed")
+                )
+            } else if result.propagation_complete {
+                "Access revoked and propagated".into()
+            } else {
+                "Revocation incomplete; inspect JSON outcome".into()
+            };
+            let mut rendered = output(&result, summary)?;
+            rendered.exit = exit;
+            Ok(rendered)
+        }
         Command::Hook(command) => run_hook(command, agent, cwd),
         Command::Monitor(args) => run_monitor(args, agent.as_ref(), cwd, json),
         Command::Setup(args) => run_setup(args, cwd),

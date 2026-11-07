@@ -17,6 +17,9 @@ use crate::{
     wire::{FrameKind, MAX_FRAME_BYTES, Operation, RpcFrame, valid_name},
 };
 use serde::{Deserialize, Serialize};
+#[path = "quic/revocation_tls.rs"]
+mod revocation_tls;
+use crate::revocations::RevocationManager;
 pub const ALPN: &[u8] = b"lockyard-node/1";
 
 pub struct Identity {
@@ -44,7 +47,12 @@ fn roots(certificates: Vec<CertificateDer<'static>>) -> Result<rustls::RootCertS
     }
     Ok(roots)
 }
-fn server(bind: SocketAddr, identity: Identity, roots: rustls::RootCertStore) -> Result<Endpoint> {
+fn server(
+    bind: SocketAddr,
+    identity: Identity,
+    roots: rustls::RootCertStore,
+    revocations: Option<Arc<RevocationManager>>,
+) -> Result<Endpoint> {
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
         Arc::new(roots),
         Arc::new(rustls::crypto::ring::default_provider()),
@@ -54,10 +62,22 @@ fn server(bind: SocketAddr, identity: Identity, roots: rustls::RootCertStore) ->
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()?
-    .with_client_cert_verifier(verifier)
+    .with_client_cert_verifier(Arc::new(revocation_tls::ClientVerifier {
+        inner: verifier,
+        state: revocations,
+        local_pin: PeerPin::certificate(
+            identity
+                .certificates
+                .first()
+                .ok_or("node certificate missing")?
+                .as_ref(),
+        )
+        .to_hex(),
+    }))
     .with_single_cert(identity.certificates, identity.private_key.into())?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
     tls.max_early_data_size = 0;
+    tls.send_tls13_tickets = 0;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
     ));
@@ -68,15 +88,38 @@ fn server(bind: SocketAddr, identity: Identity, roots: rustls::RootCertStore) ->
         .incoming_buffer_size_total(8 * 1024 * 1024);
     Ok(Endpoint::server(config, bind)?)
 }
-fn client(bind: SocketAddr, identity: Identity, roots: rustls::RootCertStore) -> Result<Endpoint> {
+fn client(
+    bind: SocketAddr,
+    identity: Identity,
+    roots: rustls::RootCertStore,
+    revocations: Option<Arc<RevocationManager>>,
+) -> Result<Endpoint> {
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .build()?;
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()?
-    .with_root_certificates(roots)
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(revocation_tls::ServerVerifier {
+        inner: verifier,
+        state: revocations,
+        local_pin: PeerPin::certificate(
+            identity
+                .certificates
+                .first()
+                .ok_or("node certificate missing")?
+                .as_ref(),
+        )
+        .to_hex(),
+    }))
     .with_client_auth_cert(identity.certificates, identity.private_key.into())?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
     tls.enable_early_data = false;
+    tls.resumption = rustls::client::Resumption::disabled();
     let mut config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
     ));
@@ -84,6 +127,23 @@ fn client(bind: SocketAddr, identity: Identity, roots: rustls::RootCertStore) ->
     let mut endpoint = Endpoint::client(bind)?;
     endpoint.set_default_client_config(config);
     Ok(endpoint)
+}
+/// An authenticated peer close is an error signal, not trusted revocation evidence.
+/// Keep every other QUIC/stream error intact, including application close reasons
+/// that merely contain the word "revoked".
+fn transport_error(
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    let error: Box<dyn std::error::Error + Send + Sync> = Box::new(error);
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error.as_ref());
+    while let Some(current) = cause {
+        if matches!(current.downcast_ref::<quinn::ConnectionError>(),Some(quinn::ConnectionError::ApplicationClosed(close)) if close.error_code==quinn::VarInt::from_u32(0x105))
+        {
+            return "revoked".into();
+        }
+        cause = current.source();
+    }
+    error
 }
 struct Stream {
     send: SendStream,
@@ -96,28 +156,35 @@ impl Stream {
         }
         self.send
             .write_all(&(frame.len() as u32).to_be_bytes())
-            .await?;
-        self.send.write_all(frame).await?;
+            .await
+            .map_err(transport_error)?;
+        self.send.write_all(frame).await.map_err(transport_error)?;
         Ok(())
     }
     pub async fn read(&mut self) -> Result<Vec<u8>> {
         let mut size = [0; 4];
-        self.recv.read_exact(&mut size).await?;
+        self.recv
+            .read_exact(&mut size)
+            .await
+            .map_err(transport_error)?;
         let size = u32::from_be_bytes(size) as usize;
         if size > MAX_FRAME_BYTES {
             return Err("node frame is too large".into());
         }
         let mut frame = vec![0; size];
-        self.recv.read_exact(&mut frame).await?;
+        self.recv
+            .read_exact(&mut frame)
+            .await
+            .map_err(transport_error)?;
         Ok(frame)
     }
 }
 async fn open(connection: &Connection) -> Result<Stream> {
-    let (send, recv) = connection.open_bi().await?;
+    let (send, recv) = connection.open_bi().await.map_err(transport_error)?;
     Ok(Stream { send, recv })
 }
 async fn accept(connection: &Connection) -> Result<Stream> {
-    let (send, recv) = connection.accept_bi().await?;
+    let (send, recv) = connection.accept_bi().await.map_err(transport_error)?;
     Ok(Stream { send, recv })
 }
 
@@ -154,7 +221,9 @@ async fn connect(
     pin: PeerPin,
 ) -> Result<Connection> {
     let connection =
-        tokio::time::timeout(Duration::from_secs(10), endpoint.connect(address, name)?).await??;
+        tokio::time::timeout(Duration::from_secs(10), endpoint.connect(address, name)?)
+            .await?
+            .map_err(transport_error)?;
     check_pin(connection, &[pin])
 }
 impl Identity {
@@ -275,6 +344,8 @@ pub struct DirectServer {
     endpoint: Endpoint,
     local_node_id: String,
     peers: Vec<PeerPolicy>,
+    local_pin: String,
+    revocations: Option<Arc<RevocationManager>>,
     handshakes: tokio::sync::Mutex<FuturesUnordered<BoxFuture<'static, Result<DirectConnection>>>>,
 }
 impl DirectServer {
@@ -284,6 +355,16 @@ impl DirectServer {
         identity: Identity,
         trust_anchors: Vec<Vec<u8>>,
         peers: Vec<PeerPolicy>,
+    ) -> Result<Self> {
+        Self::bind_with_revocations(bind, local_node_id, identity, trust_anchors, peers, None)
+    }
+    pub fn bind_with_revocations(
+        bind: SocketAddr,
+        local_node_id: String,
+        identity: Identity,
+        trust_anchors: Vec<Vec<u8>>,
+        peers: Vec<PeerPolicy>,
+        revocations: Option<Arc<RevocationManager>>,
     ) -> Result<Self> {
         if !valid_name(&local_node_id) || peers.is_empty() {
             return Err("local identity and registered peers are required".into());
@@ -298,6 +379,14 @@ impl DirectServer {
                 return Err("peer identities and certificate pins must be unique".into());
             }
         }
+        let local_pin = PeerPin::certificate(
+            identity
+                .certificates
+                .first()
+                .ok_or("node certificate missing")?
+                .as_ref(),
+        )
+        .to_hex();
         let endpoint = server(
             bind,
             identity,
@@ -307,11 +396,14 @@ impl DirectServer {
                     .map(CertificateDer::from)
                     .collect(),
             )?,
+            revocations.clone(),
         )?;
         Ok(Self {
             endpoint,
             local_node_id,
             peers,
+            local_pin,
+            revocations,
             handshakes: tokio::sync::Mutex::new(FuturesUnordered::new()),
         })
     }
@@ -332,13 +424,16 @@ impl DirectServer {
                     let incoming=incoming.ok_or("direct endpoint closed")?;
                     let peers=self.peers.clone();
                     let local_node_id=self.local_node_id.clone();
+                    let revocations=self.revocations.clone();
+                    let local_pin=self.local_pin.clone();
                     handshakes.push(Box::pin(async move {
                         let pins=peers.iter().map(PeerPolicy::validate).collect::<Result<Vec<_>>>()?;
-                        let connection=tokio::time::timeout(Duration::from_secs(10),incoming).await??;
+                        let connection=tokio::time::timeout(Duration::from_secs(10),incoming).await?.map_err(transport_error)?;
                         let connection=check_pin(connection,&pins)?;
                         let pin=connection.peer_identity().and_then(|identity|identity.downcast::<Vec<CertificateDer<'static>>>().ok()).and_then(|chain|chain.first().map(|certificate|PeerPin::certificate(certificate.as_ref()))).ok_or("peer certificate missing")?;
                         let peer=peers.iter().zip(pins).find(|(_,expected)|*expected==pin).map(|(peer,_)|peer.clone()).ok_or("peer identity not registered")?;
-                        Ok(DirectConnection {connection,local_node_id,peer})
+                        if let Some(state)=&revocations {state.register(pin.to_hex(),local_pin.clone(),peer.node_id.clone(),connection.clone())?;}
+                        Ok(DirectConnection {connection,local_node_id,peer,revocations,local_pin,revocations_negotiated:Arc::new(std::sync::atomic::AtomicBool::new(false))})
                     }));
                 }
             }
@@ -348,7 +443,9 @@ impl DirectServer {
 pub struct DirectClient {
     endpoint: Endpoint,
     local_node_id: String,
-    sessions: Mutex<HashMap<String, DirectConnection>>,
+    sessions: Arc<Mutex<HashMap<String, DirectConnection>>>,
+    local_pin: String,
+    revocations: Option<Arc<RevocationManager>>,
 }
 impl DirectClient {
     pub fn bind(
@@ -357,8 +454,42 @@ impl DirectClient {
         identity: Identity,
         trust_anchors: Vec<Vec<u8>>,
     ) -> Result<Self> {
+        Self::bind_with_revocations(bind, local_node_id, identity, trust_anchors, None)
+    }
+    pub fn bind_with_revocations(
+        bind: SocketAddr,
+        local_node_id: String,
+        identity: Identity,
+        trust_anchors: Vec<Vec<u8>>,
+        revocations: Option<Arc<RevocationManager>>,
+    ) -> Result<Self> {
         if !valid_name(&local_node_id) {
             return Err("invalid local node identity".into());
+        }
+        let local_pin = PeerPin::certificate(
+            identity
+                .certificates
+                .first()
+                .ok_or("node certificate missing")?
+                .as_ref(),
+        )
+        .to_hex();
+        let sessions: Arc<Mutex<HashMap<String, DirectConnection>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        if let Some(state) = &revocations {
+            let weak = Arc::downgrade(&sessions);
+            let own_pin = local_pin.clone();
+            state.register_cache_pruner(Box::new(move |deny| {
+                if let Some(cache) = weak.upgrade()
+                    && let Ok(mut cache) = cache.lock()
+                {
+                    cache.retain(|_, connection| {
+                        !deny.contains(&own_pin)
+                            && !deny.contains(&connection.peer.certificate_sha256)
+                            && connection.connection.close_reason().is_none()
+                    });
+                }
+            }))?;
         }
         Ok(Self {
             endpoint: client(
@@ -370,9 +501,12 @@ impl DirectClient {
                         .map(CertificateDer::from)
                         .collect(),
                 )?,
+                revocations.clone(),
             )?,
             local_node_id,
-            sessions: Mutex::new(HashMap::new()),
+            sessions,
+            local_pin,
+            revocations,
         })
     }
     pub async fn connect(
@@ -382,25 +516,47 @@ impl DirectClient {
         peer: PeerPolicy,
     ) -> Result<DirectConnection> {
         let pin = peer.validate()?;
+        if let Some(state) = &self.revocations {
+            state.authorize_pin(&pin.to_hex())?;
+            state.authorize_pin(&self.local_pin)?;
+        }
         let key = format!("{address}|{tls_name}|{}", serde_json::to_string(&peer)?);
-        {
-            let sessions = self
+        let cached = {
+            let mut sessions = self
                 .sessions
                 .lock()
                 .map_err(|_| "direct session cache is unavailable")?;
-            if let Some(connection) = sessions
-                .get(&key)
-                .filter(|connection| connection.connection.close_reason().is_none())
-            {
-                return Ok(connection.clone());
+            sessions.retain(|_, connection| connection.connection.close_reason().is_none());
+            sessions.get(&key).cloned()
+        };
+        if let Some(connection) = cached {
+            if let Some(state) = &self.revocations {
+                state.register(
+                    pin.to_hex(),
+                    self.local_pin.clone(),
+                    connection.peer.node_id.clone(),
+                    connection.connection.clone(),
+                )?;
             }
+            return Ok(connection);
         }
         let connection = connect(&self.endpoint, address, tls_name, pin).await?;
         let connection = DirectConnection {
             connection,
             local_node_id: self.local_node_id.clone(),
             peer,
+            revocations: self.revocations.clone(),
+            local_pin: self.local_pin.clone(),
+            revocations_negotiated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
+        if let Some(state) = &self.revocations {
+            state.register(
+                pin.to_hex(),
+                self.local_pin.clone(),
+                connection.peer.node_id.clone(),
+                connection.connection.clone(),
+            )?;
+        }
         let mut sessions = self
             .sessions
             .lock()
@@ -410,7 +566,22 @@ impl DirectClient {
         {
             sessions.remove(&key);
         }
-        sessions.insert(key, connection.clone());
+        sessions.insert(key.clone(), connection.clone());
+        drop(sessions);
+        if let Some(state) = &self.revocations
+            && let Err(error) = state.register(
+                pin.to_hex(),
+                self.local_pin.clone(),
+                connection.peer.node_id.clone(),
+                connection.connection.clone(),
+            )
+        {
+            self.sessions
+                .lock()
+                .map_err(|_| "direct session cache is unavailable")?
+                .remove(&key);
+            return Err(error);
+        }
         Ok(connection)
     }
     pub fn close(&self) {
@@ -422,24 +593,65 @@ pub struct DirectConnection {
     connection: Connection,
     local_node_id: String,
     peer: PeerPolicy,
+    local_pin: String,
+    revocations: Option<Arc<RevocationManager>>,
+    revocations_negotiated: Arc<std::sync::atomic::AtomicBool>,
 }
 impl DirectConnection {
+    pub(crate) fn revocations_negotiated(&self) -> bool {
+        self.revocations_negotiated
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn mark_revocations_negotiated(&self) {
+        self.revocations_negotiated
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
     pub fn peer(&self) -> &PeerPolicy {
         &self.peer
     }
     pub fn close(&self) {
         self.connection.close(0u32.into(), b"node shutting down");
     }
+    pub async fn closed(&self) -> String {
+        let reason = self.connection.closed().await;
+        if self
+            .authorize()
+            .is_err_and(|error| error.to_string() == "revoked")
+        {
+            return "revoked".into();
+        }
+        match reason {
+            quinn::ConnectionError::ApplicationClosed(close)
+                if close.error_code == quinn::VarInt::from_u32(0x105) =>
+            {
+                "revoked".into()
+            }
+            error => error.to_string(),
+        }
+    }
+    fn authorize(&self) -> Result<()> {
+        if let Some(state) = &self.revocations {
+            state.authorize_pin(&self.peer.certificate_sha256)?;
+            state.authorize_pin(&self.local_pin)?;
+        }
+        Ok(())
+    }
     pub async fn open(&self) -> Result<RpcStream> {
+        self.authorize()?;
+        let stream =
+            tokio::time::timeout(Duration::from_secs(30), open(&self.connection)).await??;
+        self.authorize()?;
         Ok(RpcStream {
-            stream: tokio::time::timeout(Duration::from_secs(30), open(&self.connection)).await??,
+            stream,
             local_node_id: self.local_node_id.clone(),
             peer: self.peer.clone(),
         })
     }
     pub async fn accept(&self) -> Result<RpcStream> {
+        let stream = accept(&self.connection).await?;
+        self.authorize()?;
         Ok(RpcStream {
-            stream: accept(&self.connection).await?,
+            stream,
             local_node_id: self.local_node_id.clone(),
             peer: self.peer.clone(),
         })
@@ -498,215 +710,9 @@ impl RpcStream {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{crypto::PayloadCodec, wire::new_id};
-    use lockyard_cloud_client::WorkspaceKey;
+#[path = "quic/tests.rs"]
+mod tests;
 
-    fn pair() -> (Vec<u8>, Vec<u8>) {
-        let generated = rcgen::generate_simple_self_signed(vec!["lockyard-node".into()]).unwrap();
-        (
-            generated.cert.der().to_vec(),
-            generated.signing_key.serialize_der(),
-        )
-    }
-    fn identity(pair: &(Vec<u8>, Vec<u8>)) -> Identity {
-        Identity::from_der(vec![pair.0.clone()], pair.1.clone()).unwrap()
-    }
-    fn policy(node: &str, certificate: &[u8]) -> PeerPolicy {
-        PeerPolicy {
-            node_id: node.into(),
-            certificate_sha256: PeerPin::certificate(certificate).to_hex(),
-            allowed_operations: vec![Operation::NodePing],
-        }
-    }
-
-    #[tokio::test]
-    async fn malicious_peer_cannot_spoof_source_or_allocate_oversized_frame() {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let server_pair = pair();
-            let client_pair = pair();
-            let server = DirectServer::bind(
-                "127.0.0.1:0".parse().unwrap(),
-                "worker".into(),
-                identity(&server_pair),
-                vec![client_pair.0.clone()],
-                vec![policy("controller", &client_pair.0)],
-            )
-            .unwrap();
-            let address = server.local_addr().unwrap();
-            let task = tokio::spawn(async move {
-                let connection = server.accept().await.unwrap();
-                let mut oversized = connection.accept().await.unwrap();
-                assert_eq!(
-                    oversized.recv().await.unwrap_err().to_string(),
-                    "node frame is too large"
-                );
-                let mut spoofed = connection.accept().await.unwrap();
-                assert_eq!(
-                    spoofed.recv().await.unwrap_err().to_string(),
-                    "incoming RPC identity mismatch"
-                );
-            });
-            let client = DirectClient::bind(
-                "127.0.0.1:0".parse().unwrap(),
-                "controller".into(),
-                identity(&client_pair),
-                vec![server_pair.0.clone()],
-            )
-            .unwrap();
-            let connection = client
-                .connect(address, "lockyard-node", policy("worker", &server_pair.0))
-                .await
-                .unwrap();
-            let (mut oversized, _) = connection.connection.open_bi().await.unwrap();
-            oversized
-                .write_all(&((MAX_FRAME_BYTES + 1) as u32).to_be_bytes())
-                .await
-                .unwrap();
-            let mut frame = RpcFrame {
-                v: 1,
-                kind: FrameKind::Request,
-                id: new_id().unwrap(),
-                source: "spoofed-node".into(),
-                target: "worker".into(),
-                operation: Operation::NodePing,
-                in_reply_to: None,
-                source_certificate_sha256: None,
-                target_certificate_sha256: None,
-                retention: None,
-                payload: String::new(),
-            };
-            PayloadCodec::new("workspace".into(), WorkspaceKey::from_entropy([7; 32]))
-                .unwrap()
-                .encode(&mut frame, &serde_json::json!({}))
-                .unwrap();
-            let mut raw = open(&connection.connection).await.unwrap();
-            raw.write(&serde_json::to_vec(&frame).unwrap())
-                .await
-                .unwrap();
-            task.await.unwrap();
-            client.close();
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn anonymous_tls_client_is_never_exposed_as_an_authenticated_connection() {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let server_pair = pair();
-            let registered = pair();
-            let server = DirectServer::bind(
-                "127.0.0.1:0".parse().unwrap(),
-                "worker".into(),
-                identity(&server_pair),
-                vec![registered.0.clone()],
-                vec![policy("controller", &registered.0)],
-            )
-            .unwrap();
-            let address = server.local_addr().unwrap();
-            let task = tokio::spawn(async move {
-                assert!(server.accept().await.is_err());
-            });
-            let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(roots(vec![CertificateDer::from(server_pair.0)]).unwrap())
-            .with_no_client_auth();
-            tls.alpn_protocols = vec![ALPN.to_vec()];
-            let config = quinn::ClientConfig::new(Arc::new(
-                quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
-            ));
-            let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-            endpoint.set_default_client_config(config);
-            let _ = endpoint.connect(address, "lockyard-node").unwrap().await;
-            task.await.unwrap();
-            endpoint.close(0u32.into(), b"done");
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn stalled_handshake_does_not_serialize_other_peers() {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let server_pair = pair();
-            let client_pair = pair();
-            let server = DirectServer::bind(
-                "127.0.0.1:0".parse().unwrap(),
-                "worker".into(),
-                identity(&server_pair),
-                vec![client_pair.0.clone()],
-                vec![policy("controller", &client_pair.0)],
-            )
-            .unwrap();
-            let address = server.local_addr().unwrap();
-            let task = tokio::spawn(async move {
-                let connection = server.accept().await.unwrap();
-                let mut stream = connection.accept().await.unwrap();
-                assert!(stream.recv().await.is_ok());
-            });
-            // Forward just the first QUIC Initial. Keep the socket alive while dropping the
-            // rest of the handshake, so the server must poll other incoming handshakes.
-            let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let relay_address = relay.local_addr().unwrap();
-            let stalled = DirectClient::bind(
-                "127.0.0.1:0".parse().unwrap(),
-                "controller".into(),
-                identity(&client_pair),
-                vec![server_pair.0.clone()],
-            )
-            .unwrap();
-            let stalled_policy = policy("worker", &server_pair.0);
-            let stalled_task = tokio::spawn(async move {
-                let _ = stalled
-                    .connect(relay_address, "lockyard-node", stalled_policy)
-                    .await;
-            });
-            let mut datagram = [0u8; 65536];
-            let (bytes, _) = relay.recv_from(&mut datagram).await.unwrap();
-            relay.send_to(&datagram[..bytes], address).await.unwrap();
-            let client = DirectClient::bind(
-                "127.0.0.1:0".parse().unwrap(),
-                "controller".into(),
-                identity(&client_pair),
-                vec![server_pair.0.clone()],
-            )
-            .unwrap();
-            let connection = tokio::time::timeout(
-                Duration::from_secs(2),
-                client.connect(address, "lockyard-node", policy("worker", &server_pair.0)),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            let mut stream = connection.open().await.unwrap();
-            let mut frame = RpcFrame {
-                v: 1,
-                kind: FrameKind::Request,
-                id: new_id().unwrap(),
-                source: "controller".into(),
-                target: "worker".into(),
-                operation: Operation::NodePing,
-                in_reply_to: None,
-                source_certificate_sha256: None,
-                target_certificate_sha256: None,
-                retention: None,
-                payload: String::new(),
-            };
-            PayloadCodec::new("workspace".into(), WorkspaceKey::from_entropy([7; 32]))
-                .unwrap()
-                .encode(&mut frame, &serde_json::json!({}))
-                .unwrap();
-            stream.send(&frame).await.unwrap();
-            task.await.unwrap();
-            stalled_task.abort();
-            client.close();
-        })
-        .await
-        .unwrap();
-    }
-}
+#[cfg(test)]
+#[path = "quic/revocation_error_tests.rs"]
+mod revocation_error_tests;

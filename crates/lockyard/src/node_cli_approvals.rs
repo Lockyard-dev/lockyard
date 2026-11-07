@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use lockyard_core::Result;
 use lockyard_node::{
     approvals::{self, ApprovalExpectation, OwnerApproval},
-    executor::RunnerProfile,
+    executor::{RepositoryConfig, RunnerProfile},
     provenance::{self, SigningKey, TrustedSigningKey},
     wire::{self, JobSpec},
 };
@@ -26,6 +26,9 @@ pub struct ContextArgs {
     /// Independently reviewed JSON RunnerProfile, including pinned customer-owner public keys.
     #[arg(long)]
     runner_config: PathBuf,
+    /// Reviewed repository configuration when the executor injects cloud credentials.
+    #[arg(long)]
+    repository_config: Option<PathBuf>,
     #[arg(long)]
     workspace: String,
     #[arg(long)]
@@ -53,6 +56,9 @@ pub enum ApprovalCommand {
         /// Independently reviewed target profile; its exact hash must match the frozen request.
         #[arg(long)]
         runner_config: PathBuf,
+        /// Reviewed repository configuration when the executor injects cloud credentials.
+        #[arg(long)]
+        repository_config: Option<PathBuf>,
         #[arg(long)]
         key_file: PathBuf,
         #[arg(long)]
@@ -86,6 +92,9 @@ pub enum ApprovalCommand {
         request: PathBuf,
         #[arg(long)]
         runner_config: PathBuf,
+        /// Reviewed repository configuration when the executor injects cloud credentials.
+        #[arg(long)]
+        repository_config: Option<PathBuf>,
         #[arg(long)]
         key_file: PathBuf,
         #[arg(long)]
@@ -131,6 +140,7 @@ fn expectation<'a>(
     context: &'a ContextArgs,
     spec: &'a JobSpec,
     runner: &'a RunnerProfile,
+    repository: Option<&'a RepositoryConfig>,
 ) -> ApprovalExpectation<'a> {
     ApprovalExpectation {
         workspace: &context.workspace,
@@ -139,6 +149,7 @@ fn expectation<'a>(
         spec,
         resolved_revision: &context.revision,
         runner,
+        repository_cloud: repository.and_then(|repository| repository.cloud.as_ref()),
     }
 }
 fn now_ms() -> u64 {
@@ -282,6 +293,7 @@ pub fn run(command: ApprovalCommand) -> Result<Value> {
             certificate_sha256,
             input,
             runner_config,
+            repository_config,
             key_file,
             not_before_ms,
             expires_at_ms,
@@ -297,10 +309,26 @@ pub fn run(command: ApprovalCommand) -> Result<Value> {
                 ));
             }
             let runner: RunnerProfile = read_json(&runner_config)?;
+            let repository: Option<RepositoryConfig> =
+                repository_config.as_deref().map(read_json).transpose()?;
+            if approvals::repository_cloud_sha256(
+                repository
+                    .as_ref()
+                    .and_then(|repository| repository.cloud.as_ref()),
+            )
+            .map_err(|error| invalid(error.0))?
+                != bundle.repository_cloud_sha256
+            {
+                return Err(invalid(
+                    "frozen request differs from independently reviewed repository credentials",
+                ));
+            }
             if lockyard_node::executor::runner_config_digest(&runner)
                 .map_err(|error| invalid(error.0))?
                 != bundle.runner_configuration_sha256
                 || runner.action != bundle.action
+                || (!runner.action.requires_owner()
+                    && runner.requires_external_approval() != bundle.external_spec)
                 || runner.container.image != bundle.image_reference
                 || runner.owner_approval_authorities != bundle.owner_approval_authorities
             {
@@ -358,8 +386,13 @@ pub fn run(command: ApprovalCommand) -> Result<Value> {
                 ));
             }
             let runner: RunnerProfile = read_json(&context.runner_config)?;
+            let repository: Option<RepositoryConfig> = context
+                .repository_config
+                .as_deref()
+                .map(read_json)
+                .transpose()?;
             let claim = approvals::prepare(
-                &expectation(&context, &spec, &runner),
+                &expectation(&context, &spec, &runner, repository.as_ref()),
                 not_before_ms,
                 expires_at_ms,
             )
@@ -377,12 +410,15 @@ pub fn run(command: ApprovalCommand) -> Result<Value> {
             input,
             request,
             runner_config,
+            repository_config,
             key_file,
             output,
         } => {
             let claim = OwnerApproval::load(&input).map_err(|error| invalid(error.0))?;
             let spec: JobSpec = read_json(&request)?;
             let runner: RunnerProfile = read_json(&runner_config)?;
+            let repository: Option<RepositoryConfig> =
+                repository_config.as_deref().map(read_json).transpose()?;
             if spec.owner_approval.is_some() {
                 return Err(invalid("sign requires the original unapproved request"));
             }
@@ -393,6 +429,9 @@ pub fn run(command: ApprovalCommand) -> Result<Value> {
                 spec: &spec,
                 resolved_revision: &claim.resolved_revision,
                 runner: &runner,
+                repository_cloud: repository
+                    .as_ref()
+                    .and_then(|repository| repository.cloud.as_ref()),
             };
             if approvals::prepare(&expected, claim.not_before_ms, claim.expires_at_ms)
                 .map_err(|error| invalid(error.0))?
@@ -430,6 +469,11 @@ pub fn run(command: ApprovalCommand) -> Result<Value> {
         } => {
             let mut spec: JobSpec = read_json(&context.request)?;
             let runner: RunnerProfile = read_json(&context.runner_config)?;
+            let repository: Option<RepositoryConfig> = context
+                .repository_config
+                .as_deref()
+                .map(read_json)
+                .transpose()?;
             let document =
                 provenance::load_document(&approval).map_err(|error| invalid(error.0))?;
             let key = TrustedSigningKey { public_key };
@@ -441,7 +485,7 @@ pub fn run(command: ApprovalCommand) -> Result<Value> {
             let claim = approvals::verify(
                 &document,
                 &[key],
-                &expectation(&context, &spec, &runner),
+                &expectation(&context, &spec, &runner, repository.as_ref()),
                 now_ms(),
             )
             .map_err(|error| invalid(error.0))?;

@@ -145,6 +145,7 @@ fn offline_cli_prepares_signs_verifies_and_attaches_exact_request() {
         spec: &spec,
         resolved_revision: &"c".repeat(40),
         runner: &runner,
+        repository_cloud: None,
     };
     approvals::enforce(&expected, now()).unwrap();
     // Modified arguments cannot be signed using the old owner-reviewed claim.
@@ -361,4 +362,167 @@ fn owner_key_custody_detects_repository_created_after_key_generation() {
     assert!(!output.status.success());
     assert!(!output_path.exists());
     assert!(key.exists());
+}
+
+#[test]
+fn ep06_offline_cli_signs_compute_with_reviewed_repository_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    let generated = checked(
+        cli(root.path())
+            .args(["node", "approval", "key", "--name", "owner"])
+            .output()
+            .unwrap(),
+    );
+    let request_file = root.path().join("request.json");
+    let runner_file = root.path().join("runner.json");
+    let repository_file = root.path().join("repository.json");
+    write(&request_file, &request());
+    let mut compute = profile(generated["public_key"].clone());
+    compute["action"] = json!("compute");
+    compute["container"]["network"] = json!("none");
+    write(&runner_file, &compute);
+    let mut repository = json!({"checkout":"/private/reviewed/source", "cloud":{
+        "url":"https://broker.example.invalid", "workspace":"workspace", "repository":"remote",
+        "token_file":"/private/reviewed/cloud-token"}, "retention":{"content_ttl_seconds":3600}});
+    write(&repository_file, &repository);
+    let claim_file = root.path().join("claim.json");
+    let signed_file = root.path().join("approval.json");
+    let mut command = cli(root.path());
+    command.args(["node", "approval", "prepare"]);
+    context(&mut command, &request_file, &runner_file);
+    checked(
+        command
+            .arg("--repository-config")
+            .arg(&repository_file)
+            .args([
+                "--not-before-ms",
+                &(now() - 1000).to_string(),
+                "--expires-at-ms",
+                &(now() + 60_000).to_string(),
+            ])
+            .arg("--output")
+            .arg(&claim_file)
+            .output()
+            .unwrap(),
+    );
+    checked(
+        cli(root.path())
+            .args(["node", "approval", "sign"])
+            .arg("--input")
+            .arg(&claim_file)
+            .arg("--request")
+            .arg(&request_file)
+            .arg("--runner-config")
+            .arg(&runner_file)
+            .arg("--repository-config")
+            .arg(&repository_file)
+            .arg("--key-file")
+            .arg(generated["key_file"].as_str().unwrap())
+            .arg("--output")
+            .arg(&signed_file)
+            .output()
+            .unwrap(),
+    );
+    let attached = root.path().join("authorized.json");
+    let mut command = cli(root.path());
+    command.args(["node", "approval", "verify"]);
+    context(&mut command, &request_file, &runner_file);
+    checked(
+        command
+            .arg("--repository-config")
+            .arg(&repository_file)
+            .arg("--approval")
+            .arg(&signed_file)
+            .arg("--public-key")
+            .arg(generated["public_key"].as_str().unwrap())
+            .arg("--output-request")
+            .arg(&attached)
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        serde_json::from_slice::<JobSpec>(&fs::read(attached).unwrap())
+            .unwrap()
+            .owner_approval
+            .is_some()
+    );
+    // The durable workflow bundle uses the same reviewed credentials and offline signer.
+    let runner: RunnerProfile = serde_json::from_value(compute.clone()).unwrap();
+    let mut frozen = request();
+    frozen["revision"] = json!("c".repeat(40));
+    frozen["expected_runner_sha256"] =
+        json!(lockyard_node::executor::runner_config_digest(&runner).unwrap());
+    let cloud_claim: Value = serde_json::from_slice(&fs::read(&claim_file).unwrap()).unwrap();
+    let frozen_file = root.path().join("frozen.json");
+    write(
+        &frozen_file,
+        &json!({
+            "external_spec":false, "workspace":"workspace", "node_id":"worker",
+            "node_certificate_sha256":"b".repeat(64), "spec":frozen, "resolved_revision":"c".repeat(40),
+            "runner_configuration_sha256":frozen["expected_runner_sha256"],
+            "repository_cloud_sha256":cloud_claim["repository_cloud_sha256"],
+            "image_reference":compute["container"]["image"], "image_digest":compute["container"]["image"],
+            "action":"compute", "owner_approval_authorities":compute["owner_approval_authorities"]
+        }),
+    );
+    let frozen_signed = root.path().join("frozen-approval.json");
+    checked(
+        cli(root.path())
+            .args([
+                "node",
+                "approval",
+                "sign-materialized",
+                "--workspace",
+                "workspace",
+                "--node",
+                "worker",
+            ])
+            .arg("--certificate-sha256")
+            .arg("b".repeat(64))
+            .arg("--input")
+            .arg(&frozen_file)
+            .arg("--runner-config")
+            .arg(&runner_file)
+            .arg("--repository-config")
+            .arg(&repository_file)
+            .arg("--key-file")
+            .arg(generated["key_file"].as_str().unwrap())
+            .args([
+                "--not-before-ms",
+                &(now() - 1000).to_string(),
+                "--expires-at-ms",
+                &(now() + 60_000).to_string(),
+            ])
+            .arg("--output")
+            .arg(&frozen_signed)
+            .output()
+            .unwrap(),
+    );
+    let bundle: approvals::MaterializedApproval =
+        serde_json::from_slice(&fs::read(frozen_file).unwrap()).unwrap();
+    bundle
+        .verify(&provenance::load_document(&frozen_signed).unwrap(), now())
+        .unwrap();
+    repository["cloud"]["url"] = json!("https://changed.example.invalid");
+    write(&repository_file, &repository);
+    let rejected = root.path().join("should-not-exist.json");
+    let mut command = cli(root.path());
+    command.args(["node", "approval", "verify"]);
+    context(&mut command, &request_file, &runner_file);
+    assert!(
+        !command
+            .arg("--repository-config")
+            .arg(&repository_file)
+            .arg("--approval")
+            .arg(&signed_file)
+            .arg("--public-key")
+            .arg(generated["public_key"].as_str().unwrap())
+            .arg("--output-request")
+            .arg(&rejected)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(!rejected.exists());
 }

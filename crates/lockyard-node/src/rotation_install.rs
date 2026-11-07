@@ -1451,6 +1451,7 @@ mod tests {
             project_retention: Default::default(),
             workflow: None,
             delegation_socket: None,
+            revocations: None,
             rpc_timeout_seconds: 60,
         };
         private_write(&config.private_key, b"unused synthetic private key");

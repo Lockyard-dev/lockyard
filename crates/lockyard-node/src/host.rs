@@ -14,6 +14,8 @@ use crate::{
 };
 #[path = "host_delegation.rs"]
 mod delegation_adapter;
+#[path = "host_revocations.rs"]
+mod revocation_adapter;
 #[path = "host_workflow.rs"]
 mod workflow_adapter;
 use lockyard_cloud_client::WorkspaceKey;
@@ -51,6 +53,8 @@ pub struct NodeConfig {
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
     pub relay: Option<RelaySettings>,
+    #[serde(default)]
+    pub revocations: Option<crate::revocations::RevocationConfig>,
     pub executor: Option<ExecutorConfig>,
     /// Explicitly disclose opaque terminal job IDs and states to the configured broker.
     #[serde(default)]
@@ -104,6 +108,12 @@ impl NodeConfig {
             .unwrap_or_else(|| self.state_dir.join("control.sock"))
     }
     fn validate(&self) -> Result<()> {
+        if let Some(revocations) = &self.revocations {
+            revocations.validate()?;
+            if revocations.trust.workspace_id != self.workspace {
+                return Err("revocation_signer_untrusted".into());
+            }
+        }
         if self.metadata_notifications && (self.relay.is_none() || self.executor.is_none()) {
             return Err("job metadata notifications require an executor and relay".into());
         }
@@ -202,6 +212,10 @@ impl PeerConfig {
 }
 #[derive(Serialize, Deserialize)]
 pub struct NodeStatus {
+    #[serde(default)]
+    pub revocations_enforced: bool,
+    #[serde(default)]
+    pub revocations: Option<crate::revocations::RevocationSnapshot>,
     pub node_id: String,
     pub workspace: String,
     pub executor_enabled: bool,
@@ -241,6 +255,9 @@ pub struct JobNotificationStatus {
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Control {
     Status,
+    Revocations {
+        documents: Vec<crate::revocations::SignedDocument>,
+    },
     Drain {
         enabled: bool,
     },
@@ -471,6 +488,7 @@ struct Host {
     executor: Option<Executor>,
     workflow: Option<Arc<crate::workflow::WorkflowController>>,
     direct: Option<DirectClient>,
+    revocations: Option<Arc<crate::revocations::RevocationManager>>,
     relay: Option<RelaySender>,
     // Every access is an immediate map operation. A synchronous mutex lets the
     // registration guard clean up even when its async RPC future is cancelled.
@@ -994,6 +1012,14 @@ impl Host {
     }
     fn status(&self) -> NodeStatus {
         NodeStatus {
+            revocations_enforced: self
+                .revocations
+                .as_ref()
+                .is_some_and(|state| state.config().required),
+            revocations: self
+                .revocations
+                .as_ref()
+                .and_then(|state| state.snapshot().ok()),
             node_id: self.config.node_id.clone(),
             workspace: self.config.workspace.clone(),
             executor_enabled: self.executor.is_some(),
@@ -1255,6 +1281,9 @@ impl Host {
         caller: Caller,
         sender_policy: Option<crate::retention::RetentionPolicy>,
     ) -> RpcReply<Value> {
+        if op == Operation::RevocationsApply {
+            return self.apply_revocation_payload(payload);
+        }
         if op == Operation::NodePing {
             if let Some(resolve) = payload.get("resolve") {
                 #[derive(Deserialize)]
@@ -1307,7 +1336,7 @@ impl Host {
                 return match self.executor.as_ref() {
                     Some(executor) => match executor.capabilities(&self.certificate_sha256) {
                         Ok(capabilities) => RpcReply::success(
-                            json!({"node_id":self.config.node_id,"capabilities":capabilities}),
+                            json!({"node_id":self.config.node_id,"capabilities":capabilities,"protocol_capabilities":self.revocation_capabilities()}),
                         ),
                         Err(_) => RpcReply::failure(
                             "capabilities_unavailable",
@@ -1315,11 +1344,13 @@ impl Host {
                         ),
                     },
                     None => RpcReply::success(
-                        json!({"node_id":self.config.node_id,"capabilities":null}),
+                        json!({"node_id":self.config.node_id,"capabilities":self.revocation_capabilities()}),
                     ),
                 };
             }
-            return RpcReply::success(json!({"node_id":self.config.node_id}));
+            return RpcReply::success(
+                json!({"node_id":self.config.node_id,"capabilities":self.revocation_capabilities(),"revocations_enforced":self.revocations.as_ref().is_some_and(|state|state.config().required)}),
+            );
         }
         let Some(executor) = self.executor.clone() else {
             return RpcReply::failure("executor_disabled", "This node does not execute jobs.");
@@ -1388,7 +1419,7 @@ impl Host {
                         .map_err(|e| e.0)?;
                         serde_json::to_value(chunk)
                     }
-                    Operation::NodePing => unreachable!(),
+                    Operation::NodePing | Operation::RevocationsApply => unreachable!(),
                 };
                 value.map_err(|_| "response_encoding_failed")
             })
@@ -1427,6 +1458,9 @@ impl Host {
         reply: &RpcReply<Value>,
         request: Option<&crate::retention::ContentRetention>,
     ) -> Result<Option<crate::retention::ContentRetention>> {
+        if op == Operation::RevocationsApply {
+            return Ok(None);
+        }
         if op == Operation::NodePing {
             if let Some(resolve) = payload.get("resolve") {
                 let receiver = self.project_policy(resolve)?;
@@ -1691,6 +1725,17 @@ impl Host {
         target_pin: Option<String>,
     ) -> Result<RpcReply<Value>> {
         let peer = self.config.peers.iter().find(|p| p.node_id == target);
+        if self.known_revoked_direct_target(
+            target_pin
+                .as_deref()
+                .or_else(|| peer.map(|peer| peer.certificate_sha256.as_str())),
+        ) {
+            return Ok(RpcReply::failure(
+                "revoked",
+                "Access to this identity has been revoked.",
+            ));
+        }
+        let payload = self.announce_direct_capabilities(op, payload);
         let mut frame = RpcFrame {
             v: wire::PROTOCOL_VERSION,
             kind: FrameKind::Request,
@@ -1738,9 +1783,40 @@ impl Host {
             .await
         {
             // Once sent, a failure is uncertain. Relay may retry the exact same encrypted frame.
-            if let Ok(Ok(response)) = tokio::time::timeout(timeout, connection.rpc(&frame)).await {
-                return self.decode_response(&frame, &response);
+            match tokio::time::timeout(timeout, self.direct_rpc(&connection, &frame)).await {
+                Ok(Ok(reply)) => return Ok(reply),
+                Ok(Err(error)) if error.to_string() == "revoked" => {
+                    // A peer's authenticated close stops this attempt, without treating its
+                    // unsigned reason as a durable local deny-list update.
+                    if let Some(state) = &self.revocations {
+                        state.wake();
+                    }
+                    return Ok(RpcReply::failure(
+                        "revoked",
+                        "Access to this identity has been revoked.",
+                    ));
+                }
+                _ => {}
             }
+            if self.known_revoked_direct_target(Some(&peer.certificate_sha256)) {
+                return Ok(RpcReply::failure(
+                    "revoked",
+                    "Access to this identity has been revoked.",
+                ));
+            }
+        }
+        // A verified revoke may arrive while connect fails or times out. Recheck on every
+        // fallthrough, including failed handshakes, before selecting any relay route.
+        if self.known_revoked_direct_target(
+            frame
+                .target_certificate_sha256
+                .as_deref()
+                .or_else(|| peer.map(|peer| peer.certificate_sha256.as_str())),
+        ) {
+            return Ok(RpcReply::failure(
+                "revoked",
+                "Access to this identity has been revoked.",
+            ));
         }
         let relay = self
             .relay
@@ -1839,7 +1915,12 @@ impl Host {
             .codec
             .decode(response)
             .map_err(|_| "response authentication failed")?;
-        if request.operation != Operation::NodePing && reply.ok && response.retention.is_none() {
+        if !matches!(
+            request.operation,
+            Operation::NodePing | Operation::RevocationsApply
+        ) && reply.ok
+            && response.retention.is_none()
+        {
             return Err("successful response requires content retention".into());
         }
         Ok(reply)
@@ -2057,6 +2138,7 @@ async fn control_connection(host: Arc<Host>, mut stream: UnixStream) -> Result<(
             .map_err(|_| "invalid control request")?;
     let result: Result<Value> = match request {
         Control::Status => Ok(serde_json::to_value(host.status())?),
+        Control::Revocations { documents } => host.propagate_revocations(documents).await,
         Control::DrainStatus => host.drain_status_value(),
         Control::Dispatch {
             expected_local_certificate_sha256,
@@ -2237,6 +2319,19 @@ pub async fn local_dispatch(
     )
     .await
 }
+/// Applies signed closure pages through the private daemon control channel.
+pub async fn local_revocations(
+    config_path: &Path,
+    documents: Vec<crate::revocations::SignedDocument>,
+) -> Result<Value> {
+    let config = NodeConfig::load(config_path)?;
+    call_control(
+        &config.socket_path(),
+        Control::Revocations { documents },
+        Duration::from_secs(config.rpc_timeout_seconds),
+    )
+    .await
+}
 /// Controls the local persistent DAG controller. Delegation sockets reject this protocol.
 pub async fn local_workflow(
     config_path: &Path,
@@ -2312,14 +2407,20 @@ async fn direct_connection(host: Arc<Host>, connection: quic::DirectConnection) 
             Err(_) => continue,
         };
         let host = host.clone();
+        let connection = connection.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let mut stream = stream;
-            if let Ok(frame) = stream.recv().await
-                && let Ok(response) = host.handle(frame, false).await
-            {
-                let _ = stream.send(&response).await;
-                let _ = stream.finish();
+            if let Ok(frame) = stream.recv().await {
+                let response = match host.direct_frame_gate(&connection, &frame) {
+                    Ok(Some(response)) => Ok(response),
+                    Ok(None) => host.handle(frame, false).await,
+                    Err(error) => Err(error),
+                };
+                if let Ok(response) = response {
+                    let _ = stream.send(&response).await;
+                    let _ = stream.finish();
+                }
             }
         });
     }
@@ -3239,6 +3340,9 @@ async fn relay_loop(host: Arc<Host>, mut client: RelayClient) {
         };
         match event {
             RelayEvent::Connected => {
+                if let Some(state) = &host.revocations {
+                    state.wake();
+                }
                 if let Some(task) = response_replay.take() {
                     task.abort();
                 }
@@ -3561,6 +3665,15 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
         .transpose()?;
     let codec = PayloadCodec::new(config.workspace.clone(), key)?;
     let roots = read_certificates(&config.trust_anchors)?;
+    let revocations = config
+        .revocations
+        .clone()
+        .map(|settings| crate::revocations::RevocationManager::open(settings, &config.state_dir))
+        .transpose()?;
+    // The initial challenge completes before exposing any direct listener/client.
+    if let Some(state) = &revocations {
+        let _ = revocation_adapter::refresh_once(&config, state).await;
+    }
     let direct = if config.peers.iter().any(|p| p.address.is_some()) {
         let bind: SocketAddr = if config
             .peers
@@ -3572,7 +3685,7 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
         } else {
             "0.0.0.0:0".parse()?
         };
-        Some(DirectClient::bind(
+        Some(DirectClient::bind_with_revocations(
             bind,
             config.node_id.clone(),
             quic::Identity {
@@ -3580,12 +3693,13 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
                 private_key: identity.private_key.clone_key(),
             },
             roots.clone(),
+            revocations.clone(),
         )?)
     } else {
         None
     };
     let server = if let Some(bind) = config.listen {
-        Some(DirectServer::bind(
+        Some(DirectServer::bind_with_revocations(
             bind,
             config.node_id.clone(),
             quic::Identity {
@@ -3594,6 +3708,7 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
             },
             roots,
             config.peers.iter().map(PeerConfig::policy).collect(),
+            revocations.clone(),
         )?)
     } else {
         None
@@ -3632,6 +3747,7 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
         executor,
         workflow,
         direct,
+        revocations,
         relay: sender,
         pending: std::sync::Mutex::new(HashMap::new()),
         request_locks: (0..64).map(|_| Mutex::new(())).collect(),
@@ -3666,6 +3782,13 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
         }
     }
     let mut tasks = Tasks(Vec::new());
+    if host.revocations.is_some() {
+        tasks
+            .0
+            .push(tokio::spawn(revocation_adapter::monitor(Arc::downgrade(
+                &host,
+            ))));
+    }
     if host.config.metadata_notifications {
         let client = crate::cloud::NodeCloudClient::from_config(&host.config)?;
         let executor = host
@@ -3916,6 +4039,7 @@ mod tests {
             project_retention: BTreeMap::new(),
             workflow: None,
             delegation_socket: None,
+            revocations: None,
             rpc_timeout_seconds: 60,
         };
         let codec =
@@ -3930,6 +4054,7 @@ mod tests {
             executor: None,
             workflow: None,
             direct: None,
+            revocations: None,
             relay: None,
             pending: std::sync::Mutex::new(HashMap::new()),
             request_locks: (0..64).map(|_| Mutex::new(())).collect(),
@@ -4900,6 +5025,7 @@ mod tests {
                 executor: None,
                 workflow: None,
                 direct: None,
+                revocations: None,
                 relay: None,
                 pending: std::sync::Mutex::new(HashMap::new()),
                 request_locks: (0..64).map(|_| Mutex::new(())).collect(),
@@ -5869,3 +5995,11 @@ mod tests {
         assert!(NodeConfig::load(&path).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "host_revocations_tests.rs"]
+mod revocation_negotiation_tests;
+
+#[cfg(test)]
+#[path = "host_revocations_race_tests.rs"]
+mod revocation_connect_race_tests;

@@ -1,12 +1,11 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
-//! Offline owner authorization for explicitly managed external-action runner profiles.
+//! Offline owner authorization for declared external workload specifications.
 //!
-//! This is a profile policy, not a classifier for arbitrary shell commands. Node administrators
-//! must classify profiles and scope credentials correctly; ordinary networked compute with
-//! credentials is capable of side effects. Execution hosts and their administrators are trusted.
+//! Signatures bind configuration and destination references, not every dynamic shell/network
+//! operation. Execution hosts and their administrators are trusted.
 use crate::{
-    executor::{RunnerProfile, runner_config_digest},
+    executor::{CloudConfig, RunnerProfile, runner_config_digest},
     provenance::{self, ProvenanceError, SignedDocument, SigningKey, TrustedSigningKey},
     wire::{self, JobSpec},
 };
@@ -49,6 +48,9 @@ pub struct OwnerApproval {
     pub request_sha256: String,
     pub resolved_revision: String,
     pub runner_configuration_sha256: String,
+    /// Configured broker destinations and credential references, never resolved values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_cloud_sha256: Option<String>,
     pub image_reference: String,
     pub image_digest: String,
     pub action: ManagedAction,
@@ -71,7 +73,10 @@ impl OwnerApproval {
                 .resolved_revision
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || !self.action.requires_owner()
+            || self
+                .repository_cloud_sha256
+                .as_ref()
+                .is_some_and(|hash| !provenance::valid_sha256(hash))
             || self.not_before_ms == 0
             || self.expires_at_ms <= self.not_before_ms
             || self.expires_at_ms - self.not_before_ms > MAX_APPROVAL_WINDOW_MS
@@ -107,6 +112,7 @@ pub struct ApprovalExpectation<'a> {
     pub spec: &'a JobSpec,
     pub resolved_revision: &'a str,
     pub runner: &'a RunnerProfile,
+    pub repository_cloud: Option<&'a CloudConfig>,
 }
 
 pub fn request_sha256(spec: &JobSpec) -> Result<String> {
@@ -125,6 +131,12 @@ pub fn prepare(
     not_before_ms: u64,
     expires_at_ms: u64,
 ) -> Result<OwnerApproval> {
+    if !expected.runner.action.requires_owner()
+        && (!requires_owner_approval(expected)
+            || expected.runner.owner_approval_authorities.is_empty())
+    {
+        return Err(ProvenanceError("owner_approval_required"));
+    }
     let claim = OwnerApproval {
         version: 1,
         workspace: expected.workspace.into(),
@@ -137,6 +149,7 @@ pub fn prepare(
         resolved_revision: expected.resolved_revision.into(),
         runner_configuration_sha256: runner_config_digest(expected.runner)
             .map_err(|_| ProvenanceError("owner_approval_runner_encoding_failed"))?,
+        repository_cloud_sha256: repository_cloud_sha256(expected.repository_cloud)?,
         image_reference: expected.runner.container.image.clone(),
         image_digest: crate::supply_chain::immutable_image_digest(&expected.runner.container.image)
             .map_err(|_| ProvenanceError("invalid_owner_approval_image"))?,
@@ -175,10 +188,26 @@ pub fn verify(
     Ok(claim)
 }
 
-/// Compute profiles keep the ordinary all-members dispatch contract. Supplying a token to one
-/// is rejected so changing an external profile to compute cannot silently consume its approval.
+pub fn repository_cloud_sha256(cloud: Option<&CloudConfig>) -> Result<Option<String>> {
+    cloud
+        .map(|cloud| {
+            serde_json::to_vec(cloud)
+                .map(|bytes| provenance::sha256(&bytes))
+                .map_err(|_| ProvenanceError("owner_approval_request_encoding_failed"))
+        })
+        .transpose()
+}
+
+pub fn requires_owner_approval(expected: &ApprovalExpectation<'_>) -> bool {
+    expected.runner.action.requires_owner()
+        || expected.runner.requires_external_approval()
+        || expected.repository_cloud.is_some()
+}
+
+/// Offline compute without credentials retains all-member dispatch; all declared external
+/// specifications and explicitly managed profiles require independently pinned owner authority.
 pub fn enforce(expected: &ApprovalExpectation<'_>, now_ms: u64) -> Result<()> {
-    if expected.runner.action.requires_owner() {
+    if requires_owner_approval(expected) {
         let document = expected
             .spec
             .owner_approval
@@ -201,20 +230,32 @@ pub fn enforce(expected: &ApprovalExpectation<'_>, now_ms: u64) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializedApproval {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub external_spec: bool,
     pub workspace: String,
     pub node_id: String,
     pub node_certificate_sha256: String,
     pub spec: JobSpec,
     pub resolved_revision: String,
     pub runner_configuration_sha256: String,
+    /// Configured broker destinations and credential references, never resolved values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_cloud_sha256: Option<String>,
     pub image_reference: String,
     pub image_digest: String,
     pub action: ManagedAction,
     pub owner_approval_authorities: Vec<TrustedSigningKey>,
 }
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 impl MaterializedApproval {
     pub fn prepare(&self, not_before_ms: u64, expires_at_ms: u64) -> Result<OwnerApproval> {
-        if self.spec.revision != self.resolved_revision
+        if (!self.action.requires_owner()
+            && !self.external_spec
+            && self.repository_cloud_sha256.is_none())
+            || self.spec.revision != self.resolved_revision
             || self.spec.expected_runner_sha256.as_deref()
                 != Some(self.runner_configuration_sha256.as_str())
             || self.owner_approval_authorities.is_empty()
@@ -237,6 +278,7 @@ impl MaterializedApproval {
             request_sha256: request_sha256(&self.spec)?,
             resolved_revision: self.resolved_revision.clone(),
             runner_configuration_sha256: self.runner_configuration_sha256.clone(),
+            repository_cloud_sha256: self.repository_cloud_sha256.clone(),
             image_reference: self.image_reference.clone(),
             image_digest: self.image_digest.clone(),
             action: self.action,
@@ -297,6 +339,7 @@ mod tests {
             spec,
             resolved_revision: "cccccccccccccccccccccccccccccccccccccccc",
             runner,
+            repository_cloud: None,
         }
     }
     #[test]
@@ -499,6 +542,7 @@ mod tests {
             "owner_approval_required"
         );
         runner.action = ManagedAction::Compute;
+        runner.container.network = crate::executor::ContainerNetwork::None;
         runner.owner_approval_authorities.clear();
         enforce(&expected(&spec, &runner), 150).unwrap();
         assert!(prepare(&expected(&spec, &runner), 100, 200).is_err());

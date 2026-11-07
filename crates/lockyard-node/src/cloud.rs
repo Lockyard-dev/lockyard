@@ -137,6 +137,108 @@ impl NodeCloudClient {
         Ok(client)
     }
 
+    /// Keep the node's independently configured TLS roots, resolver and redirect policy.
+    pub fn revocation_client(&self) -> Result<lockyard_cloud_client::Client> {
+        let token = self.token.clone().ok_or("unauthorized")?;
+        Ok(
+            lockyard_cloud_client::Client::new(&self.broker_url(), token)?
+                .with_revocation_agent(self.agent.as_ref().clone()),
+        )
+    }
+
+    /// Reuse configured TLS policy with a separately selected live owner credential.
+    pub fn revocation_http_agent(config: &NodeConfig) -> Result<ureq::Agent> {
+        let settings = config
+            .revocations
+            .as_ref()
+            .ok_or("revocation_signer_untrusted")?;
+        settings.validate()?;
+        let paths = if let Some(relay) = &config.relay {
+            let mut origin = url::Url::parse(&relay.url)?;
+            if origin.scheme() == "wss" {
+                origin
+                    .set_scheme("https")
+                    .map_err(|_| "revocation_signer_untrusted")?;
+            }
+            if origin.as_str().trim_end_matches('/') != settings.trust.server_origin {
+                return Err("revocation_signer_untrusted".into());
+            }
+            relay.tls_roots.clone()
+        } else {
+            (0..8)
+                .map(|index| config.state_dir.join(format!("broker-root-{index}.der")))
+                .filter(|path| path.exists())
+                .collect()
+        };
+        let roots = paths
+            .iter()
+            .map(|path| crate::local_files::read_public(path, 64 * 1024))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self::anonymous(
+            &settings.trust.server_origin,
+            config.node_id.clone(),
+            &roots,
+        )?
+        .agent
+        .as_ref()
+        .clone())
+    }
+
+    /// Explicit owner provisioning over authenticated HTTPS; received lists never select this key.
+    pub fn bootstrap_revocation_trust(
+        &self,
+        workspace_id: &str,
+    ) -> Result<lockyard_cloud_client::revocations::RevocationTrust> {
+        let trust = self.revocation_client()?.revocation_key(&self.node_id)?;
+        if trust.workspace_id != workspace_id {
+            return Err("revocation_signer_untrusted".into());
+        }
+        Ok(trust)
+    }
+
+    /// Refresh direct-only nodes as well: enrollment retains the cloud credential and roots
+    /// independently of whether the relay transport is enabled.
+    pub fn for_revocations(config: &NodeConfig) -> Result<Self> {
+        let revocations = config
+            .revocations
+            .as_ref()
+            .ok_or("revocation_signer_untrusted")?;
+        revocations.validate()?;
+        let (token_file, root_files) = if let Some(relay) = &config.relay {
+            let mut origin = url::Url::parse(&relay.url)?;
+            if origin.scheme() == "wss" {
+                origin
+                    .set_scheme("https")
+                    .map_err(|_| "revocation_signer_untrusted")?;
+            }
+            if origin.as_str().trim_end_matches('/') != revocations.trust.server_origin {
+                return Err("revocation_signer_untrusted".into());
+            }
+            (relay.token_file.clone(), relay.tls_roots.clone())
+        } else {
+            let roots = (0..8)
+                .map(|index| config.state_dir.join(format!("broker-root-{index}.der")))
+                .filter(|path| path.exists())
+                .collect();
+            (config.state_dir.join("node-token"), roots)
+        };
+        let bytes = private_file(&token_file, 4096)?;
+        let token = std::str::from_utf8(&bytes)
+            .map_err(|_| "unauthorized")?
+            .trim()
+            .to_owned();
+        let roots = root_files
+            .iter()
+            .map(|path| crate::local_files::read_public(path, 64 * 1024))
+            .collect::<Result<Vec<_>>>()?;
+        Self::new(
+            &revocations.trust.server_origin,
+            config.node_id.clone(),
+            token,
+            &roots,
+        )
+    }
+
     pub(crate) fn with_identity_proof(mut self, proof: String) -> Result<Self> {
         if proof.len() > 8192 || !crate::wire::valid_ciphertext(&proof) {
             return Err("invalid node registration identity proof".into());

@@ -136,6 +136,14 @@ pub enum NodeCommand {
         #[arg(long)]
         tls_name: String,
     },
+    /// Explicitly pin the server revocation key through the configured authenticated HTTPS origin.
+    RevocationTrust {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Write a new private config; review it and restart the daemon with this path.
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Run the node service in the foreground.
     Serve {
         #[arg(long)]
@@ -582,6 +590,28 @@ pub fn node(command: NodeCommand) -> Result<Value> {
             Ok(
                 json!({"config":config,"certificate":identity.certificate,"certificate_sha256":identity.certificate_sha256,"result_signing":{"workspace":workspace,"key_file":signing_file,"public_key":signer.trusted_key().public_key}}),
             )
+        }
+        NodeCommand::RevocationTrust { config, output } => {
+            let source = config_path(config)?;
+            let mut configuration =
+                host::NodeConfig::load(&source).map_err(|error| invalid(&error.to_string()))?;
+            let client = lockyard_node::cloud::NodeCloudClient::from_config(&configuration)
+                .map_err(|error| invalid(&error.to_string()))?;
+            let trust = client
+                .bootstrap_revocation_trust(&configuration.workspace)
+                .map_err(|error| invalid(&error.to_string()))?;
+            let key_id = trust.key_id.clone();
+            configuration.revocations = Some(lockyard_node::revocations::RevocationConfig {
+                required: true,
+                poll_seconds: 30,
+                max_offline_seconds: 600,
+                trust,
+            });
+            let destination = absolute(&output)?;
+            let bytes = toml::to_string_pretty(&configuration)
+                .map_err(|_| invalid("cannot encode node configuration"))?;
+            write_new(&destination, bytes.as_bytes())?;
+            Ok(json!({"config":destination,"key_id":key_id,"restart_required":true}))
         }
         NodeCommand::Serve { config } => {
             let config = config_path(config)?;

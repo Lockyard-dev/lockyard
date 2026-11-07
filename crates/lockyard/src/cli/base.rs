@@ -89,6 +89,10 @@ pub(super) enum Command {
     #[cfg(unix)]
     #[command(subcommand)]
     Job(node_cli::JobCommand),
+    /// Revoke Cloud credentials and propagate signed denies to direct peers.
+    #[cfg(unix)]
+    #[command(subcommand)]
+    Revoke(crate::revoke_access::RevokeCommand),
     /// Run the MCP server over standard input and output.
     Mcp(McpArgs),
 }

@@ -164,6 +164,8 @@ pub enum FrameKind {
 pub enum Operation {
     #[serde(rename = "node.ping")]
     NodePing,
+    #[serde(rename = "revocations.apply")]
+    RevocationsApply,
     #[serde(rename = "job.submit")]
     JobSubmit,
     #[serde(rename = "job.status")]
@@ -184,6 +186,7 @@ impl Operation {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NodePing => "node.ping",
+            Self::RevocationsApply => "revocations.apply",
             Self::JobSubmit => "job.submit",
             Self::JobStatus => "job.status",
             Self::JobCancel => "job.cancel",

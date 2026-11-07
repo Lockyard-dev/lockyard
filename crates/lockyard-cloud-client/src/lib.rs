@@ -12,6 +12,7 @@ pub mod device;
 mod fake;
 mod registry;
 mod repository;
+pub mod revocations;
 
 pub use backend::CloudBackend;
 pub use crypto::{CONTENT_FIELDS, FieldRule, WorkspaceKey, route_matches, transform_fields};

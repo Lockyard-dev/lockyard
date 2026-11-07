@@ -9,6 +9,7 @@ fn queued_cancellation_immediately_has_a_signed_terminal_result() {
     let signer = SigningKey::generate(&root.path().join("signing.pk8")).unwrap();
     let trusted = signer.trusted_key();
     let config = ExecutorConfig {
+        external_actions: Default::default(),
         node_id: "worker".into(),
         state_dir: root.path().join("executor"),
         repositories: BTreeMap::new(),
@@ -138,6 +139,7 @@ async fn signed_negative_terminal_reaches_cloud_notification_fixture() {
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let signer = SigningKey::generate(&root.path().join("signing.pk8")).unwrap();
     let config = ExecutorConfig {
+        external_actions: Default::default(),
         node_id: "worker".into(),
         state_dir: root.path().join("executor"),
         repositories: BTreeMap::new(),
@@ -225,6 +227,7 @@ fn signature_persist_failure_never_exposes_a_successful_signed_patch() {
         public_key: key.trusted_key().public_key,
     };
     let config = ExecutorConfig {
+        external_actions: Default::default(),
         node_certificate_sha256: None,
         protected_identity_files: Vec::new(),
         node_id: "worker".into(),

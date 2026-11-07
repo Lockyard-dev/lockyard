@@ -67,6 +67,7 @@ impl DelegationProvider for Provider {
             project_retention: BTreeMap::new(),
             workflow: None,
             delegation_socket: Some("/run/lockyard-delegation/control.sock".into()),
+            revocations: None,
             rpc_timeout_seconds: host.config.rpc_timeout_seconds,
         };
         config.validate()?;

@@ -211,6 +211,7 @@ fn expired_unsigned_terminal_restart_preserves_recoverable_signed_outcome() {
     let path = root.path().join("signing.pk8");
     let key = SigningKey::generate(&path).unwrap();
     let config = ExecutorConfig {
+        external_actions: Default::default(),
         node_id: "worker".into(),
         state_dir: root.path().join("executor"),
         repositories: BTreeMap::new(),
@@ -277,6 +278,7 @@ fn receipt_signer_failure_does_not_delay_purge_and_retries_from_tombstone() {
     let path = root.path().join("signing.pk8");
     let key = SigningKey::generate(&path).unwrap();
     let config = ExecutorConfig {
+        external_actions: Default::default(),
         node_id: "worker".into(),
         state_dir: root.path().join("executor"),
         repositories: BTreeMap::new(),
@@ -328,6 +330,7 @@ fn credential_job_export_is_signed_results_only_and_restores_without_a_runnable_
     let signer = SigningKey::generate(&root.path().join("signing.pk8")).unwrap();
     let trusted = signer.trusted_key();
     let config = ExecutorConfig {
+        external_actions: Default::default(),
         node_id: "worker".into(),
         state_dir: root.path().join("executor"),
         repositories: BTreeMap::new(),

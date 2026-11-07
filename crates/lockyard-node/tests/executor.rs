@@ -168,6 +168,7 @@ fn fixture(path: &Path) -> ExecutorConfig {
     git(&checkout, &["commit", "-qm", "base"]);
     let (image, provenance, supply_chain) = security_fixture(path);
     ExecutorConfig {
+        external_actions: Default::default(),
         node_certificate_sha256: None,
         protected_identity_files: Vec::new(),
         scheduling: Default::default(),
@@ -233,6 +234,43 @@ fn spec(n: u8, code: &str) -> JobSpec {
         owner_approval: None,
     }
 }
+// Runtime fixtures with injected credentials still exercise their original lifecycle/isolation
+// behavior after EP06: authorize the exact configured scope instead of weakening that scope.
+fn approve_external_fixture(root: &Path, config: &mut ExecutorConfig, request: &mut JobSpec) {
+    use lockyard_node::approvals::{self, ApprovalExpectation};
+    let owner = SigningKey::generate(&root.join("signing/owner.pk8")).unwrap();
+    config.node_certificate_sha256 = Some("b".repeat(64));
+    config
+        .runners
+        .get_mut(&request.runner)
+        .unwrap()
+        .owner_approval_authorities = vec![owner.trusted_key()];
+    let repository = &config.repositories[&request.repository];
+    let revision = git(&repository.checkout, &["rev-parse", &request.revision]);
+    let current = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    request.owner_approval = Some(
+        approvals::prepare(
+            &ApprovalExpectation {
+                workspace: &config.provenance.as_ref().unwrap().workspace,
+                node_id: &config.node_id,
+                node_certificate_sha256: config.node_certificate_sha256.as_deref().unwrap(),
+                spec: request,
+                resolved_revision: &revision,
+                runner: &config.runners[&request.runner],
+                repository_cloud: repository.cloud.as_ref(),
+            },
+            current - 1000,
+            current + 60_000,
+        )
+        .unwrap()
+        .sign(&owner)
+        .unwrap(),
+    );
+}
+
 fn wait(executor: &Executor, id: &str, predicate: impl Fn(&JobRecord) -> bool) -> JobRecord {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -939,6 +977,7 @@ fn managed_external_profiles_require_owner_before_journal_clone_or_runtime() {
             spec: &request,
             resolved_revision: &revision,
             runner: &config.runners["python"],
+            repository_cloud: None,
         },
         current - 1000,
         current + 60_000,
@@ -1006,6 +1045,7 @@ fn owner_approval_is_one_use_with_durable_idempotent_retries_and_no_reexecution(
             spec: &request,
             resolved_revision: &revision,
             runner: &config.runners["python"],
+            repository_cloud: None,
         },
         current - 1000,
         expires,
@@ -1140,14 +1180,17 @@ else: sys.exit(1)
                 token_file: None,
             });
         }
+        let mut request = spec(17, "not executed by fixture");
+        request.timeout_seconds = Some(1);
+        if !patch_helper {
+            approve_external_fixture(dir.path(), &mut config, &mut request);
+        }
         let executor = Executor::new_with_workspace_key(
             config,
             "actual-workspace-id".into(),
             WorkspaceKey::from_entropy([77; 32]),
         )
         .unwrap();
-        let mut request = spec(17, "not executed by fixture");
-        request.timeout_seconds = Some(1);
         executor.submit(request.clone(), &caller()).unwrap();
         let record = wait(&executor, &request.id, |record| {
             record.state == JobState::InterruptedUnknown
@@ -1302,13 +1345,14 @@ elif 'run' in args:
     let source_head = git(&source, &["rev-parse", "HEAD"]);
     fs::write(source.join("base.txt"), "dirty checkout\n").unwrap();
     let state = config.state_dir.clone();
+    let mut request = spec(13, "literal; $(never interpreted)");
+    approve_external_fixture(dir.path(), &mut config, &mut request);
     let executor = Executor::new_with_workspace_key(
         config,
         "actual-workspace-id".into(),
         WorkspaceKey::from_entropy([77; 32]),
     )
     .unwrap();
-    let request = spec(13, "literal; $(never interpreted)");
     executor.submit(request.clone(), &caller()).unwrap();
     let record = finished(&executor, &request.id);
     assert_eq!(record.state, JobState::Succeeded);

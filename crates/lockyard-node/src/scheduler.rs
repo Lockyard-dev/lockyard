@@ -54,6 +54,9 @@ impl NodeScheduling {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerCapability {
+    /// Declared runner network/credentials require approval independently of its action label.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub external_approval_required: bool,
     #[serde(default)]
     pub action: crate::approvals::ManagedAction,
     #[serde(default)]
@@ -68,6 +71,9 @@ pub struct RunnerCapability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeCapabilities {
+    /// Content-free bindings for repositories that inject cloud credentials.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub repository_cloud_sha256: BTreeMap<String, String>,
     pub version: u8,
     pub node_id: String,
     pub certificate_sha256: String,
@@ -83,12 +89,26 @@ pub struct NodeCapabilities {
     pub unknown: usize,
     pub draining: bool,
 }
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 impl NodeCapabilities {
+    pub fn requires_owner_approval(&self, repository: &str, runner: &str) -> bool {
+        self.runners[runner].action.requires_owner()
+            || self.runners[runner].external_approval_required
+            || self.repository_cloud_sha256.contains_key(repository)
+    }
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.version != 1
             || !crate::wire::valid_name(&self.node_id)
             || !sha256(&self.certificate_sha256)
             || self.runners.len() > 256
+            || self.repository_cloud_sha256.len() > 4096
+            || self
+                .repository_cloud_sha256
+                .iter()
+                .any(|(repository, digest)| !self.projects.contains(repository) || !sha256(digest))
             || self.projects.len() > 4096
             || self
                 .projects
@@ -134,6 +154,8 @@ impl NodeCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevisionCapability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_cloud_sha256: Option<String>,
     pub node_id: String,
     pub certificate_sha256: String,
     pub repository: String,
@@ -214,6 +236,11 @@ pub fn select_node<'a>(
         let Some(profile) = node.runners.get(runner) else {
             continue;
         };
+        if node.requires_owner_approval(project, runner)
+            && profile.owner_approval_authorities.is_empty()
+        {
+            continue;
+        }
         if placement
             .image_digest
             .as_ref()
@@ -496,6 +523,7 @@ mod tests {
     use super::*;
     fn node(id: &str, queued: usize) -> NodeCapabilities {
         NodeCapabilities {
+            repository_cloud_sha256: BTreeMap::new(),
             version: 1,
             node_id: id.into(),
             certificate_sha256: "a".repeat(64),
@@ -511,6 +539,7 @@ mod tests {
             runners: BTreeMap::from([(
                 "build".into(),
                 RunnerCapability {
+                    external_approval_required: false,
                     action: Default::default(),
                     owner_approval_authorities: vec![],
                     image_reference: format!("sha256:{}", "b".repeat(64)),
@@ -684,5 +713,55 @@ mod tests {
             next_job(&jobs, &policy, 2, Some(total), &resources, 42000),
             Some("large")
         );
+    }
+    #[test]
+    fn ep06_unapprovable_external_compute_is_not_a_placement_candidate() {
+        for repository_credentials in [false, true] {
+            let mut unavailable = serde_json::to_value(node("a", 0)).unwrap();
+            if repository_credentials {
+                unavailable["repository_cloud_sha256"] = serde_json::json!({"repo":"e".repeat(64)});
+            } else {
+                unavailable["runners"]["build"]["external_approval_required"] =
+                    serde_json::json!(true);
+            }
+            unavailable["projects"] = serde_json::json!(["repo", "offline"]);
+            unavailable["runners"]["offline"] =
+                serde_json::to_value(&node("offline", 0).runners["build"]).unwrap();
+            let mut approved = unavailable.clone();
+            approved["node_id"] = serde_json::json!("b");
+            approved["runners"]["build"]["owner_approval_authorities"] =
+                serde_json::json!([{"public_key":"a".repeat(64)}]);
+            let unavailable: NodeCapabilities = serde_json::from_value(unavailable).unwrap();
+            let approved: NodeCapabilities = serde_json::from_value(approved).unwrap();
+            let nodes = [unavailable, approved];
+            assert_eq!(
+                select_node(&nodes[..1], &Placement::default(), "offline", "offline")
+                    .unwrap()
+                    .node_id,
+                "a"
+            );
+            if repository_credentials {
+                assert_eq!(
+                    select_node(&nodes[..1], &Placement::default(), "offline", "build")
+                        .unwrap()
+                        .node_id,
+                    "a"
+                );
+            }
+            let selected = select_node(&nodes, &Placement::default(), "repo", "build").unwrap();
+            assert_eq!(selected.node_id, "b");
+            assert_eq!(
+                select_node(&nodes[..1], &Placement::default(), "repo", "build").unwrap_err(),
+                "no_compatible_node"
+            );
+            let explicit = Placement {
+                node: Some("a".into()),
+                ..Placement::default()
+            };
+            assert_eq!(
+                select_node(&nodes, &explicit, "repo", "build").unwrap_err(),
+                "no_compatible_node"
+            );
+        }
     }
 }

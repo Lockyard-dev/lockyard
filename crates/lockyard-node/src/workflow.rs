@@ -279,6 +279,10 @@ impl StepState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnerGate {
+    #[serde(default)]
+    pub external_spec: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_cloud_sha256: Option<String>,
     pub action: crate::approvals::ManagedAction,
     pub authorities: Vec<TrustedSigningKey>,
     pub image_reference: String,
@@ -448,7 +452,13 @@ impl WorkflowRecord {
             if let Some(checkpoint) = &step.checkpoint {
                 let spec = step_spec(self, definition)?;
                 if checkpoint.owner_gate.as_ref().is_some_and(|gate| {
-                    !gate.action.requires_owner()
+                    (!gate.action.requires_owner()
+                        && !gate.external_spec
+                        && gate.repository_cloud_sha256.is_none())
+                        || gate
+                            .repository_cloud_sha256
+                            .as_ref()
+                            .is_some_and(|digest| !valid_hash(digest))
                         || gate.authorities.is_empty()
                         || gate.authorities.len() > 32
                         || gate.authorities.iter().any(|key| key.validate().is_err())
@@ -1551,10 +1561,18 @@ impl WorkflowController {
                         spec_sha256: spec_hash(&spec)?,
                         spec,
                         resolved_revision: None,
-                        owner_gate: node.runners[&definition.job.runner]
-                            .action
-                            .requires_owner()
+                        owner_gate: node
+                            .requires_owner_approval(
+                                &definition.job.repository,
+                                &definition.job.runner,
+                            )
                             .then(|| OwnerGate {
+                                external_spec: node.runners[&definition.job.runner]
+                                    .external_approval_required,
+                                repository_cloud_sha256: node
+                                    .repository_cloud_sha256
+                                    .get(&definition.job.repository)
+                                    .cloned(),
                                 action: node.runners[&definition.job.runner].action,
                                 authorities: node.runners[&definition.job.runner]
                                     .owner_approval_authorities
@@ -1563,9 +1581,10 @@ impl WorkflowController {
                                     .image_reference
                                     .clone(),
                             }),
-                        dispatch_committed: !node.runners[&definition.job.runner]
-                            .action
-                            .requires_owner(),
+                        dispatch_committed: !node.requires_owner_approval(
+                            &definition.job.repository,
+                            &definition.job.runner,
+                        ),
                     };
                     let step = record.steps.get_mut(&definition.key).unwrap();
                     step.state = if checkpoint.owner_gate.is_some() {
@@ -1848,6 +1867,8 @@ impl WorkflowController {
                     || revision.profile.image_digest != action.checkpoint.image_digest
                     || revision.profile.image_reference != gate.image_reference
                     || revision.profile.action != gate.action
+                    || revision.profile.external_approval_required != gate.external_spec
+                    || revision.repository_cloud_sha256 != gate.repository_cloud_sha256
                     || revision.profile.owner_approval_authorities != gate.authorities
                     || ![40, 64].contains(&revision.resolved_revision.len())
                     || !revision
@@ -1993,12 +2014,14 @@ fn owner_bundle(
     let mut spec = checkpoint.spec.clone();
     spec.owner_approval = None;
     Ok(crate::approvals::MaterializedApproval {
+        external_spec: gate.external_spec,
         workspace: record.workspace.clone(),
         node_id: checkpoint.node_id.clone(),
         node_certificate_sha256: checkpoint.certificate_sha256.clone(),
         spec,
         resolved_revision: revision.clone(),
         runner_configuration_sha256: checkpoint.runner_configuration_sha256.clone(),
+        repository_cloud_sha256: gate.repository_cloud_sha256.clone(),
         image_reference: gate.image_reference.clone(),
         image_digest: checkpoint.image_digest.clone(),
         action: gate.action,
@@ -2378,6 +2401,7 @@ mod tests {
     }
     fn capability() -> NodeCapabilities {
         NodeCapabilities {
+            repository_cloud_sha256: BTreeMap::new(),
             version: 1,
             node_id: "worker".into(),
             certificate_sha256: "a".repeat(64),
@@ -2393,6 +2417,7 @@ mod tests {
             runners: BTreeMap::from([(
                 "build".into(),
                 RunnerCapability {
+                    external_approval_required: false,
                     action: Default::default(),
                     owner_approval_authorities: vec![],
                     image_reference: format!("sha256:{}", "b".repeat(64)),
@@ -2478,6 +2503,10 @@ mod tests {
                     let runner = resolve["runner"].as_str().unwrap();
                     return Ok(RpcReply::success(
                         serde_json::to_value(crate::scheduler::RevisionCapability {
+                            repository_cloud_sha256: capability
+                                .repository_cloud_sha256
+                                .get(resolve["repository"].as_str().unwrap())
+                                .cloned(),
                             node_id: capability.node_id.clone(),
                             certificate_sha256: capability.certificate_sha256.clone(),
                             repository: resolve["repository"].as_str().unwrap().into(),
@@ -3364,5 +3393,115 @@ mod tests {
         assert!(actual.cancel_requested);
         assert_eq!(actual.steps[2].state, StepState::Succeeded);
         assert_eq!(actual.state, WorkflowState::Succeeded);
+    }
+    #[tokio::test]
+    async fn ep06_external_compute_workflow_waits_for_exact_owner_approval_across_restart() {
+        for cloud_credentials in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let driver = FixtureDriver::new(root.path());
+            let owner = SigningKey::generate(&root.path().join("owner.pk8")).unwrap();
+            let mut node = serde_json::to_value(capability()).unwrap();
+            node["runners"]["build"]["owner_approval_authorities"] = json!([owner.trusted_key()]);
+            node["runners"]["build"]["external_approval_required"] = json!(!cloud_credentials);
+            if cloud_credentials {
+                node["repository_cloud_sha256"] = json!({"repo":"e".repeat(64)});
+            }
+            *driver.nodes.lock().unwrap() = vec![serde_json::from_value(node).unwrap()];
+            let mut graph = definition();
+            graph.steps.truncate(1);
+            let controller = open(root.path(), &driver, 1000);
+            let submitted = controller.submit(graph, 1000).unwrap();
+            controller.tick(&driver, 1000).await.unwrap();
+            assert_eq!(
+                controller.status(FLOW).unwrap().steps[0].state,
+                StepState::AwaitingOwner
+            );
+            assert!(driver.calls.lock().unwrap().is_empty());
+            let bundle = controller.approval_request(FLOW, "a").unwrap();
+            assert_eq!(bundle.action, crate::approvals::ManagedAction::Compute);
+            let encoded = serde_json::to_value(&bundle).unwrap();
+            assert_eq!(
+                encoded["repository_cloud_sha256"],
+                if cloud_credentials {
+                    json!("e".repeat(64))
+                } else {
+                    Value::Null
+                }
+            );
+            let after = after_workflow_update(&controller, 100);
+            drop(controller);
+            let controller = open(root.path(), &driver, after);
+            assert_eq!(controller.approval_request(FLOW, "a").unwrap(), bundle);
+            let approval = bundle
+                .prepare(1, after + 60_000)
+                .unwrap()
+                .sign(&owner)
+                .unwrap();
+            controller
+                .approval_attach(FLOW, "a", &submitted.definition_sha256, approval, after)
+                .unwrap();
+            controller.tick(&driver, after + 100).await.unwrap();
+            assert_eq!(
+                driver
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(op, _, _)| *op == Operation::JobSubmit)
+                    .count(),
+                1
+            );
+        }
+    }
+    #[tokio::test]
+    async fn ep06_unapprovable_external_compute_does_not_block_other_workflow_steps() {
+        for repository_credentials in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let driver = FixtureDriver::new(root.path());
+            {
+                let mut nodes = driver.nodes.lock().unwrap();
+                let mut external = serde_json::to_value(nodes[0].runners["build"].clone()).unwrap();
+                external["external_approval_required"] = json!(!repository_credentials);
+                nodes[0]
+                    .runners
+                    .insert("external".into(), serde_json::from_value(external).unwrap());
+                nodes[0].projects.push("offline".into());
+                if repository_credentials {
+                    let mut encoded = serde_json::to_value(&nodes[0]).unwrap();
+                    encoded["repository_cloud_sha256"] = json!({"repo":"e".repeat(64)});
+                    nodes[0] = serde_json::from_value(encoded).unwrap();
+                }
+            }
+            let mut graph = definition();
+            graph.steps.truncate(2);
+            graph.steps[0].job.runner = "external".into();
+            graph.steps[1].job.repository = "offline".into();
+            let mut controller = open(root.path(), &driver, 1000);
+            controller.retention.insert(
+                "offline".into(),
+                RetentionPolicy {
+                    content_ttl_seconds: 60,
+                },
+            );
+            controller.submit(graph, 1000).unwrap();
+            controller.tick(&driver, 1000).await.unwrap();
+            let state = controller.status(FLOW).unwrap();
+            assert_eq!(state.steps[0].state, StepState::Pending);
+            assert_eq!(
+                state.steps[0].last_error.as_deref(),
+                Some("no_compatible_node")
+            );
+            assert_eq!(state.steps[1].state, StepState::Running);
+            assert_eq!(
+                driver
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(op, _, _)| *op == Operation::JobSubmit)
+                    .count(),
+                1
+            );
+        }
     }
 }

@@ -68,6 +68,9 @@ struct Bundle {
     /// Public signing trust is part of the authenticated, encrypted enrollment bundle.
     #[serde(default)]
     result_trust: Value,
+    /// Pinned by the owner and carried only inside the authenticated ciphertext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revocations: Option<crate::revocations::RevocationConfig>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -519,6 +522,7 @@ pub fn create(
         workspace_key_phrase: key.phrase(),
         broker_tls_roots: roots.clone(),
         result_trust,
+        revocations: config.revocations.clone(),
     };
     let plaintext = serde_json::to_string(&bundle).map_err(|_| "cannot seal enrollment bundle")?;
     let payload = bundle_key(&secret).encrypt(&config.workspace, &aad(&metadata), &plaintext)?;
@@ -814,6 +818,15 @@ pub fn join(ticket_path: &Path, state_dir: &Path, config_path: &Path) -> Result<
     {
         return Err("node enrollment trust context does not match its invitation".into());
     }
+    if let Some(revocations) = &bundle.revocations {
+        revocations.validate()?;
+        if revocations.trust.workspace_id != ticket.metadata.workspace_id
+            || revocations.trust.server_origin.trim_end_matches('/')
+                != ticket.metadata.broker_url.trim_end_matches('/')
+        {
+            return Err("revocation_signer_untrusted".into());
+        }
+    }
     let key = WorkspaceKey::from_phrase(&bundle.workspace_key_phrase)
         .map_err(|_| "invalid encrypted workspace key")?;
     stage_workspace_key(&ticket.metadata.workspace_id, &key)?;
@@ -830,6 +843,9 @@ pub fn join(ticket_path: &Path, state_dir: &Path, config_path: &Path) -> Result<
         "relay":{"url":ticket.metadata.broker_url,"token_file":token_file,"tls_roots":root_paths},"rpc_timeout_seconds":60});
     if !bundle.result_trust.is_null() && bundle.result_trust != json!({}) {
         config["result_trust"] = bundle.result_trust;
+    }
+    if let Some(revocations) = bundle.revocations {
+        config["revocations"] = serde_json::to_value(revocations)?;
     }
     let encoded =
         toml::to_string_pretty(&config).map_err(|_| "cannot encode joined node configuration")?;
@@ -969,6 +985,36 @@ mod tests {
             expires_at: now().unwrap() + 900,
             credential_expires_at: now().unwrap() + 86400,
         }
+    }
+
+    #[test]
+    fn encrypted_enrollment_preserves_independent_revocation_pin() {
+        use ring::signature::KeyPair;
+        let metadata = metadata();
+        let signer = signature::Ed25519KeyPair::from_seed_unchecked(&[37; 32]).unwrap();
+        let public_key = hex(signer.public_key().as_ref());
+        let key_id = sha(signer.public_key().as_ref());
+        let revocations = json!({"required":true,"poll_seconds":30,"max_offline_seconds":600,
+            "trust":{"workspace_id":WORKSPACE,"key_id":key_id,
+                "public_key":public_key,"server_origin":"https://broker.example"}});
+        let plaintext = json!({"metadata":metadata,"recipient_tls_name":"node.example",
+            "workspace_key_phrase":WorkspaceKey::from_entropy([42;32]).phrase(),
+            "broker_tls_roots":[],"result_trust":{},"revocations":revocations});
+        let secret = [41; 32];
+        let encrypted = bundle_key(&secret)
+            .encrypt(WORKSPACE, &aad(&metadata), &plaintext.to_string())
+            .unwrap();
+        let decrypted = bundle_key(&secret)
+            .decrypt(WORKSPACE, &aad(&metadata), &encrypted)
+            .unwrap();
+        let bundle: Bundle = serde_json::from_str(&decrypted)
+            .expect("encrypted enrollment must accept pinned revocation trust");
+        let restored = serde_json::to_value(bundle).unwrap();
+        assert_eq!(restored["revocations"], revocations);
+        assert_ne!(
+            restored["revocations"]["trust"]["public_key"],
+            restored["workspace_key_phrase"]
+        );
     }
 
     #[test]

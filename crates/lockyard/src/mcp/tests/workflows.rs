@@ -7,6 +7,7 @@
         assert_eq!(
             compact,
             [
+                "revoke_access",
                 "start_work",
                 "check",
                 "update",

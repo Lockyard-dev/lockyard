@@ -44,6 +44,9 @@ impl std::error::Error for ExecutorError {}
 #[serde(deny_unknown_fields)]
 pub struct ExecutorConfig {
     pub node_id: String,
+    /// Workspace admission policy; only trusted node configuration can set this.
+    #[serde(default)]
+    pub external_actions: ExternalActionsPolicy,
     /// Authenticated local TLS incarnation, populated by NodeHost; not user-settable in TOML.
     #[serde(skip)]
     pub node_certificate_sha256: Option<String>,
@@ -58,6 +61,16 @@ pub struct ExecutorConfig {
     pub limits: ExecutionLimits,
     #[serde(default)]
     pub scheduling: crate::scheduler::NodeScheduling,
+}
+
+/// External workloads always require an owner signature. Deny additionally forbids
+/// a networked workload from receiving any configured credentials, even when signed.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalActionsPolicy {
+    #[default]
+    RequireApproval,
+    Deny,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -102,6 +115,16 @@ pub struct RunnerProfile {
     /// Explicit project aliases permitted to use this profile's credentials.
     #[serde(default)]
     pub credential_repositories: Vec<String>,
+}
+
+impl RunnerProfile {
+    pub fn has_credentials(&self) -> bool {
+        !self.secrets.is_empty() || !self.env_passthrough.is_empty()
+    }
+
+    pub fn requires_external_approval(&self) -> bool {
+        !matches!(self.container.network, ContainerNetwork::None) || self.has_credentials()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]

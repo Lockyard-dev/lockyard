@@ -7,6 +7,7 @@ pub(crate) fn retention_fixture() -> (tempfile::TempDir, ExecutorConfig, Executo
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let config = ExecutorConfig {
+        external_actions: Default::default(),
         node_id: "worker".into(),
         state_dir: root.path().join("executor"),
         repositories: BTreeMap::new(),
@@ -252,6 +253,7 @@ os.execve('/usr/bin/git',['git']+a[a.index('fixture:image')+1:],os.environ)
 
 mod content_retention;
 mod credentials;
+mod external_actions;
 mod patch;
 mod provenance;
 mod queue;

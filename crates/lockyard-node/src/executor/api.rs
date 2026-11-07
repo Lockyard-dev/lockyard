@@ -174,6 +174,7 @@ impl Executor {
                 Ok((
                     name.clone(),
                     RunnerCapability {
+                        external_approval_required: runner.requires_external_approval(),
                         action: runner.action,
                         owner_approval_authorities: runner.owner_approval_authorities.clone(),
                         image_reference: runner.container.image.clone(),
@@ -191,7 +192,21 @@ impl Executor {
                 ))
             })
             .collect::<Result<_>>()?;
+        let repository_cloud_sha256 = self
+            .inner
+            .config
+            .repositories
+            .iter()
+            .filter_map(|(name, repository)| {
+                repository.cloud.as_ref().map(|cloud| {
+                    crate::approvals::repository_cloud_sha256(Some(cloud))
+                        .map(|digest| (name.clone(), digest.expect("a cloud config has a digest")))
+                        .map_err(|error| ExecutorError(error.0))
+                })
+            })
+            .collect::<Result<_>>()?;
         let result = NodeCapabilities {
+            repository_cloud_sha256,
             version: 1,
             node_id: self.inner.config.node_id.clone(),
             certificate_sha256: certificate_sha256.into(),
@@ -248,6 +263,10 @@ impl Executor {
             .get(runner)
             .ok_or(ExecutorError("runner_not_configured"))?;
         Ok(crate::scheduler::RevisionCapability {
+            repository_cloud_sha256: crate::approvals::repository_cloud_sha256(
+                project.cloud.as_ref(),
+            )
+            .map_err(|error| ExecutorError(error.0))?,
             node_id: self.inner.config.node_id.clone(),
             certificate_sha256: certificate_sha256.into(),
             repository: repository.into(),
@@ -255,6 +274,7 @@ impl Executor {
             resolved_revision: resolve_revision(&project.checkout, revision)?,
             runner: runner.into(),
             profile: crate::scheduler::RunnerCapability {
+                external_approval_required: profile.requires_external_approval(),
                 action: profile.action,
                 owner_approval_authorities: profile.owner_approval_authorities.clone(),
                 image_reference: profile.container.image.clone(),
@@ -511,22 +531,45 @@ impl Executor {
 
     pub(super) fn verify_owner_approval(&self, spec: &JobSpec, revision: &str) -> Result<()> {
         let runner = &self.inner.config.runners[&spec.runner];
-        if !runner.action.requires_owner() && spec.owner_approval.is_none() {
+        let repository_cloud = self.inner.config.repositories[&spec.repository]
+            .cloud
+            .as_ref();
+        let has_credentials = runner.has_credentials() || repository_cloud.is_some();
+        let networked = !matches!(runner.container.network, ContainerNetwork::None);
+        if self.inner.config.external_actions == ExternalActionsPolicy::Deny
+            && networked
+            && has_credentials
+        {
+            return Err(ExecutorError("external_actions_denied"));
+        }
+        let requires_owner = runner.action.requires_owner() || networked || has_credentials;
+        if !requires_owner && spec.owner_approval.is_none() {
             return Ok(());
+        }
+        if requires_owner && spec.owner_approval.is_none() {
+            return Err(ExecutorError("owner_approval_required"));
         }
         let workspace = &self
             .inner
             .config
             .provenance
             .as_ref()
-            .ok_or(ExecutorError("result_signing_required"))?
+            .ok_or(ExecutorError(if runner.action.requires_owner() {
+                "result_signing_required"
+            } else {
+                "owner_approval_required"
+            }))?
             .workspace;
         let pin = self
             .inner
             .config
             .node_certificate_sha256
             .as_deref()
-            .ok_or(ExecutorError("owner_approval_node_incarnation_required"))?;
+            .ok_or(ExecutorError(if runner.action.requires_owner() {
+                "owner_approval_node_incarnation_required"
+            } else {
+                "owner_approval_required"
+            }))?;
         let expected = crate::approvals::ApprovalExpectation {
             workspace,
             node_id: &self.inner.config.node_id,
@@ -534,8 +577,15 @@ impl Executor {
             spec,
             resolved_revision: revision,
             runner,
+            repository_cloud,
         };
-        crate::approvals::enforce(&expected, now_ms()).map_err(|error| ExecutorError(error.0))
+        crate::approvals::enforce(&expected, now_ms()).map_err(|error| {
+            ExecutorError(if runner.action.requires_owner() {
+                error.0
+            } else {
+                "owner_approval_required"
+            })
+        })
     }
 
     pub(super) fn validate(&self, spec: &JobSpec) -> Result<()> {

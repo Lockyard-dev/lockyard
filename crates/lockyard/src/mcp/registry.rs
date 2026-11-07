@@ -43,6 +43,7 @@ pub(super) fn compact_tools() -> Vec<Value> {
         "description": "Lease length in minutes, from 1 through 240."
     });
     vec![
+        revoke_tool(),
         tool_def(
             "start_work",
             "Claim paths before editing; ttl is in minutes. Accept an offered zone with handover_id, or take a task.",
@@ -129,6 +130,7 @@ pub(super) fn full_tools() -> Vec<Value> {
     let registry_id = json!({"oneOf": [{"type":"string"}, {"type":"integer"}]});
     let step = || json!({"id": int, "if_version": int, "reason": text});
     vec![
+        revoke_tool(),
         tool_def(
             "node_status",
             "Inspect the local node service",
@@ -652,4 +654,22 @@ pub(super) fn full_tools() -> Vec<Value> {
             &["on"],
         ),
     ]
+}
+
+/// Shared definition keeps the full and compact authorization surface identical.
+fn revoke_tool() -> Value {
+    let uuid = json!({"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"});
+    let pin = json!({"type":"string","pattern":"^[0-9a-f]{64}$"});
+    let target = json!({"oneOf":[
+        {"type":"object","properties":{"kind":{"const":"token"},"token_id":uuid},"required":["kind","token_id"],"additionalProperties":false},
+        {"type":"object","properties":{"kind":{"const":"sso_session"},"token_id":uuid},"required":["kind","token_id"],"additionalProperties":false},
+        {"type":"object","properties":{"kind":{"const":"cert_pin"},"certificate_sha256":pin},"required":["kind","certificate_sha256"],"additionalProperties":false},
+        {"type":"object","properties":{"kind":{"const":"machine"},"node_id":{"type":"string"},"credential_id":uuid,"certificate_sha256":pin},"required":["kind","node_id","credential_id","certificate_sha256"],"additionalProperties":false}
+    ]});
+    tool_def(
+        "revoke_access",
+        "Revoke Cloud and direct access; partial or unknown outcomes remain errors.",
+        json!({"target":target,"node_config":{"type":"string"}}),
+        &["target"],
+    )
 }
