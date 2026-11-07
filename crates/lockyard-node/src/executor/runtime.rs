@@ -11,6 +11,7 @@ pub(super) fn runtime_command(profile: &ContainerProfile, job_dir: &Path) -> Com
     // Empty per-job client config prevents ambient Docker proxy/credential settings leaking in.
     command.env("DOCKER_CONFIG", job_dir.join("runtime-config"));
     match profile.runtime {
+        ContainerRuntime::Native => {}
         ContainerRuntime::Docker => {
             command.arg("--host=unix:///var/run/docker.sock");
         }
@@ -61,6 +62,9 @@ pub(super) fn container_command(
     name: &str,
     patch: bool,
 ) -> Result<Command> {
+    if matches!(profile.runtime, ContainerRuntime::Native) {
+        return crate::native::command(profile, job_dir, worktree, program, name, patch);
+    }
     let identity = container_identity(job_dir)?;
     let mut command = runtime_command(profile, job_dir);
     command
@@ -226,8 +230,18 @@ pub(super) fn bounded_status(
 }
 
 pub(super) fn verify_runtime_limits(profile: &ContainerProfile, job_dir: &Path) -> Result<()> {
+    if matches!(profile.runtime, ContainerRuntime::Native) {
+        let capabilities =
+            crate::native::capabilities(profile.cgroup_root.as_deref(), &profile.runtime_program);
+        return if capabilities.available {
+            Ok(())
+        } else {
+            Err(ExecutorError("container_limits_unavailable"))
+        };
+    }
     let mut command = runtime_command(profile, job_dir);
     match profile.runtime {
+        ContainerRuntime::Native => unreachable!(),
         ContainerRuntime::Docker => {
             command.args([
                 "info",
@@ -243,6 +257,7 @@ pub(super) fn verify_runtime_limits(profile: &ContainerProfile, job_dir: &Path) 
     let text = String::from_utf8_lossy(&bytes);
     let verified =
         match profile.runtime {
+            ContainerRuntime::Native => unreachable!(),
             ContainerRuntime::Docker => text.trim() == "true true true",
             ContainerRuntime::Podman => serde_json::from_str::<Vec<String>>(&text)
                 .ok()
@@ -279,12 +294,14 @@ pub(super) fn verify_runtime_limits(profile: &ContainerProfile, job_dir: &Path) 
         "info",
         "--format",
         match profile.runtime {
+            ContainerRuntime::Native => unreachable!(),
             ContainerRuntime::Docker => "{{json .SecurityOptions}}",
             ContainerRuntime::Podman => "{{.Host.Security.Rootless}}",
         },
     ]);
     let value = probe_runtime(&mut security)?;
     let rootless = match profile.runtime {
+        ContainerRuntime::Native => unreachable!(),
         ContainerRuntime::Docker => serde_json::from_slice::<Vec<String>>(&value)
             .map_err(|_| ExecutorError("runtime_identity_unavailable"))?
             .iter()
@@ -310,6 +327,17 @@ pub(super) fn admit_image(profile: &ContainerProfile, job_dir: &Path) -> Result<
         .ok_or(ExecutorError("supply_chain_policy_required"))?;
     let admission = crate::supply_chain::verify_image(policy, &profile.image, now_ms())
         .map_err(|error| ExecutorError(error.0))?;
+    if matches!(profile.runtime, ContainerRuntime::Native) {
+        let rootfs = profile
+            .native_rootfs
+            .as_deref()
+            .ok_or(ExecutorError("native_rootfs_unavailable"))?;
+        let actual = crate::native::rootfs_digest(rootfs)?;
+        if actual != admission.image_config_digest || actual != admission.image_digest {
+            return Err(ExecutorError("native_rootfs_identity_mismatch"));
+        }
+        return Ok(admission);
+    }
     let mut inspect = runtime_command(profile, job_dir);
     inspect.args(["image", "inspect", "--format", "{{.Id}}", &profile.image]);
     let bytes = probe_runtime(&mut inspect)
@@ -338,6 +366,9 @@ pub(super) fn probe_runtime(command: &mut Command) -> Result<Vec<u8>> {
 }
 
 pub(super) fn stop_container(profile: &ContainerProfile, job_dir: &Path, name: &str) -> bool {
+    if matches!(profile.runtime, ContainerRuntime::Native) {
+        return crate::native::stop(profile, job_dir, name);
+    }
     let mut remove = runtime_command(profile, job_dir);
     remove
         .args(["container", "rm", name])
@@ -392,6 +423,7 @@ pub(super) fn stop_container(profile: &ContainerProfile, job_dir: &Path, name: &
     }
     let text = String::from_utf8_lossy(&error);
     match profile.runtime {
+        ContainerRuntime::Native => unreachable!(),
         ContainerRuntime::Docker => [
             format!("Error: No such container: {name}"),
             format!("Error: No such object: {name}"),

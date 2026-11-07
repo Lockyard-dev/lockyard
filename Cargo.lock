@@ -948,7 +948,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "lockyard"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "libc",
@@ -965,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "lockyard-cloud-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "lockyard-core",
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "lockyard-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "notify",
@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "lockyard-node"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -1000,6 +1000,7 @@ dependencies = [
  "hpke",
  "libc",
  "lockyard-cloud-client",
+ "lockyard-core",
  "p256",
  "quinn",
  "rand_chacha 0.10.0",

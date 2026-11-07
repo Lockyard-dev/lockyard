@@ -9,9 +9,20 @@ pub(super) fn check_execution_identity_paths(config: &ExecutorConfig) -> Result<
     if let Some(signing) = &config.provenance {
         protected.push(signing.key_file.clone());
     }
-    for repository in config.repositories.values() {
-        let checkout = fs::canonicalize(&repository.checkout)
-            .map_err(|_| ExecutorError("checkout_unavailable"))?;
+    let mut mounts: Vec<_> = config
+        .repositories
+        .values()
+        .map(|repository| repository.checkout.as_path())
+        .collect();
+    mounts.extend(
+        config
+            .runners
+            .values()
+            .filter_map(|runner| runner.container.native_rootfs.as_deref()),
+    );
+    for mount in mounts {
+        let checkout =
+            fs::canonicalize(mount).map_err(|_| ExecutorError("checkout_unavailable"))?;
         for path in &protected {
             let path = match fs::canonicalize(path) {
                 Ok(path) => path,

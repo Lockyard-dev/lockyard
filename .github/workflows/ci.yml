@@ -42,6 +42,26 @@ jobs:
           cargo build --locked -p lockyard
           python3 tools/ci/required-e2ee-mcp.py --binary target/debug/lockyard
 
+  crate-versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Require a version bump for changed crate code
+        shell: bash
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          base="${PR_BASE:-${PUSH_BASE:-}}"
+          if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
+            base="$(git rev-parse HEAD^)"
+          fi
+          sh scripts/check-versions.sh --changed "$base"
+      - run: sh tests/check-versions-changes.test.sh
+
   # Licenses, advisories and banned crates. A new dependency that fails this is refused.
   supply-chain:
     runs-on: ubuntu-latest
@@ -70,6 +90,35 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action
       - run: cargo build --locked -p lockyard
       - run: ./target/debug/lockyard.exe about
+  node-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action
+        with:
+          components: clippy
+      - run: cargo build --locked -p lockyard -p lockyard-node --bin lockyard --bin lockyard-sandbox
+      - name: Provision an immutable rootfs and precise AppArmor attachments
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debootstrap apparmor-utils slirp4netns
+          sudo sh tools/ci/prepare-native-rootfs.sh /var/lib/lockyard-ci-rootfs
+          sudo install -m 755 target/debug/lockyard /usr/local/bin/lockyard
+          sudo install -D -m 755 target/debug/lockyard-sandbox /usr/local/libexec/lockyard-sandbox
+          sudo /usr/local/bin/lockyard node install --apparmor --sandbox-binary /usr/local/bin/lockyard
+      - name: Require real unprivileged cgroup and namespace enforcement
+        shell: bash
+        env:
+          LOCKYARD_NATIVE_ROOTFS: /var/lib/lockyard-ci-rootfs
+          LOCKYARD_NATIVE_SANDBOX_BINARY: /usr/local/bin/lockyard
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          sudo systemctl start "user@$(id -u).service"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          sh tools/ci/test-native-executor.sh
+
   node-containers:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -135,7 +184,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck --shell=sh install.sh scripts/check-versions.sh \
-            tests/install-sh.test.sh tests/check-versions.test.sh \
+            tests/install-sh.test.sh tests/check-versions.test.sh tests/check-versions-changes.test.sh \
             examples/two-agents/run.sh
 
   # The two-agent example is the README's claim that Lockyard refuses a second claim; run it.

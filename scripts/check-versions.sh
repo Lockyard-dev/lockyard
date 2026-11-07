@@ -10,6 +10,72 @@
 
 set -eu
 
+# CI mode compares each changed product crate with the event's base commit. It also works
+# on a tracked working tree for a local preflight; release/tag consistency remains below.
+if [ "${1:-}" = "--changed" ]; then
+    base="${2:?usage: check-versions.sh --changed <base-commit> [root]}"
+    root="${3:-.}"
+    cd "$root"
+    python3 - "$base" <<'PYCODE'
+import pathlib
+import re
+import subprocess
+import sys
+
+base = sys.argv[1]
+
+def git(*args):
+    return subprocess.check_output(["git", *args], stderr=subprocess.STDOUT).decode("utf-8")
+
+def section(text, name):
+    match = re.search(r"^\[" + re.escape(name) + r"\]\s*\n(.*?)(?=^\[|\Z)", text, re.M | re.S)
+    return match.group(1) if match else ""
+
+def package_version(text, workspace):
+    package = section(text, "package")
+    inherited = re.search(r"^version\.workspace\s*=\s*true\s*(?:#.*)?$", package, re.M)
+    content = section(workspace, "workspace.package") if inherited else package
+    match = re.search(r'^version\s*=\s*"([^"]+)"', content, re.M)
+    if not match:
+        raise ValueError("package version missing or unsupported")
+    value = match.group(1)
+    if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value):
+        raise ValueError("version must be a numeric three-part semver")
+    return tuple(map(int, value.split("."))), value
+
+try:
+    git("rev-parse", "--verify", base + "^{commit}")
+    changed = git("diff", "--no-renames", "--name-only", "-z", base, "--", "crates/").split("\0")
+    crates = set()
+    for path in changed:
+        parts = pathlib.PurePosixPath(path).parts
+        if len(parts) >= 4 and parts[2] == "src" or len(parts) == 3 and parts[2] in {"build.rs", "Cargo.toml"}:
+            crates.add("/".join(parts[:2]))
+    old_workspace = git("show", base + ":Cargo.toml")
+    workspace = pathlib.Path("Cargo.toml").read_text()
+    failures = []
+    for crate in sorted(crates):
+        manifest = crate + "/Cargo.toml"
+        if not pathlib.Path(manifest).is_file():
+            continue  # Removed crates have no release to version.
+        exists = subprocess.run(["git", "cat-file", "-e", base + ":" + manifest], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if exists.returncode:
+            continue  # A new crate establishes its initial version.
+        old, old_text = package_version(git("show", base + ":" + manifest), old_workspace)
+        current, current_text = package_version(pathlib.Path(manifest).read_text(), workspace)
+        if current <= old:
+            failures.append(f"{crate}: code changed, bump version above {old_text} (current {current_text})")
+    if failures:
+        print("\n".join(failures), file=sys.stderr)
+        sys.exit(1)
+    print(f"changed crate versions: {len(crates)} checked against {base}")
+except (OSError, ValueError, subprocess.CalledProcessError) as error:
+    print(f"crate version check unavailable: {error}", file=sys.stderr)
+    sys.exit(1)
+PYCODE
+    exit $?
+fi
+
 version="${1:?usage: check-versions.sh <version> [root]}"
 version="${version#v}"
 root="${2:-.}"

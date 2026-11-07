@@ -39,11 +39,41 @@ fn version_about_and_usage_errors() {
     let version = ok(dir.path(), "a", &["--version"]);
     assert_eq!(
         version.trim(),
-        format!("lockyard {}", lockyard_core::VERSION)
+        format!("lockyard {}", lockyard_core::BUILD_VERSION)
     );
     assert!(ok(dir.path(), "a", &["about"]).contains(lockyard_core::HOMEPAGE));
     assert_eq!(lockyard(dir.path(), "a", &["nope"]).status.code(), Some(2));
     assert_eq!(lockyard(dir.path(), "a", &[]).status.code(), Some(2));
+}
+
+#[test]
+fn version_and_every_doctor_path_show_the_same_build_identity() {
+    let dir = project();
+    let version = ok(dir.path(), "a", &["--version"]);
+    assert!(version.contains("git="), "{version}");
+    assert!(version.contains("built="), "{version}");
+    let mut identity = None;
+    for arguments in [
+        vec!["--json", "doctor"],
+        vec!["--json", "doctor", "--smoke"],
+    ] {
+        let result = lockyard(dir.path(), "a", &arguments);
+        let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+        let build = &report["build"];
+        assert_eq!(build["semver"], lockyard_core::VERSION, "{report}");
+        let sha = build["git_sha"].as_str().unwrap();
+        let timestamp = build["built_at_unix"].as_str().unwrap();
+        assert!(
+            sha == "unknown" || (sha.len() >= 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        );
+        assert!(timestamp.parse::<u64>().is_ok_and(|time| time > 0));
+        assert!(version.contains(&format!("git={sha}")), "{version}");
+        assert!(version.contains(&format!("built={timestamp}")), "{version}");
+        if let Some(previous) = &identity {
+            assert_eq!(build, previous);
+        }
+        identity = Some(build.clone());
+    }
 }
 
 #[test]

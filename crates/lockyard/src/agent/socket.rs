@@ -256,7 +256,7 @@ impl Transport for AgentSocket {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::os::unix::net::UnixListener;
+    use std::os::{fd::AsRawFd, unix::net::UnixListener};
 
     fn socket_reply(call: Call, value: Value) -> Result<Value, ClientError> {
         let dir = tempfile::tempdir().unwrap();
@@ -325,10 +325,18 @@ mod tests {
     fn a_full_unix_listener_queue_does_not_block_connect() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.sock");
-        let _listener = UnixListener::bind(&path).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        // The platform's default backlog can exceed the process's descriptor limit.
+        // Keep this fixture small so it fills the listener queue rather than the FD table.
+        assert_eq!(
+            unsafe { libc::listen(listener.as_raw_fd(), 1) },
+            0,
+            "cannot set fixture listener backlog: {}",
+            io::Error::last_os_error()
+        );
         let mut connected = Vec::new();
         let mut bounded = false;
-        for _ in 0..5000 {
+        for _ in 0..16 {
             match connect_bounded(&path, Duration::from_millis(20)) {
                 Ok(stream) => {
                     assert!(

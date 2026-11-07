@@ -292,6 +292,22 @@ impl Executor {
             {
                 return Err(ExecutorError("invalid_runner_profile"));
             }
+            if matches!(container.runtime, ContainerRuntime::Native) {
+                let report = crate::native::capabilities(
+                    container.cgroup_root.as_deref(),
+                    &container.runtime_program,
+                );
+                if !report.available {
+                    return Err(ExecutorError("container_limits_unavailable"));
+                }
+                if !container
+                    .native_rootfs
+                    .as_ref()
+                    .is_some_and(|path| path.is_absolute() && path != Path::new("/"))
+                {
+                    return Err(ExecutorError("native_rootfs_unavailable"));
+                }
+            }
             crate::supply_chain::immutable_image_digest(&container.image)
                 .map_err(|error| ExecutorError(error.0))?;
             container
@@ -392,11 +408,14 @@ impl Executor {
             if !valid_id(&id) {
                 continue;
             }
-            if retention::load_tombstone(&config.state_dir.join("job-tombstones"), &id)
-                .map_err(|error| ExecutorError(error.0))?
-                .is_some()
+            if let Some(tombstone) =
+                retention::load_tombstone(&config.state_dir.join("job-tombstones"), &id)
+                    .map_err(|error| ExecutorError(error.0))?
             {
-                retire_job_directory(&config.state_dir, &id)?;
+                // Reconcile the old journal before any content can be retired.
+                if legacy_erasure_authorized(&config, &tombstone)? {
+                    retire_job_directory(&config.state_dir, &id)?;
+                }
                 continue;
             }
             let path = entry.path().join("record.json");
@@ -485,6 +504,9 @@ impl Executor {
                 retention::load_tombstone(&config.state_dir.join("job-tombstones"), &id)
                     .map_err(|error| ExecutorError(error.0))?
                     .ok_or(ExecutorError("job_tombstone_missing"))?;
+            if !legacy_erasure_authorized(&config, &tombstone)? {
+                continue;
+            }
             if retention::load_purge_completion(
                 &config.state_dir.join("purge-completed"),
                 &tombstone,

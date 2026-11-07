@@ -57,6 +57,16 @@ Downloads require an output directory owned by the invoking user and without gro
 
 Expired terminal jobs retain a minimal, separately signed terminal receipt for dispatch reconciliation. It binds the target node and workspace, original request digest, submitting node and certificate, terminal state, and completion time. It carries no logs, patch, prompt, or claim that artifacts remain available. The receipt can release the outbound maintenance fence, but an expired status remains an error and cannot release workflow dependencies. Content deletion does not wait for receipt signing; if signing or receipt storage fails, the private immutable tombstone permits a later signing attempt. Until a valid receipt is available, the dispatch remains unresolved.
 
-A legacy tombstone with a valid signed result can also settle the dispatch. An older unsigned tombstone with no recorded completion time cannot be upgraded to a receipt, and a legacy outbound dispatch without the original request digest or source certificate cannot be settled from expired metadata. These cases require the existing explicit operator reconciliation; they do not justify re-executing the job or recovering expired content.
+A legacy tombstone with a valid signed result can also settle the dispatch. An older unsigned tombstone with no recorded completion time first uses the automatic evidence reconciliation below. Unresolved evidence, or a legacy outbound dispatch without the original request digest/source certificate, still requires explicit operator reconciliation; it never justifies re-executing a job or recovering expired content.
 
 Content reads are refused at the retention deadline. Logical deletion runs on startup and during the next available maintenance pass (normally every 30 seconds); it is not an exact wall-clock erasure guarantee while the daemon or storage is unavailable. This process cannot erase previously downloaded copies, backups, filesystem snapshots, or physical storage remnants.
+
+
+Legacy tombstones without `completed_at_ms` are reconciled before content cleanup. A verified retained
+signed result (pinned node/workspace/job/request/outcome) or the matching private node journal supplies
+the completion time. Conflicting, corrupt or absent evidence produces `status: needs_review` and the
+durable `tombstone_reconciliation_required` diagnostic; surviving content is preserved. An immutable
+tombstone and its existing purge hash are never rewritten: a bounded private `.reconciliation` sidecar
+binds the recovered timestamp to the tombstone digest. Receipt generation uses that recovered time.
+The current broker stores metadata notifications, not signed manifests; it cannot yet supply a missing
+signed result. This release verifies retained signed results and does not invent a cloud retrieval API.

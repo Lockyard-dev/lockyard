@@ -23,6 +23,19 @@ All notable changes to Lockyard are recorded here. The format follows
 - Hook announces allowed edits; outside-hook writes are detection-only (README limits).
 - Errors include a next step; credentials and journals use crash-safe replace/fsync.
 
+## [0.2.0] - 2026-11-07
+
+### Added
+
+- Native Linux job isolation with delegated cgroups v2, namespaces and seccomp; diagnostics explain missing host capabilities.
+- Automatic reconciliation of old unsigned tombstones, with explicit review for unresolved records.
+- Build identity in version/diagnostics, same-version signed build updates, and CI crate-version bump enforcement.
+
+### Changed
+
+- Linux selects native isolation by default; Docker remains an explicit option.
+- Missing revocation trust is rejected before creating private revocation state.
+
 ## [0.1.0] - 2026-11-04
 
 First release published to crates.io, npm, PyPI and GitHub Releases.

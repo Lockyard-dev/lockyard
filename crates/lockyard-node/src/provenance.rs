@@ -382,6 +382,12 @@ fn valid_revision(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 fn valid_optional_error(value: &Option<String>) -> bool {
+    if value
+        .as_deref()
+        .is_some_and(|code| matches!(code, "limit_exceeded:memory" | "limit_exceeded:pids"))
+    {
+        return true;
+    }
     value.as_ref().is_none_or(|value| {
         !value.is_empty()
             && value.len() <= 96

@@ -33,6 +33,20 @@ pub use store::{Agent, DIR_NAME, Store, validate_agent};
 /// Version of this build.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Full source revision, or `unknown` when building a source archive without Git.
+pub const GIT_SHA: &str = env!("LOCKYARD_GIT_SHA");
+
+/// Build time as Unix seconds; SOURCE_DATE_EPOCH can pin it for reproducible builds.
+pub const BUILD_TIME: &str = env!("LOCKYARD_BUILD_TIME");
+
+/// Human-readable semantic version and source/build identity.
+pub const BUILD_VERSION: &str = env!("LOCKYARD_BUILD_VERSION");
+
+/// Shared build identity for diagnostic surfaces.
+pub fn build_info() -> serde_json::Value {
+    serde_json::json!({"semver": VERSION, "git_sha": GIT_SHA, "built_at_unix": BUILD_TIME})
+}
+
 /// Home of the project.
 pub const HOMEPAGE: &str = "https://lockyard.dev";
 
@@ -41,7 +55,7 @@ pub const SUMMARY: &str = "Coordination for coding agents: a shared bus, work zo
 
 /// Text of `lockyard about`.
 pub fn about() -> String {
-    format!("Lockyard {VERSION}\n{SUMMARY}\n{HOMEPAGE}")
+    format!("Lockyard {BUILD_VERSION}\n{SUMMARY}\n{HOMEPAGE}")
 }
 
 #[cfg(test)]

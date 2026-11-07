@@ -76,6 +76,7 @@ pub struct Release {
     pub format: u8,
     pub release_id: String,
     pub version: String,
+    /// Signed monotonic build ID; orders rebuilds of an equal semantic version.
     pub sequence: u64,
     pub platform: String,
     pub minimum_current_version: String,
@@ -889,7 +890,7 @@ fn validate_prepared(
         || prepared.base_generation != state.generation
         || prepared.base_binary_sha256 != current.binary_sha256
         || release.sequence <= state.high_water_sequence
-        || version(&release.version)? <= version(&current.version)?
+        || version(&release.version)? < version(&current.version)?
         || version(&current.version)? < version(&release.minimum_current_version)?
     {
         return Err(UpdateError("managed_update_rollback_or_base_conflict"));
@@ -1557,6 +1558,30 @@ mod tests {
             b"1"
         );
     }
+    #[test]
+    fn same_semver_newer_signed_build_is_allowed_without_weakening_rollback_guards() {
+        let f = fixture();
+        let (binary, path, _) = candidate(&f, env!("CARGO_PKG_VERSION"), 2);
+        prepare_inner(&f.context, &path, &binary).unwrap();
+        let (binary, path, _) = candidate(&f, env!("CARGO_PKG_VERSION"), 1);
+        assert_eq!(
+            prepare_inner(&f.context, &path, &binary).unwrap_err().0,
+            "managed_update_rollback_or_base_conflict"
+        );
+        let (binary, path, document) = candidate(&f, &future_version(1), 3);
+        let policy = f.context.policy().unwrap();
+        let mut release = verify(&document, &policy.trusted).unwrap();
+        release.version = "0.0.0".into();
+        release.minimum_current_version = "0.0.0".into();
+        let lower = f.signer.sign_document(DOMAIN, &release).unwrap();
+        fs::remove_file(&path).unwrap();
+        publish_json(&path, &lower, false).unwrap();
+        assert_eq!(
+            prepare_inner(&f.context, &path, &binary).unwrap_err().0,
+            "managed_update_rollback_or_base_conflict"
+        );
+    }
+
     #[test]
     fn wrong_approval_changed_binary_signature_platform_and_minimum_version_refuse_before_mutation()
     {

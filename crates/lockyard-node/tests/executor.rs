@@ -61,9 +61,34 @@ fn operator() -> Caller {
         certificate_sha256: None,
     }
 }
-fn enabled() -> bool {
-    std::env::var_os("LOCKYARD_NODE_EXECUTOR_IMAGE").is_some()
+fn native_live_selected() -> bool {
+    cfg!(target_os = "linux")
+        && std::env::var_os("LOCKYARD_NATIVE_CGROUP_ROOT").is_some()
+        && std::env::var_os("LOCKYARD_NATIVE_ROOTFS").is_some()
 }
+fn enabled() -> bool {
+    native_live_selected() || std::env::var_os("LOCKYARD_NODE_EXECUTOR_IMAGE").is_some()
+}
+fn live_fixture(path: &Path) -> ExecutorConfig {
+    #[cfg(target_os = "linux")]
+    if native_live_selected() {
+        let mut config = native_cases::configured_fixture(path)
+            .expect("native legacy acceptance requires working delegated cgroups, namespaces and signed rootfs");
+        // Preserve every existing literal agent/name assertion in the legacy acceptance cases.
+        config.node_id = "fixture-node".into();
+        return config;
+    }
+    fixture(path)
+}
+#[cfg(target_os = "linux")]
+fn live_native_cgroup(name: &str) -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(std::env::var_os("LOCKYARD_NATIVE_CGROUP_ROOT").unwrap());
+    root.join(format!(
+        "lockyard-{}",
+        &provenance::sha256(name.as_bytes())[..32]
+    ))
+}
+
 // Synthetic attester data is explicit test trust, not a claim that an upstream scanner ran.
 fn security_fixture(path: &Path) -> (String, ResultSigningConfig, SupplyChainPolicy) {
     let private = path.join("signing");
@@ -192,6 +217,9 @@ fn fixture(path: &Path) -> ExecutorConfig {
                 owner_approval_authorities: Vec::new(),
                 container: ContainerProfile {
                     runtime: ContainerRuntime::Docker,
+                    cgroup_root: None,
+                    native_rootfs: None,
+                    native_network_program: None,
                     runtime_program: runtime_program(),
                     image,
                     supply_chain: Some(supply_chain),
@@ -300,7 +328,7 @@ fn literal_arguments_deduplicate_and_preserve_dirty_checkout() {
         "set LOCKYARD_NODE_EXECUTOR_IMAGE to the preinstalled fixture image"
     );
     let dir = tempfile::tempdir().unwrap();
-    let config = fixture(dir.path());
+    let config = live_fixture(dir.path());
     let checkout = config.repositories["repo"].checkout.clone();
     fs::write(checkout.join("base.txt"), "dirty\n").unwrap();
     let executor = Executor::new(config).unwrap();
@@ -347,7 +375,7 @@ fn queued_revision_is_pinned_and_concurrency_is_bounded() {
         "set LOCKYARD_NODE_EXECUTOR_IMAGE to the preinstalled fixture image"
     );
     let dir = tempfile::tempdir().unwrap();
-    let config = fixture(dir.path());
+    let config = live_fixture(dir.path());
     let checkout = config.repositories["repo"].checkout.clone();
     let old_revision = git(&checkout, &["rev-parse", "HEAD"]);
     let executor = Executor::new(config).unwrap();
@@ -385,7 +413,7 @@ fn output_is_capped_and_timeout_and_cancel_stop_child_groups() {
         "set LOCKYARD_NODE_EXECUTOR_IMAGE to the preinstalled fixture image"
     );
     let dir = tempfile::tempdir().unwrap();
-    let mut config = fixture(dir.path());
+    let mut config = live_fixture(dir.path());
     config.limits.max_log_bytes = 257;
     let executor = Executor::new(config).unwrap();
     let output = spec(
@@ -426,31 +454,45 @@ fn output_is_capped_and_timeout_and_cancel_stop_child_groups() {
     assert!(child_pid > 0);
     // The runtime removes the container after killing all processes in its process namespace.
     let name = format!("lockyard-fixture-node-{}", cancel.id);
-    assert!(
-        !Command::new(runtime_program())
-            .args([
-                "--host=unix:///var/run/docker.sock",
-                "container",
-                "inspect",
-                &name
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
-    );
+    #[cfg(target_os = "linux")]
+    if native_live_selected() {
+        assert!(
+            !live_native_cgroup(&name).exists(),
+            "cancelled cgroup still exists"
+        );
+    }
+    if !native_live_selected() {
+        assert!(
+            !Command::new(runtime_program())
+                .args([
+                    "--host=unix:///var/run/docker.sock",
+                    "container",
+                    "inspect",
+                    &name
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
 }
 
 #[test]
 #[ignore = "requires a resource-capable Docker daemon and LOCKYARD_NODE_EXECUTOR_IMAGE"]
 fn live_container_enforces_resource_limits_and_private_mount_policy() {
+    #[cfg(target_os = "linux")]
+    if native_live_selected() {
+        live_native_resource_policy();
+        return;
+    }
     assert!(
         enabled(),
         "set LOCKYARD_NODE_EXECUTOR_IMAGE to the fixture image"
     );
     let dir = tempfile::tempdir().unwrap();
-    let mut config = fixture(dir.path());
+    let mut config = live_fixture(dir.path());
     let profile = &mut config.runners.get_mut("python").unwrap().container;
     profile.memory_mb = 64;
     profile.cpu_millis = 500;
@@ -629,7 +671,7 @@ fn codex_profile_injects_mcp_without_user_config_mutation_and_redacts_token() {
         "set LOCKYARD_NODE_EXECUTOR_IMAGE to the preinstalled fixture image"
     );
     let dir = tempfile::tempdir().unwrap();
-    let mut config = fixture(dir.path());
+    let mut config = live_fixture(dir.path());
     let code = "import sys,os,pathlib,json; print(json.dumps(sys.argv[1:])); print(os.environ['LOCKYARD_AGENT']); print(os.environ['LOCKYARD_URL']); print(os.environ['LOCKYARD_TOKEN']); print(pathlib.Path('.lockyard/config.toml').read_text())";
     let token = dir.path().join("token");
     fs::write(&token, "fixture-sensitive-token\n").unwrap();
@@ -644,15 +686,16 @@ fn codex_profile_injects_mcp_without_user_config_mutation_and_redacts_token() {
     runner.kind = RunnerKind::Codex;
     runner.mcp_program = Some("/configured/lockyard".into());
     runner.fixed_args = vec!["-c".into(), code.into()];
+    let mut request = spec(7, "");
+    request.arguments.clear();
+    request.prompt = Some("--literal-prompt".into());
+    approve_external_fixture(dir.path(), &mut config, &mut request);
     let executor = Executor::new_with_workspace_key(
         config,
         "actual-workspace-id".into(),
         WorkspaceKey::from_entropy([77; 32]),
     )
     .unwrap();
-    let mut request = spec(7, "");
-    request.arguments.clear();
-    request.prompt = Some("--literal-prompt".into());
     executor.submit(request.clone(), &caller()).unwrap();
     assert_eq!(finished(&executor, &request.id).state, JobState::Succeeded);
     let log = String::from_utf8(executor.read_log(&request.id, 0, 65536).unwrap().bytes).unwrap();
@@ -687,7 +730,7 @@ fn actual_daemon_crash_marks_unknown_and_never_reexecutes() {
         "set LOCKYARD_NODE_EXECUTOR_IMAGE to the preinstalled fixture image"
     );
     let dir = tempfile::tempdir().unwrap();
-    let config = fixture(dir.path());
+    let config = live_fixture(dir.path());
     let config_path = dir.path().join("fixture.json");
     fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     let mut daemon = Command::new(std::env::current_exe().unwrap())
@@ -735,11 +778,31 @@ fn actual_daemon_crash_marks_unknown_and_never_reexecutes() {
     );
     // Operator review identifies the container by its deterministic name, never an old PID.
     let name = format!("lockyard-fixture-node-{}", running.spec.id);
-    let _ = Command::new(runtime_program())
-        .args(["--host=unix:///var/run/docker.sock", "kill", &name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    #[cfg(target_os = "linux")]
+    if native_live_selected() {
+        let group = live_native_cgroup(&name);
+        fs::write(group.join("cgroup.kill"), "1").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read_to_string(group.join("cgroup.events"))
+            .unwrap()
+            .lines()
+            .any(|line| line == "populated 0")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "native orphan cgroup never stopped"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        fs::remove_dir(group).unwrap();
+    }
+    if !native_live_selected() {
+        let _ = Command::new(runtime_program())
+            .args(["--host=unix:///var/run/docker.sock", "kill", &name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     executor
         .resolve_unknown(&running.spec.id, &operator())
         .unwrap();
@@ -1471,6 +1534,26 @@ elif 'run' in args:
 #[test]
 #[ignore = "requires the local Docker socket; requires fixture image when resource controls exist"]
 fn runtime_resource_capability_report_is_respected() {
+    #[cfg(target_os = "linux")]
+    if native_live_selected() {
+        let root =
+            std::path::PathBuf::from(std::env::var_os("LOCKYARD_NATIVE_CGROUP_ROOT").unwrap());
+        let report =
+            lockyard_node::native::capabilities(Some(&root), &native_cases::sandbox_program());
+        assert!(
+            report.available,
+            "native limits unavailable: {:?}",
+            report.reasons
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let executor = Executor::new(live_fixture(dir.path())).unwrap();
+        let request = spec(14, "print('native enforced')");
+        executor.submit(request.clone(), &caller()).unwrap();
+        let record = finished(&executor, &request.id);
+        assert_eq!(record.state, JobState::Succeeded, "{record:?}");
+        assert!(record.result_manifest.is_some());
+        return;
+    }
     let output = Command::new(runtime_program())
         .args([
             "--host=unix:///var/run/docker.sock",
@@ -1495,7 +1578,7 @@ fn runtime_resource_capability_report_is_respected() {
         );
     }
     let dir = tempfile::tempdir().unwrap();
-    let config = fixture(dir.path());
+    let config = live_fixture(dir.path());
     let executor = Executor::new(config).unwrap();
     let request = spec(14, "print('container only')");
     executor.submit(request.clone(), &caller()).unwrap();
@@ -1669,4 +1752,125 @@ fn completed_job_recovers_missing_signature_without_reexecuting_or_changing_outc
     assert_eq!(result.error_code, completed.error_code);
     assert_eq!(result.result_manifest, completed.result_manifest);
     assert!(result.pid.is_none());
+}
+
+#[path = "executor/native_cases.rs"]
+mod native_cases;
+
+#[cfg(target_os = "linux")]
+fn live_native_resource_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = live_fixture(dir.path());
+    let profile = &mut config.runners.get_mut("python").unwrap().container;
+    profile.memory_mb = 64;
+    profile.cpu_millis = 500;
+    profile.pids_limit = 16;
+    let checkout = config.repositories["repo"].checkout.clone();
+    let executor = Executor::new(config).unwrap();
+    let code = format!(
+        "import pathlib,time; assert not pathlib.Path({}).exists(); print('limits-ready',flush=True)\nwhile True: pass",
+        serde_json::to_string(&checkout.to_string_lossy()).unwrap()
+    );
+    let inspect = spec(21, &code);
+    executor.submit(inspect.clone(), &caller()).unwrap();
+    wait(&executor, &inspect.id, |record| {
+        record.state == JobState::Running
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&executor.read_log(&inspect.id, 0, 4096).unwrap().bytes)
+        .contains("limits-ready")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "native resource inspector never started"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let group = live_native_cgroup(&format!("lockyard-fixture-node-{}", inspect.id));
+    assert_eq!(
+        fs::read_to_string(group.join("memory.max")).unwrap().trim(),
+        (64 * 1024 * 1024).to_string()
+    );
+    assert_eq!(
+        fs::read_to_string(group.join("memory.swap.max"))
+            .unwrap()
+            .trim(),
+        "0"
+    );
+    assert_eq!(
+        fs::read_to_string(group.join("pids.max")).unwrap().trim(),
+        "16"
+    );
+    let quota = fs::read_to_string(group.join("cpu.max")).unwrap();
+    let quota = quota
+        .split_whitespace()
+        .map(|value| value.parse::<u64>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(quota[0] * 2, quota[1]);
+    let throttled = |group: &Path| -> u64 {
+        fs::read_to_string(group.join("cpu.stat"))
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("nr_throttled "))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let before = throttled(&group);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while throttled(&group) <= before {
+        assert!(
+            Instant::now() < deadline,
+            "CPU quota did not throttle actual workload"
+        );
+        thread::sleep(Duration::from_millis(30));
+    }
+    executor.cancel(&inspect.id, &caller()).unwrap();
+    assert_eq!(finished(&executor, &inspect.id).state, JobState::Cancelled);
+    assert!(!group.exists());
+    let pids = spec(
+        22,
+        r#"import errno,subprocess
+children=[]
+limited=False
+try:
+ for _ in range(32):
+  try: children.append(subprocess.Popen(['/bin/sleep','30']))
+  except OSError as error:
+   if error.errno != errno.EAGAIN: raise
+   limited=True
+   break
+finally:
+ for child in children: child.terminate()
+ for child in children: child.wait()
+assert limited
+assert len(children)<16
+print('pid-limit-enforced',flush=True)
+"#,
+    );
+    executor.submit(pids.clone(), &caller()).unwrap();
+    let result = finished(&executor, &pids.id);
+    assert_eq!(result.state, JobState::Failed, "{result:?}");
+    assert_eq!(result.error_code.as_deref(), Some("limit_exceeded:pids"));
+    assert!(result.result_manifest.is_some());
+    assert!(
+        String::from_utf8_lossy(&executor.read_log(&pids.id, 0, 4096).unwrap().bytes)
+            .contains("pid-limit-enforced")
+    );
+    let memory = spec(
+        23,
+        r#"chunks=[]
+for _ in range(32):
+ chunk=bytearray(8*1024*1024)
+ for offset in range(0,len(chunk),4096): chunk[offset]=1
+ chunks.append(chunk)
+raise RuntimeError('runtime did not enforce the configured memory bound')
+"#,
+    );
+    executor.submit(memory.clone(), &caller()).unwrap();
+    let result = finished(&executor, &memory.id);
+    assert_eq!(result.state, JobState::Failed, "{result:?}");
+    assert_eq!(result.error_code.as_deref(), Some("limit_exceeded:memory"));
+    assert!(result.result_manifest.is_some());
+    assert!(result.patch_error.is_none(), "{result:?}");
 }

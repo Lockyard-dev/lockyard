@@ -180,7 +180,7 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             )
         }
         Command::About => output(
-            &json!({ "version": lockyard_core::VERSION }),
+            &json!({ "version": lockyard_core::VERSION, "build": lockyard_core::build_info() }),
             lockyard_core::about(),
         ),
         Command::Machine => {
@@ -258,7 +258,29 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
         Command::Hook(command) => run_hook(command, agent, cwd),
         Command::Monitor(args) => run_monitor(args, agent.as_ref(), cwd, json),
         Command::Setup(args) => run_setup(args, cwd),
-        Command::Doctor { client, smoke } => {
+        Command::Doctor {
+            client,
+            smoke,
+            node_config,
+        } => {
+            #[cfg(unix)]
+            if let Some(path) = node_config.as_deref() {
+                let data = node_cli::native_doctor(path)?;
+                let exit = if data["healthy"].as_bool() == Some(true) {
+                    0
+                } else {
+                    1
+                };
+                let mut rendered = output(
+                    &data,
+                    serde_json::to_string_pretty(&data)
+                        .map_err(|error| Error::Invalid(error.to_string()))?,
+                )?;
+                rendered.exit = exit;
+                return Ok(rendered);
+            }
+            #[cfg(not(unix))]
+            let _ = node_config;
             if client.is_none() && !smoke {
                 let data = onboarding::doctor(cwd, agent.as_deref(), None, false)?;
                 // Invalid configuration is intentionally summarized without leaking tokens.
@@ -388,6 +410,13 @@ fn deliver(out: &Output, json: bool) -> std::io::Result<()> {
 }
 
 fn main() -> ExitCode {
+    #[cfg(unix)]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|value| value == "__native-sandbox")
+    {
+        return ExitCode::from(lockyard_node::native::sandbox_main() as u8);
+    }
     let cli = Cli::parse();
     let json = cli.json;
     if let Command::Mcp(args) = &cli.command {

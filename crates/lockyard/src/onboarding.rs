@@ -665,6 +665,7 @@ fn check(checks: &mut Vec<Value>, name: &str, state: &str, message: &str) {
 /// `smoke` creates and removes a separate temporary local project, leaving the current project alone.
 pub fn doctor(cwd: &Path, agent: Option<&str>, client: Option<&str>, smoke: bool) -> Result<Value> {
     let mut checks = Vec::new();
+    check(&mut checks, "build", "ok", lockyard_core::BUILD_VERSION);
     let executable = std::env::current_exe().is_ok_and(|path| path.is_file());
     check(
         &mut checks,
@@ -768,7 +769,9 @@ pub fn doctor(cwd: &Path, agent: Option<&str>, client: Option<&str>, smoke: bool
         );
     }
     let ok = checks.iter().all(|item| item["state"] != "failed");
-    Ok(json!({"ok":ok,"checks":checks,"smoke":smoke_report,"network_authorization_verified":false}))
+    Ok(
+        json!({"ok":ok,"checks":checks,"smoke":smoke_report,"network_authorization_verified":false,"build":lockyard_core::build_info()}),
+    )
 }
 
 fn cloud_checks(checks: &mut Vec<Value>, config: &Config) {

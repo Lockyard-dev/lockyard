@@ -38,6 +38,31 @@ fn init(dir: &Path) -> std::process::Output {
         .unwrap()
 }
 #[test]
+fn apparmor_install_requires_an_explicit_flag_and_names_the_actual_helper() {
+    let dir = tempfile::tempdir().unwrap();
+    let help = command(dir.path())
+        .args(["node", "install", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        help.status.success(),
+        "{}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let text = String::from_utf8(help.stdout).unwrap();
+    assert!(text.contains("--apparmor"));
+    assert!(text.contains("--sandbox-binary"));
+    assert!(text.contains("--lockyard-binary"));
+    let refused = command(dir.path())
+        .args(["node", "install", "--sandbox-binary", "/absent/helper"])
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--apparmor"));
+    assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
+}
+
+#[test]
 fn init_requires_existing_key_and_refuses_overwrite() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path();

@@ -1,0 +1,13 @@
+# Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
+# Template: lockyard node install --apparmor substitutes canonical root-owned binaries.
+# This grants userns creation only. cgroups/namespaces/seccomp enforce job isolation.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile lockyard "@LOCKYARD_BINARY@" flags=(default_allow) {
+    userns,
+}
+
+profile lockyard-sandbox "@SANDBOX_BINARY@" flags=(default_allow) {
+    userns,
+}

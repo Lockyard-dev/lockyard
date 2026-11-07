@@ -130,9 +130,17 @@ mod tests {
         io::{Read, Seek, SeekFrom, Write},
         os::unix::fs::{PermissionsExt, symlink},
     };
+
+    fn private_root() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
     #[test]
     fn private_descriptor_publishes_exact_bytes_and_never_overwrites_existing_output() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let path = root.path().join("result.patch");
         let mut download = Download::new(&path, "patch").unwrap();
         download.file().write_all(b"verified").unwrap();
@@ -153,7 +161,7 @@ mod tests {
     }
     #[test]
     fn symlink_swap_cannot_clobber_a_victim_or_publish_unverified_replacement() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let path = root.path().join("result.patch");
         let victim = root.path().join("victim");
         fs::write(&victim, b"unchanged").unwrap();
@@ -170,7 +178,7 @@ mod tests {
     }
     #[test]
     fn replacement_after_verification_cannot_be_published_as_the_verified_file() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let path = root.path().join("result.patch");
         let mut download = Download::new(&path, "patch").unwrap();
         download.file().write_all(b"verified").unwrap();
@@ -187,7 +195,7 @@ mod tests {
 
     #[test]
     fn shared_writable_output_directory_is_rejected_before_creating_temporary() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
         assert!(Download::new(&root.path().join("result"), "patch").is_err());
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);

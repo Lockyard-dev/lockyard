@@ -1,9 +1,9 @@
-# Container execution on a remote node
+# Isolated execution on a remote node
 
 Managed `git_push`, `publish` and `deploy` profiles additionally require [offline owner authorization](node-owner-approvals.md). Compute profiles retain all-member dispatch; trusted administrators must classify profiles and scope credentials.
 
-The node executes only locally configured runner profiles. Every job runs in a Docker or Podman
-container; a missing runtime or image fails the job. There is no host execution fallback. Install an
+The node executes only locally configured runner profiles. Linux defaults to the [native cgroups v2 backend](node-native-executor.md); Docker and Podman remain explicit options. On macOS native execution refuses honestly.
+The Docker/Podman configuration below remains supported: a missing runtime or image fails the job. There is no host execution fallback. Install an
 image containing the selected program and Git before enabling a profile. Images are never pulled by
 the executor. A Codex image also needs Codex, Lockyard, and its explicitly configured model credential.
 The runtime must advertise memory, CPU, and PID controls; unavailable controls fail closed with

@@ -21,12 +21,29 @@ mod key_rotation;
 #[path = "node_download.rs"]
 mod download;
 
+#[path = "node_install.rs"]
+mod install;
 #[path = "node_update_cli.rs"]
 mod node_update_cli;
 
 #[derive(Subcommand)]
 #[command(defer = true)]
 pub enum NodeCommand {
+    /// Explicitly install and load AppArmor user-namespace permission for the exact binaries; root only.
+    Install {
+        #[arg(long, required = true)]
+        apparmor: bool,
+        #[arg(long)]
+        sandbox_binary: PathBuf,
+        /// Defaults to this executable; use the installed root-owned path.
+        #[arg(long)]
+        lockyard_binary: Option<PathBuf>,
+    },
+    /// Measure the provisioned native rootfs for its offline signed attestation.
+    NativeImageDigest {
+        #[arg(long)]
+        rootfs: PathBuf,
+    },
     /// Explicit local offline signed executable maintenance; never restarts a daemon.
     Update {
         #[command(subcommand)]
@@ -454,6 +471,18 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 pub fn node(command: NodeCommand) -> Result<Value> {
     match command {
+        NodeCommand::Install {
+            apparmor,
+            sandbox_binary,
+            lockyard_binary,
+        } => install::apparmor(apparmor, &sandbox_binary, lockyard_binary.as_deref()),
+        NodeCommand::NativeImageDigest { rootfs } => {
+            let digest = lockyard_node::native::rootfs_digest(&rootfs)
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            Ok(
+                json!({"image": format!("native@{digest}"), "image_digest": digest, "image_config_digest": digest}),
+            )
+        }
         NodeCommand::Update { command } => node_update_cli::run(command),
         NodeCommand::Approval { command } => approvals::run(command),
         NodeCommand::KeyRotation { command } => key_rotation::run(command),
@@ -1421,4 +1450,52 @@ fn authenticated_manifest(
         return Err(invalid("signed result differs from returned job metadata"));
     }
     Ok((signed, manifest))
+}
+
+pub fn native_doctor(path: &Path) -> Result<Value> {
+    let config = host::NodeConfig::load(path).map_err(|error| Error::Invalid(error.to_string()))?;
+    let mut runners = serde_json::Map::new();
+    let mut healthy = true;
+    if let Some(executor) = config.executor {
+        for (name, runner) in executor.runners {
+            if matches!(
+                runner.container.runtime,
+                lockyard_node::executor::ContainerRuntime::Native
+            ) {
+                let mut report = lockyard_node::native::capabilities(
+                    runner.container.cgroup_root.as_deref(),
+                    &runner.container.runtime_program,
+                );
+                if !runner.container.native_rootfs.as_ref().is_some_and(|path| {
+                    path.is_absolute() && path.is_dir() && path != Path::new("/")
+                }) {
+                    report.reasons.push(
+                        "native_rootfs must name a provisioned immutable private image directory"
+                            .into(),
+                    );
+                }
+                if matches!(
+                    runner.container.network,
+                    lockyard_node::executor::ContainerNetwork::Bridge
+                ) && !runner
+                    .container
+                    .native_network_program
+                    .as_ref()
+                    .is_some_and(|path| path.is_absolute() && path.is_file())
+                {
+                    report.reasons.push("bridge requires native_network_program=/usr/bin/slirp4netns; host networking is never inherited".into());
+                }
+                report.available &= report.reasons.is_empty();
+                healthy &= report.available;
+                runners.insert(
+                    name,
+                    serde_json::to_value(report)
+                        .map_err(|error| Error::Invalid(error.to_string()))?,
+                );
+            }
+        }
+    }
+    Ok(
+        json!({"healthy": healthy, "native_executor": runners, "build": lockyard_core::build_info()}),
+    )
 }

@@ -29,3 +29,5 @@ pub mod workflow;
 
 /// Transport failures do not establish whether an already sent request executed.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+pub mod native;

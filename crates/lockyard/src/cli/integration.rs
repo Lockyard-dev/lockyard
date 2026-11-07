@@ -299,8 +299,8 @@ pub(super) fn doctor_output(findings: Vec<setup::Finding>) -> Result<Output> {
         .iter()
         .any(|finding| finding.check == "cloud" && finding.ok);
     let mut out = output(
-        &json!({"ok": healthy, "checks": checks, "smoke": null, "network_authorization_verified": network_authorization_verified}),
-        text,
+        &json!({"ok": healthy, "checks": checks, "smoke": null, "network_authorization_verified": network_authorization_verified, "build": lockyard_core::build_info()}),
+        format!("Lockyard {}\n{text}", lockyard_core::BUILD_VERSION),
     )?;
     if !healthy {
         out.exit = EXIT_FAILURE;

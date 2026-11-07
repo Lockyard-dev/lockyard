@@ -213,6 +213,8 @@ impl PeerConfig {
 #[derive(Serialize, Deserialize)]
 pub struct NodeStatus {
     #[serde(default)]
+    pub build: serde_json::Value,
+    #[serde(default)]
     pub revocations_enforced: bool,
     #[serde(default)]
     pub revocations: Option<crate::revocations::RevocationSnapshot>,
@@ -1012,6 +1014,7 @@ impl Host {
     }
     fn status(&self) -> NodeStatus {
         NodeStatus {
+            build: lockyard_core::build_info(),
             revocations_enforced: self
                 .revocations
                 .as_ref()
@@ -3923,6 +3926,26 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn node_diagnostics_exposes_shared_build_identity() {
+        let (_root, host) = fixture();
+        let status = serde_json::to_value(host.status()).unwrap();
+        assert_eq!(status["build"]["semver"], env!("CARGO_PKG_VERSION"));
+        let sha = status["build"]["git_sha"].as_str().unwrap();
+        assert!(
+            sha == "unknown"
+                || (sha.len() >= 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        );
+        assert!(
+            status["build"]["built_at_unix"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                > 0
+        );
+    }
+
     impl Host {
         fn seal<T: Serialize>(&self, frame: &mut RpcFrame, payload: &T) -> Result<()> {
             if frame.operation != Operation::NodePing {

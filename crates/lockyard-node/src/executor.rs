@@ -130,7 +130,14 @@ impl RunnerProfile {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContainerProfile {
+    #[serde(default)]
     pub runtime: ContainerRuntime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_rootfs: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_network_program: Option<PathBuf>,
     pub runtime_program: PathBuf,
     pub image: String,
     pub supply_chain: Option<SupplyChainPolicy>,
@@ -145,9 +152,11 @@ pub struct ContainerProfile {
 fn default_git_program() -> PathBuf {
     "/usr/bin/git".into()
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContainerRuntime {
+    #[default]
+    Native,
     Docker,
     Podman,
 }
@@ -566,6 +575,8 @@ mod api;
 mod execution;
 mod queue;
 mod retained_content;
+mod tombstone_reconciliation;
+use tombstone_reconciliation::*;
 mod retention_files;
 mod startup;
 use retention_files::*;
@@ -586,3 +597,12 @@ use streams::*;
 
 #[cfg(test)]
 pub(crate) mod regression_tests;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn native_probe_diagnostic(command: &mut Command) -> std::result::Result<(), String> {
+    match runtime_output(command, Duration::from_secs(5), 4096, None) {
+        Ok((status, _, _)) if status.success() => Ok(()),
+        Ok((_, _, error)) => Err(String::from_utf8_lossy(&error).trim().to_owned()),
+        Err(error) => Err(error.to_string()),
+    }
+}

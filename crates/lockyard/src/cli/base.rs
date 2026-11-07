@@ -3,7 +3,7 @@
 use super::*;
 
 #[derive(Parser)]
-#[command(name = "lockyard", version, about = lockyard_core::SUMMARY)]
+#[command(name = "lockyard", version = lockyard_core::BUILD_VERSION, about = lockyard_core::SUMMARY)]
 pub(super) struct Cli {
     /// Name of this agent. Defaults to LOCKYARD_AGENT, then CLAUDE_CODE_SESSION_ID.
     #[arg(long, global = true)]
@@ -64,6 +64,9 @@ pub(super) enum Command {
     Setup(SetupArgs),
     /// Check project readiness; optional client or smoke diagnostics are read-only.
     Doctor {
+        /// Inspect Linux execution enforcement for this node configuration.
+        #[arg(long)]
+        node_config: Option<PathBuf>,
         #[arg(long)]
         client: Option<String>,
         #[arg(long)]

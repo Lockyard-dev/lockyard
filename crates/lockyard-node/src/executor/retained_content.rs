@@ -22,8 +22,14 @@ impl Executor {
             .provenance
             .as_ref()
             .ok_or(ExecutorError("terminal_receipt_signing_unavailable"))?;
+        let reconciled = if tombstone.completed_at_ms.is_none() {
+            Some(reconcile_legacy_tombstone(&self.inner.config, tombstone)?)
+        } else {
+            None
+        };
         let completed_at_ms = tombstone
             .completed_at_ms
+            .or_else(|| reconciled.as_ref().and_then(|value| value.completed_at_ms))
             .filter(|t| *t > 0 && *t <= tombstone.terminal_expires_at_ms)
             .ok_or(ExecutorError("terminal_receipt_legacy_unavailable"))?;
         let receipt = retention::TerminalReceipt {
@@ -47,6 +53,19 @@ impl Executor {
     }
     pub fn expired_metadata(&self, id: &str) -> Result<Option<serde_json::Value>> {
         if let Some(tombstone) = self.tombstone(id)? {
+            let reconciliation = if tombstone.completed_at_ms.is_none() {
+                Some(reconcile_legacy_tombstone(&self.inner.config, &tombstone)?)
+            } else {
+                None
+            };
+            let status = if reconciliation
+                .as_ref()
+                .is_some_and(|value| value.status == ReconciliationStatus::NeedsReview)
+            {
+                "needs_review"
+            } else {
+                "content_expired"
+            };
             let completion = retention::load_purge_completion(
                 &self.inner.config.state_dir.join("purge-completed"),
                 &tombstone,
@@ -58,7 +77,8 @@ impl Executor {
             };
             return Ok(Some(
                 serde_json::json!({"job_id":id,"content_expired":true,"erasure_committed":true,
-                "erasure_complete":completion.is_some(),"purge_completion":completion,"tombstone":tombstone,"terminal_receipt":receipt,"terminal_receipt_error":receipt_error}),
+                "erasure_complete":completion.is_some(),"purge_completion":completion,"tombstone":tombstone,"terminal_receipt":receipt,"terminal_receipt_error":receipt_error,
+                "status":status,"reconciliation":reconciliation}),
             ));
         }
         let jobs = self
@@ -92,6 +112,7 @@ impl Executor {
             .lock()
             .map_err(|_| ExecutorError("executor_poisoned"))?;
         let result = (|| {
+            self.reconcile_legacy_tombstones()?;
             let pending = self
                 .inner
                 .pending_erasures
@@ -112,7 +133,10 @@ impl Executor {
                 let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
                     continue;
                 };
-                if valid_id(&id) && self.tombstone(&id)?.is_some() {
+                if valid_id(&id)
+                    && let Some(tombstone) = self.tombstone(&id)?
+                    && legacy_erasure_authorized(&self.inner.config, &tombstone)?
+                {
                     self.inner
                         .jobs
                         .lock()
@@ -203,7 +227,10 @@ impl Executor {
                 let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
                     continue;
                 };
-                if valid_id(&id) && self.tombstone(&id)?.is_some() {
+                if valid_id(&id)
+                    && let Some(tombstone) = self.tombstone(&id)?
+                    && legacy_erasure_authorized(&self.inner.config, &tombstone)?
+                {
                     fs::remove_dir_all(entry.path()).map_err(io_error)?;
                 }
             }

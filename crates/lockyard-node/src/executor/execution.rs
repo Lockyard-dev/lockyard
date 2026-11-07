@@ -616,6 +616,14 @@ impl Executor {
         if final_state == JobState::Succeeded && !status.success() {
             final_state = JobState::Failed;
         }
+        let native_limit = if matches!(runner.container.runtime, ContainerRuntime::Native) {
+            crate::native::limit_error(&job_dir, &name)
+        } else {
+            None
+        };
+        if native_limit.is_some() && final_state == JobState::Succeeded {
+            final_state = JobState::Failed;
+        }
         let key_cleanup_error =
             final_state != JobState::InterruptedUnknown && remove_runtime_key(&job_dir).is_err();
         if key_cleanup_error && final_state == JobState::Succeeded {
@@ -676,6 +684,11 @@ impl Executor {
                 record.error_code = Some("log_incomplete".into());
             } else if key_cleanup_error {
                 record.error_code = Some("runtime_key_cleanup_failed".into());
+            }
+            if let Some(code) = native_limit
+                && final_state == JobState::Failed
+            {
+                record.error_code = Some(code.into());
             }
             record.state = final_state;
             record.exit_code = status.code();

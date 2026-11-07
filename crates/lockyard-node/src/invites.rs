@@ -1100,7 +1100,10 @@ mod tests {
 
     #[test]
     fn recipient_preparation_has_private_identity_and_contains_only_public_request_data() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let state = temp.path().join("recipient");
         let output = temp.path().join("request.json");
         prepare(
@@ -1145,7 +1148,10 @@ mod tests {
 
     #[test]
     fn create_only_receipt_publication_is_atomic_between_competing_local_processes() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let path = temp.path().join("receipt");
         let winners = std::thread::scope(|scope| {
             (0..16)
@@ -1171,6 +1177,33 @@ mod tests {
     }
 
     #[test]
+    fn receipt_publication_rejects_writable_output_parents_before_creating_files() {
+        let temp = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        for mode in [0o720, 0o702, 0o777] {
+            let parent = temp.path().join(format!("parent-{mode:o}"));
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(mode)).unwrap();
+            let receipt = parent.join("receipt");
+            assert!(
+                persist(&receipt, b"private enrollment receipt")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not writable by others"),
+                "unsafe parent mode {mode:o} was not rejected"
+            );
+            assert!(!receipt.exists());
+            assert_eq!(
+                fs::read_dir(&parent).unwrap().count(),
+                0,
+                "unsafe parent mode {mode:o} received a partial file"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_invitation_ids_cannot_escape_the_private_state_directory() {
         let mut metadata = metadata();
         metadata.id = "x/../../../../bad-path-xxxx".into();
@@ -1182,7 +1215,10 @@ mod tests {
 
     #[test]
     fn an_expired_ticket_or_wrong_recipient_never_creates_a_claim_or_workspace_key() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let state = temp.path().join("recipient");
         let request_path = temp.path().join("request");
         prepare(

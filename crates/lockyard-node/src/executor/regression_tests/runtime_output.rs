@@ -214,6 +214,9 @@ fn ambiguous_inspection_error_does_not_confirm_container_stop() {
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
     let profile = ContainerProfile {
         runtime: ContainerRuntime::Docker,
+        cgroup_root: None,
+        native_rootfs: None,
+        native_network_program: None,
         runtime_program: runtime,
         image: "fixture:image".into(),
         supply_chain: None,

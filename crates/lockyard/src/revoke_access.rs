@@ -171,7 +171,6 @@ pub(crate) fn execute(
         ));
     }
     let directory = root.join(".lockyard/private-revocations");
-    private_directory(&directory)?;
     let trust_path = directory.join(format!("trust-{}.json", digest(url.as_bytes())));
     let trust = if let Some(trust) = node_trust {
         trust
@@ -203,6 +202,7 @@ pub(crate) fn execute(
             peers,
         ));
     }
+    private_directory(&directory)?;
     let mut client = crate::open::direct_client(&url)?;
     if let Some(path) = node_config.as_deref() {
         let node = lockyard_node::host::NodeConfig::load(path)

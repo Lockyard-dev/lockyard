@@ -236,6 +236,9 @@ os.execve('/usr/bin/git',['git']+a[a.index('fixture:image')+1:],os.environ)
     (
         ContainerProfile {
             runtime: ContainerRuntime::Docker,
+            cgroup_root: None,
+            native_rootfs: None,
+            native_network_program: None,
             runtime_program: runtime,
             image: "fixture:image".into(),
             supply_chain: None,
@@ -279,3 +282,5 @@ impl Write for FailingWriter {
         Ok(())
     }
 }
+
+mod legacy_tombstones;

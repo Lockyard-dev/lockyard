@@ -79,6 +79,7 @@ fn assert_missing_trust_refuses_without_bootstrap(surface: Option<&str>) {
                 .as_str()
                 .is_some_and(|hint| hint.contains("lockyard node revocation-trust"))
             && !trust_path.exists()
+            && !root.path().join(".lockyard/private-revocations").exists()
             && requests.is_empty()
             && server.posts.lock().unwrap().is_empty()
             && (surface.is_some() || exit == 1),
