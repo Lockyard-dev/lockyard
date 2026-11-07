@@ -126,7 +126,10 @@ fn specs(root: &Path, client: &str, home: &Path, codex_home: Option<&Path>) -> R
             path: codex_home
                 .map_or_else(|| home.join(".codex"), Path::to_path_buf)
                 .join("config.toml"),
-            entries: vec![entry(&["mcp_servers", "lockyard"], server)],
+            entries: vec![entry(
+                &["mcp_servers", "lockyard"],
+                json!({"command":"lockyard", "args":["mcp"], "env_vars":["LOCKYARD_AGENT", "LOCKYARD_URL", "LOCKYARD_TOKEN_FILE", "LOCKYARD_TOKEN", "LOCKYARD_NODE_CONFIG", "XDG_CONFIG_HOME", "LOCKYARD_REQUIRE_E2EE", "LOCKYARD_E2EE_WORKSPACE_ID"]}),
+            )],
             toml: true,
         }]),
         _ => Err(invalid("client must be claude, codex or cursor")),
@@ -277,7 +280,53 @@ fn insert_entry(value: &mut Value, item: &Entry) -> Result<bool> {
     Ok(true)
 }
 
-const TOML_BLOCK: &str = "# BEGIN LOCKYARD MANAGED MCP\n[mcp_servers.lockyard]\ncommand = \"lockyard\"\nargs = [\"mcp\"]\n# END LOCKYARD MANAGED MCP\n";
+const LEGACY_TOML_BLOCK: &str = "# BEGIN LOCKYARD MANAGED MCP\n[mcp_servers.lockyard]\ncommand = \"lockyard\"\nargs = [\"mcp\"]\n# END LOCKYARD MANAGED MCP\n";
+const AGENT_ONLY_TOML_BLOCK: &str = "# BEGIN LOCKYARD MANAGED MCP\n[mcp_servers.lockyard]\ncommand = \"lockyard\"\nargs = [\"mcp\"]\nenv_vars = [\"LOCKYARD_AGENT\"]\n# END LOCKYARD MANAGED MCP\n";
+const CLOUD_TOML_BLOCK: &str = "# BEGIN LOCKYARD MANAGED MCP\n[mcp_servers.lockyard]\ncommand = \"lockyard\"\nargs = [\"mcp\"]\nenv_vars = [\"LOCKYARD_AGENT\", \"LOCKYARD_URL\", \"LOCKYARD_TOKEN_FILE\", \"LOCKYARD_TOKEN\"]\n# END LOCKYARD MANAGED MCP\n";
+const TOML_BLOCK: &str = "# BEGIN LOCKYARD MANAGED MCP\n[mcp_servers.lockyard]\ncommand = \"lockyard\"\nargs = [\"mcp\"]\nenv_vars = [\"LOCKYARD_AGENT\", \"LOCKYARD_URL\", \"LOCKYARD_TOKEN_FILE\", \"LOCKYARD_TOKEN\", \"LOCKYARD_NODE_CONFIG\", \"XDG_CONFIG_HOME\", \"LOCKYARD_REQUIRE_E2EE\", \"LOCKYARD_E2EE_WORKSPACE_ID\"]\n# END LOCKYARD MANAGED MCP\n";
+
+fn legacy_codex_entry() -> Entry {
+    entry(
+        &["mcp_servers", "lockyard"],
+        json!({"command":"lockyard", "args":["mcp"]}),
+    )
+}
+
+fn legacy_codex_versions() -> [(&'static str, Entry); 3] {
+    [
+        (LEGACY_TOML_BLOCK, legacy_codex_entry()),
+        (
+            CLOUD_TOML_BLOCK,
+            entry(
+                &["mcp_servers", "lockyard"],
+                json!({"command":"lockyard", "args":["mcp"], "env_vars":["LOCKYARD_AGENT", "LOCKYARD_URL", "LOCKYARD_TOKEN_FILE", "LOCKYARD_TOKEN"]}),
+            ),
+        ),
+        (
+            AGENT_ONLY_TOML_BLOCK,
+            entry(
+                &["mcp_servers", "lockyard"],
+                json!({"command":"lockyard", "args":["mcp"], "env_vars":["LOCKYARD_AGENT"]}),
+            ),
+        ),
+    ]
+}
+
+fn supported_ownership(spec: &Spec, owned: &Manifest) -> bool {
+    if spec.toml {
+        (owned.entries == spec.entries && owned.toml_block.as_deref() == Some(TOML_BLOCK))
+            || legacy_codex_versions().iter().any(|(block, entry)| {
+                owned.entries.as_slice() == std::slice::from_ref(entry)
+                    && owned.toml_block.as_deref() == Some(*block)
+            })
+    } else {
+        owned.toml_block.is_none()
+            && owned
+                .entries
+                .iter()
+                .all(|entry| spec.entries.contains(entry))
+    }
+}
 
 struct Planned {
     bytes: Vec<u8>,
@@ -293,13 +342,7 @@ fn plan(
     action: SetupAction,
 ) -> Result<Planned> {
     let mut ownership = Manifest::empty();
-    if let Some(owned) = owned
-        && (owned
-            .entries
-            .iter()
-            .any(|entry| !spec.entries.contains(entry))
-            || (owned.toml_block.is_some() && owned.toml_block.as_deref() != Some(TOML_BLOCK)))
-    {
+    if owned.is_some_and(|owned| !supported_ownership(spec, owned)) {
         return Err(invalid(
             "ownership manifest contains unsupported entries; preserving configuration",
         ));
@@ -321,7 +364,20 @@ fn plan(
             });
         }
         let mut next = source.to_string();
+        let legacy_versions = legacy_codex_versions();
         if let Some(block) = owned.and_then(|owned| owned.toml_block.as_ref()) {
+            // The receipt is persisted before the configuration. A process interrupted during
+            // an upgrade can therefore leave a current receipt beside the exact legacy block.
+            let block = if block == TOML_BLOCK && !next.contains(TOML_BLOCK) {
+                legacy_versions
+                    .iter()
+                    .find(|(block, entry)| {
+                        next.matches(block).count() == 1 && contains(&value, entry)
+                    })
+                    .map_or(block.as_str(), |(block, _)| *block)
+            } else {
+                block.as_str()
+            };
             if !next.contains(block)
                 && !next.contains("# BEGIN LOCKYARD MANAGED MCP")
                 && locate(&value, &spec.entries[0].path).is_none()
@@ -336,7 +392,15 @@ fn plan(
                     ownership.toml_block = Some(TOML_BLOCK.into());
                     ownership.entries = spec.entries.clone();
                 }
-            } else if next.matches(block).count() != 1 {
+            } else if next.matches(block).count() != 1
+                || !contains(
+                    &value,
+                    legacy_versions
+                        .iter()
+                        .find(|(legacy, _)| *legacy == block)
+                        .map_or(&spec.entries[0], |(_, entry)| entry),
+                )
+            {
                 return Err(invalid(
                     "managed TOML block changed; preserving configuration",
                 ));
@@ -941,6 +1005,144 @@ mod tests {
             true
         );
         assert_eq!(fs::read_to_string(path).unwrap(), user);
+    }
+
+    #[test]
+    fn legacy_codex_receipt_upgrades_without_claiming_other_configuration() {
+        for (legacy_block, legacy_entry) in legacy_codex_versions() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(".codex/config.toml");
+            fs::create_dir(path.parent().unwrap()).unwrap();
+            let user =
+                "# Keep this comment\nmodel = 'my-model'\n[mcp_servers.other]\ncommand = 'other'\n";
+            let original = format!("{user}{legacy_block}");
+            fs::write(&path, &original).unwrap();
+            let mut receipt = Manifest::empty();
+            receipt.entries = vec![legacy_entry];
+            receipt.toml_block = Some(legacy_block.into());
+            let original_receipt = serde_json::to_vec(&receipt).unwrap();
+            fs::write(sidecar(&path), &original_receipt).unwrap();
+
+            assert_eq!(
+                setup_at(dir.path(), "codex", SetupAction::Check, dir.path()).unwrap()["ok"],
+                false
+            );
+            let preview = setup_at(dir.path(), "codex", SetupAction::Preview, dir.path()).unwrap();
+            assert_eq!(preview["ok"], true);
+            assert_eq!(preview["files"][0]["would_change"], true);
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert_eq!(fs::read(sidecar(&path)).unwrap(), original_receipt);
+
+            assert_eq!(
+                setup_at(dir.path(), "codex", SetupAction::Apply, dir.path()).unwrap()["ok"],
+                true
+            );
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                format!("{user}{TOML_BLOCK}")
+            );
+            let upgraded = manifest(&path).unwrap().unwrap();
+            assert_eq!(upgraded.toml_block.as_deref(), Some(TOML_BLOCK));
+            assert_eq!(
+                upgraded.entries[0].value["env_vars"],
+                json!([
+                    "LOCKYARD_AGENT",
+                    "LOCKYARD_URL",
+                    "LOCKYARD_TOKEN_FILE",
+                    "LOCKYARD_TOKEN",
+                    "LOCKYARD_NODE_CONFIG",
+                    "XDG_CONFIG_HOME",
+                    "LOCKYARD_REQUIRE_E2EE",
+                    "LOCKYARD_E2EE_WORKSPACE_ID"
+                ])
+            );
+            assert_eq!(
+                setup_at(dir.path(), "codex", SetupAction::Check, dir.path()).unwrap()["ok"],
+                true
+            );
+            let repeated = setup_at(dir.path(), "codex", SetupAction::Apply, dir.path()).unwrap();
+            assert_eq!(repeated["files"][0]["would_change"], false);
+            assert_eq!(
+                setup_at(dir.path(), "codex", SetupAction::Remove, dir.path()).unwrap()["ok"],
+                true
+            );
+            assert_eq!(fs::read_to_string(path).unwrap(), user);
+        }
+    }
+
+    #[test]
+    fn interrupted_codex_upgrade_can_resume_from_the_exact_legacy_block() {
+        for (legacy_block, _) in legacy_codex_versions() {
+            let dir = tempfile::tempdir().unwrap();
+            let spec = specs(dir.path(), "codex", dir.path(), None)
+                .unwrap()
+                .remove(0);
+            fs::create_dir(spec.path.parent().unwrap()).unwrap();
+            fs::write(&spec.path, legacy_block).unwrap();
+            let mut receipt = Manifest::empty();
+            receipt.entries = spec.entries.clone();
+            receipt.toml_block = Some(TOML_BLOCK.into());
+            fs::write(sidecar(&spec.path), serde_json::to_vec(&receipt).unwrap()).unwrap();
+
+            let report = setup_at(dir.path(), "codex", SetupAction::Apply, dir.path()).unwrap();
+            assert_eq!(report["ok"], true);
+            assert_eq!(fs::read_to_string(spec.path).unwrap(), TOML_BLOCK);
+        }
+    }
+
+    #[test]
+    fn codex_upgrade_refuses_modified_entries_and_receipts() {
+        for (legacy_block, legacy_entry) in legacy_codex_versions() {
+            for current_receipt in [false, true] {
+                for change in ["command", "outside_block", "receipt"] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join(".codex/config.toml");
+                    fs::create_dir(path.parent().unwrap()).unwrap();
+                    let original = match change {
+                        "command" => {
+                            legacy_block.replace("command = \"lockyard\"", "command = \"custom\"")
+                        }
+                        "outside_block" => {
+                            format!("{legacy_block}env = {{ CUSTOM_AGENT = \"custom\" }}\n")
+                        }
+                        _ => legacy_block.to_string(),
+                    };
+                    fs::write(&path, &original).unwrap();
+                    let mut receipt = Manifest::empty();
+                    receipt.entries = if current_receipt {
+                        specs(dir.path(), "codex", dir.path(), None)
+                            .unwrap()
+                            .remove(0)
+                            .entries
+                    } else {
+                        vec![legacy_entry.clone()]
+                    };
+                    receipt.toml_block = Some(
+                        if current_receipt {
+                            TOML_BLOCK
+                        } else {
+                            legacy_block
+                        }
+                        .into(),
+                    );
+                    if change == "receipt" {
+                        receipt.entries[0].value["command"] = json!("custom");
+                    }
+                    let original_receipt = serde_json::to_vec(&receipt).unwrap();
+                    fs::write(sidecar(&path), &original_receipt).unwrap();
+                    for action in [
+                        SetupAction::Preview,
+                        SetupAction::Apply,
+                        SetupAction::Remove,
+                    ] {
+                        let report = setup_at(dir.path(), "codex", action, dir.path()).unwrap();
+                        assert_eq!(report["ok"], false, "{current_receipt} {change} {action:?}");
+                        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+                        assert_eq!(fs::read(sidecar(&path)).unwrap(), original_receipt);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

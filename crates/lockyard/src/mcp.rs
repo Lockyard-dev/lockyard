@@ -196,6 +196,120 @@ fn tools() -> Vec<Value> {
     let step = || json!({"id": int, "if_version": int, "reason": text});
     vec![
         tool_def(
+            "node_status",
+            "Inspect the local node service",
+            json!({"config":text}),
+            &[],
+        ),
+        tool_def(
+            "node_list",
+            "List the Cloud node directory when a relay is configured, otherwise configured peers",
+            json!({"config":text}),
+            &[],
+        ),
+        tool_def(
+            "node_ping",
+            "Ping a configured node",
+            json!({"config":text,"target":text}),
+            &["target"],
+        ),
+        tool_def(
+            "node_describe",
+            "Read encrypted node labels, configured resource budget, profiles and load",
+            json!({"config":text,"target":text}),
+            &["target"],
+        ),
+        tool_def(
+            "workflow_inputs",
+            "Read typed predecessor result references for this job; fetch patches explicitly",
+            json!({}),
+            &[],
+        ),
+        tool_def(
+            "flow_submit",
+            "Durably submit a distributed DAG with an explicit stable workflow ULID",
+            json!({"config":text,"definition":object}),
+            &["definition"],
+        ),
+        tool_def(
+            "flow_status",
+            "Inspect one distributed workflow without prompts or arguments",
+            json!({"config":text,"id":text}),
+            &["id"],
+        ),
+        tool_def(
+            "flow_list",
+            "List a bounded page of private local distributed workflow summaries",
+            json!({"config":text,"offset":int,"limit":int}),
+            &[],
+        ),
+        tool_def(
+            "flow_cancel",
+            "Request cancellation of one workflow; unknown execution requires reconciliation",
+            json!({"config":text,"id":text}),
+            &["id"],
+        ),
+        tool_def(
+            "flow_approval_request",
+            "Read an exact frozen external-action request after verified predecessor results",
+            json!({"config":text,"id":text,"step":text}),
+            &["id", "step"],
+        ),
+        tool_def(
+            "flow_approval_attach",
+            "Attach a separately signed owner approval to one frozen step before first dispatch",
+            json!({"config":text,"id":text,"step":text,"definition_sha256":text,"approval":object}),
+            &["id", "step", "definition_sha256", "approval"],
+        ),
+        tool_def(
+            "job_receipts",
+            "List private local submission receipts",
+            json!({"config":text}),
+            &[],
+        ),
+        tool_def(
+            "job_receipt",
+            "Inspect a private local submission receipt",
+            json!({"config":text,"job_id":text}),
+            &["job_id"],
+        ),
+        tool_def(
+            "job_submit",
+            "Submit using a stable job ID; query the same ID if the outcome is unknown",
+            json!({"config":text,"target":text,"id":text,"repository":text,"revision":text,"runner":text,"arguments":names,"prompt":text,"timeout_seconds":int,"priority":int,"owner_approval":object}),
+            &["target", "id", "repository", "runner"],
+        ),
+        tool_def(
+            "job_status",
+            "Inspect a job",
+            json!({"config":text,"target":text,"job_id":text}),
+            &["target", "job_id"],
+        ),
+        tool_def(
+            "job_cancel",
+            "Cancel a job",
+            json!({"config":text,"target":text,"job_id":text}),
+            &["target", "job_id"],
+        ),
+        tool_def(
+            "job_logs",
+            "Read a bounded log chunk",
+            json!({"config":text,"target":text,"job_id":text,"offset":int,"limit":int}),
+            &["target", "job_id"],
+        ),
+        tool_def(
+            "job_patch",
+            "Download a retained Git patch to a new private local file",
+            json!({"config":text,"target":text,"job_id":text,"output":text}),
+            &["target", "job_id", "output"],
+        ),
+        tool_def(
+            "job_resolve_unknown",
+            "Resolve an interrupted job after operator review",
+            json!({"config":text,"target":text,"job_id":text}),
+            &["target", "job_id"],
+        ),
+        tool_def(
             "workflow_run",
             "Execute an explicit resumable plan; partial and uncertain writes are reported per step, never an atomic transaction",
             json!({"operation_id":text,"plan":object}),
@@ -582,7 +696,9 @@ fn call_tool(params: &Value, agent: Option<&str>, cwd: &Path) -> (Value, Option<
             tool_result(format!("{MAIL_WARNING}\n{result}"), false)
         }
         Ok(result) => {
-            let failed = name == "workflow_run" && result["ok"] != true;
+            let failed = (name == "workflow_run" && result["ok"] != true)
+                || result.get("ok") == Some(&Value::Bool(false))
+                || result.pointer("/reply/ok") == Some(&Value::Bool(false));
             tool_result(result.to_string(), failed)
         }
         Err(error) => tool_result(error.to_string(), true),
@@ -755,6 +871,180 @@ fn session_state(text: Option<String>) -> Result<Option<SessionState>> {
     .transpose()
 }
 
+#[cfg(not(unix))]
+fn node_tool(_name: &str, _args: Args<'_>) -> Result<Value> {
+    Err(Error::Invalid(
+        "remote node orchestration requires a Unix host; this platform supports the existing coordination tools".into(),
+    ))
+}
+
+#[cfg(unix)]
+fn node_tool(name: &str, args: Args<'_>) -> Result<Value> {
+    use lockyard_node::wire::{self, JobSpec, Operation};
+    use std::path::PathBuf;
+    let config = args.some_text("config")?.map(PathBuf::from);
+    if name == "workflow_inputs" {
+        let path = std::env::var_os("LOCKYARD_WORKFLOW_INPUTS_FILE")
+            .ok_or_else(|| Error::Invalid("this job has no workflow input context".into()))?;
+        return encode(
+            &lockyard_node::workflow::read_context(std::path::Path::new(&path)).map_err(|_| {
+                Error::Invalid("workflow input context is unavailable or invalid".into())
+            })?,
+        );
+    }
+    if name.starts_with("flow_") {
+        use lockyard_node::workflow::WorkflowControl;
+        let request = match name {
+            "flow_submit" => WorkflowControl::Submit {
+                definition: serde_json::from_value(
+                    args.get("definition")
+                        .cloned()
+                        .ok_or_else(|| wrong_type("definition", "an object"))?,
+                )
+                .map_err(|_| Error::Invalid("invalid distributed workflow definition".into()))?,
+            },
+            "flow_status" => WorkflowControl::Status {
+                id: args.text("id")?.into(),
+            },
+            "flow_list" => WorkflowControl::List {
+                offset: usize::try_from(args.some_int("offset")?.unwrap_or(0))
+                    .map_err(|_| Error::Invalid("offset must be nonnegative".into()))?,
+                limit: usize::try_from(args.some_int("limit")?.unwrap_or(100))
+                    .ok()
+                    .filter(|limit| (1..=100).contains(limit))
+                    .ok_or_else(|| Error::Invalid("limit must be 1..100".into()))?,
+            },
+            "flow_cancel" => WorkflowControl::Cancel {
+                id: args.text("id")?.into(),
+            },
+            "flow_approval_request" => WorkflowControl::ApprovalRequest {
+                id: args.text("id")?.into(),
+                step: args.text("step")?.into(),
+            },
+            "flow_approval_attach" => WorkflowControl::ApprovalAttach {
+                id: args.text("id")?.into(),
+                step: args.text("step")?.into(),
+                definition_sha256: args.text("definition_sha256")?.into(),
+                approval: serde_json::from_value(
+                    args.get("approval")
+                        .cloned()
+                        .ok_or_else(|| wrong_type("approval", "an object"))?,
+                )
+                .map_err(|_| Error::Invalid("invalid signed owner approval".into()))?,
+            },
+            _ => {
+                return Err(Error::Invalid(
+                    "unknown distributed workflow operation".into(),
+                ));
+            }
+        };
+        return crate::node_cli::workflow_control(config, request);
+    }
+    if name == "node_status" {
+        return crate::node_cli::node(crate::node_cli::NodeCommand::Status { config });
+    }
+    if name == "node_list" {
+        return crate::node_cli::node(crate::node_cli::NodeCommand::List { config });
+    }
+    if name == "job_receipts" {
+        return crate::node_cli::receipts(config, None);
+    }
+    if name == "job_receipt" {
+        return crate::node_cli::receipts(config, Some(args.text("job_id")?));
+    }
+    let target = args.text("target")?;
+    if name == "node_ping" {
+        return crate::node_cli::rpc(config, target, Operation::NodePing, Value::Null);
+    }
+    if name == "node_describe" {
+        return crate::node_cli::rpc(
+            config,
+            target,
+            Operation::NodePing,
+            json!({"describe":true}),
+        );
+    }
+    if name == "job_submit" {
+        let id = args.text("id")?.to_string();
+        if !wire::valid_ulid(&id) {
+            return Err(Error::Invalid("job ID must be a ULID".into()));
+        }
+        let arguments = match args.get("arguments") {
+            None => Vec::new(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| Error::Invalid("arguments must contain strings".into()))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            _ => return Err(Error::Invalid("arguments must be an array".into())),
+        };
+        let timeout_seconds = args
+            .some_int("timeout_seconds")?
+            .map(|n| {
+                u64::try_from(n)
+                    .map_err(|_| Error::Invalid("timeout_seconds must be positive".into()))
+            })
+            .transpose()?;
+        let spec = JobSpec {
+            id,
+            repository: args.text("repository")?.into(),
+            revision: args.some_text("revision")?.unwrap_or_else(|| "HEAD".into()),
+            runner: args.text("runner")?.into(),
+            arguments,
+            prompt: args.some_text("prompt")?,
+            timeout_seconds,
+            priority: i16::try_from(args.some_int("priority")?.unwrap_or(0))
+                .ok()
+                .filter(|priority| lockyard_node::scheduler::valid_priority(*priority))
+                .ok_or_else(|| Error::Invalid("priority must be between -20 and 20".into()))?,
+            workflow_inputs: Vec::new(),
+            expected_runner_sha256: None,
+            owner_approval: args
+                .get("owner_approval")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| Error::Invalid("invalid owner approval document".into()))?,
+        };
+        return Ok(crate::node_cli::submit(config, target, spec));
+    }
+    let job_id = args.text("job_id")?;
+    if name == "job_patch" {
+        return crate::node_cli::patch(
+            config,
+            target,
+            job_id,
+            std::path::Path::new(args.text("output")?),
+        );
+    }
+    let operation = match name {
+        "job_status" => Operation::JobStatus,
+        "job_cancel" => Operation::JobCancel,
+        "job_logs" => Operation::JobLog,
+        "job_resolve_unknown" => Operation::JobResolveUnknown,
+        _ => return Err(Error::Invalid("unknown tool".into())),
+    };
+    let payload = if name == "job_logs" {
+        let offset = u64::try_from(args.some_int("offset")?.unwrap_or(0))
+            .map_err(|_| Error::Invalid("invalid log offset".into()))?;
+        let limit = u32::try_from(
+            args.some_int("limit")?
+                .unwrap_or(i64::from(wire::DEFAULT_LOG_BYTES)),
+        )
+        .map_err(|_| Error::Invalid("invalid log limit".into()))?;
+        if limit == 0 || limit > wire::MAX_LOG_BYTES {
+            return Err(Error::Invalid("invalid log limit".into()));
+        }
+        json!({"job_id":job_id,"offset":offset,"limit":limit})
+    } else {
+        json!({"job_id":job_id})
+    };
+    crate::node_cli::rpc(config, target, operation, payload)
+}
+
 fn run_tool(
     name: &str,
     args: Args<'_>,
@@ -762,6 +1052,16 @@ fn run_tool(
     cwd: &Path,
     after: &mut Option<After>,
 ) -> Result<Value> {
+    if name == "node_status"
+        || name == "node_list"
+        || name == "node_ping"
+        || name == "node_describe"
+        || name == "workflow_inputs"
+        || name.starts_with("flow_")
+        || name.starts_with("job_")
+    {
+        return node_tool(name, args);
+    }
     let now = crate::now_ms();
     let mut opened = open(cwd, agent)?;
     let me = || {

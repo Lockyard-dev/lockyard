@@ -847,7 +847,11 @@ fn remove_pause_record(pgid: i32) {
 }
 
 fn recover_paused_groups() {
-    let Ok(entries) = fs::read_dir(pause_dir()) else {
+    recover_paused_groups_from(&pause_dir());
+}
+
+fn recover_paused_groups_from(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
     for entry in entries.flatten() {
@@ -1232,21 +1236,63 @@ mod recovery_tests {
         command.spawn().unwrap()
     }
 
-    fn is_stopped(pid: i32) -> bool {
-        let mut status = 0;
-        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
-        result == pid && status & 0xff == 0x7f
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let pid = self.0.id() as i32;
+            let _ = resume_group(pid);
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn process_state(pid: i32) -> Option<char> {
+        #[cfg(target_os = "linux")]
+        {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            stat.rsplit_once(") ")?.1.chars().next()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let output = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            String::from_utf8(output.stdout).ok()?.trim().chars().next()
+        }
+    }
+
+    fn wait_for_state(pid: i32, stopped: bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = process_state(pid).expect("the owned test child must remain alive");
+            assert!(
+                !matches!(state, 'Z' | 'X'),
+                "the owned test child must not exit"
+            );
+            if matches!(state, 'T' | 't') == stopped {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the owned child did not reach the expected state"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
     }
 
     #[test]
     fn recovery_resumes_a_group_only_when_its_start_time_matches() {
-        let mut child = child_group();
-        let pid = child.id() as i32;
+        let child = OwnedChild(child_group());
+        let pid = child.0.id() as i32;
         let group_start = process_start_time(pid).unwrap();
         pause_group(pid).unwrap();
-        let dir = pause_dir();
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{pid}.json"));
+        wait_for_state(pid, true);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{pid}.json"));
         let record = PauseRecord {
             owner_pid: i32::MAX,
             owner_start: "gone".into(),
@@ -1255,10 +1301,12 @@ mod recovery_tests {
             paused_at_ms: now_ms(),
         };
         fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
-        recover_paused_groups();
-        assert!(!is_stopped(pid));
+        recover_paused_groups_from(dir.path());
+        wait_for_state(pid, false);
+        assert!(!path.exists());
 
         pause_group(pid).unwrap();
+        wait_for_state(pid, true);
         let reused = PauseRecord {
             owner_pid: i32::MAX,
             owner_start: "gone".into(),
@@ -1267,15 +1315,16 @@ mod recovery_tests {
             paused_at_ms: now_ms(),
         };
         fs::write(&path, serde_json::to_vec(&reused).unwrap()).unwrap();
-        recover_paused_groups();
-        assert!(
-            is_stopped(pid),
-            "a mismatched process start time must never be signalled"
-        );
-        resume_group(pid).unwrap();
-        let _ = fs::remove_file(path);
-        let _ = child.kill();
-        let _ = child.wait();
+        recover_paused_groups_from(dir.path());
+        let until = std::time::Instant::now() + Duration::from_millis(100);
+        while std::time::Instant::now() < until {
+            assert!(
+                matches!(process_state(pid), Some('T' | 't')),
+                "a mismatched process start time must never be signalled"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!path.exists());
     }
 
     #[test]

@@ -5,6 +5,8 @@ mod context;
 mod guard;
 mod hook;
 mod mcp;
+#[cfg(unix)]
+mod node_cli;
 mod onboarding;
 mod open;
 mod workflow;
@@ -132,6 +134,14 @@ enum Command {
     /// Execute or inspect explicit resumable coordination steps.
     #[command(subcommand)]
     Workflow(WorkflowCommand),
+    /// Manage a remote orchestration node.
+    #[cfg(unix)]
+    #[command(subcommand)]
+    Node(node_cli::NodeCommand),
+    /// Submit and inspect remote jobs.
+    #[cfg(unix)]
+    #[command(subcommand)]
+    Job(node_cli::JobCommand),
     /// Run the MCP server over standard input and output.
     Mcp,
 }
@@ -2253,7 +2263,7 @@ fn setup(client: SetupClient) -> String {
             format!("Add to .mcp.json:\n{server}"),
         ],
         SetupClient::Codex => vec![
-            "Add to ~/.codex/config.toml:\n[mcp_servers.lockyard]\ncommand = \"lockyard\"\nargs = [\"mcp\"]"
+            "Add to ~/.codex/config.toml:\n[mcp_servers.lockyard]\ncommand = \"lockyard\"\nargs = [\"mcp\"]\nenv_vars = [\"LOCKYARD_AGENT\", \"LOCKYARD_URL\", \"LOCKYARD_TOKEN_FILE\", \"LOCKYARD_TOKEN\", \"LOCKYARD_NODE_CONFIG\", \"XDG_CONFIG_HOME\", \"LOCKYARD_REQUIRE_E2EE\", \"LOCKYARD_E2EE_WORKSPACE_ID\"]"
                 .to_string(),
         ],
         SetupClient::Cursor => vec![format!("Add to .cursor/mcp.json:\n{server}")],
@@ -2520,8 +2530,26 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             }
             Ok(result)
         }
+        #[cfg(unix)]
+        Command::Node(command) => node_output(node_cli::node(command)?),
+        #[cfg(unix)]
+        Command::Job(command) => node_output(node_cli::job(command)?),
         Command::Mcp => output(&Value::Null, ""),
     }
+}
+
+#[cfg(unix)]
+fn node_output(data: Value) -> Result<Output> {
+    let failed = data.get("ok") == Some(&Value::Bool(false))
+        || data.pointer("/reply/ok") == Some(&Value::Bool(false));
+    let mut out = output(
+        &data,
+        serde_json::to_string_pretty(&data).unwrap_or_default(),
+    )?;
+    if failed {
+        out.exit = EXIT_FAILURE;
+    }
+    Ok(out)
 }
 
 fn current_dir() -> Result<PathBuf> {

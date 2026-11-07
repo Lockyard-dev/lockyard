@@ -1,6 +1,6 @@
 # Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 [workspace]
-members = ["crates/lockyard", "crates/lockyard-core", "crates/lockyard-cloud-client"]
+members = ["crates/lockyard", "crates/lockyard-core", "crates/lockyard-cloud-client", "crates/lockyard-node"]
 resolver = "3"
 
 [workspace.package]
@@ -14,6 +14,7 @@ description = "Coordination for coding agents: a shared bus, work zones and task
 [workspace.dependencies]
 lockyard-core = { path = "crates/lockyard-core", version = "0.0.1" }
 lockyard-cloud-client = { path = "crates/lockyard-cloud-client", version = "0.0.1" }
+lockyard-node = { path = "crates/lockyard-node", version = "0.0.1" }
 clap = { version = "4.6", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -22,6 +23,7 @@ toml = "0.8"
 ureq = { version = "2.12", default-features = false, features = ["tls", "json"] }
 tempfile = "3"
 libc = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 
 [profile.release]
 lto = "thin"

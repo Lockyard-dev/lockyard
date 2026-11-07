@@ -23,7 +23,8 @@ python3 -m pip install lockyard
 
 `lockyard setup claude`, `lockyard setup codex` and `lockyard setup cursor` print configuration snippets for MCP; the
 Claude setup also prints the edit hook settings. Set `LOCKYARD_AGENT` to a unique name for each agent. The MCP server
-starts with `lockyard mcp` and communicates over standard input and output.
+starts with `lockyard mcp` and communicates over standard input and output. The Codex configuration forwards
+the agent identity and configured Cloud URL/token variables; export them before starting Codex.
 
 ## Zones
 

@@ -166,6 +166,25 @@ fn codex_install_uses_isolated_home_and_keeps_toml_comments() {
         &["setup", "codex", "--apply", "--json"],
     );
     assert!(fs::read_to_string(&path).unwrap().starts_with(original));
+    let installed: toml::Value = fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert_eq!(
+        installed["mcp_servers"]["lockyard"]["env_vars"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "LOCKYARD_AGENT",
+            "LOCKYARD_URL",
+            "LOCKYARD_TOKEN_FILE",
+            "LOCKYARD_TOKEN",
+            "LOCKYARD_NODE_CONFIG",
+            "XDG_CONFIG_HOME",
+            "LOCKYARD_REQUIRE_E2EE",
+            "LOCKYARD_E2EE_WORKSPACE_ID"
+        ]
+    );
     ok(
         project.path(),
         home.path(),

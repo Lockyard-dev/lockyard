@@ -21,6 +21,18 @@ use the current directory. Codex and Cursor setup currently install MCP only;
 they do not claim that edit hooks are activated. Claude setup merges the supported
 edit/tool hooks. Reload the coding client after configuration changes.
 
+Export `LOCKYARD_AGENT` with a unique name before starting each coding client.
+Codex's managed MCP entry forwards `LOCKYARD_AGENT`, `LOCKYARD_URL`,
+`LOCKYARD_TOKEN_FILE`, `LOCKYARD_TOKEN`, `LOCKYARD_NODE_CONFIG`, `XDG_CONFIG_HOME`,
+`LOCKYARD_REQUIRE_E2EE` and `LOCKYARD_E2EE_WORKSPACE_ID` from the client environment
+to the Lockyard process. This preserves node configuration, the selected local
+key store and an already-required encryption policy. Cloud mode requires the trusted URL and either token source;
+prefer a private token file. Setup stores these variable names, never their
+values. Existing unchanged managed Codex
+entries upgrade with `lockyard setup codex --apply`; `--check` reports the older
+entry as missing until it is upgraded. Customized entries are preserved and
+reported as conflicts.
+
 Preview reports intended file changes and conflicts without writing or showing
 existing configuration values. Apply preserves unrelated MCP entries, settings,
 hooks and TOML comments. A different existing `lockyard` server is a conflict:

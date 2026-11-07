@@ -3,29 +3,73 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt, clippy
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-  packages:
-    runs-on: ubuntu-latest
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+      - name: Require E2EE from the actual MCP subprocess
+        run: |
+          cargo build --locked -p lockyard
+          python3 tools/ci/required-e2ee-mcp.py --binary target/debug/lockyard
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - run: cargo build --locked -p lockyard
+      - run: ./target/debug/lockyard.exe about
+  node-containers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Require a local runtime with CPU, memory and process limits
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime="$(command -v docker)"
+          controls="$(env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH "$runtime" --host=unix:///var/run/docker.sock info --format '{{.MemoryLimit}} {{.CPUCfsQuota}} {{.PidsLimit}}')"
+          test "$controls" = 'true true true'
+          echo "LOCKYARD_NODE_EXECUTOR_RUNTIME=$runtime" >> "$GITHUB_ENV"
+      - name: Build the local executor fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker_local() {
+            env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH "$LOCKYARD_NODE_EXECUTOR_RUNTIME" --host=unix:///var/run/docker.sock "$@"
+          }
+          docker_local build -f tools/ci/node-executor.Dockerfile -t lockyard-node-ci:fixture tools/ci
+          fixture="$(docker_local image inspect lockyard-node-ci:fixture --format '{{.Id}}')"
+          echo "LOCKYARD_NODE_EXECUTOR_IMAGE=$fixture" >> "$GITHUB_ENV"
+      - name: Exercise every real-container executor case
+        run: cargo test --locked -p lockyard-node --test executor -- --include-ignored --test-threads=1
+  packages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - run: node --test packages/npm/test/*.test.js
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - run: python -m unittest discover -s packages/pypi/tests
