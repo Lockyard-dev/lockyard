@@ -42,6 +42,18 @@ pub trait Backend {
     fn agents(&self) -> Result<Vec<AgentSeen>>;
 
     fn claim(&mut self, agent: &str, request: &ClaimRequest, now: i64) -> Result<Claim>;
+    /// Creation is an outcome of this write, never a property of a stored claim.
+    /// Legacy cloud backends cannot distinguish creation from server-side reuse.
+    fn claim_with_creation_status(
+        &mut self,
+        agent: &str,
+        request: &ClaimRequest,
+        now: i64,
+    ) -> Result<(Claim, Option<bool>)> {
+        let created = (!self.is_cloud()).then_some(true);
+        self.claim(agent, request, now)
+            .map(|claim| (claim, created))
+    }
     fn renew(
         &mut self,
         agent: &str,
@@ -416,6 +428,25 @@ pub fn claim_or_reuse_with_status(
     request: &ClaimRequest,
     now: i64,
 ) -> Result<(Claim, bool)> {
+    acquire_claim(backend, agent, request, now).map(|(claim, submitted, _)| (claim, submitted))
+}
+
+/// Returns an operation-scoped creation receipt. `None` must never authorize rollback.
+pub fn claim_or_reuse_with_creation_status(
+    backend: &mut dyn Backend,
+    agent: &str,
+    request: &ClaimRequest,
+    now: i64,
+) -> Result<(Claim, Option<bool>)> {
+    acquire_claim(backend, agent, request, now).map(|(claim, _, created)| (claim, created))
+}
+
+fn acquire_claim(
+    backend: &mut dyn Backend,
+    agent: &str,
+    request: &ClaimRequest,
+    now: i64,
+) -> Result<(Claim, bool, Option<bool>)> {
     if !request.paths.is_empty() {
         let existing = backend.claims(
             &ClaimQuery {
@@ -428,16 +459,16 @@ pub fn claim_or_reuse_with_status(
             .into_iter()
             .find(|claim| claim_covers_request(claim, agent, request))
         {
-            return Ok((claim, false));
+            return Ok((claim, false, Some(false)));
         }
     }
-    let claim = backend.claim(agent, request, now)?;
+    let (claim, created) = backend.claim_with_creation_status(agent, request, now)?;
     if !claim_covers_request(&claim, agent, request) {
         return Err(Error::Protocol(
             "claim response did not grant the requested paths to this session".into(),
         ));
     }
-    Ok((claim, true))
+    Ok((claim, true, created))
 }
 
 fn claim_covers_request(claim: &Claim, agent: &str, request: &ClaimRequest) -> bool {

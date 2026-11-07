@@ -23,7 +23,9 @@ pub mod tasks;
 pub mod watch;
 pub mod zones;
 
-pub use backend::{Backend, claim_or_reuse, claim_or_reuse_with_status};
+pub use backend::{
+    Backend, claim_or_reuse, claim_or_reuse_with_creation_status, claim_or_reuse_with_status,
+};
 pub use error::{Error, Result};
 pub use paths::ZonePath;
 pub use store::{Agent, DIR_NAME, Store, validate_agent};

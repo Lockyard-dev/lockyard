@@ -29,6 +29,10 @@ struct State {
     inbox: Vec<Value>,
     refuse_claims: Option<(u16, Value)>,
     claim_reused_on_post: Option<Value>,
+    claim_created: Option<Value>,
+    omit_claim_meta: bool,
+    echo_reused_claim_meta: bool,
+    refuse_release: Option<(u16, Value)>,
     refuse_registry_claim: bool,
     check_reply: Option<Value>,
 }
@@ -135,15 +139,39 @@ fn route_reply(state: &mut State, method: &str, route: &str, body: &Value) -> (u
             if let Some(refusal) = state.refuse_claims.clone() {
                 return refusal;
             }
-            if let Some(claim) = state.claim_reused_on_post.clone() {
+            if let Some(mut claim) = state.claim_reused_on_post.clone() {
+                state.claims.push(claim.clone());
+                if state.echo_reused_claim_meta {
+                    claim["meta"] = body["meta"].clone();
+                }
+                if let Some(created) = &state.claim_created {
+                    claim["created"] = created.clone();
+                }
                 return (200, claim);
             }
             let id = state.claims.len() as i64 + 1;
             let claim = json!({"id": id, "session": "alice", "paths": body["paths"], "meta": body["meta"], "fence": 1, "expires_at": "later"});
             state.claims.push(claim.clone());
-            (200, claim)
+            let mut reply = claim;
+            if state.omit_claim_meta {
+                reply.as_object_mut().unwrap().remove("meta");
+            }
+            if let Some(created) = &state.claim_created {
+                reply["created"] = created.clone();
+            }
+            (200, reply)
         }
         ("GET", "/api/v1/zones/claims") => (200, json!({"claims": state.claims})),
+        ("DELETE", _) if route.starts_with("/api/v1/zones/claims/") => {
+            if let Some(refusal) = state.refuse_release.clone() {
+                return refusal;
+            }
+            let id = route.rsplit('/').next().unwrap().parse::<i64>().unwrap();
+            state
+                .claims
+                .retain(|claim| claim["id"] != id || claim["fence"] != body["fence"]);
+            (200, json!({"released":1}))
+        }
         ("GET", "/api/v1/presence") => (200, json!({"sessions":[]})),
         ("GET", "/api/v1/registry/items/D-1") if state.refuse_registry_claim => (
             200,
@@ -289,6 +317,7 @@ fn start_work_cloud_rollback_releases_only_its_own_acquisition() {
         {
             let mut state = server.state.lock().unwrap();
             state.refuse_registry_claim = true;
+            state.claim_created = Some(json!(!concurrent_reuse));
             if concurrent_reuse {
                 // The GET snapshot was empty, but another same-session request
                 // acquired this claim before our POST reached the server.
@@ -357,6 +386,214 @@ fn start_work_cloud_rollback_releases_only_its_own_acquisition() {
             assert_eq!(deletes[0].path, "/api/v1/zones/claims/1");
             assert_eq!(deletes[0].body["fence"], 1);
         }
+    }
+}
+
+fn run_failed_start_work(server: &Server) -> Value {
+    server.state.lock().unwrap().refuse_registry_claim = true;
+    let dir = cloud_project(server);
+    let runtime = tempfile::tempdir().unwrap();
+    let mut child = binary(dir.path(), runtime.path())
+        .args(["mcp"])
+        .env("LOCKYARD_AGENT", "alice")
+        .env("LOCKYARD_TOKEN", "test-token")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"start_work", "arguments":{"paths":["src"], "task":"D-1"}}
+        })
+    )
+    .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let answer: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(answer["result"]["isError"], true, "{answer}");
+    assert_eq!(
+        server
+            .seen("POST", "/api/v1/registry/items/D-1/claim")
+            .len(),
+        1,
+        "{answer}"
+    );
+    answer
+}
+
+fn failed_start_work(server: &Server) -> Value {
+    let answer = run_failed_start_work(server);
+    assert_eq!(
+        server.seen("POST", "/api/v1/zones/claims").len(),
+        1,
+        "{answer}"
+    );
+    answer
+}
+
+#[test]
+fn start_work_cloud_rolls_back_created_claim_without_meta() {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.claim_created = Some(json!(true));
+        state.omit_claim_meta = true;
+    }
+    failed_start_work(&server);
+    let deletes = server.seen("DELETE", "/api/v1/zones/claims/1");
+    assert_eq!(
+        deletes.len(),
+        1,
+        "new claim was leaked when meta was absent"
+    );
+    assert_eq!(deletes[0].body["fence"], 1);
+    assert!(server.state.lock().unwrap().claims.is_empty());
+}
+
+#[test]
+fn start_work_cloud_preserves_reused_claim_even_when_request_meta_is_echoed() {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.claim_reused_on_post = Some(json!({
+            "id":42, "session":"alice", "paths":["src"], "fence":7
+        }));
+        state.claim_created = Some(json!(false));
+        state.echo_reused_claim_meta = true;
+    }
+    failed_start_work(&server);
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .seen
+            .iter()
+            .all(|r| r.method != "DELETE"),
+        "a reused claim was released on reflected request metadata"
+    );
+    assert_eq!(server.state.lock().unwrap().claims[0]["id"], 42);
+}
+
+#[test]
+fn start_work_cloud_preserves_unknown_creation_even_with_echoed_meta() {
+    for created in [None, Some(Value::Null), Some(json!("true")), Some(json!(1))] {
+        let server = Server::start();
+        server.state.lock().unwrap().claim_created = created;
+        failed_start_work(&server);
+        assert!(
+            server
+                .state
+                .lock()
+                .unwrap()
+                .seen
+                .iter()
+                .all(|r| r.method != "DELETE"),
+            "an unknown creation outcome authorized rollback"
+        );
+    }
+}
+
+#[test]
+fn start_work_cloud_requires_positive_id_and_fence_for_rollback() {
+    for (id, fence) in [(0, Some(7)), (42, None), (42, Some(0)), (42, Some(-1))] {
+        let server = Server::start();
+        {
+            let mut claim = json!({"id":id, "session":"alice", "paths":["src"]});
+            if let Some(fence) = fence {
+                claim["fence"] = json!(fence);
+            }
+            let mut state = server.state.lock().unwrap();
+            state.claim_created = Some(json!(true));
+            state.claim_reused_on_post = Some(claim);
+        }
+        failed_start_work(&server);
+        assert!(
+            server
+                .state
+                .lock()
+                .unwrap()
+                .seen
+                .iter()
+                .all(|r| r.method != "DELETE")
+        );
+    }
+}
+
+#[test]
+fn start_work_cloud_preserves_task_error_when_fenced_cleanup_is_refused() {
+    for status in [403, 412] {
+        let server = Server::start();
+        {
+            let mut state = server.state.lock().unwrap();
+            state.claim_created = Some(json!(true));
+            state.refuse_release = Some((
+                status,
+                json!({"error":{"code":"conflict", "message":"owner or fence changed"}}),
+            ));
+        }
+        let answer = failed_start_work(&server);
+        assert!(
+            answer.to_string().contains("task is already taken"),
+            "{answer}"
+        );
+        let deletes = server.seen("DELETE", "/api/v1/zones/claims/1");
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0].body["fence"], 1);
+        assert_eq!(server.state.lock().unwrap().claims.len(), 1);
+    }
+}
+
+#[test]
+fn start_work_cloud_seeded_acquisition_scenarios_preserve_existing_leases() {
+    let mut seed = 0xC03_u64;
+    for case in 0..32 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let scenario = (seed >> 32) % 4;
+        let server = Server::start();
+        {
+            let mut state = server.state.lock().unwrap();
+            state.omit_claim_meta = seed & 1 != 0;
+            state.echo_reused_claim_meta = true;
+            match scenario {
+                0 => state.claims.push(
+                    json!({"id":9, "session":"alice", "paths":["src"], "fence":3, "created":true}),
+                ),
+                1 => {
+                    state.claim_reused_on_post =
+                        Some(json!({"id":42, "session":"alice", "paths":["src"], "fence":7}));
+                    state.claim_created = (seed & 2 != 0).then_some(json!(false));
+                }
+                2 => state.claim_created = Some(json!(true)),
+                _ => state.claim_created = (seed & 2 != 0).then_some(Value::Null),
+            }
+        }
+        run_failed_start_work(&server);
+        let state = server.state.lock().unwrap();
+        let deletes: Vec<_> = state.seen.iter().filter(|r| r.method == "DELETE").collect();
+        if scenario == 2 {
+            assert_eq!(deletes.len(), 1, "case {case}, seed {seed}");
+            assert!(state.claims.is_empty(), "case {case}, seed {seed}");
+        } else {
+            assert!(deletes.is_empty(), "case {case}, seed {seed}");
+            assert_eq!(state.claims.len(), 1, "case {case}, seed {seed}");
+        }
+        assert_eq!(
+            state
+                .seen
+                .iter()
+                .filter(|r| r.method == "POST" && r.path == "/api/v1/zones/claims")
+                .count(),
+            usize::from(scenario != 0)
+        );
     }
 }
 

@@ -680,7 +680,17 @@ impl<T: Transport> Backend for CloudBackend<T> {
             .collect())
     }
 
-    fn claim(&mut self, agent: &str, request: &ClaimRequest, _now: i64) -> Result<Claim> {
+    fn claim(&mut self, agent: &str, request: &ClaimRequest, now: i64) -> Result<Claim> {
+        self.claim_with_creation_status(agent, request, now)
+            .map(|(claim, _)| claim)
+    }
+
+    fn claim_with_creation_status(
+        &mut self,
+        agent: &str,
+        request: &ClaimRequest,
+        _now: i64,
+    ) -> Result<(Claim, Option<bool>)> {
         let body =
             serde_json::to_value(request).map_err(|error| Error::Invalid(error.to_string()))?;
         let mut call = Call::write(agent, "POST", "/api/v1/zones/claims".into(), body);
@@ -691,7 +701,11 @@ impl<T: Transport> Backend for CloudBackend<T> {
         call.long_poll = request
             .queue_wait_seconds
             .is_some_and(|seconds| seconds > 0);
-        Ok(one(self.transport.call(&call)?, "claim")?)
+        let reply = self.transport.call(&call)?;
+        // Only the POST outcome is evidence. Stored meta and GET snapshots cannot
+        // distinguish concurrent same-session reuse from a newly created lease.
+        let created = reply.get("created").and_then(Value::as_bool);
+        Ok((one(reply, "claim")?, created))
     }
 
     fn renew(
@@ -1640,6 +1654,59 @@ mod tests {
 
     fn claim_json(id: i64) -> Value {
         json!({"id": id, "session": "me", "paths": ["src"], "fence": 2})
+    }
+
+    #[test]
+    fn claim_creation_status_is_transient_and_does_not_change_submitted_status() {
+        for (field, expected) in [
+            (None, None),
+            (Some(Value::Null), None),
+            (Some(json!("true")), None),
+            (Some(json!(1)), None),
+            (Some(json!(true)), Some(true)),
+            (Some(json!(false)), Some(false)),
+        ] {
+            let mut reply = claim_json(7);
+            if let Some(field) = field {
+                reply["created"] = field;
+            }
+            let (server, mut cloud) = backend(vec![json!([]), reply]);
+            let request = ClaimRequest {
+                paths: vec!["src".into()],
+                ..ClaimRequest::default()
+            };
+            let (claim, created) =
+                lockyard_core::claim_or_reuse_with_creation_status(&mut cloud, "me", &request, 0)
+                    .unwrap();
+            assert_eq!(created, expected);
+            assert!(
+                serde_json::to_value(claim)
+                    .unwrap()
+                    .get("created")
+                    .is_none()
+            );
+            sees(
+                &server,
+                &[
+                    ("GET", "/api/v1/zones/claims?session=me"),
+                    ("POST", "/api/v1/zones/claims"),
+                ],
+            );
+        }
+        let mut reply = claim_json(7);
+        reply["created"] = json!(false);
+        let (_server, mut cloud) = backend(vec![json!([]), reply]);
+        let (_, submitted) = lockyard_core::claim_or_reuse_with_status(
+            &mut cloud,
+            "me",
+            &ClaimRequest {
+                paths: vec!["src".into()],
+                ..ClaimRequest::default()
+            },
+            0,
+        )
+        .unwrap();
+        assert!(submitted, "server-side reuse still submits a POST");
     }
 
     #[test]

@@ -1391,25 +1391,17 @@ fn run_composite(
                 if let Some(nonce) = nonce.as_ref() {
                     request.meta = Some(json!({"lockyard_start_work_nonce": nonce}));
                 }
-                let (claim, submitted) = lockyard_core::claim_or_reuse_with_status(
+                let (claim, created) = lockyard_core::claim_or_reuse_with_creation_status(
                     opened.backend.as_mut(),
                     me,
                     &request,
                     crate::now_ms(),
                 )?;
-                // Cloud POST may reuse a claim created by a concurrent call.
-                // Only an echoed per-attempt marker proves this call created it.
-                let created = submitted
-                    && (!cloud
-                        || nonce.as_deref().is_some_and(|nonce| {
-                            claim
-                                .meta
-                                .as_ref()
-                                .and_then(|meta| meta.get("lockyard_start_work_nonce"))
-                                .and_then(Value::as_str)
-                                == Some(nonce)
-                        }));
-                let rollback = created.then_some((claim.id, cloud.then_some(claim.fence)));
+                // Unknown legacy responses preserve the lease. Ownership and a
+                // matching fence alone do not prove creation within one session.
+                let rollback = (created == Some(true)
+                    && (!cloud || (claim.id > 0 && claim.fence > 0)))
+                    .then_some((claim.id, cloud.then_some(claim.fence)));
                 (encode(&claim)?, rollback)
             };
             let mut answer = json!({"claim": claim});

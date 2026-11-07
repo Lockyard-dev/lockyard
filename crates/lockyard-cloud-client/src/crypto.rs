@@ -74,6 +74,28 @@ pub(crate) fn transform_fields_policy(
     encrypt: bool,
     require_encrypted: bool,
 ) -> Result<(), String> {
+    // Acquisition receipts are operation metadata, absent from the legacy shared
+    // claim schema. Admit only this boolean on the exact POST reply, then run the
+    // complete existing claim/content validation without changing that schema.
+    if require_encrypted
+        && !encrypt
+        && method.eq_ignore_ascii_case("POST")
+        && route.split('?').next() == Some("/api/v1/zones/claims")
+        && let Some(created) = value.get("created").cloned()
+    {
+        if !created.is_boolean() {
+            return Err("required node claim creation receipt must be boolean".into());
+        }
+        let mut claim = value.clone();
+        claim
+            .as_object_mut()
+            .expect("field belongs to object")
+            .remove("created");
+        transform_fields_policy(&mut claim, method, route, workspace, key, false, true)?;
+        claim["created"] = created;
+        *value = claim;
+        return Ok(());
+    }
     let (map, api) = parsed()?;
     let normalized = route.split('?').next().unwrap_or(route);
     let mut schemas = Vec::new();
@@ -1968,6 +1990,97 @@ mod tests {
                 .unwrap(),
             "private work"
         );
+    }
+
+    #[test]
+    fn claim_creation_receipt_is_boolean_and_scoped_to_the_post_reply() {
+        let key = WorkspaceKey::from_entropy([9; 32]);
+        let note = key.encrypt("w", "note", "private work").unwrap();
+        for created in [true, false] {
+            let mut reply = serde_json::json!({"id":7, "note":note, "created":created});
+            transform_fields_policy(
+                &mut reply,
+                "POST",
+                "/api/v1/zones/claims",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(reply["created"], created);
+            assert_eq!(reply["note"], "private work");
+        }
+        for created in [
+            Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!({"secret":"text"}),
+        ] {
+            let mut reply = serde_json::json!({"id":7, "created":created});
+            assert!(
+                transform_fields_policy(
+                    &mut reply,
+                    "POST",
+                    "/api/v1/zones/claims",
+                    "w",
+                    Some(&key),
+                    false,
+                    true
+                )
+                .is_err()
+            );
+        }
+        for (method, route, encrypt, mut value) in [
+            (
+                "GET",
+                "/api/v1/zones/claims",
+                false,
+                serde_json::json!([{"id":7, "created":true}]),
+            ),
+            (
+                "POST",
+                "/api/v1/zones/claims",
+                true,
+                serde_json::json!({"paths":["src"], "created":true}),
+            ),
+            (
+                "POST",
+                "/api/v1/zones/queue",
+                false,
+                serde_json::json!({"id":7, "created":true}),
+            ),
+            (
+                "GET",
+                "/api/v1/events",
+                false,
+                serde_json::json!([{"seq":1, "type":"zone.claimed", "payload":{"id":7, "created":true}}]),
+            ),
+            (
+                "POST",
+                "/api/v1/zones/claims",
+                false,
+                serde_json::json!({"id":7, "created":true, "secret":"text"}),
+            ),
+            (
+                "POST",
+                "/api/v1/zones/claims",
+                false,
+                serde_json::json!({"id":7, "created":true, "note":"plaintext"}),
+            ),
+            (
+                "POST",
+                "/api/v1/zones/claims",
+                false,
+                serde_json::json!({"id":7, "created":true, "meta":{"created":true}}),
+            ),
+        ] {
+            assert!(
+                transform_fields_policy(&mut value, method, route, "w", Some(&key), encrypt, true)
+                    .is_err(),
+                "accepted {method} {route}: {value}"
+            );
+        }
     }
 
     #[test]
