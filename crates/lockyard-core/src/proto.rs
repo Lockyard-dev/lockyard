@@ -184,6 +184,9 @@ pub struct Claim {
     /// False when the holder is unavailable: such a claim stops blocking and may be taken by anyone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder_available: Option<bool>,
+    /// Server-selected repository path policy, independent of the client operating system.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_insensitive_paths: Option<bool>,
     /// Dirty paths of other sessions inside this claim.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub foreign_dirty_paths: Vec<DirtyPath>,

@@ -558,62 +558,66 @@ fn pause_dir() -> std::path::PathBuf {
     shared_dir().join("paused")
 }
 
+#[cfg(target_os = "macos")]
+fn process_bsd_info(pid: i32) -> Option<(u32, u64, u64)> {
+    #[repr(C)]
+    struct BsdInfo {
+        flags: u32,
+        status: u32,
+        xstatus: u32,
+        pid: u32,
+        ppid: u32,
+        uid: u32,
+        gid: u32,
+        ruid: u32,
+        rgid: u32,
+        svuid: u32,
+        svgid: u32,
+        rfu: u32,
+        comm: [u8; 16],
+        name: [u8; 32],
+        nfiles: u32,
+        pgid: u32,
+        pjobc: u32,
+        tdev: u32,
+        tpgid: u32,
+        nice: i32,
+        start_sec: u64,
+        start_usec: u64,
+    }
+    #[link(name = "proc")]
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
+    }
+    let mut info = std::mem::MaybeUninit::<BsdInfo>::uninit();
+    let size = std::mem::size_of::<BsdInfo>() as libc::c_int;
+    let bytes = unsafe { proc_pidinfo(pid, 3, 0, info.as_mut_ptr().cast(), size) };
+    if bytes < size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    Some((info.status, info.start_sec, info.start_usec))
+}
+
 fn process_start_time(pid: i32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        return stat
-            .rsplit_once(") ")?
+        stat.rsplit_once(") ")?
             .1
             .split_whitespace()
             .nth(19)
-            .map(str::to_owned);
+            .map(str::to_owned)
     }
     #[cfg(target_os = "macos")]
     {
-        #[repr(C)]
-        struct BsdInfo {
-            flags: u32,
-            status: u32,
-            xstatus: u32,
-            pid: u32,
-            ppid: u32,
-            uid: u32,
-            gid: u32,
-            ruid: u32,
-            rgid: u32,
-            svuid: u32,
-            svgid: u32,
-            rfu: u32,
-            comm: [u8; 16],
-            name: [u8; 32],
-            nfiles: u32,
-            pgid: u32,
-            pjobc: u32,
-            tdev: u32,
-            tpgid: u32,
-            nice: i32,
-            start_sec: u64,
-            start_usec: u64,
-        }
-        #[link(name = "proc")]
-        unsafe extern "C" {
-            fn proc_pidinfo(
-                pid: libc::c_int,
-                flavor: libc::c_int,
-                arg: u64,
-                buffer: *mut libc::c_void,
-                buffersize: libc::c_int,
-            ) -> libc::c_int;
-        }
-        let mut info = std::mem::MaybeUninit::<BsdInfo>::uninit();
-        let size = std::mem::size_of::<BsdInfo>() as libc::c_int;
-        let bytes = unsafe { proc_pidinfo(pid, 3, 0, info.as_mut_ptr().cast(), size) };
-        if bytes < size {
-            return None;
-        }
-        let info = unsafe { info.assume_init() };
-        Some(format!("{}.{}", info.start_sec, info.start_usec))
+        process_bsd_info(pid).map(|(_, seconds, micros)| format!("{seconds}.{micros}"))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -712,7 +716,7 @@ fn process_memory(pid: i32) -> Option<u64> {
             found = true;
             let _ = member;
         }
-        return found.then_some(total.max(page));
+        found.then_some(total.max(page))
     }
     #[cfg(target_os = "macos")]
     {
@@ -851,8 +855,12 @@ fn recover_paused_groups() {
     recover_paused_groups_in(&pause_dir());
 }
 
-fn recover_paused_groups_in(dir: &std::path::Path) {
-    let Ok(entries) = fs::read_dir(dir) else {
+fn recover_paused_groups_in(dir: &Path) {
+    recover_paused_groups_from(dir);
+}
+
+fn recover_paused_groups_from(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
     for entry in entries.flatten() {
@@ -1243,26 +1251,81 @@ mod recovery_tests {
         result == pid && status & 0xff == 0x7f
     }
 
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let pid = self.0.id() as i32;
+            let _ = resume_group(pid);
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn process_state(pid: i32) -> Option<char> {
+        #[cfg(target_os = "linux")]
+        {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            stat.rsplit_once(") ")?.1.chars().next()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // libproc remains available when the process sandbox disallows invoking ps.
+            // Darwin sys/proc.h defines SSTOP=4 and SZOMB=5.
+            process_bsd_info(pid).map(|(status, _, _)| match status {
+                4 => 'T',
+                5 => 'Z',
+                _ => 'R',
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let output = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            String::from_utf8(output.stdout).ok()?.trim().chars().next()
+        }
+    }
+
+    fn wait_for_state(pid: i32, stopped: bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = process_state(pid).expect("the owned test child must remain alive");
+            assert!(
+                !matches!(state, 'Z' | 'X'),
+                "the owned test child must not exit"
+            );
+            if matches!(state, 'T' | 't') == stopped {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the owned child did not reach the expected state"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[test]
     fn recovery_resumes_a_group_only_when_its_start_time_matches() {
-        let mut child = child_group();
-        let pid = child.id() as i32;
+        let child = OwnedChild(child_group());
+        let pid = child.0.id() as i32;
         let Some(group_start) = process_start_time(pid) else {
             // Process metadata can be hidden by sandbox policies; this test needs it to
-            // distinguish a live group from a reused pid.
-            let _ = child.kill();
-            let _ = child.wait();
+            // distinguish a live group from a reused pid. OwnedChild always cleans up.
             return;
         };
         if pause_group(pid).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
             return;
         }
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().to_path_buf();
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{pid}.json"));
+        wait_for_state(pid, true);
+        // Reap the stop notification before checking that recovery resumes the child.
+        assert!(is_stopped(pid));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{pid}.json"));
         let record = PauseRecord {
             owner_pid: i32::MAX,
             owner_start: "gone".into(),
@@ -1271,14 +1334,15 @@ mod recovery_tests {
             paused_at_ms: now_ms(),
         };
         fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
-        recover_paused_groups_in(&dir);
+        recover_paused_groups_in(dir.path());
+        wait_for_state(pid, false);
         assert!(!is_stopped(pid));
+        assert!(!path.exists());
 
         if pause_group(pid).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
             return;
         }
+        wait_for_state(pid, true);
         let reused = PauseRecord {
             owner_pid: i32::MAX,
             owner_start: "gone".into(),
@@ -1287,15 +1351,20 @@ mod recovery_tests {
             paused_at_ms: now_ms(),
         };
         fs::write(&path, serde_json::to_vec(&reused).unwrap()).unwrap();
-        recover_paused_groups_in(&dir);
+        recover_paused_groups_from(dir.path());
         assert!(
             is_stopped(pid),
             "a mismatched process start time must never be signalled"
         );
-        let _ = resume_group(pid);
-        let _ = fs::remove_file(path);
-        let _ = child.kill();
-        let _ = child.wait();
+        let until = std::time::Instant::now() + Duration::from_millis(100);
+        while std::time::Instant::now() < until {
+            assert!(
+                matches!(process_state(pid), Some('T' | 't')),
+                "a mismatched process start time must never be signalled"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!path.exists());
     }
 
     #[test]

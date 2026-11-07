@@ -117,8 +117,9 @@ fn check_item(item: Value) -> std::result::Result<PathCheck, ClientError> {
 
 /// [`Backend`] on a [`Transport`]. The `agent` of each call is its session.
 pub struct CloudBackend<T: Transport> {
-    transport: T,
-    session: String,
+    pub(crate) transport: T,
+    pub(crate) session: String,
+    write_idempotency_key: Option<String>,
 }
 
 impl<T: Transport> CloudBackend<T> {
@@ -127,6 +128,7 @@ impl<T: Transport> CloudBackend<T> {
         Self {
             transport,
             session: session.to_string(),
+            write_idempotency_key: None,
         }
     }
 
@@ -167,12 +169,24 @@ impl<T: Transport> CloudBackend<T> {
         agent: &str,
         id: &str,
         operation: &str,
-        mut body: Value,
+        body: Value,
         item: &Value,
     ) -> Result<tasks::Task> {
+        task_from(&self.item_step_response(agent, id, operation, body, item)?)
+    }
+
+    /// Preserve the exact mutation response when callers need its authoritative assignment.
+    fn item_step_response(
+        &self,
+        agent: &str,
+        id: &str,
+        operation: &str,
+        mut body: Value,
+        item: &Value,
+    ) -> Result<Value> {
         body["expected_version"] = item["version"].clone();
         let route = format!("{ITEMS}/{}/{operation}", item_id(id));
-        task_from(&self.post(agent, route, &body)?)
+        self.post(agent, route, &body)
     }
 
     /// Select by explicit area, then prefix. With neither, use the first area; an empty registry
@@ -224,9 +238,11 @@ impl<T: Transport> CloudBackend<T> {
         body: &impl Serialize,
     ) -> Result<Value> {
         let body = serde_json::to_value(body).map_err(|error| Error::Invalid(error.to_string()))?;
-        Ok(self
-            .transport
-            .call(&Call::write(session, method, path, body))?)
+        let mut call = Call::write(session, method, path, body);
+        if let Some(key) = &self.write_idempotency_key {
+            call.key = Some(key.clone());
+        }
+        Ok(self.transport.call(&call)?)
     }
 }
 
@@ -324,7 +340,16 @@ fn message(value: Value) -> Result<Message> {
 }
 
 fn item_id(id: &str) -> String {
-    id.to_string()
+    // Legacy cloud callers can still use a bare D- item number. Area-prefixed IDs
+    // remain authoritative and retain every prefix component and padding digit.
+    if !id.is_empty()
+        && id.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(number) = id.parse::<i64>()
+    {
+        format!("D-{number}")
+    } else {
+        id.to_string()
+    }
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -358,7 +383,8 @@ fn commit_names_file(value: &str) -> bool {
     let Some((revision, path)) = value.split_once(':') else {
         return false;
     };
-    if !(7..=64).contains(&revision.len()) || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !(7..=64).contains(&revision.len()) || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         return false;
     }
     if path.is_empty() || path.starts_with('/') || path.ends_with('/') || path.contains('\\') {
@@ -374,10 +400,10 @@ fn require_commit_file(target: &str, value: &str) -> Result<()> {
             "commit evidence must name a file in git as <rev>:<path>".into(),
         ));
     }
-    if commit_names_file(value) {
-        if let Ok(cwd) = std::env::current_dir() {
-            refuse_if_file_missing(&cwd, value)?;
-        }
+    if commit_names_file(value)
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        refuse_if_file_missing(&cwd, value)?;
     }
     Ok(())
 }
@@ -548,6 +574,7 @@ fn task_from(item: &Value) -> Result<tasks::Task> {
         title: text(item, "title").to_string(),
         body: text(item, "body").to_string(),
         status: task_status(text(item, "status")),
+        raw_status: Some(text(item, "status").to_string()),
         author: session_of(text(item, "created_by")),
         assignee: assignment.map(|found| session_of(text(found, "executor"))),
         lease_until: assignment.and_then(|found| millis(found, "lease_expires_at")),
@@ -584,6 +611,54 @@ fn task_from(item: &Value) -> Result<tasks::Task> {
 }
 
 impl<T: Transport> Backend for CloudBackend<T> {
+    fn set_write_idempotency_key(&mut self, key: Option<String>) {
+        self.write_idempotency_key = key;
+    }
+
+    fn registry_search(&self, query: &Value) -> Result<Value> {
+        crate::registry::search(self, query, false)
+    }
+    fn registry_ready(&self, query: &Value) -> Result<Value> {
+        crate::registry::search(self, query, true)
+    }
+    fn registry_item(&self, id: i64) -> Result<Value> {
+        crate::registry::item(self, id, false)
+    }
+    fn registry_blockers(&self, id: i64) -> Result<Value> {
+        crate::registry::item(self, id, true)
+    }
+    fn registry_item_by_id(&self, id: &str) -> Result<Value> {
+        crate::registry::item_by_id(self, id, false)
+    }
+    fn registry_blockers_by_id(&self, id: &str) -> Result<Value> {
+        crate::registry::item_by_id(self, id, true)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn registry_link(
+        &mut self,
+        agent: &str,
+        id: i64,
+        to: i64,
+        kind: &str,
+        version: i64,
+        key: &str,
+    ) -> Result<Value> {
+        crate::registry::link(self, agent, id, to, kind, version, key)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn registry_link_by_id(
+        &mut self,
+        agent: &str,
+        id: &str,
+        to: &str,
+        kind: &str,
+        version: i64,
+        key: &str,
+    ) -> Result<Value> {
+        crate::registry::link_by_id(self, agent, id, to, kind, version, key)
+    }
+
     fn is_cloud(&self) -> bool {
         true
     }
@@ -609,6 +684,9 @@ impl<T: Transport> Backend for CloudBackend<T> {
         let body =
             serde_json::to_value(request).map_err(|error| Error::Invalid(error.to_string()))?;
         let mut call = Call::write(agent, "POST", "/api/v1/zones/claims".into(), body);
+        if let Some(key) = &self.write_idempotency_key {
+            call.key = Some(key.clone());
+        }
         // With a short wait the server holds the answer until the zone frees up.
         call.long_poll = request
             .queue_wait_seconds
@@ -877,7 +955,11 @@ impl<T: Transport> Backend for CloudBackend<T> {
         Ok(())
     }
 
-    fn inbox(&mut self, agent: &str, filter: InboxQuery, _now: i64) -> Result<InboxPage> {
+    fn inbox(&mut self, agent: &str, filter: InboxQuery, now: i64) -> Result<InboxPage> {
+        self.peek_inbox(agent, filter, now)
+    }
+
+    fn peek_inbox(&self, agent: &str, filter: InboxQuery, _now: i64) -> Result<InboxPage> {
         let tail = query(&[
             ("all", filter.all.then(|| "true".to_string())),
             (
@@ -1046,10 +1128,10 @@ impl<T: Transport> Backend for CloudBackend<T> {
                 "task target {target:?} needs evidence this client cannot provide; use code_accepted or ci_passed"
             )));
         }
-        if target != "ci_passed" {
-            if let Some(value) = spec.evidence.as_deref() {
-                require_commit_file(target, value)?;
-            }
+        if target != "ci_passed"
+            && let Some(value) = spec.evidence.as_deref()
+        {
+            require_commit_file(target, value)?;
         }
         let evidence: Vec<Value> = spec
             .evidence
@@ -1092,6 +1174,37 @@ impl<T: Transport> Backend for CloudBackend<T> {
     fn claim_task(&mut self, agent: &str, id: &str, _ttl: i64, _now: i64) -> Result<tasks::Task> {
         let item = self.item(agent, id)?;
         self.item_step(agent, id, "claim", json!({"session": agent}), &item)
+    }
+
+    fn claim_task_receipt(&mut self, agent: &str, id: i64, ttl: i64, now: i64) -> Result<Value> {
+        // Retain the numeric JSON identity used by the original workflow protocol.
+        let mut result = self.claim_task_receipt_by_id(agent, &format!("D-{id}"), ttl, now)?;
+        let task_id = result["id"].as_str().unwrap_or_default();
+        let number = task_id
+            .strip_prefix("D-")
+            .and_then(|digits| digits.parse::<i64>().ok())
+            .ok_or_else(|| Error::Protocol(format!("{task_id:?} is not a legacy backlog id")))?;
+        result["id"] = json!(number);
+        Ok(result)
+    }
+
+    fn claim_task_receipt_by_id(
+        &mut self,
+        agent: &str,
+        id: &str,
+        _ttl: i64,
+        _now: i64,
+    ) -> Result<Value> {
+        let item = self.item(agent, id)?;
+        let claimed =
+            self.item_step_response(agent, id, "claim", json!({"session": agent}), &item)?;
+        // Use the mutation's identity and assignment verbatim. The workflow verifies both;
+        // substituting the requested ID could hide an unrelated successful mutation.
+        let mut result = serde_json::to_value(task_from(&claimed)?)
+            .map_err(|error| Error::Protocol(error.to_string()))?;
+        result["registry_assignment"] = claimed["assignment"].clone();
+        result["registry_assignment_source"] = json!("claim_response");
+        Ok(result)
     }
 
     fn renew_task(&mut self, agent: &str, id: &str, _ttl: i64, _now: i64) -> Result<tasks::Task> {
@@ -2335,6 +2448,127 @@ mod tests {
     }
 
     #[test]
+    fn cloud_task_numeric_alias_preserves_all_explicit_area_prefixes() {
+        let cases = [
+            ("12", "D-12"),
+            ("0012", "D-12"),
+            ("D-12", "D-12"),
+            ("FE-0319", "FE-0319"),
+            ("PA-0001", "PA-0001"),
+            ("G-SG-0012", "G-SG-0012"),
+        ];
+        let replies = cases
+            .iter()
+            .map(|(_, id)| {
+                let mut value = item("ready", 1);
+                value["id"] = json!(id);
+                value
+            })
+            .collect();
+        let (server, cloud) = backend(replies);
+        for (requested, canonical) in cases {
+            assert_eq!(cloud.task(requested).unwrap().id, canonical);
+        }
+        sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/items/D-12"),
+                ("GET", "/api/v1/registry/items/D-12"),
+                ("GET", "/api/v1/registry/items/D-12"),
+                ("GET", "/api/v1/registry/items/FE-0319"),
+                ("GET", "/api/v1/registry/items/PA-0001"),
+                ("GET", "/api/v1/registry/items/G-SG-0012"),
+            ],
+        );
+    }
+
+    #[test]
+    fn workflow_claim_receipt_keeps_the_mutation_assignment_and_legacy_numeric_id() {
+        let mut before = item("ready", 3);
+        before["id"] = json!("D-12");
+        let mut claimed = item("active", 4);
+        claimed["id"] = json!("D-12");
+        claimed["assignment"] = json!({
+            "executor": "token:ab:me",
+            "session": "me",
+            "claimed_at": "2026-11-02T10:00:00+00:00",
+            "lease_expires_at": "2026-11-02T12:00:00+00:00",
+            "lease_active": true,
+        });
+        let assignment = claimed["assignment"].clone();
+        let (server, mut cloud) = backend(vec![before, claimed]);
+        let receipt = cloud.claim_task_receipt("me", 12, 60, 0).unwrap();
+        assert_eq!(receipt["id"], 12);
+        assert_eq!(receipt["raw_status"], "active");
+        assert_eq!(receipt["registry_assignment"], assignment);
+        assert_eq!(receipt["registry_assignment_source"], "claim_response");
+        let seen = sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/items/D-12"),
+                ("POST", "/api/v1/registry/items/D-12/claim"),
+            ],
+        );
+        assert_eq!(seen[1].body["expected_version"], 3);
+    }
+
+    #[test]
+    fn workflow_string_claim_receipt_preserves_area_identity_and_mutation_assignment() {
+        let mut before = item("ready", 7);
+        before["id"] = json!("FE-0319");
+        let mut claimed = item("active", 8);
+        claimed["id"] = json!("FE-0319");
+        claimed["assignment"] = json!({
+            "executor": "token:ab:me",
+            "session": "me",
+            "claimed_at": "2026-11-02T10:00:00+00:00",
+            "lease_expires_at": "2026-11-02T12:00:00+00:00",
+            "lease_active": true,
+        });
+        let assignment = claimed["assignment"].clone();
+        let (server, mut cloud) = backend(vec![before, claimed]);
+        let receipt = cloud
+            .claim_task_receipt_by_id("me", "FE-0319", 60, 0)
+            .unwrap();
+        assert_eq!(receipt["id"], "FE-0319");
+        assert_eq!(receipt["raw_status"], "active");
+        assert_eq!(receipt["registry_assignment"], assignment);
+        assert_eq!(receipt["registry_assignment_source"], "claim_response");
+        let seen = sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/items/FE-0319"),
+                ("POST", "/api/v1/registry/items/FE-0319/claim"),
+            ],
+        );
+        assert_eq!(seen[1].body["expected_version"], 7);
+    }
+
+    #[test]
+    fn workflow_string_claim_receipt_keeps_an_unrelated_mutation_identity_visible() {
+        let mut before = item("ready", 7);
+        before["id"] = json!("FE-0319");
+        let mut claimed = item("active", 8);
+        claimed["id"] = json!("PA-0001");
+        let (_server, mut cloud) = backend(vec![before, claimed]);
+        let receipt = cloud
+            .claim_task_receipt_by_id("me", "FE-0319", 60, 0)
+            .unwrap();
+        assert_eq!(receipt["id"], "PA-0001");
+    }
+
+    #[test]
+    fn workflow_claim_receipt_does_not_hide_an_unrelated_mutation_result() {
+        let mut before = item("ready", 3);
+        before["id"] = json!("D-12");
+        let mut claimed = item("active", 4);
+        claimed["id"] = json!("D-13");
+        let (_server, mut cloud) = backend(vec![before, claimed]);
+        let receipt = cloud.claim_task_receipt("me", 12, 60, 0).unwrap();
+        assert_eq!(receipt["id"], 13);
+    }
+
+    #[test]
     fn ready_registry_listing_filters_by_area_and_preserves_details_in_priority_stage_order() {
         let mut ready = item("ready", 1);
         ready["acceptance"] = json!("tests pass");
@@ -2643,9 +2877,11 @@ mod tests {
         assert!(server.requests().iter().all(|call| call.method == "GET"));
 
         let (server, mut cloud) = backend(vec![item_target("done", 7, "code_accepted")]);
-        assert!(cloud
-            .reject_task("me", "G-SG-0012", "empty commit", "", 0)
-            .is_err());
+        assert!(
+            cloud
+                .reject_task("me", "G-SG-0012", "empty commit", "", 0)
+                .is_err()
+        );
         assert!(server.requests().iter().all(|call| call.method == "GET"));
 
         let (server, mut cloud) = backend(vec![
@@ -2653,13 +2889,7 @@ mod tests {
             item_target("ready", 8, "code_accepted"),
         ]);
         cloud
-            .reject_task(
-                "me",
-                "G-SG-0012",
-                "empty commit",
-                "48bbf9a:src/Game.cs",
-                0,
-            )
+            .reject_task("me", "G-SG-0012", "empty commit", "48bbf9a:src/Game.cs", 0)
             .unwrap();
         let seen = server.requests();
         let transition = seen

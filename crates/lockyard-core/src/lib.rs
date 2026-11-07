@@ -17,6 +17,7 @@ pub mod machine;
 pub mod outside;
 pub mod paths;
 pub mod proto;
+pub mod repository;
 mod store;
 pub mod tasks;
 pub mod watch;

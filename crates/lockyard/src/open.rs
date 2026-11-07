@@ -2,7 +2,7 @@
 
 //! Picks the one backend of a project from `.lockyard/config.toml`.
 
-use lockyard_cloud_client::{Client, CloudBackend, token_id};
+use lockyard_cloud_client::{Client, CloudBackend, RepositoryTransport, token_id};
 use lockyard_core::config::{Config, Mode};
 use lockyard_core::paths::find_root;
 use lockyard_core::{Backend, Error, Result, Store, ZonePath};
@@ -127,11 +127,14 @@ pub fn open(cwd: &Path, agent: Option<&str>) -> Result<Opened> {
     Ok(Opened { backend, root })
 }
 
-fn direct(url: &str, session: &str) -> Result<Box<dyn Backend>> {
+fn direct(url: &str, session: &str, repository: Option<&str>) -> Result<Box<dyn Backend>> {
     trusted_url(url)?;
     let client =
         Client::new(url, Config::token_for(url)?)?.configure_content_encryption(session)?;
-    Ok(Box::new(CloudBackend::new(client, session)))
+    Ok(Box::new(CloudBackend::new(
+        RepositoryTransport::new(client, repository)?,
+        session,
+    )))
 }
 
 /// A trusted direct client for workspace administration commands.
@@ -147,6 +150,13 @@ fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
     /// Long enough for a long poll passed through the agent.
     const CLI_TIMEOUT: Duration = Duration::from_secs(40);
     let (url, workspace) = endpoint(config)?;
+    // Legacy agent handshakes identify the URL/token but don't attest an encryption
+    // policy or key binding. Node jobs must use their own verified client context.
+    if std::env::var_os("LOCKYARD_REQUIRE_E2EE").is_some()
+        || std::env::var_os("LOCKYARD_E2EE_WORKSPACE_ID").is_some()
+    {
+        return direct(&url, session, config.repository.as_deref());
+    }
     let socket = AgentSocket::connect(&crate::agent::socket_path(), &url, &workspace, CLI_TIMEOUT);
     let token = Config::token_for(&url).ok();
     match socket {
@@ -156,9 +166,12 @@ fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
                 .as_deref()
                 .is_none_or(|token| socket.token_id().is_ok_and(|id| id == token_id(token))) =>
         {
-            Ok(Box::new(CloudBackend::new(socket, session)))
+            Ok(Box::new(CloudBackend::new(
+                RepositoryTransport::new(socket, config.repository.as_deref())?,
+                session,
+            )))
         }
-        _ => direct(&url, session),
+        _ => direct(&url, session, config.repository.as_deref()),
     }
 }
 
@@ -177,5 +190,5 @@ mod tests {
 #[cfg(not(unix))]
 fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
     let (url, _) = endpoint(config)?;
-    direct(&url, session)
+    direct(&url, session, config.repository.as_deref())
 }

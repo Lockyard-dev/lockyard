@@ -1,12 +1,17 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
 mod agent;
+mod context;
 mod guard;
 mod hook;
 mod mcp;
 mod monitor;
+#[cfg(unix)]
+mod node_cli;
+mod onboarding;
 mod open;
 mod setup;
+mod workflow;
 
 use clap::{Args, Parser, Subcommand};
 use lockyard_core::bus::BROADCAST;
@@ -59,6 +64,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum Command {
     /// Create a project in the current folder.
     Init,
@@ -102,16 +108,52 @@ enum Command {
     Hook(HookCommand),
     /// Show mail and writes made outside the hook as they happen.
     Monitor(MonitorArgs),
-    /// Write Lockyard into the agent tools installed here.
+    /// Configure agent tools, or inspect a named client's managed integration.
     Setup(SetupArgs),
-    /// Check that this project and its agent tools are wired up.
-    Doctor,
+    /// Check project readiness; optional client or smoke diagnostics are read-only.
+    Doctor {
+        #[arg(long)]
+        client: Option<String>,
+        #[arg(long)]
+        smoke: bool,
+    },
+    /// Read a bounded briefing without marking mail read or renewing leases.
+    Context {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 8192)]
+        max_bytes: usize,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Execute or inspect explicit resumable coordination steps.
+    #[command(subcommand)]
+    Workflow(WorkflowCommand),
+    /// Manage a remote orchestration node.
+    #[cfg(unix)]
+    #[command(subcommand)]
+    Node(node_cli::NodeCommand),
+    /// Submit and inspect remote jobs.
+    #[cfg(unix)]
+    #[command(subcommand)]
+    Job(node_cli::JobCommand),
     /// Run the MCP server over standard input and output.
     Mcp(McpArgs),
 }
 
 #[derive(Args)]
 struct SetupArgs {
+    /// Managed integration client; preserves the cloud setup CLIENT command form.
+    #[arg(value_enum, conflicts_with = "clients")]
+    client: Option<SetupClient>,
+    #[arg(long, requires = "client", conflicts_with_all = ["check", "remove", "preview", "dry_run", "uninstall", "print"])]
+    apply: bool,
+    #[arg(long, requires = "client", conflicts_with_all = ["apply", "remove", "preview", "dry_run", "uninstall", "print"])]
+    check: bool,
+    #[arg(long, requires = "client", conflicts_with_all = ["apply", "check", "preview", "dry_run", "uninstall", "print"])]
+    remove: bool,
+    #[arg(long, requires = "client", conflicts_with_all = ["apply", "check", "remove", "dry_run", "uninstall", "print"])]
+    preview: bool,
     /// claude, codex, cursor, gemini, copilot or all. Default: the ones found here.
     #[arg(long = "client")]
     clients: Vec<String>,
@@ -124,6 +166,13 @@ struct SetupArgs {
     /// Print the snippets instead of writing any file.
     #[arg(long)]
     print: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy)]
+enum SetupClient {
+    Claude,
+    Codex,
+    Cursor,
 }
 
 #[derive(Args)]
@@ -150,6 +199,21 @@ struct MonitorArgs {
     /// Stop after this many seconds, whether or not anything arrived.
     #[arg(long)]
     timeout: Option<u64>,
+}
+
+#[derive(Subcommand)]
+#[command(defer = true)]
+enum WorkflowCommand {
+    /// Execute a JSON plan. Completed steps are not repeated; uncertain writes require reconciliation.
+    Run {
+        /// Stable operation identifier, retained for retries.
+        id: String,
+        /// JSON plan file, or - to read stdin. Paths in plans are project-relative.
+        #[arg(long)]
+        plan: PathBuf,
+    },
+    /// Inspect receipts without performing writes or retrying steps.
+    Inspect { id: String },
 }
 
 #[derive(Args)]
@@ -204,6 +268,7 @@ impl ClaimStyle {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum ZoneCommand {
     /// Claim paths, all of them or none.
     Claim {
@@ -370,6 +435,7 @@ enum ZoneCommand {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum DirtyCommand {
     /// Report paths with uncommitted changes.
     Report {
@@ -400,6 +466,7 @@ enum DirtyCommand {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum MsgCommand {
     /// Send to an agent, or to `*` for everyone.
     Send {
@@ -466,7 +533,61 @@ enum MsgCommand {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum TaskCommand {
+    /// Cloud registry items that are actionable, with raw states and dependency links.
+    Ready {
+        #[arg(long)]
+        actor: Option<String>,
+        #[arg(long)]
+        area: Option<String>,
+        #[arg(long = "type")]
+        kind: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u16,
+    },
+    /// Search cloud registry metadata. Encrypted content is not searched by the server.
+    Search {
+        query: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        actor: Option<String>,
+        #[arg(long)]
+        area: Option<String>,
+        #[arg(long = "type")]
+        kind: Option<String>,
+        #[arg(long)]
+        priority: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u16,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Explain dependency and scheduling blockers using the server's visibility rules.
+    WhyBlocked {
+        #[arg(value_parser=parse_task_id)]
+        id: String,
+    },
+    /// Show full cloud registry dependency links, without reducing statuses.
+    Links {
+        #[arg(value_parser=parse_task_id)]
+        id: String,
+    },
+    /// Add a typed dependency link at an explicitly observed version.
+    Link {
+        #[arg(value_parser=parse_task_id)]
+        id: String,
+        #[arg(value_parser=parse_task_id)]
+        to: String,
+        #[arg(long, default_value = "blocks")]
+        kind: String,
+        #[arg(long)]
+        if_version: i64,
+        /// ULID retained across retries. Generated if omitted and printed in the result.
+        #[arg(long)]
+        key: Option<String>,
+    },
     /// Add an open task.
     Add {
         title: String,
@@ -610,6 +731,7 @@ struct WorkRef {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum WorkCommand {
     /// Offer a task to an agent, or to `*`.
     Offer {
@@ -676,6 +798,12 @@ enum WorkCommand {
         task: WorkRef,
         #[arg(long)]
         to: String,
+        /// Context, checks, risks and next steps for the receiving agent.
+        #[arg(long)]
+        report: Option<String>,
+        /// A commit relevant to this handoff. Repeat for several.
+        #[arg(long = "commit")]
+        commits: Vec<String>,
     },
     /// Take a task handed to this agent. Needs the version.
     Take {
@@ -695,6 +823,7 @@ enum WorkCommand {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum BoardCommand {
     /// Set a value.
     Set {
@@ -747,6 +876,7 @@ enum StateName {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum PresenceCommand {
     /// List sessions active lately.
     List {
@@ -785,6 +915,7 @@ struct AgentArgs {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum AgentCommand {
     /// Install a launchd or systemd user unit and start it. Needs LOCKYARD_TOKEN_FILE.
     Install {
@@ -803,6 +934,7 @@ enum AgentCommand {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum CloudCommand {
     /// Trust a server URL before sending a user token to it.
     Trust { url: String },
@@ -854,6 +986,7 @@ enum CloudCommand {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum CloudAreaCommand {
     List,
     Create {
@@ -875,6 +1008,7 @@ enum CloudAreaCommand {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum KeyCommand {
     /// Generate and store a workspace key locally.
     Create,
@@ -885,6 +1019,7 @@ enum KeyCommand {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum EncryptionCommand {
     /// Show encryption mode and whether this machine has the matching key.
     Status,
@@ -895,6 +1030,7 @@ enum EncryptionCommand {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum TokenCommand {
     /// Create a token. The raw token prints once and cannot be read again.
     Create {
@@ -913,6 +1049,7 @@ enum TokenCommand {
 }
 
 #[derive(Subcommand)]
+#[command(defer = true)]
 enum HookCommand {
     /// Refuse a path claimed by another session.
     Check {
@@ -1165,7 +1302,13 @@ fn sent_line(message: &Message) -> String {
 
 fn task_line(task: &Task) -> String {
     let assignee = task.assignee.as_deref().unwrap_or("-");
-    format!("{}  {}  {}  {}", task.id, task.status, assignee, task.title)
+    format!(
+        "{}  {}  {}  {}",
+        task.id,
+        task.raw_status.as_deref().unwrap_or(task.status.as_str()),
+        assignee,
+        task.title
+    )
 }
 
 fn work_line(task: &WorkTask) -> String {
@@ -1685,6 +1828,72 @@ fn run_task(mut opened: Opened, command: TaskCommand, agent: Option<&String>) ->
     let now = now_ms();
     let store = opened.backend.as_mut();
     let changed = match command {
+        TaskCommand::Ready {
+            actor,
+            area,
+            kind,
+            limit,
+        } => {
+            let data = store
+                .registry_ready(&json!({"actor":actor,"area":area,"type":kind,"limit":limit}))?;
+            return output(
+                &data,
+                serde_json::to_string_pretty(&data).unwrap_or_default(),
+            );
+        }
+        TaskCommand::Search {
+            query,
+            status,
+            actor,
+            area,
+            kind,
+            priority,
+            limit,
+            cursor,
+        } => {
+            let data = store.registry_search(&json!({"q":query,"status":status,"actor":actor,"area":area,"type":kind,"priority":priority,"limit":limit,"cursor":cursor}))?;
+            return output(
+                &data,
+                serde_json::to_string_pretty(&data).unwrap_or_default(),
+            );
+        }
+        TaskCommand::WhyBlocked { id } => {
+            let data = store.registry_blockers_by_id(&id)?;
+            return output(
+                &data,
+                serde_json::to_string_pretty(&data).unwrap_or_default(),
+            );
+        }
+        TaskCommand::Links { id } => {
+            let item = store.registry_item_by_id(&id)?;
+            let data = json!({"id":item["id"],"status":item["status"],"version":item["version"],"links":item["links"]});
+            return output(
+                &data,
+                serde_json::to_string_pretty(&data).unwrap_or_default(),
+            );
+        }
+        TaskCommand::Link {
+            id,
+            to,
+            kind,
+            if_version,
+            key,
+        } => {
+            let key = key.unwrap_or_else(lockyard_cloud_client::ulid);
+            let item = store.registry_link_by_id(
+                &resolve_agent(agent)?,
+                &id,
+                &to,
+                &kind,
+                if_version,
+                &key,
+            )?;
+            let data = json!({"idempotency_key":key,"item":item});
+            return output(
+                &data,
+                serde_json::to_string_pretty(&data).unwrap_or_default(),
+            );
+        }
         TaskCommand::List { all, status, ready } => {
             if ready && (all || status.is_some()) {
                 return Err(Error::Invalid(
@@ -1790,9 +1999,11 @@ fn run_task(mut opened: Opened, command: TaskCommand, agent: Option<&String>) ->
         TaskCommand::Accept { id, note } => {
             store.accept_task(&resolve_agent(agent)?, &id, &note, now)?
         }
-        TaskCommand::Reject { id, reason, evidence } => {
-            store.reject_task(&resolve_agent(agent)?, &id, &reason, &evidence, now)?
-        }
+        TaskCommand::Reject {
+            id,
+            reason,
+            evidence,
+        } => store.reject_task(&resolve_agent(agent)?, &id, &reason, &evidence, now)?,
         TaskCommand::Cancel { id, note } => {
             store.cancel_task(&resolve_agent(agent)?, &id, &note, now)?
         }
@@ -1889,11 +2100,18 @@ fn run_work(mut opened: Opened, command: WorkCommand, agent: Option<&String>) ->
                 ..work_step(&task)
             },
         ),
-        WorkCommand::Handoff { task, to } => (
+        WorkCommand::Handoff {
+            task,
+            to,
+            report,
+            commits,
+        } => (
             task.id,
             WorkAction::Handoff,
             WorkStep {
                 to: Some(to),
+                report,
+                commits,
                 ..work_step(&task)
             },
         ),
@@ -2487,7 +2705,8 @@ fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
                 "assignee": item.assignee, "to": item.to})
             })
             .collect();
-        let mut tasks = backend.tasks(None, false)?;
+        let backlog = backend.tasks(None, false)?;
+        let mut tasks = backlog.clone();
         tasks.retain(|task| task.assignee.as_deref() == Some(session));
         tasks.truncate(20);
         lines.push(join(&tasks, task_line, "no tasks"));
@@ -2497,6 +2716,7 @@ fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Output> {
             "offers": offers,
             "work": work,
             "tasks": tasks,
+            "backlog": backlog,
             "machine_level": machine_level,
             "unannounced": unannounced,
         });
@@ -2610,6 +2830,42 @@ fn run_hook(command: HookCommand, agent: Option<String>, cwd: &Path) -> Result<O
     output(&Value::Null, "")
 }
 
+fn setup(client: SetupClient) -> String {
+    let server = r#"{
+  "mcpServers": {
+    "lockyard": { "command": "lockyard", "args": ["mcp"] }
+  }
+}"#;
+    let mut sections = match client {
+        SetupClient::Claude => vec![
+            format!("Add to .claude/settings.json:\n{}", hook::SETTINGS),
+            format!("Add to .mcp.json:\n{server}"),
+        ],
+        SetupClient::Codex => vec![
+            "Add to ~/.codex/config.toml:\n[mcp_servers.lockyard]\ncommand = \"lockyard\"\nargs = [\"mcp\"]\nenv_vars = [\"LOCKYARD_AGENT\", \"LOCKYARD_URL\", \"LOCKYARD_TOKEN_FILE\", \"LOCKYARD_TOKEN\", \"LOCKYARD_NODE_CONFIG\", \"XDG_CONFIG_HOME\", \"LOCKYARD_REQUIRE_E2EE\", \"LOCKYARD_E2EE_WORKSPACE_ID\"]"
+                .to_string(),
+        ],
+        SetupClient::Cursor => vec![format!("Add to .cursor/mcp.json:\n{server}")],
+    };
+    sections.push("Set LOCKYARD_AGENT to a unique name for each agent.".to_string());
+    sections.join("\n\n")
+}
+
+fn onboarding_output(mut data: Value) -> Result<Output> {
+    if let Some(checks) = data.get_mut("checks").and_then(Value::as_array_mut) {
+        for check in checks {
+            check["check"] = check["name"].clone();
+            check["ok"] = json!(check["state"] != "failed");
+            check["detail"] = check["message"].clone();
+        }
+    }
+    let mut result = output(&data, onboarding::text(&data))?;
+    if data["ok"] == false {
+        result.exit = EXIT_FAILURE;
+    }
+    Ok(result)
+}
+
 /// The clients a run covers: the named ones, or every one found in this project and home.
 fn chosen_clients(args: &SetupArgs, site: &setup::Site) -> Result<Vec<setup::Client>> {
     if args.clients.iter().any(|name| name == "all") {
@@ -2634,6 +2890,30 @@ fn chosen_clients(args: &SetupArgs, site: &setup::Site) -> Result<Vec<setup::Cli
 }
 
 fn run_setup(args: SetupArgs, cwd: &Path) -> Result<Output> {
+    if let Some(client) = args.client {
+        if args.dry_run || args.uninstall || args.print {
+            return Err(Error::Invalid("use --preview/--remove with positional CLIENT, or --client CLIENT for legacy setup options".into()));
+        }
+        if !(args.apply || args.check || args.remove || args.preview) {
+            let text = setup(client);
+            return output(&json!({"setup": text}), text);
+        }
+        let client = match client {
+            SetupClient::Claude => "claude",
+            SetupClient::Codex => "codex",
+            SetupClient::Cursor => "cursor",
+        };
+        let action = if args.apply {
+            onboarding::SetupAction::Apply
+        } else if args.check {
+            onboarding::SetupAction::Check
+        } else if args.remove {
+            onboarding::SetupAction::Remove
+        } else {
+            onboarding::SetupAction::Preview
+        };
+        return onboarding_output(onboarding::setup(cwd, client, action)?);
+    }
     // Setup configures one project, so it needs one: the files it writes name this folder.
     let root = lockyard_core::paths::find_root(cwd).ok_or(Error::NoProject)?;
     let site = setup::Site::discover(&root)?;
@@ -2772,7 +3052,23 @@ fn doctor_output(findings: Vec<setup::Finding>) -> Result<Output> {
         .collect::<Vec<_>>()
         .join("\n");
     let healthy = findings.iter().all(|finding| finding.ok);
-    let mut out = output(&json!({"ok": healthy, "checks": findings}), text)?;
+    let checks: Vec<Value> = findings
+        .iter()
+        .map(|finding| {
+            json!({
+                "ok": finding.ok, "check": finding.check, "detail": finding.detail,
+                "name": finding.check, "state": if finding.ok { "ok" } else { "failed" },
+                "message": finding.detail,
+            })
+        })
+        .collect();
+    let network_authorization_verified = findings
+        .iter()
+        .any(|finding| finding.check == "cloud" && finding.ok);
+    let mut out = output(
+        &json!({"ok": healthy, "checks": checks, "smoke": null, "network_authorization_verified": network_authorization_verified}),
+        text,
+    )?;
     if !healthy {
         out.exit = EXIT_FAILURE;
     }
@@ -2781,6 +3077,10 @@ fn doctor_output(findings: Vec<setup::Finding>) -> Result<Output> {
 
 /// Inside a hook the event names the session, so only an explicit name overrides it.
 fn env_agent_explicit() -> Option<String> {
+    env_lockyard_agent()
+}
+
+fn env_lockyard_agent() -> Option<String> {
     std::env::var("LOCKYARD_AGENT")
         .ok()
         .filter(|value| !value.is_empty())
@@ -2946,9 +3246,105 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
         Command::Hook(command) => run_hook(command, agent, cwd),
         Command::Monitor(args) => run_monitor(args, agent.as_ref(), cwd, json),
         Command::Setup(args) => run_setup(args, cwd),
-        Command::Doctor => run_doctor(cwd, agent.as_ref()),
+        Command::Doctor { client, smoke } => {
+            if client.is_none() && !smoke {
+                let data = onboarding::doctor(cwd, agent.as_deref(), None, false)?;
+                // Invalid configuration is intentionally summarized without leaking tokens.
+                if data["checks"].as_array().is_some_and(|checks| {
+                    checks
+                        .iter()
+                        .any(|check| check["name"] == "configuration" && check["state"] == "failed")
+                }) {
+                    return onboarding_output(data);
+                }
+                run_doctor(cwd, agent.as_ref())
+            } else {
+                onboarding_output(onboarding::doctor(
+                    cwd,
+                    agent.as_deref(),
+                    client.as_deref(),
+                    smoke,
+                )?)
+            }
+        }
+        Command::Context {
+            limit,
+            max_bytes,
+            cursor,
+        } => {
+            let mut opened = open()?;
+            let data = context::snapshot(
+                opened.backend.as_mut(),
+                &resolve_agent(agent.as_ref())?,
+                now_ms(),
+                &context::ContextOptions {
+                    limit,
+                    max_bytes,
+                    cursor,
+                },
+            )?;
+            output(&data, data.to_string())
+        }
+        Command::Workflow(WorkflowCommand::Inspect { id }) => {
+            let root = lockyard_core::paths::find_root(cwd).ok_or(Error::NoProject)?;
+            let data = workflow::inspect(&root, &id)?;
+            output(
+                &data,
+                serde_json::to_string_pretty(&data).unwrap_or_default(),
+            )
+        }
+        Command::Workflow(WorkflowCommand::Run { id, plan }) => {
+            let mut bytes = Vec::new();
+            if plan.as_os_str() == "-" {
+                std::io::stdin().take(65537).read_to_end(&mut bytes)?;
+            } else {
+                std::fs::File::open(plan)?
+                    .take(65537)
+                    .read_to_end(&mut bytes)?;
+            }
+            if bytes.len() > 65536 {
+                return Err(Error::Invalid("workflow plan exceeds 65536 bytes".into()));
+            }
+            let plan: Value = serde_json::from_slice(&bytes)
+                .map_err(|error| Error::Invalid(format!("invalid workflow JSON: {error}")))?;
+            let mut opened = open()?;
+            let data = workflow::run(
+                &opened.root,
+                opened.backend.as_mut(),
+                &resolve_agent(agent.as_ref())?,
+                now_ms(),
+                &id,
+                &plan,
+            )?;
+            let mut result = output(
+                &data,
+                serde_json::to_string_pretty(&data).unwrap_or_default(),
+            )?;
+            if data["ok"] != true {
+                result.exit = EXIT_FAILURE;
+            }
+            Ok(result)
+        }
+        #[cfg(unix)]
+        Command::Node(command) => node_output(node_cli::node(command)?),
+        #[cfg(unix)]
+        Command::Job(command) => node_output(node_cli::job(command)?),
         Command::Mcp(_) => output(&Value::Null, ""),
     }
+}
+
+#[cfg(unix)]
+fn node_output(data: Value) -> Result<Output> {
+    let failed = data.get("ok") == Some(&Value::Bool(false))
+        || data.pointer("/reply/ok") == Some(&Value::Bool(false));
+    let mut out = output(
+        &data,
+        serde_json::to_string_pretty(&data).unwrap_or_default(),
+    )?;
+    if failed {
+        out.exit = EXIT_FAILURE;
+    }
+    Ok(out)
 }
 
 fn current_dir() -> Result<PathBuf> {
@@ -3043,9 +3439,78 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn deferred_nested_commands_keep_global_flags_defaults_and_required_arguments() {
+        let cli = Cli::try_parse_from([
+            "lockyard", "node", "workflow", "list", "--offset", "3", "--agent", "worker", "--json",
+        ])
+        .unwrap();
+        assert_eq!(cli.agent.as_deref(), Some("worker"));
+        assert!(cli.json);
+        let Command::Node(node_cli::NodeCommand::Workflow {
+            command:
+                node_cli::DistributedWorkflowCommand::List {
+                    offset,
+                    limit,
+                    config,
+                },
+        }) = cli.command
+        else {
+            panic!("expected distributed workflow list")
+        };
+        assert_eq!(offset, 3);
+        assert_eq!(limit, 100);
+        assert!(config.is_none());
+        for args in [
+            vec!["lockyard", "node", "workflow", "submit"],
+            vec!["lockyard", "job", "manifest", "worker", "job-id"],
+            vec!["lockyard", "hook", "unknown-client"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn setup_accepts_both_production_and_managed_client_forms() {
+        let prod =
+            Cli::try_parse_from(["lockyard", "setup", "--client", "gemini", "--dry-run"]).unwrap();
+        let Command::Setup(args) = prod.command else {
+            panic!("expected setup")
+        };
+        assert_eq!(args.clients, ["gemini"]);
+        assert!(args.dry_run);
+        assert!(args.client.is_none());
+        let managed = Cli::try_parse_from(["lockyard", "setup", "codex", "--apply"]).unwrap();
+        let Command::Setup(args) = managed.command else {
+            panic!("expected setup")
+        };
+        assert!(matches!(args.client, Some(SetupClient::Codex)));
+        assert!(args.apply);
+        assert!(args.clients.is_empty());
+        for args in [
+            vec!["lockyard", "setup", "--apply"],
+            vec!["lockyard", "setup", "codex", "--client", "claude"],
+            vec!["lockyard", "setup", "codex", "--apply", "--dry-run"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn production_doctor_checks_keep_both_json_field_conventions() {
+        let result =
+            doctor_output(vec![setup::Finding::failed("project", "run lockyard init")]).unwrap();
+        assert_eq!(result.json["checks"][0]["check"], "project");
+        assert_eq!(result.json["checks"][0]["name"], "project");
+        assert_eq!(result.json["checks"][0]["state"], "failed");
+        assert_eq!(result.exit, EXIT_FAILURE);
+    }
+
     #[test]
     fn zone_answer_help_states_the_eta_format() {
         let mut command = Cli::command();
+        command.build();
         let help = command
             .find_subcommand_mut("zone")
             .unwrap()
@@ -3057,6 +3522,41 @@ mod tests {
     }
 
     #[test]
+    fn work_handoff_accepts_context_and_commit_references() {
+        let cli = Cli::try_parse_from([
+            "lockyard",
+            "work",
+            "handoff",
+            "W-12",
+            "--to",
+            "next",
+            "--if-version",
+            "3",
+            "--report",
+            "Tests passed; next verify staging",
+            "--commit",
+            "abc123",
+            "--commit",
+            "def456",
+        ])
+        .unwrap();
+        let Command::Work(WorkCommand::Handoff {
+            task,
+            to,
+            report,
+            commits,
+        }) = cli.command
+        else {
+            panic!("expected work handoff")
+        };
+        assert_eq!(task.id, 12);
+        assert_eq!(task.if_version, Some(3));
+        assert_eq!(to, "next");
+        assert_eq!(report.as_deref(), Some("Tests passed; next verify staging"));
+        assert_eq!(commits, ["abc123", "def456"]);
+    }
+
+    #[test]
     fn ids_read_with_or_without_a_prefix() {
         assert_eq!(parse_id("12"), Ok(12));
         assert_eq!(parse_id("T-12"), Ok(12));
@@ -3064,6 +3564,30 @@ mod tests {
         assert_eq!(parse_id("W-3"), Ok(3));
         assert!(parse_id("T12").is_err());
         assert!(parse_id("nope").is_err());
+    }
+
+    #[test]
+    fn raw_registry_commands_accept_native_and_legacy_task_identifiers() {
+        for id in ["12", "D-12", "FE-0319", "G-SG-0012"] {
+            for verb in ["links", "why-blocked"] {
+                assert!(Cli::try_parse_from(["lockyard", "task", verb, id]).is_ok());
+            }
+            let cli = Cli::try_parse_from([
+                "lockyard",
+                "task",
+                "link",
+                id,
+                "PA-0007",
+                "--if-version",
+                "1",
+            ])
+            .unwrap();
+            let Command::Task(TaskCommand::Link { id: parsed, to, .. }) = cli.command else {
+                panic!("expected task link")
+            };
+            assert_eq!(parsed, id);
+            assert_eq!(to, "PA-0007");
+        }
     }
 
     #[test]

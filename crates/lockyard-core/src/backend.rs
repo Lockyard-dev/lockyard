@@ -29,6 +29,10 @@ fn cloud<T>(feature: &str) -> Result<T> {
 
 /// Every operation of Lockyard, in either mode.
 pub trait Backend {
+    /// Override the key for a workflow's single write step. Always clear after the step.
+    /// Local writes do not have a remote idempotency ledger; uncertain outcomes must be reconciled.
+    fn set_write_idempotency_key(&mut self, _key: Option<String>) {}
+
     /// True when state lives on the server, so local clocks must not be compared with leases.
     fn is_cloud(&self) -> bool {
         false
@@ -146,6 +150,10 @@ pub trait Backend {
     }
     /// Reads mail and marks nothing: the caller shows it first, then calls [`Backend::inbox_seen`].
     fn inbox(&mut self, agent: &str, query: InboxQuery, now: i64) -> Result<InboxPage>;
+    /// Observe mail without registering an agent, updating presence or marking receipts.
+    fn peek_inbox(&self, _agent: &str, _query: InboxQuery, _now: i64) -> Result<InboxPage> {
+        cloud("read-only inbox")
+    }
     fn unread(&self, agent: &str) -> Result<i64>;
     fn inbox_seen(&mut self, agent: &str, ids: &[i64], now: i64) -> Result<usize>;
     fn inbox_claim(
@@ -187,6 +195,50 @@ pub trait Backend {
     }
     fn task(&self, id: &str) -> Result<tasks::Task>;
     fn task_history(&self, id: &str) -> Result<Vec<tasks::TaskEvent>>;
+    /// The full cloud registry protocol, without collapsing registry states into local task states.
+    fn registry_search(&self, _query: &Value) -> Result<Value> {
+        cloud("task search")
+    }
+    fn registry_ready(&self, _query: &Value) -> Result<Value> {
+        cloud("task ready")
+    }
+    fn registry_item(&self, _id: i64) -> Result<Value> {
+        cloud("task registry")
+    }
+    fn registry_blockers(&self, _id: i64) -> Result<Value> {
+        cloud("task why-blocked")
+    }
+    /// Read a registry item without discarding its area prefix or number padding.
+    fn registry_item_by_id(&self, _id: &str) -> Result<Value> {
+        cloud("task registry")
+    }
+    fn registry_blockers_by_id(&self, _id: &str) -> Result<Value> {
+        cloud("task why-blocked")
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn registry_link(
+        &mut self,
+        _agent: &str,
+        _id: i64,
+        _to: i64,
+        _kind: &str,
+        _version: i64,
+        _key: &str,
+    ) -> Result<Value> {
+        cloud("task link")
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn registry_link_by_id(
+        &mut self,
+        _agent: &str,
+        _id: &str,
+        _to: &str,
+        _kind: &str,
+        _version: i64,
+        _key: &str,
+    ) -> Result<Value> {
+        cloud("task link")
+    }
     fn add_task(&mut self, author: &str, spec: &tasks::TaskSpec, now: i64) -> Result<tasks::Task>;
     /// Changes the urgency of a task.
     fn plan_task(
@@ -198,6 +250,24 @@ pub trait Backend {
         cloud("task plan")
     }
     fn claim_task(&mut self, agent: &str, id: &str, ttl: i64, now: i64) -> Result<tasks::Task>;
+    /// A workflow claim result, preserving ownership evidence from the mutation response itself.
+    /// Cloud implementations must retain the assignment identity; a later read cannot establish
+    /// which assignment this write created. Local tasks use their current-owner policy on resume.
+    fn claim_task_receipt(&mut self, agent: &str, id: i64, ttl: i64, now: i64) -> Result<Value> {
+        serde_json::to_value(self.claim_task(agent, &id.to_string(), ttl, now)?)
+            .map_err(|error| Error::Protocol(error.to_string()))
+    }
+    /// Preserve the full task identity in a workflow claim receipt.
+    fn claim_task_receipt_by_id(
+        &mut self,
+        agent: &str,
+        id: &str,
+        ttl: i64,
+        now: i64,
+    ) -> Result<Value> {
+        serde_json::to_value(self.claim_task(agent, id, ttl, now)?)
+            .map_err(|error| Error::Protocol(error.to_string()))
+    }
     fn renew_task(&mut self, agent: &str, id: &str, ttl: i64, now: i64) -> Result<tasks::Task>;
     fn release_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task>;
     fn submit_task(
@@ -382,6 +452,7 @@ fn claim_record(claim: zones::Claim) -> Claim {
         meta: None,
         version: None,
         holder_available: None,
+        case_insensitive_paths: None,
         foreign_dirty_paths: Vec::new(),
     }
 }
@@ -578,6 +649,16 @@ impl Backend for Store {
         let messages = Store::inbox(self, agent, query.all, false, query.limit, now)?;
         Ok(InboxPage {
             messages: messages.into_iter().map(message_record).collect(),
+            skipped: 0,
+        })
+    }
+
+    fn peek_inbox(&self, agent: &str, query: InboxQuery, _now: i64) -> Result<InboxPage> {
+        Ok(InboxPage {
+            messages: Store::peek_inbox(self, agent, query.all, query.limit)?
+                .into_iter()
+                .map(message_record)
+                .collect(),
             skipped: 0,
         })
     }
@@ -811,6 +892,18 @@ mod tests {
                 .token_create("a", &TokenRequest::default())
                 .map(|_| ()),
             backend.token_revoke("a", "x").map(|_| ()),
+            backend.registry_search(&json!({})).map(|_| ()),
+            backend.registry_ready(&json!({})).map(|_| ()),
+            backend.registry_item(1).map(|_| ()),
+            backend.registry_blockers(1).map(|_| ()),
+            backend.registry_item_by_id("FE-0319").map(|_| ()),
+            backend.registry_blockers_by_id("FE-0319").map(|_| ()),
+            backend
+                .registry_link_by_id("a", "FE-0319", "G-SG-0012", "blocks", 1, "key")
+                .map(|_| ()),
+            backend
+                .registry_link("a", 1, 2, "blocks", 1, "key")
+                .map(|_| ()),
             backend
                 .plan_task("a", "D-1", &tasks::TaskPlan::default())
                 .map(|_| ()),
@@ -830,6 +923,53 @@ mod tests {
             let error = refusal.unwrap_err();
             assert!(error.to_string().contains("needs cloud mode"), "{error}");
         }
+    }
+
+    #[test]
+    fn a_numeric_workflow_claim_preserves_the_local_string_task_contract() {
+        let (_dir, mut store) = test_store();
+        let backend: &mut dyn Backend = &mut store;
+        let task = backend
+            .add_task(
+                "lead",
+                &tasks::TaskSpec {
+                    title: "workflow claim".into(),
+                    ..tasks::TaskSpec::default()
+                },
+                0,
+            )
+            .unwrap();
+        let id = task_number(&task.id).unwrap();
+        let receipt = backend.claim_task_receipt("worker", id, 10, 1).unwrap();
+        assert_eq!(receipt["id"], task.id);
+        assert_eq!(receipt["status"], "claimed");
+        assert_eq!(receipt["assignee"], "worker");
+        assert_eq!(
+            backend.task(&task.id).unwrap().assignee.as_deref(),
+            Some("worker")
+        );
+    }
+
+    #[test]
+    fn a_string_workflow_claim_uses_the_local_task_contract() {
+        let (_dir, mut store) = test_store();
+        let backend: &mut dyn Backend = &mut store;
+        let task = backend
+            .add_task(
+                "lead",
+                &tasks::TaskSpec {
+                    title: "string workflow claim".into(),
+                    ..tasks::TaskSpec::default()
+                },
+                0,
+            )
+            .unwrap();
+        let receipt = backend
+            .claim_task_receipt_by_id("worker", &task.id, 10, 1)
+            .unwrap();
+        assert_eq!(receipt["id"], task.id);
+        assert_eq!(receipt["status"], "claimed");
+        assert_eq!(receipt["assignee"], "worker");
     }
 
     #[test]

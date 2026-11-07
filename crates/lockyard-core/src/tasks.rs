@@ -74,6 +74,9 @@ pub struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     pub status: Status,
+    /// Exact registry status, when this is a projection of a cloud item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_status: Option<String>,
     pub author: String,
     pub assignee: Option<String>,
     pub lease_until: Option<i64>,
@@ -83,6 +86,7 @@ pub struct Task {
     /// Urgency of a backlog item. Local tasks have none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
+    /// Dependency links are preserved for cloud task consumers.
     /// Registry links and structured evidence are available for cloud registry items.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<serde_json::Value>,
@@ -307,7 +311,8 @@ impl Store {
             )));
         }
         let executor = task.assignee.clone().unwrap_or_default();
-        if let Some(message) = crate::admission::review_refusal(agent, &executor, "", &decision, reason)
+        if let Some(message) =
+            crate::admission::review_refusal(agent, &executor, "", &decision, reason)
         {
             let error = if message.contains("reason") || message.contains("decision") {
                 Error::Invalid(message)
@@ -481,6 +486,7 @@ fn read_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         acceptance: None,
         stage: None,
         target: None,
+        raw_status: None,
         links: Vec::new(),
         registry_evidence: Vec::new(),
     })
@@ -559,6 +565,26 @@ mod tests {
     const TTL: i64 = 10;
     const TTL_MS: i64 = TTL * MINUTE_MS;
 
+    #[test]
+    fn a_task_preserves_local_registry_details_and_exact_cloud_status_together() {
+        let (_dir, mut store) = test_store();
+        let mut task = store.add_task("lead", "ship", "", 0).unwrap();
+        task.acceptance = Some("tests pass".into());
+        task.stage = Some("review".into());
+        task.target = Some("production".into());
+        task.raw_status = Some("blocked".into());
+        task.links = vec![serde_json::json!({"to": "FE-12", "kind": "blocks"})];
+        task.registry_evidence = vec![serde_json::json!({"value": "test report"})];
+        let value = serde_json::to_value(&task).unwrap();
+        assert_eq!(value["id"], task.id);
+        assert_eq!(value["acceptance"], "tests pass");
+        assert_eq!(value["stage"], "review");
+        assert_eq!(value["target"], "production");
+        assert_eq!(value["raw_status"], "blocked");
+        assert_eq!(value["links"][0]["to"], "FE-12");
+        assert_eq!(value["registry_evidence"][0]["value"], "test report");
+    }
+
     fn task_in_review(store: &mut Store) -> i64 {
         let id = store
             .add_task("lead", "ship", "", 0)
@@ -633,7 +659,9 @@ mod tests {
         store
             .submit_task(executor, number, "tests pass", 2)
             .unwrap();
-        store.review_task("codex-review", number, "pass", "", 3).unwrap();
+        store
+            .review_task("codex-review", number, "pass", "", 3)
+            .unwrap();
         assert!(matches!(
             store.accept_task("claude-opus-5-5-medium", number, "", 4),
             Err(Error::Denied(message)) if message.contains("own work")
@@ -653,10 +681,7 @@ mod tests {
             .into_iter()
             .map(|event| event.action)
             .collect();
-        assert_eq!(
-            actions,
-            ["add", "claim", "submit", "review_pass", "accept"]
-        );
+        assert_eq!(actions, ["add", "claim", "submit", "review_pass", "accept"]);
     }
 
     #[test]
@@ -745,12 +770,16 @@ mod tests {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
         pass_and_accept(&mut store, id, 3);
-        assert!(store
-            .reject_task("lead", id, "empty delivery", "", 4)
-            .is_err());
-        assert!(store
-            .reject_task("worker", id, "empty delivery", "48bbf9a:src/Game.cs", 4)
-            .is_err());
+        assert!(
+            store
+                .reject_task("lead", id, "empty delivery", "", 4)
+                .is_err()
+        );
+        assert!(
+            store
+                .reject_task("worker", id, "empty delivery", "48bbf9a:src/Game.cs", 4)
+                .is_err()
+        );
         let task = store
             .reject_task("lead", id, "empty delivery", "48bbf9a:src/Game.cs", 4)
             .unwrap();

@@ -83,6 +83,8 @@ The six are the whole working loop: `start_work` claims paths and takes a task, 
 and releases, `status` says where everything stands. Each is the same sequence of the underlying tools, so a refusal
 is a refusal in both surfaces. `LOCKYARD_MCP_TOOLS=full` does the same as the flag, and the flag wins.
 
+For configuration snippets, use `lockyard setup --print --client claude`, `--client codex` or `--client cursor`. Set `LOCKYARD_AGENT` to a unique name for each agent. The MCP server communicates over standard input and output. The Codex configuration forwards the agent identity and configured Cloud URL/token variables; export them before starting Codex.
+
 ## Zones
 
 A claim is a lease on paths. It covers everything below them, and an expired lease frees the path, so a crashed agent
@@ -148,6 +150,8 @@ Create `.lockyard/config.toml`:
 mode = "cloud"
 url = "https://your-server.example"
 workspace = "your-team"
+# Optional: the same stable repository ID in every checkout of this repository.
+# repository = "api"
 ```
 
 Then sign in:
@@ -250,16 +254,33 @@ guarantee that a machine cannot hang.
 and `LOCKYARD_E2E_SERVER`, a shell command that runs the server in the foreground on a database that survives a restart.
 The suite starts and stops that server itself. Without the URL it skips, and with `LOCKYARD_E2E_REQUIRED=1` it fails instead.
 
+## Development workflows
+
+`lockyard task ready`, `task search`, `task links` and `task why-blocked` expose the cloud registry's
+native task states and dependency information. `lockyard context` builds a bounded briefing for a new
+session, and `work handoff --report ... --commit ...` carries context to the next agent.
+
+An explicit `lockyard workflow run <operation-id> --plan plan.json` records each coordination step.
+Retries preserve completed steps and stop on uncertain writes or stale ownership; the workflow is not
+an atomic transaction. See [context, handoff and workflows](docs/context-workflows.md).
+
+`lockyard doctor --smoke` verifies local coordination with two temporary agents. Client configuration
+changes are opt-in with `setup <client> --preview`, `--apply`, `--check` and `--remove`.
+See [managed client setup](docs/onboarding.md).
+
+For several repositories sharing cloud tasks and messages, configure distinct stable repository IDs.
+See [repository namespaces](docs/repositories.md) before changing an active project's identity.
+
 ## Limits
 
-- Lockyard prevents accidents between cooperating agents. Agent names are not authenticated, and an agent can pretend to
-  be another one.
+- Lockyard prevents accidents between cooperating agents. In local mode, agent names are cooperative identities rather than
+  authenticated users, and an agent can pretend to be another one. Cloud sessions are bound to workspace tokens; a credential role is not proof of a physical human identity.
 - The hook sees file edit tools only. A file changed by a shell command (`sed -i`, an editor, a build script) is **not
   refused**. `lockyard monitor` can notice it, mail the holder and show it in `status` / `doctor` — that is detection,
   not prevention. By the time the event arrives the write has already happened.
 - Subagents of one Claude Code session share its session id, so they count as one agent.
-- On macOS and Windows, path comparisons fold ASCII case to match their usual case-insensitive file systems. Other
-  platforms compare paths exactly.
+- In local mode, paths use NFC normalization and Unicode case-insensitive comparison on every operating system.
+  Cloud path comparison follows the repository's server catalog policy so different client operating systems agree.
 - In local mode all agents must run on one machine.
 - Cloud edit checks answer from a local mirror (see [docs/cloud-mirror.md](docs/cloud-mirror.md)); a stale or missing
   mirror refuses the edit rather than guess.

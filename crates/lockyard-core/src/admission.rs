@@ -59,7 +59,13 @@ pub fn is_executor(actor: &str, executor: &str, session: &str) -> bool {
 }
 
 /// Why this agent may not record a review, or `None` when Codex may.
-pub fn review_refusal(actor: &str, executor: &str, session: &str, decision: &str, reason: &str) -> Option<String> {
+pub fn review_refusal(
+    actor: &str,
+    executor: &str,
+    session: &str,
+    decision: &str,
+    reason: &str,
+) -> Option<String> {
     if product(agent_name(actor)) != "codex" {
         return Some("Only Codex reviews submitted work.".into());
     }
@@ -77,7 +83,12 @@ pub fn review_refusal(actor: &str, executor: &str, session: &str, decision: &str
 }
 
 /// Why this agent may not accept. `codex_passed` is a Codex PASS newer than the submit.
-pub fn accept_refusal(actor: &str, executor: &str, session: &str, codex_passed: bool) -> Option<String> {
+pub fn accept_refusal(
+    actor: &str,
+    executor: &str,
+    session: &str,
+    codex_passed: bool,
+) -> Option<String> {
     if is_executor(actor, executor, session) {
         return Some("An executor cannot accept their own work.".into());
     }
@@ -91,7 +102,7 @@ pub fn accept_refusal(actor: &str, executor: &str, session: &str, codex_passed: 
 }
 
 fn tokens(name: &str) -> Vec<String> {
-    name.split(|c: char| c == '-' || c == '_' || c == '.')
+    name.split(['-', '_', '.'])
         .filter(|part| !part.is_empty())
         .map(|part| part.to_ascii_lowercase())
         .collect()
@@ -103,10 +114,7 @@ mod tests {
 
     #[test]
     fn a_model_flag_is_the_same_agent() {
-        assert!(same_agent(
-            "cursor-grok-4.7-high",
-            "cursor-grok-4.7-fast"
-        ));
+        assert!(same_agent("cursor-grok-4.7-high", "cursor-grok-4.7-fast"));
         assert!(same_agent(
             "token:abc:cursor-grok-4.7-high",
             "cursor-grok-4.7-fast"
@@ -114,10 +122,7 @@ mod tests {
         assert!(!same_agent("claude-a", "claude-b"));
         assert!(same_agent("cursor-grok-4.7-high", "cursor-grok-4.7-xhigh"));
         assert!(same_agent("cursor-grok-4.7-high", "cursor-grok-4.7-medium"));
-        assert!(same_agent(
-            "claude-opus-5-5-high",
-            "claude-opus-5-5-medium"
-        ));
+        assert!(same_agent("claude-opus-5-5-high", "claude-opus-5-5-medium"));
         assert!(same_agent(
             "codex-gpt-5.6-sol-high",
             "codex-gpt-5.6-sol-medium"
@@ -139,35 +144,40 @@ mod tests {
         let executor = "cursor-grok-4.7-high";
         assert!(accept_refusal(executor, executor, "", true).is_some());
         assert!(accept_refusal("cursor-grok-4.7-fast", executor, "", true).is_some());
-        assert!(accept_refusal("codex-review", executor, "", true)
-            .unwrap()
-            .contains("Claude"));
-        assert!(accept_refusal("claude-accept", executor, "", false)
-            .unwrap()
-            .contains("PASS"));
+        assert!(
+            accept_refusal("codex-review", executor, "", true)
+                .unwrap()
+                .contains("Claude")
+        );
+        assert!(
+            accept_refusal("claude-accept", executor, "", false)
+                .unwrap()
+                .contains("PASS")
+        );
         assert!(accept_refusal("claude-accept", executor, "", true).is_none());
-        assert!(accept_refusal("owner-1", executor, "", true)
-            .unwrap()
-            .contains("Claude"));
+        assert!(
+            accept_refusal("owner-1", executor, "", true)
+                .unwrap()
+                .contains("Claude")
+        );
         assert!(review_refusal("claude-accept", executor, "", "pass", "").is_some());
         assert!(review_refusal("codex-review", executor, "", "reject", " ").is_some());
         assert!(review_refusal("codex-review", executor, "", "pass", "").is_none());
         assert!(review_refusal("codex-worker", "codex-worker-fast", "", "pass", "").is_some());
-        assert!(accept_refusal(
-            "claude-opus-5-5-medium",
-            "claude-opus-5-5-high",
-            "",
-            true
-        )
-        .unwrap()
-        .contains("executor"));
-        assert!(review_refusal(
-            "codex-gpt-5.6-sol-medium",
-            "codex-gpt-5.6-sol-high",
-            "",
-            "pass",
-            ""
-        )
-        .is_some());
+        assert!(
+            accept_refusal("claude-opus-5-5-medium", "claude-opus-5-5-high", "", true)
+                .unwrap()
+                .contains("executor")
+        );
+        assert!(
+            review_refusal(
+                "codex-gpt-5.6-sol-medium",
+                "codex-gpt-5.6-sol-high",
+                "",
+                "pass",
+                ""
+            )
+            .is_some()
+        );
     }
 }

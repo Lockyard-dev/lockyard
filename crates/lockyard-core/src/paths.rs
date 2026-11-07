@@ -37,6 +37,11 @@ impl ZonePath {
             // Case is folded only when comparing, so a Mac and a Linux client name `src/Auth` alike.
             parts.push(part.nfc().collect::<String>());
         }
+        if parts.first().map(String::as_str) == Some(".lockyard-repository") {
+            return Err(Error::Invalid(
+                ".lockyard-repository is reserved for repository protocol addresses".into(),
+            ));
+        }
         if parts.is_empty() {
             return Ok(Some(Self(ROOT.into())));
         }
@@ -63,13 +68,28 @@ impl ZonePath {
 
     /// True when this path is the requested path or one of its parent directories.
     pub fn contains(&self, other: &Self) -> bool {
-        let outer = comparable(self.as_str(), true);
-        let inner = comparable(other.as_str(), true);
+        let (repository_outer, outer) = crate::repository::split(self.as_str());
+        let (repository_inner, inner) = crate::repository::split(other.as_str());
+        if repository_outer != repository_inner {
+            return false;
+        }
+        let outer = comparable(outer, true);
+        let inner = comparable(inner, true);
         outer == ROOT || inner == outer || is_inside(&inner, &outer)
+    }
+
+    /// Cloud caches use the repository policy returned by the server, rather than this machine's OS.
+    pub fn overlaps_with_case(&self, other: &Self, fold_case: bool) -> bool {
+        overlaps(self.as_str(), other.as_str(), fold_case)
     }
 }
 
 fn overlaps(a: &str, b: &str, fold_case: bool) -> bool {
+    let (repository_a, a) = crate::repository::split(a);
+    let (repository_b, b) = crate::repository::split(b);
+    if repository_a != repository_b {
+        return false;
+    }
     overlaps_exact(&comparable(a, fold_case), &comparable(b, fold_case))
 }
 
@@ -142,6 +162,19 @@ mod tests {
     }
 
     #[test]
+    fn physical_paths_cannot_impersonate_virtual_repository_addresses() {
+        let (_dir, root) = project();
+        fs::create_dir_all(root.join(".lockyard-repository/api/src")).unwrap();
+        assert!(matches!(
+            ZonePath::resolve(&root, &root, ".lockyard-repository/api/src"),
+            Err(Error::Invalid(_))
+        ));
+        // Wire records still need this representation in the aggregate daemon cache.
+        let stored = ZonePath::stored(".lockyard-repository/api/src".into());
+        assert_eq!(stored.as_str(), ".lockyard-repository/api/src");
+    }
+
+    #[test]
     fn path_overlap_can_fold_ascii_case_on_any_platform() {
         assert!(!overlaps("SRC", "src/file.rs", false));
         assert!(overlaps("SRC", "src/file.rs", true));
@@ -152,6 +185,43 @@ mod tests {
     #[test]
     fn path_overlap_folds_unicode_case_on_case_insensitive_platforms() {
         assert!(overlaps("src/É", "src/é/file", true));
+    }
+
+    #[test]
+    fn repository_roots_and_legacy_root_are_separate_even_when_comparing_without_case() {
+        let api = ".lockyard-repository/api";
+        let web = ".lockyard-repository/web";
+        assert!(overlaps(api, &format!("{api}/src/file"), false));
+        assert!(!overlaps(api, &format!("{web}/src/file"), false));
+        assert!(!overlaps(".", &format!("{api}/src/file"), false));
+        assert!(!overlaps(api, "src/file", true));
+        assert!(overlaps(
+            &format!("{api}/SRC"),
+            &format!("{api}/src/file"),
+            true
+        ));
+        assert!(!overlaps(
+            &format!("{api}/SRC"),
+            &format!("{api}/src/file"),
+            false
+        ));
+    }
+
+    #[test]
+    fn repository_namespaces_preserve_unicode_aliases_and_containment_boundaries() {
+        let path = |text: &str| ZonePath::stored(text.into());
+        let root = path(".lockyard-repository/api");
+        let directory = path(".lockyard-repository/api/src/Cafe\u{0301}");
+        let file = path(".lockyard-repository/api/src/CAF\u{00c9}/file.rs");
+        assert!(directory.overlaps_with_case(&file, true));
+        assert!(!directory.overlaps_with_case(&file, false));
+        assert!(directory.contains(&file));
+        assert!(!file.contains(&directory));
+        assert!(root.contains(&file));
+        assert!(!path(".").contains(&file));
+        assert!(!root.contains(&path(".lockyard-repository/web/src/file.rs")));
+        assert!(!root.contains(&path("src/file.rs")));
+        assert!(!directory.overlaps(&path(".lockyard-repository/web/src/CAF\u{00c9}")));
     }
 
     fn zone(root: &Path, cwd: &Path, raw: &str) -> String {

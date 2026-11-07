@@ -10,9 +10,12 @@ mod crypto;
 pub mod device;
 #[cfg(test)]
 mod fake;
+mod registry;
+mod repository;
 
 pub use backend::CloudBackend;
 pub use crypto::{CONTENT_FIELDS, FieldRule, WorkspaceKey, route_matches, transform_fields};
+pub use repository::RepositoryTransport;
 
 const ENCRYPTION_PATH: &str = "/api/v1/workspace/encryption";
 
@@ -248,6 +251,9 @@ pub struct Call {
     pub session: String,
     pub method: String,
     pub path: String,
+    /// Repository scope for zone operations. Empty means the legacy namespace; absent is aggregate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<Value>,
     /// Idempotency key. Required on every write.
@@ -340,6 +346,7 @@ pub struct Client {
     workspace: Option<String>,
     content_key: Option<WorkspaceKey>,
     encryption_enabled: bool,
+    expected_e2ee_workspace: Option<String>,
 }
 
 impl Client {
@@ -360,6 +367,25 @@ impl Client {
         if token.is_empty() {
             return Err(ClientError::Invalid("a token is required".into()));
         }
+        let force = match std::env::var("LOCKYARD_REQUIRE_E2EE") {
+            Ok(value) if matches!(value.as_str(), "1" | "true") => true,
+            Ok(value) if matches!(value.as_str(), "" | "0" | "false") => false,
+            Err(std::env::VarError::NotPresent) => false,
+            _ => {
+                return Err(ClientError::Invalid(
+                    "invalid required encryption policy".into(),
+                ));
+            }
+        };
+        let expected_e2ee_workspace = match std::env::var("LOCKYARD_E2EE_WORKSPACE_ID") {
+            Ok(value) if valid_workspace_identity(&value) => Some(value),
+            Err(std::env::VarError::NotPresent) if !force => None,
+            _ => {
+                return Err(ClientError::Invalid(
+                    "required encryption needs a valid bound workspace identity".into(),
+                ));
+            }
+        };
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(2))
             .timeout_read(Duration::from_secs(5))
@@ -378,7 +404,28 @@ impl Client {
             workspace: None,
             content_key: None,
             encryption_enabled: false,
+            expected_e2ee_workspace,
         })
+    }
+
+    /// Require encryption independently of the legacy server preference, bound to this workspace.
+    pub fn require_e2ee_for(mut self, workspace: &str) -> Result<Self, ClientError> {
+        if !valid_workspace_identity(workspace) {
+            return Err(ClientError::Invalid(
+                "invalid required encryption workspace identity".into(),
+            ));
+        }
+        if self
+            .expected_e2ee_workspace
+            .as_deref()
+            .is_some_and(|expected| expected != workspace)
+        {
+            return Err(ClientError::Invalid(
+                "required encryption workspace cannot be rebound".into(),
+            ));
+        }
+        self.expected_e2ee_workspace = Some(workspace.to_string());
+        Ok(self)
     }
 
     /// Enables local content encryption for a workspace. The key stays in this process.
@@ -394,12 +441,19 @@ impl Client {
         self
     }
 
-    /// Read the server setting once and configure this client. A 404 means the server predates
-    /// the setting endpoint, so the client stays in cleartext compatibility mode.
+    /// Read the server setting once. Only legacy clients may use cleartext compatibility
+    /// when the endpoint is absent; a node job requires a verified workspace and local key.
     pub fn configure_content_encryption(self, session: &str) -> Result<Self, ClientError> {
         let response = match self.call(&Call::get(session, ENCRYPTION_PATH.into())) {
             Ok(value) => value,
-            Err(ClientError::NotFound(_)) => return Ok(self),
+            Err(ClientError::NotFound(_)) if self.expected_e2ee_workspace.is_none() => {
+                return Ok(self);
+            }
+            Err(ClientError::NotFound(_)) => {
+                return Err(ClientError::Invalid(
+                    "required node encryption cannot verify this server's workspace policy".into(),
+                ));
+            }
             Err(error) => return Err(error),
         };
         let setting: WorkspaceEncryption = serde_json::from_value(response).map_err(|error| {
@@ -413,6 +467,13 @@ impl Client {
         self,
         setting: WorkspaceEncryption,
     ) -> Result<Self, ClientError> {
+        if let Some(expected) = &self.expected_e2ee_workspace
+            && expected != &setting.workspace_id
+        {
+            return Err(ClientError::Invalid(
+                "workspace identity differs from the node encryption context".into(),
+            ));
+        }
         if !matches!(setting.encryption.as_str(), "off" | "required")
             || (setting.encryption == "required" && setting.key_id.is_none())
         {
@@ -422,9 +483,13 @@ impl Client {
         }
         let key = WorkspaceKey::load_for_workspace(&setting.workspace_id)
             .map_err(ClientError::Invalid)?;
-        if setting.encryption == "required"
-            && let (Some(key), Some(expected)) = (&key, setting.key_id.as_deref())
-        {
+        let required = setting.encryption == "required" || self.expected_e2ee_workspace.is_some();
+        if self.expected_e2ee_workspace.is_some() && key.is_none() {
+            return Err(ClientError::Invalid(
+                "required node workspace encryption key is unavailable".into(),
+            ));
+        }
+        if required && let (Some(key), Some(expected)) = (&key, setting.key_id.as_deref()) {
             let actual = key.key_id();
             if actual != expected {
                 return Err(ClientError::Invalid(format!(
@@ -432,11 +497,7 @@ impl Client {
                 )));
             }
         }
-        Ok(self.with_content_encryption(
-            &setting.workspace_id,
-            key,
-            setting.encryption == "required",
-        ))
+        Ok(self.with_content_encryption(&setting.workspace_id, key, required))
     }
 
     /// Fetch the server's setting without enabling transformations, for encryption management.
@@ -506,6 +567,16 @@ impl Client {
         if let Some(key) = &call.key {
             request = request.set("Idempotency-Key", key);
         }
+        if let Some(repository) = &call.repository {
+            request = request.set(
+                "X-Lockyard-Repository",
+                if repository.is_empty() {
+                    "-"
+                } else {
+                    repository
+                },
+            );
+        }
         // The caller's remaining wait decides whether a retry fits; it never cuts a request short.
         // A short per-request timeout broke TLS handshakes on macOS ("Resource temporarily
         // unavailable"), so only the outbox's own attempt limit bounds a single request.
@@ -527,13 +598,29 @@ impl Client {
                     response.status()
                 ))))
             }
+            Ok(response) if call.repository.as_deref().is_some_and(|repository| !repository.is_empty()
+                && response.header("X-Lockyard-Repository") != Some(repository)) => {
+                Err(Failure::Final(ClientError::Invalid("this server does not confirm repository namespace support; upgrade the server before using repository-scoped coordination".into())))
+            }
             Ok(response) => decode(response).map_err(Failure::Retry),
             Err(ureq::Error::Status(status, response)) => {
                 let retry_after = response
                     .header("Retry-After")
                     .and_then(|value| value.parse::<u64>().ok());
                 let body = response.into_string().unwrap_or_default();
-                let error = ClientError::from_api(ApiError::parse(status, &body, retry_after));
+                let mut api_error=ApiError::parse(status,&body,retry_after);
+                if let Some(workspace)=self.workspace.as_deref() {
+                    crypto::transform_error_details(&mut api_error.details,workspace,self.content_key.as_ref(),self.expected_e2ee_workspace.is_some())
+                        .map_err(|message|Failure::Final(ClientError::Invalid(message)))?;
+                }
+                if self.expected_e2ee_workspace.is_some() {
+                    // Error messages are server-authored text, not authenticated application content.
+                    api_error.message=format!("Cloud request failed with HTTP {status}");
+                    if api_error.code.len()>64 || !api_error.code.bytes().all(|byte|byte.is_ascii_lowercase()||byte.is_ascii_digit()||byte==b'_') {
+                        api_error.code="cloud_error".into();
+                    }
+                }
+                let error = ClientError::from_api(api_error);
                 // A frozen server stays frozen for its whole window: the caller decides what to do.
                 let again = status == 429
                     || (300..400).contains(&status)
@@ -561,20 +648,36 @@ impl Transport for Client {
                 "writes require an Idempotency-Key".into(),
             ));
         }
-        if !call.path.starts_with('/') || call.path.contains("..") {
+        let route = call.path.split('?').next().unwrap_or(&call.path);
+        if let Some(expected) = &self.expected_e2ee_workspace
+            && !(call.method == "GET" && route == ENCRYPTION_PATH)
+            && (!self.encryption_enabled
+                || self.content_key.is_none()
+                || self.workspace.as_deref() != Some(expected.as_str()))
+        {
+            return Err(ClientError::Invalid(
+                "node content request requires a verified encrypted workspace context".into(),
+            ));
+        }
+        if !route.starts_with('/') || route.split('/').any(|part| matches!(part, "." | "..")) {
             return Err(ClientError::Invalid(
                 "request path must be an absolute API path".into(),
             ));
         }
+        if self.expected_e2ee_workspace.is_some() {
+            crypto::validate_required_route(&call.method, &call.path)
+                .map_err(ClientError::Invalid)?;
+        }
         let mut body = call.body.clone();
         if let (Some(value), Some(workspace)) = (&mut body, self.workspace.as_deref()) {
-            transform_fields(
+            crypto::transform_fields_policy(
                 value,
                 &call.method,
                 &call.path,
                 workspace,
                 self.content_key.as_ref(),
                 self.encryption_enabled,
+                self.expected_e2ee_workspace.is_some(),
             )
             .map_err(ClientError::Invalid)?;
         }
@@ -595,13 +698,14 @@ impl Transport for Client {
             match self.attempt(call, encoded.as_deref(), remaining) {
                 Ok(mut value) => {
                     if let Some(workspace) = self.workspace.as_deref() {
-                        transform_fields(
+                        crypto::transform_fields_policy(
                             &mut value,
                             &call.method,
                             &call.path,
                             workspace,
                             self.content_key.as_ref(),
                             false,
+                            self.expected_e2ee_workspace.is_some(),
                         )
                         .map_err(ClientError::Invalid)?;
                     }
@@ -668,6 +772,14 @@ fn wait_fits_deadline(
     retry_wait(error, fallback).saturating_add(RETRY_ROUND_TRIP_ESTIMATE) <= remaining
 }
 
+fn valid_workspace_identity(workspace: &str) -> bool {
+    !workspace.is_empty()
+        && workspace.len() <= 64
+        && workspace
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
 fn allowed_url(url: &str) -> bool {
     if url.starts_with("https://") {
         return true;
@@ -700,6 +812,16 @@ pub fn token_id(token: &str) -> String {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     });
     format!("{hash:016x}")
+}
+
+/// Bind durable operation receipts to a credential without storing its value.
+/// This fingerprint is not an authentication token and must never replace authorization.
+pub fn credential_fingerprint(token: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, token.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn decode(response: ureq::Response) -> Result<Value, ClientError> {
@@ -777,7 +899,11 @@ mod tests {
     impl KeyEnv {
         fn new() -> Self {
             let previous = std::env::var_os("XDG_CONFIG_HOME");
-            let path = std::env::temp_dir().join(format!("lockyard-test-{}", ulid()));
+            // Key storage rejects symlinked parents; macOS commonly spells its temp root via /var.
+            let path = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("lockyard-test-{}", ulid()));
             unsafe { std::env::set_var("XDG_CONFIG_HOME", &path) };
             Self { previous, path }
         }
@@ -822,6 +948,787 @@ mod tests {
             .unwrap();
         assert_eq!(result["body"], "plain");
         assert_eq!(server.requests()[1].body["body"], "plain");
+    }
+
+    const NODE_WORKSPACE: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+    fn forced_client(server: &FakeServer, key: WorkspaceKey) -> Client {
+        Client::new(&server.url(), "fixture-token".into())
+            .unwrap()
+            .require_e2ee_for(NODE_WORKSPACE)
+            .unwrap()
+            .with_content_encryption(NODE_WORKSPACE, Some(key), true)
+    }
+
+    #[test]
+    fn node_context_encrypts_even_when_legacy_setting_is_off() {
+        let _lock = KEY_ENV.lock().unwrap();
+        let _env = KeyEnv::new();
+        let key = WorkspaceKey::from_entropy([83; 32]);
+        key.store_for_workspace(NODE_WORKSPACE).unwrap();
+        let envelope = key
+            .encrypt(NODE_WORKSPACE, "body", "private reply")
+            .unwrap();
+        let server = FakeServer::start(vec![
+            setting("off", None),
+            Reply::json(200, json!({"body":envelope})),
+        ]);
+        let client = Client::new(&server.url(), "fixture-token".into())
+            .unwrap()
+            .require_e2ee_for(NODE_WORKSPACE)
+            .unwrap()
+            .configure_content_encryption("node-job")
+            .unwrap();
+        let response = client
+            .call(&Call::write(
+                "node-job",
+                "POST",
+                "/api/v1/bus/messages".into(),
+                json!({"body":"private prompt"}),
+            ))
+            .unwrap();
+        assert_eq!(response["body"], "private reply");
+        let requests = server.requests();
+        let wire = requests[1].body["body"].as_str().unwrap();
+        assert!(wire.starts_with("lyenc1."));
+        assert_eq!(
+            key.decrypt(NODE_WORKSPACE, "body", wire).unwrap(),
+            "private prompt"
+        );
+        assert!(!requests[1].body.to_string().contains("private prompt"));
+    }
+
+    #[test]
+    fn node_context_refuses_missing_policy_key_or_wrong_workspace() {
+        let _lock = KEY_ENV.lock().unwrap();
+        let _env = KeyEnv::new();
+        for reply in [
+            Reply::json(404, json!({})),
+            setting("off", None),
+            Reply::json(
+                200,
+                json!({"encryption":"off","workspace_id":"another-workspace","key_id":null}),
+            ),
+        ] {
+            let server = FakeServer::start(vec![reply]);
+            let error = Client::new(&server.url(), "fixture-token".into())
+                .unwrap()
+                .require_e2ee_for(NODE_WORKSPACE)
+                .unwrap()
+                .configure_content_encryption("node-job")
+                .err()
+                .unwrap();
+            assert!(matches!(error, ClientError::Invalid(_)));
+            assert_eq!(server.requests().len(), 1);
+        }
+    }
+
+    #[test]
+    fn node_context_cannot_be_disabled_or_rebound_by_legacy_builder() {
+        let key = WorkspaceKey::from_entropy([84; 32]);
+        let server = FakeServer::start(vec![]);
+        for client in [
+            forced_client(&server, key.clone()).with_content_encryption(
+                NODE_WORKSPACE,
+                Some(key.clone()),
+                false,
+            ),
+            forced_client(&server, key.clone()).with_content_encryption(
+                "another-workspace",
+                Some(key),
+                true,
+            ),
+        ] {
+            assert!(
+                client
+                    .call(&Call::get("node-job", "/api/v1/bus/inbox".into()))
+                    .is_err()
+            );
+        }
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn node_context_refuses_plaintext_or_unauthenticated_content_responses() {
+        for body in [
+            json!({"messages":[{"body":"plaintext from cloud"}]}),
+            json!({"messages":[{"body":"lyenc1.invalid.envelope"}]}),
+            json!({"messages":[{"body":{"nested":"plaintext"}}]}),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(200, body)]);
+            let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
+            assert!(matches!(
+                client.call(&Call::get("node-job", "/api/v1/bus/inbox".into())),
+                Err(ClientError::Invalid(_))
+            ));
+            assert_eq!(server.requests().len(), 1);
+        }
+    }
+
+    #[test]
+    fn node_context_rejects_unclassified_legacy_response_metadata() {
+        for meta in [
+            json!({"code":"legacy content"}),
+            json!("legacy content"),
+            json!({}),
+        ] {
+            for (path, body) in [
+                ("/api/v1/zones/claims", json!([{"meta":meta}])),
+                ("/api/v1/zones/queue", json!([{"meta":meta}])),
+                (
+                    "/api/v1/events",
+                    json!([{"type":"zone.claimed","payload":{"meta":meta}}]),
+                ),
+                (
+                    "/api/v1/events",
+                    json!([{"type":"zone.queued","payload":{"meta":meta}}]),
+                ),
+            ] {
+                let server = FakeServer::start(vec![Reply::json(200, body)]);
+                let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
+                assert!(
+                    matches!(
+                        client.call(&Call::get("node-job", path.into())),
+                        Err(ClientError::Invalid(_))
+                    ),
+                    "{path}"
+                );
+                assert_eq!(server.requests().len(), 1);
+            }
+        }
+        for (path, body) in [
+            (
+                "/api/v1/zones/claims",
+                json!([{"meta":null,"hold_until_ref":null}]),
+            ),
+            ("/api/v1/zones/queue", json!([{"meta":null}])),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(200, body)]);
+            let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
+            assert!(
+                client.call(&Call::get("node-job", path.into())).is_ok(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_context_validates_nested_response_shapes_and_metadata_events() {
+        for (path, body) in [
+            (
+                "/api/v1/registry/items",
+                json!({"items":[],"future_content":"private"}),
+            ),
+            (
+                "/api/v1/registry/items",
+                json!({"items":[{"assignment":{"session":"worker","future_content":"private"}}]}),
+            ),
+            (
+                "/api/v1/registry/items",
+                json!({"items":[{"assignment":{"session":{"code":"private"}}}]}),
+            ),
+            (
+                "/api/v1/events",
+                json!([{"type":"bus.unread","payload":{"to":"member","future_content":"private"}}]),
+            ),
+            (
+                "/api/v1/events",
+                json!([{"type":"zone.claimed","payload":{"claim_id":{"code":"private"}}}]),
+            ),
+            (
+                "/api/v1/zones/catalog",
+                json!({"zones":{},"future_content":"private"}),
+            ),
+            ("/api/v1/zones/claims", json!("private")),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(200, body)]);
+            let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
+            assert!(
+                matches!(
+                    client.call(&Call::get("node-job", path.into())),
+                    Err(ClientError::Invalid(_))
+                ),
+                "{path}"
+            );
+            assert_eq!(server.requests().len(), 1);
+        }
+        for event in [
+            json!({"type":"bus.unread","payload":{"to":"member"}}),
+            json!({"type":"bus.seen","payload":{"seen":[17,"message-id"]}}),
+            json!({"type":"presence.heartbeat","payload":{"session":"member","state":"working","last_seen":"2026-11-07T07:00:00.1234567+00:00"}}),
+            json!({"type":"zone.claimed","payload":{"claim_id":17,"session":"member","paths":["src"],"note":"","reason":"claimed","fence":1}}),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(200, json!([event]))]);
+            let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
+            assert!(
+                client
+                    .call(&Call::get("node-job", "/api/v1/events".into()))
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn node_context_preserves_safe_presence_metadata_and_authenticated_legacy_content() {
+        let safe = json!({"level":"ok","load":0.5,"cpus":4});
+        for (method, path, response) in [
+            (
+                "POST",
+                "/api/v1/presence",
+                json!({"meta":safe,"activity":{"tool_running":true,"meta":safe}}),
+            ),
+            (
+                "GET",
+                "/api/v1/presence",
+                json!([{"meta":safe,"activity":{"tool_running":true,"meta":safe}}]),
+            ),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(200, response.clone())]);
+            let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
+            let call = if method == "POST" {
+                Call::write(
+                    "node-job",
+                    method,
+                    path.into(),
+                    json!({"client":"fixture","activity":{"tool_running":true,"meta":safe}}),
+                )
+            } else {
+                Call::get("node-job", path.into())
+            };
+            assert_eq!(client.call(&call).unwrap(), response);
+        }
+        for response in [
+            json!([{"meta":{"code":"private"}}]),
+            json!([{"activity":{"meta":{"code":"private"}}}]),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(200, response)]);
+            let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
+            assert!(
+                client
+                    .call(&Call::get("node-job", "/api/v1/presence".into()))
+                    .is_err()
+            );
+        }
+        let key = WorkspaceKey::from_entropy([85; 32]);
+        let encrypted = key
+            .encrypt(NODE_WORKSPACE, "legacy_raw", "private legacy content")
+            .unwrap();
+        let server = FakeServer::start(vec![Reply::json(
+            200,
+            json!({"items":[{"legacy_raw":encrypted,"assignment":{"session":"worker","lease_active":true,"released_at":null}}]}),
+        )]);
+        let client = forced_client(&server, key);
+        assert_eq!(
+            client
+                .call(&Call::get("node-job", "/api/v1/registry/items".into()))
+                .unwrap()["items"][0]["legacy_raw"],
+            "private legacy content"
+        );
+    }
+
+    #[test]
+    fn node_context_reads_backend_identifiers_enums_and_nested_dirty_content() {
+        let key = WorkspaceKey::from_entropy([85; 32]);
+        let note = key.encrypt(NODE_WORKSPACE, "note", "private note").unwrap();
+        let reason = key
+            .encrypt(NODE_WORKSPACE, "reason", "private dirty reason")
+            .unwrap();
+        let title = key
+            .encrypt(NODE_WORKSPACE, "title", "private title")
+            .unwrap();
+        let body = key
+            .encrypt(NODE_WORKSPACE, "body", "private message")
+            .unwrap();
+        let stamp = "2026-11-07T07:00:00.1234567+00:00";
+        for (path, response, field, expected) in [
+            (
+                "/api/v1/zones/claims",
+                json!([{"id":1,"session":"worker","paths":["src"],"mode":"exclusive","purpose":"work","note":note,"fence":1,"created_at":stamp,"expires_at":stamp,"version":1,"meta":null,"hold_until_ref":null,"foreign_dirty_paths":[{"path":"src/dirty","owner_session":"other","reported_by":"other","reason":reason,"task_id":17,"foreign":true,"created_at":stamp,"updated_at":stamp,"holder_session":"worker","repository":null}]}]),
+                "note",
+                "private note",
+            ),
+            (
+                "/api/v1/zones/queue",
+                json!([{"id":2,"session":"worker","paths":["src"],"mode":"exclusive","purpose":"work","note":note,"priority_of":1,"add_path_claim_id":1,"meta":null}]),
+                "note",
+                "private note",
+            ),
+            (
+                "/api/v1/registry/items",
+                json!({"items":[{"id":"D-1","type":"code","priority":"P2","status":"ready","target":"ci_passed","verification":"auto","sealed":false,"title":title,"assignment":{"session":"worker","lease_active":true,"claimed_at":stamp,"released_at":null}}]}),
+                "title",
+                "private title",
+            ),
+            (
+                "/api/v1/bus/inbox",
+                json!({"messages":[{"id":7,"thread_id":1,"in_reply_to":null,"from_session":"other","to":"worker","kind":"info","needs":"none","body":body,"created_at":stamp,"status":"unread","version":1}]}),
+                "body",
+                "private message",
+            ),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(200, response)]);
+            let client = forced_client(&server, key.clone());
+            let result = client.call(&Call::get("node-job", path.into())).unwrap();
+            let item = if result.is_array() {
+                &result[0]
+            } else if path.contains("registry") {
+                &result["items"][0]
+            } else {
+                &result["messages"][0]
+            };
+            assert_eq!(item[field], expected, "{path}");
+            if path.ends_with("claims") {
+                assert_eq!(
+                    item["foreign_dirty_paths"][0]["reason"],
+                    "private dirty reason"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn node_context_blocks_query_and_structured_content_bypasses_before_http() {
+        let server = FakeServer::start(vec![]);
+        let client = forced_client(&server, WorkspaceKey::from_entropy([86; 32]));
+        for path in [
+            "/api/v1/registry/items?q=private%20prompt",
+            "/api/v1/registry/items?%71=private",
+            "/api/v1/registry/items?unknown=private",
+            "/api/v1/new-content-endpoint",
+        ] {
+            assert!(
+                client.call(&Call::get("node-job", path.into())).is_err(),
+                "{path}"
+            );
+        }
+        for (path, body) in [
+            (
+                "/api/v1/bus/board",
+                json!({"key":"fixture","value":{"code":"private"}}),
+            ),
+            (
+                "/api/v1/bus/messages",
+                json!({"body":"private","new_content":"private"}),
+            ),
+            (
+                "/api/v1/zones/claims",
+                json!({"paths":["src/a.rs"],"meta":{"code":"private"}}),
+            ),
+            (
+                "/api/v1/presence",
+                json!({"client":"fixture","activity":{"tool_running":true,"meta":{"argv":"private"}}}),
+            ),
+            ("/api/v1/registry/import", json!({"items":[]})),
+        ] {
+            assert!(
+                client
+                    .call(&Call::write("node-job", "POST", path.into(), body))
+                    .is_err(),
+                "{path}"
+            );
+        }
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn node_context_authenticates_existing_outbox_envelopes_before_transmission() {
+        let server = FakeServer::start(vec![Reply::json(200, json!({}))]);
+        let key = WorkspaceKey::from_entropy([87; 32]);
+        let client = forced_client(&server, key.clone());
+        assert!(
+            client
+                .call(&Call::write(
+                    "node-job",
+                    "POST",
+                    "/api/v1/bus/messages".into(),
+                    json!({"body":"lyenc1.just-a-prefix"})
+                ))
+                .is_err()
+        );
+        assert!(server.requests().is_empty());
+        let envelope = key
+            .encrypt(NODE_WORKSPACE, "body", "queued private content")
+            .unwrap();
+        client
+            .call(&Call::write(
+                "node-job",
+                "POST",
+                "/api/v1/bus/messages".into(),
+                json!({"body":envelope}),
+            ))
+            .unwrap();
+        assert_eq!(server.requests()[0].body["body"], envelope);
+    }
+
+    #[test]
+    fn node_context_keeps_only_fixed_liveness_metadata_clear() {
+        let server = FakeServer::start(vec![Reply::json(200, json!({}))]);
+        let client = forced_client(&server, WorkspaceKey::from_entropy([88; 32]));
+        client.call(&Call::write("node-job", "POST", "/api/v1/presence".into(), json!({
+            "client":"fixture","activity":{"tool_running":true,"state":"working",
+                "meta":{"level":"ok","load":0.2,"cpus":4,"disk_free":null,"memory_available":1024}}
+        }))).unwrap();
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn node_context_rejects_scalar_json_bypasses_and_workspace_rebinding() {
+        let server = FakeServer::start(vec![]);
+        let client = forced_client(&server, WorkspaceKey::from_entropy([91; 32]));
+        for (path, body) in [
+            (
+                "/api/v1/presence",
+                json!({"client":"fixture","activity":"private prompt"}),
+            ),
+            (
+                "/api/v1/registry/items",
+                json!({"title":"private","body":"private","acceptance":"private","sealed":"private prompt"}),
+            ),
+            ("/api/v1/bus/messages", json!({"body":17})),
+        ] {
+            assert!(
+                client
+                    .call(&Call::write("node-job", "POST", path.into(), body))
+                    .is_err(),
+                "{path}"
+            );
+        }
+        assert!(client.require_e2ee_for("another-workspace").is_err());
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn node_context_authenticates_conflict_notes_in_holders_queue_and_errors() {
+        let key = WorkspaceKey::from_entropy([83; 32]);
+        let note = key
+            .encrypt(NODE_WORKSPACE, "note", "private holder note")
+            .unwrap();
+        let holder = json!({"path":"src","held_path":"src","claim_id":"synthetic-id","session":"other",
+            "note":note,"paths":["src"],"mode":"exclusive","purpose":"work","expires_at":null,"priority_of":null});
+        let server = FakeServer::start(vec![
+            Reply::json(
+                200,
+                json!([{"path":"src","status":"held","holder":holder,"fence":0}]),
+            ),
+            Reply::json(200, json!({"queued":true,"conflicts":[holder]})),
+            Reply::json(
+                409,
+                json!({"error":{"code":"held","message":"SERVER-UNAUTHENTICATED-TEXT","details":{"conflicts":[holder],"priority_of":null}}}),
+            ),
+        ]);
+        let client = forced_client(&server, key);
+        let checked = client
+            .call(&Call {
+                method: "POST".into(),
+                path: "/api/v1/zones/check".into(),
+                body: Some(json!({"paths":["src"]})),
+                session: "node-job".into(),
+                ..Call::default()
+            })
+            .unwrap();
+        assert_eq!(checked[0]["holder"]["note"], "private holder note");
+        let queued = client
+            .call(&Call::write(
+                "node-job",
+                "POST",
+                "/api/v1/zones/claims".into(),
+                json!({"paths":["src"]}),
+            ))
+            .unwrap();
+        assert_eq!(queued["conflicts"][0]["note"], "private holder note");
+        let error = client
+            .call(&Call::write(
+                "node-job",
+                "POST",
+                "/api/v1/zones/claims".into(),
+                json!({"paths":["src"]}),
+            ))
+            .unwrap_err();
+        let ClientError::Conflict(error) = error else {
+            panic!("expected authenticated conflict")
+        };
+        assert_eq!(error.details["conflicts"][0]["note"], "private holder note");
+        assert!(!error.message.contains("SERVER-UNAUTHENTICATED-TEXT"));
+    }
+    #[test]
+    fn node_context_preserves_real_backend_error_metadata_shapes() {
+        let key = WorkspaceKey::from_entropy([85; 32]);
+        let reason = key
+            .encrypt(NODE_WORKSPACE, "reason", "private freeze reason")
+            .unwrap();
+        for (status, details, expected) in [
+            (
+                409,
+                json!({"conflicts":[],"priority_of":null}),
+                json!({"conflicts":[],"priority_of":null}),
+            ),
+            (
+                409,
+                json!({"conflicts":[],"priority_of":7}),
+                json!({"conflicts":[],"priority_of":7}),
+            ),
+            (
+                409,
+                json!({"path":"src","owner_session":"other"}),
+                json!({"path":"src","owner_session":"other"}),
+            ),
+            (
+                412,
+                json!({"path":"src","fence":7}),
+                json!({"path":"src","fence":7}),
+            ),
+            (412, json!({"version":7}), json!({"version":7})),
+            (
+                503,
+                json!({"reason":reason}),
+                json!({"reason":"private freeze reason"}),
+            ),
+            (503, json!({"reason":null}), json!({"reason":null})),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(
+                status,
+                json!({"error":{"code":"fixed","message":"server text","details":details}}),
+            )]);
+            let client = forced_client(&server, key.clone());
+            let error = client
+                .call(&Call::write(
+                    "node-job",
+                    "POST",
+                    "/api/v1/zones/claims".into(),
+                    json!({"paths":["src"]}),
+                ))
+                .unwrap_err();
+            let (ClientError::Conflict(error)
+            | ClientError::StaleFence(error)
+            | ClientError::Frozen(error)) = error
+            else {
+                panic!("unexpected classification: {error}")
+            };
+            assert_eq!(error.details, expected);
+            assert_eq!(server.requests().len(), 1);
+        }
+    }
+
+    #[test]
+    fn node_context_rejects_plaintext_tampered_and_untyped_conflict_notes() {
+        let key = WorkspaceKey::from_entropy([84; 32]);
+        let wrong = key.encrypt(NODE_WORKSPACE, "body", "wrong field").unwrap();
+        for note in [
+            json!("plaintext"),
+            json!(wrong),
+            json!({"nested":"untyped"}),
+        ] {
+            for response in [
+                json!([{"holder":{"note":note}}]),
+                json!({"queued":true,"conflicts":[{"note":note}]}),
+            ] {
+                let path = if response.is_array() {
+                    "/api/v1/zones/check"
+                } else {
+                    "/api/v1/zones/claims"
+                };
+                let server = FakeServer::start(vec![Reply::json(200, response)]);
+                let client = forced_client(&server, key.clone());
+                let call = Call::write("node-job", "POST", path.into(), json!({"paths":["src"]}));
+                assert!(client.call(&call).is_err());
+                assert_eq!(
+                    server.requests().len(),
+                    1,
+                    "response rejection must follow actual HTTP"
+                );
+            }
+            let server = FakeServer::start(vec![Reply::json(
+                409,
+                json!({"error":{"code":"held","message":"fixed","details":{"conflicts":[{"note":note}]}}}),
+            )]);
+            let client = forced_client(&server, key.clone());
+            assert!(matches!(
+                client.call(&Call::write(
+                    "node-job",
+                    "POST",
+                    "/api/v1/zones/claims".into(),
+                    json!({"paths":["src"]})
+                )),
+                Err(ClientError::Invalid(_))
+            ));
+        }
+        let server = FakeServer::start(vec![Reply::json(200, json!([{"holder":null}]))]);
+        let client = forced_client(&server, key);
+        assert!(
+            client
+                .call(&Call::write(
+                    "node-job",
+                    "POST",
+                    "/api/v1/zones/check".into(),
+                    json!({"paths":["src"]})
+                ))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn node_context_authenticates_array_history_and_typed_event_payloads() {
+        let key = WorkspaceKey::from_entropy([89; 32]);
+        let reason = key
+            .encrypt(NODE_WORKSPACE, "reason", "private reason")
+            .unwrap();
+        let title = key
+            .encrypt(NODE_WORKSPACE, "title", "private title")
+            .unwrap();
+        let value = key
+            .encrypt(NODE_WORKSPACE, "value", "private board")
+            .unwrap();
+        let text = key
+            .encrypt(NODE_WORKSPACE, "text", "private request")
+            .unwrap();
+        let server = FakeServer::start(vec![
+            Reply::json(
+                200,
+                json!([{"op":"transitioned","reason":reason,"payload":{"title":title}}]),
+            ),
+            Reply::json(
+                200,
+                json!([{"type":"task.offered","payload":{"title":title}}]),
+            ),
+            Reply::json(
+                200,
+                json!([{"type":"board.changed","payload":{"value":value}}]),
+            ),
+            Reply::json(
+                200,
+                json!([{"type":"zone.requested","payload":{"text":text,"note":text}}]),
+            ),
+            Reply::json(200, json!([{"value":value}])),
+            Reply::json(200, json!([{"op":"owner_closed","reason":value}])),
+        ]);
+        let client = forced_client(&server, key);
+        let history = client
+            .call(&Call::get(
+                "node-job",
+                "/api/v1/registry/items/D-1/history".into(),
+            ))
+            .unwrap();
+        assert_eq!(history[0]["reason"], "private reason");
+        assert_eq!(history[0]["payload"]["title"], "private title");
+        for (field, expected) in [
+            ("title", "private title"),
+            ("value", "private board"),
+            ("note", "private request"),
+        ] {
+            let event = client
+                .call(&Call::get("node-job", "/api/v1/events".into()))
+                .unwrap();
+            assert_eq!(event[0]["payload"][field], expected);
+        }
+        let board = client
+            .call(&Call::get("node-job", "/api/v1/bus/board/history".into()))
+            .unwrap();
+        assert_eq!(board[0]["value"], "private board");
+        let closed = client
+            .call(&Call::get(
+                "node-job",
+                "/api/v1/registry/items/D-1/history".into(),
+            ))
+            .unwrap();
+        assert_eq!(closed[0]["reason"], "private board");
+    }
+
+    #[test]
+    fn node_context_rejects_plaintext_arrays_and_unknown_event_content() {
+        let key = WorkspaceKey::from_entropy([90; 32]);
+        for (path, body) in [
+            (
+                "/api/v1/registry/items/D-1/history",
+                json!([{"reason":"private plaintext"}]),
+            ),
+            (
+                "/api/v1/events",
+                json!([{"type":"task.offered","payload":{"title":"private plaintext"}}]),
+            ),
+            (
+                "/api/v1/events",
+                json!([{"type":"new.content","payload":{"new_field":"private plaintext"}}]),
+            ),
+            (
+                "/api/v1/events",
+                json!([{"type":"presence.heartbeat","payload":{"title":"private plaintext"}}]),
+            ),
+            (
+                "/api/v1/bus/board/history",
+                json!([{"value":"private plaintext"}]),
+            ),
+            (
+                "/api/v1/bus/board/history",
+                json!([{"value":"lyenc1.tampered.envelope"}]),
+            ),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(200, body)]);
+            assert!(
+                forced_client(&server, key.clone())
+                    .call(&Call::get("node-job", path.into()))
+                    .is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_context_authenticates_takeover_reason_alias_and_validates_liveness_timestamps() {
+        let key = WorkspaceKey::from_entropy([92; 32]);
+        let reason = key
+            .encrypt(NODE_WORKSPACE, "reason", "private takeover reason")
+            .unwrap();
+        let server = FakeServer::start(vec![
+            Reply::json(
+                200,
+                json!([{"type":"zone.takeover","payload":{"reason":reason}}]),
+            ),
+            Reply::json(
+                200,
+                json!([{"type":"zone.lost","payload":{"reason":"taken"}}]),
+            ),
+            Reply::json(
+                200,
+                json!([{"type":"zone.takeover","payload":{"reason":"private plaintext"}}]),
+            ),
+            Reply::json(200, json!({})),
+        ]);
+        let client = forced_client(&server, key);
+        let result = client
+            .call(&Call::get("node-job", "/api/v1/events".into()))
+            .unwrap();
+        assert_eq!(result[0]["payload"]["reason"], "private takeover reason");
+        assert_eq!(
+            client
+                .call(&Call::get("node-job", "/api/v1/events".into()))
+                .unwrap()[0]["payload"]["reason"],
+            "taken"
+        );
+        assert!(
+            client
+                .call(&Call::get("node-job", "/api/v1/events".into()))
+                .is_err()
+        );
+        for timestamp in [
+            "private prompt",
+            "2026-11-07T00:00:00.000Z-private",
+            "2026-99-99T00:00:00.000Z",
+        ] {
+            assert!(
+                client
+                    .call(&Call::write(
+                        "node-job",
+                        "POST",
+                        "/api/v1/presence".into(),
+                        json!({"client":"fixture","activity":{"tool_started_at":timestamp}})
+                    ))
+                    .is_err()
+            );
+        }
+        assert_eq!(server.requests().len(), 3);
+        client.call(&Call::write("node-job", "POST", "/api/v1/presence".into(),
+            json!({"client":"fixture","activity":{"tool_started_at":"2026-11-07T00:00:00.000Z"}}))).unwrap();
+        assert_eq!(server.requests().len(), 4);
     }
 
     #[test]

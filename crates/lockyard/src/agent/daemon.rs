@@ -205,6 +205,30 @@ impl View {
 
     fn check_path(&self, session: &str, raw: &str) -> PathCheck {
         let path = ZonePath::stored(raw.to_string());
+        let repository = lockyard_core::repository::split(raw).0;
+        // The server uses .NET OrdinalIgnoreCase. ASCII folding cannot safely answer
+        // Unicode comparisons, including exclusions and Unicode holders of ASCII paths.
+        if self.claims.iter().any(|claim| {
+            claim
+                .case_insensitive_paths
+                .unwrap_or(cfg!(any(target_os = "macos", windows)))
+                && claim
+                    .paths
+                    .iter()
+                    .any(|held| lockyard_core::repository::split(held).0 == repository)
+                && (!raw.is_ascii()
+                    || claim
+                        .paths
+                        .iter()
+                        .chain(&claim.excluded_paths)
+                        .any(|held| !held.is_ascii()))
+        }) {
+            return PathCheck {
+                path: raw.to_string(),
+                status: CheckStatus::Unknown,
+                holder: None,
+            };
+        }
         // A claim of an unavailable session stops blocking, as it does on the server.
         let covering =
             |claim: &&Claim| claim.holder_available != Some(false) && covers(claim, &path);
@@ -230,7 +254,14 @@ impl View {
                     held_path: claim
                         .paths
                         .iter()
-                        .find(|held| ZonePath::stored((*held).clone()).overlaps(&path))
+                        .find(|held| {
+                            ZonePath::stored((*held).clone()).overlaps_with_case(
+                                &path,
+                                claim
+                                    .case_insensitive_paths
+                                    .unwrap_or(cfg!(any(target_os = "macos", windows))),
+                            )
+                        })
                         .cloned()
                         .unwrap_or_default(),
                     claim: claim.id,
@@ -253,13 +284,16 @@ impl View {
 }
 
 fn covers(claim: &Claim, path: &ZonePath) -> bool {
+    let fold = claim
+        .case_insensitive_paths
+        .unwrap_or(cfg!(any(target_os = "macos", windows)));
     let inside = |list: &[String]| {
         list.iter()
-            .any(|held| ZonePath::stored(held.clone()).overlaps(path))
+            .any(|held| ZonePath::stored(held.clone()).overlaps_with_case(path, fold))
     };
     let excluded = claim.excluded_paths.iter().any(|gap| {
         let gap = ZonePath::stored(gap.clone());
-        gap.overlaps(path) && gap.as_str().len() <= path.as_str().len()
+        gap.overlaps_with_case(path, fold) && gap.as_str().len() <= path.as_str().len()
     });
     inside(&claim.paths) && !excluded
 }
@@ -340,6 +374,8 @@ struct Shared<T: Transport + 'static> {
     registry_seq: AtomicI64,
     session_event_cursors: Mutex<HashMap<String, i64>>,
     session_events: Mutex<HashMap<String, SessionEvents>>,
+    /// Successful namespace negotiations live only as long as this daemon instance.
+    repository_capabilities: Mutex<HashSet<String>>,
 }
 
 fn now_ms() -> i64 {
@@ -430,11 +466,17 @@ impl<T: Transport + 'static> Shared<T> {
         {
             let view = self.read_view();
             if view.fresh(self.timing().fresh) {
-                return Reply {
-                    checks: Some(view.check(session, &paths)),
-                    source: Some(Source::View),
-                    ..Reply::default()
-                };
+                let checks = view.check(session, &paths);
+                if checks
+                    .iter()
+                    .all(|check| check.status != CheckStatus::Unknown)
+                {
+                    return Reply {
+                        checks: Some(checks),
+                        source: Some(Source::View),
+                        ..Reply::default()
+                    };
+                }
             }
         }
         let wanted = paths.clone();
@@ -895,6 +937,28 @@ impl<T: Transport + 'static> Shared<T> {
     }
 
     fn forward(&self, mut call: Call) -> Reply {
+        let repository_probe = call.method == "GET"
+            && call.path.starts_with("/api/v1/zones/claims?")
+            && call.path.ends_with("&namespace_probe=1")
+            && call
+                .repository
+                .as_deref()
+                .is_some_and(|repository| !repository.is_empty());
+        if repository_probe
+            && self
+                .repository_capabilities
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(call.repository.as_deref().unwrap_or_default())
+        {
+            return Reply {
+                value: Some(
+                    json!({"repository_namespace_supported":true,"repository":call.repository}),
+                ),
+                source: Some(Source::View),
+                ..Reply::default()
+            };
+        }
         if call.method == "GET" && call.path == "/api/v1/bus/board" {
             let view = self.read_view();
             if view.board_fresh(self.timing().fresh) {
@@ -914,6 +978,19 @@ impl<T: Transport + 'static> Shared<T> {
             let writes = call.is_write() && call.path.starts_with("/api/v1/zones/");
             return match self.transport.call(&call) {
                 Ok(value) => {
+                    if repository_probe {
+                        self.repository_capabilities
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(call.repository.clone().unwrap_or_default());
+                        return Reply {
+                            value: Some(
+                                json!({"repository_namespace_supported":true,"repository":call.repository}),
+                            ),
+                            source: Some(Source::Server),
+                            ..Reply::default()
+                        };
+                    }
                     if writes {
                         let mut view = self.write_view();
                         view.zones_generation += 1;
@@ -1446,6 +1523,7 @@ impl<T: Transport + 'static> Daemon<T> {
             registry_seq: AtomicI64::new(load_seq(&state_dir, "registry")),
             session_event_cursors: Mutex::new(HashMap::new()),
             session_events: Mutex::new(HashMap::new()),
+            repository_capabilities: Mutex::new(HashSet::new()),
             state_dir,
             config,
             view: RwLock::new(View {
@@ -1543,6 +1621,15 @@ impl<T: Transport + 'static> Daemon<T> {
 
 #[cfg(test)]
 impl<T: Transport + 'static> Daemon<T> {
+    /// Stop and join background workers before a test inspects or seeds a stationary view.
+    fn stop_workers(&mut self) {
+        self.shared.stop();
+        let _ = UnixStream::connect(&self.shared.config.socket);
+        for worker in self.threads.drain(..) {
+            worker.join().expect("agent worker panicked");
+        }
+    }
+
     /// Handles one request without a socket.
     fn handle(&self, request: Request) -> Reply {
         let workspace = self.shared.config.workspace.clone();
@@ -1578,6 +1665,8 @@ mod tests {
         /// Every request that is not an event poll.
         calls: Mutex<Vec<String>>,
         event_calls: AtomicUsize,
+        namespace_probes: AtomicUsize,
+        namespace_unsupported: AtomicBool,
         refuse_with: Mutex<Option<u16>>,
         fail_queue: AtomicBool,
         fail_inbox_for: Mutex<Option<String>>,
@@ -1617,6 +1706,14 @@ mod tests {
 
     impl Transport for FakeServer {
         fn call(&self, call: &Call) -> Result<Value, ClientError> {
+            if call.path.ends_with("&namespace_probe=1") {
+                self.namespace_probes.fetch_add(1, Ordering::SeqCst);
+                if self.namespace_unsupported.load(Ordering::SeqCst) {
+                    return Err(ClientError::Invalid(
+                        "repository namespaces unsupported".into(),
+                    ));
+                }
+            }
             let route = call.path.split('?').next().unwrap_or_default().to_string();
             if call.long_poll || route.ends_with("/events") {
                 self.event_calls.fetch_add(1, Ordering::SeqCst);
@@ -1930,6 +2027,109 @@ mod tests {
     }
 
     #[test]
+    fn cache_checks_keep_repository_roots_separate_and_follow_the_server_case_policy() {
+        let view = View {
+            claims: vec![
+                serde_json::from_value(json!({"id": 1, "session": "bob", "paths": [".lockyard-repository/api/SRC"], "case_insensitive_paths": true})).unwrap(),
+                serde_json::from_value(json!({"id": 2, "session": "carol", "paths": ["."], "case_insensitive_paths": false})).unwrap(),
+            ],
+            ..View::default()
+        };
+        let status = |path: &str| view.check("alice", &[path.to_string()]).remove(0).status;
+        assert_eq!(
+            status(".lockyard-repository/api/src/file"),
+            CheckStatus::Held
+        );
+        assert_eq!(
+            status(".lockyard-repository/web/src/file"),
+            CheckStatus::Free
+        );
+        assert_eq!(status("src/file"), CheckStatus::Held);
+    }
+
+    #[test]
+    fn insensitive_unicode_comparisons_require_the_authoritative_server() {
+        for (held, requested, excluded) in [
+            ("Ä", "ä/file", ""),
+            ("Ж", "ж/file", ""),
+            ("Ä", "ascii", ""),
+            ("ascii", "Ä", ""),
+            ("ascii", "ascii/file", "ascii/Ä"),
+        ] {
+            let held = format!(".lockyard-repository/api/{held}");
+            let excluded =
+                (!excluded.is_empty()).then(|| format!(".lockyard-repository/api/{excluded}"));
+            let mut claim: Claim = serde_json::from_value(
+                json!({"id":1,"session":"bob","paths":[held],"case_insensitive_paths":true}),
+            )
+            .unwrap();
+            claim.excluded_paths = excluded.into_iter().collect();
+            let mut view = View {
+                claims: vec![claim],
+                ..View::default()
+            };
+            let requested = format!(".lockyard-repository/api/{requested}");
+            assert_eq!(
+                view.check("alice", std::slice::from_ref(&requested))[0].status,
+                CheckStatus::Unknown
+            );
+            assert_eq!(
+                view.check("alice", &[".lockyard-repository/web/ascii".into()])[0].status,
+                CheckStatus::Free
+            );
+            view.claims[0].case_insensitive_paths = Some(false);
+            assert_ne!(
+                view.check("alice", &[requested])[0].status,
+                CheckStatus::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn a_fresh_unicode_insensitive_view_falls_back_to_the_server() {
+        let rig = start_with(timing(), |server| {
+            server.claims.lock().unwrap().push(json!({"id":1,"session":"bob","paths":[".lockyard-repository/api/Ä"],"case_insensitive_paths":true}));
+        });
+        view_ready(&rig);
+        let before = rig.server.calls_to("/api/v1/zones/check");
+        let reply = rig
+            .daemon
+            .handle(check("alice", ".lockyard-repository/api/ä/file"));
+        assert_eq!(reply.source, Some(Source::Server));
+        assert_eq!(rig.server.calls_to("/api/v1/zones/check"), before + 1);
+    }
+
+    #[test]
+    fn successful_namespace_probes_are_cached_per_daemon_but_failures_are_not() {
+        let rig = start_with(timing(), |_| {});
+        let probe = |repository: &str| {
+            let mut call = Call::get(
+                "me",
+                format!(
+                    "/api/v1/zones/claims?path={}&namespace_probe=1",
+                    lockyard_cloud_client::encode(&format!(".lockyard-repository/{repository}"))
+                ),
+            );
+            call.repository = Some(repository.to_string());
+            Request::Call { call }
+        };
+        let first = rig.daemon.handle(probe("api"));
+        assert_eq!(first.value.unwrap()["repository_namespace_supported"], true);
+        let cached = rig.daemon.handle(probe("api"));
+        assert_eq!(cached.source, Some(Source::View));
+        assert_eq!(rig.server.namespace_probes.load(Ordering::SeqCst), 1);
+        rig.server
+            .namespace_unsupported
+            .store(true, Ordering::SeqCst);
+        assert!(rig.daemon.handle(probe("web")).error.is_some());
+        rig.server
+            .namespace_unsupported
+            .store(false, Ordering::SeqCst);
+        assert!(rig.daemon.handle(probe("web")).error.is_none());
+        assert_eq!(rig.server.namespace_probes.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
     fn unread_registers_unknown_then_upkeep_fills_it_and_events_refresh_it() {
         let rig = start_with(
             Timing {
@@ -1968,10 +2168,9 @@ mod tests {
 
     #[test]
     fn zone_snapshot_never_calls_the_backend_when_down_or_blocked() {
-        let rig = start_with(timing(), |_| {});
+        let mut rig = start_with(timing(), |_| {});
         view_ready(&rig);
-        let mut rig = rig;
-        rig.daemon.shutdown();
+        rig.daemon.stop_workers();
         let before = rig.server.calls.lock().unwrap().len();
         let ask = || Request::ZoneSnapshot {
             session: "me".into(),
@@ -2060,11 +2259,9 @@ mod tests {
 
     #[test]
     fn a_stale_view_makes_one_server_call_and_never_answers_from_memory() {
-        let rig = start_with(timing(), |server| server.claim(1, "bob", "src"));
+        let mut rig = start_with(timing(), |server| server.claim(1, "bob", "src"));
         view_ready(&rig);
-        // Stop and wait for the workers, so none of them touches the view or the server under the test.
-        let mut rig = rig;
-        rig.daemon.shutdown();
+        rig.daemon.stop_workers();
         // The upkeep threads are gone, so the view can only age.
         wait_for("the view to go stale", || {
             !rig.daemon.shared.read_view().fresh(timing().fresh)
@@ -2135,11 +2332,9 @@ mod tests {
 
     #[test]
     fn a_hung_server_gives_unknown_at_the_deadline() {
-        let rig = start_with(timing(), |_| {});
+        let mut rig = start_with(timing(), |_| {});
         view_ready(&rig);
-        // Stop and wait for the workers, so none of them touches the view or the server under the test.
-        let mut rig = rig;
-        rig.daemon.shutdown();
+        rig.daemon.stop_workers();
         wait_for("the view to go stale", || {
             !rig.daemon.shared.read_view().fresh(timing().fresh)
         });
@@ -2376,16 +2571,14 @@ mod tests {
 
     #[test]
     fn taking_mail_uses_no_backend_calls_when_down_or_hung() {
-        let rig = start_with(timing(), |server| *server.unread.lock().unwrap() = 1);
+        let mut rig = start_with(timing(), |server| *server.unread.lock().unwrap() = 1);
         rig.daemon.handle(Request::Unread {
             session: "me".into(),
         });
         wait_for("mail to be reserved", || {
             rig.daemon.shared.read_view().mail.contains_key("me")
         });
-        // Stop and wait for the workers, so none of them touches the view or the server under the test.
-        let mut rig = rig;
-        rig.daemon.shutdown();
+        rig.daemon.stop_workers();
         let before = rig.server.calls.lock().unwrap().len();
         rig.server.down.store(true, Ordering::SeqCst);
         let taken = rig.daemon.handle(Request::TakeMail {
@@ -2411,10 +2604,8 @@ mod tests {
 
     #[test]
     fn take_mail_is_atomic_across_two_hundred_concurrent_rounds() {
-        let rig = start_with(timing(), |_| {});
-        // Stop and wait for the workers, so none of them touches the view or the server under the test.
-        let mut rig = rig;
-        rig.daemon.shutdown();
+        let mut rig = start_with(timing(), |_| {});
+        rig.daemon.stop_workers();
         for id in 1..=200 {
             {
                 let mut view = rig.daemon.shared.write_view();
@@ -2468,10 +2659,8 @@ mod tests {
 
     #[test]
     fn a_mail_buffer_with_less_than_ten_seconds_of_lease_is_dropped() {
-        let rig = start_with(timing(), |_| {});
-        // Stop and wait for the workers, so none of them touches the view or the server under the test.
-        let mut rig = rig;
-        rig.daemon.shutdown();
+        let mut rig = start_with(timing(), |_| {});
+        rig.daemon.stop_workers();
         let mut view = rig.daemon.shared.write_view();
         let reserved_at = Instant::now();
         view.unread.insert(
@@ -2509,10 +2698,8 @@ mod tests {
 
     #[test]
     fn upkeep_reserves_mail_for_each_session_even_if_another_session_fails() {
-        let rig = start_with(timing(), |server| *server.unread.lock().unwrap() = 1);
-        // Stop and wait for the workers, so none of them touches the view or the server under the test.
-        let mut rig = rig;
-        rig.daemon.shutdown();
+        let mut rig = start_with(timing(), |server| *server.unread.lock().unwrap() = 1);
+        rig.daemon.stop_workers();
         rig.daemon.shared.hear("fails");
         rig.daemon.shared.hear("works");
         rig.daemon.shared.store_unread("fails", 0, 1);

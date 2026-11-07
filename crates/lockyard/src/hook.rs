@@ -39,6 +39,27 @@ const EDIT_TOOLS: [&str; 10] = [
     "write_file",
 ];
 
+/// Lines for `.claude/settings.json`.
+pub const SETTINGS: &str = r#"{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [{ "type": "command", "command": "lockyard hook claude" }]
+      }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "lockyard hook claude" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "lockyard hook claude" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "lockyard hook claude" }] }
+    ]
+  }
+}"#;
+
 /// Which tool sent the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -171,13 +192,22 @@ mod cloud {
         pub socket: AgentSocket,
         pub root: PathBuf,
         pub tool: Tool,
+        pub repository: Option<String>,
+        pub repository_confirmed: bool,
     }
 
     /// Connects to the agent. `None` when none is running for this workspace.
     pub fn connect(url: &str, workspace: &str, root: PathBuf, tool: Tool) -> Option<AgentPort> {
         let socket =
             AgentSocket::connect(&crate::agent::socket_path(), url, workspace, SOCKET_TIMEOUT)?;
-        Some(AgentPort { socket, root, tool })
+        let repository = lockyard_core::config::Config::load(&root).ok()?.repository;
+        Some(AgentPort {
+            socket,
+            root,
+            tool,
+            repository,
+            repository_confirmed: false,
+        })
     }
 
     fn failed(error: io::Error) -> Error {
@@ -190,9 +220,38 @@ mod cloud {
         }
 
         fn check(&mut self, agent: &str, path: &str, _now: i64) -> Result<Verdict> {
+            if let Some(repository) = self
+                .repository
+                .as_deref()
+                .filter(|_| !self.repository_confirmed)
+            {
+                let root = lockyard_core::repository::qualify(Some(repository), ".")?;
+                let mut call = Call::get(
+                    agent,
+                    format!(
+                        "/api/v1/zones/claims?path={}&namespace_probe=1",
+                        lockyard_cloud_client::encode(&root)
+                    ),
+                );
+                call.repository = Some(repository.to_string());
+                call.deadline_ms = Some(800);
+                let reply = self.socket.ask(&Request::Call { call }).map_err(failed)?;
+                let confirmed = reply.error.is_none()
+                    && reply.value.as_ref().is_some_and(|value| {
+                        value["repository_namespace_supported"] == true
+                            && value["repository"] == repository
+                    });
+                if !confirmed {
+                    return Ok(Verdict::Unknown);
+                }
+                self.repository_confirmed = true;
+            }
             let request = Request::Check {
                 session: agent.to_string(),
-                paths: vec![path.to_string()],
+                paths: vec![lockyard_core::repository::qualify(
+                    self.repository.as_deref(),
+                    path,
+                )?],
             };
             let reply = self.socket.ask(&request).map_err(failed)?;
             let found = reply
@@ -200,7 +259,21 @@ mod cloud {
                 .and_then(|mut checks| (!checks.is_empty()).then(|| checks.remove(0)));
             Ok(match found {
                 Some(check) if check.status == CheckStatus::Held => match check.holder {
-                    Some(holder) => Verdict::Held(Box::new(holder)),
+                    Some(mut holder) => {
+                        holder.path = lockyard_core::repository::relative(
+                            self.repository.as_deref(),
+                            &holder.path,
+                        )
+                        .unwrap_or(&holder.path)
+                        .to_string();
+                        holder.held_path = lockyard_core::repository::relative(
+                            self.repository.as_deref(),
+                            &holder.held_path,
+                        )
+                        .unwrap_or(&holder.held_path)
+                        .to_string();
+                        Verdict::Held(Box::new(holder))
+                    }
                     None => Verdict::Unknown,
                 },
                 Some(check) if check.status == CheckStatus::Unknown => Verdict::Unknown,
@@ -285,7 +358,12 @@ mod cloud {
                 session: agent.to_string(),
                 client: self.tool.name().to_string(),
                 phase,
-                write_paths: written,
+                write_paths: written
+                    .into_iter()
+                    .filter_map(|path| {
+                        lockyard_core::repository::qualify(self.repository.as_deref(), &path).ok()
+                    })
+                    .collect(),
             };
             // Told, not asked: the hook does not wait for the agent's disk.
             if let Err(error) = self.socket.tell(&request) {
@@ -386,6 +464,23 @@ fn run_cloud(
     now: i64,
     out: &mut dyn Write,
 ) -> Result<()> {
+    // The legacy agent handshake cannot attest the workspace key or required encryption
+    // policy. Like open::cloud, never use it in a required-E2EE context, even if a
+    // marker is empty or invalid. Mail and presence remain nonblocking; edits still require
+    // an authoritative zone check and fail closed when the legacy peer cannot provide one.
+    if std::env::var_os("LOCKYARD_REQUIRE_E2EE").is_some()
+        || std::env::var_os("LOCKYARD_E2EE_WORKSPACE_ID").is_some()
+    {
+        eprintln!(
+            "lockyard hook: cloud coordination unavailable in required E2EE mode; refusing unchecked edits; mail delivery unavailable."
+        );
+        return deny_unchecked_edit(
+            tool,
+            event,
+            "Lockyard cannot check this edit because the local agent cannot verify the required E2EE workspace policy. Use an agent that supports this encryption policy, then retry.",
+            out,
+        );
+    }
     let (url, workspace) = crate::open::endpoint(config)?;
     let Some(mut port) = cloud::connect(&url, &workspace, root, tool) else {
         // Fail closed: without the agent there is no zone mirror, so an edit cannot be allowed.
@@ -976,6 +1071,83 @@ fn escape_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_settings_snippet_is_valid_json() {
+        let settings: Value = serde_json::from_str(SETTINGS).unwrap();
+        assert!(settings["hooks"]["PreToolUse"].is_array());
+        assert!(settings["hooks"]["SessionEnd"].is_array());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_old_socket_peer_cannot_authorize_a_repository_path_as_free_without_the_capability_marker()
+    {
+        use crate::agent::socket::AgentSocket;
+        use crate::agent::wire::{AgentStatus, Envelope, Reply, Request};
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        crate::agent::private_dir(dir.path()).unwrap();
+        let socket_path = dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let envelope: Envelope = serde_json::from_str(&line).unwrap();
+                let reply = match envelope.request {
+                    Request::Ping => Reply {
+                        status: Some(AgentStatus {
+                            url: "http://127.0.0.1:5080".into(),
+                            workspace: "team".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    Request::Call { call } => {
+                        requests.push(call);
+                        // Old peers ignore repository headers and return an ordinary, empty claims list.
+                        Reply {
+                            value: Some(json!([])),
+                            ..Default::default()
+                        }
+                    }
+                    _ => panic!("a path check must not precede namespace capability confirmation"),
+                };
+                serde_json::to_writer(&mut stream, &reply).unwrap();
+                stream.write_all(b"\n").unwrap();
+            }
+            requests
+        });
+        let socket = AgentSocket::connect(
+            &socket_path,
+            "http://127.0.0.1:5080",
+            "team",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let mut port = cloud::AgentPort {
+            socket,
+            root: dir.path().to_path_buf(),
+            tool: Tool::Claude,
+            repository: Some("api".into()),
+            repository_confirmed: false,
+        };
+        assert_eq!(
+            port.check("alice", "src/file", 0).unwrap(),
+            Verdict::Unknown
+        );
+        let requests = peer.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].repository.as_deref(), Some("api"));
+        assert!(requests[0].path.ends_with("&namespace_probe=1"));
+    }
 
     #[test]
     fn escaped_output_preserves_unicode_and_escapes_controls() {

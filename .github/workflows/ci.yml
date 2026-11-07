@@ -3,14 +3,16 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
   rust:
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -23,8 +25,22 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        if: runner.os != 'Windows'
+      - run: cargo test --locked --workspace
+        if: runner.os != 'Windows'
+      - name: Check every Windows-supported crate
+        if: runner.os == 'Windows'
+        run: cargo clippy --locked --workspace --exclude lockyard-node --all-targets -- -D warnings
+      - name: Test every Windows-supported crate
+        if: runner.os == 'Windows'
+        run: cargo test --locked --workspace --exclude lockyard-node
+      - name: Require E2EE from the actual MCP subprocess
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo build --locked -p lockyard
+          python3 tools/ci/required-e2ee-mcp.py --binary target/debug/lockyard
 
   # Licenses, advisories and banned crates. A new dependency that fails this is refused.
   supply-chain:
@@ -46,7 +62,43 @@ jobs:
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - run: cargo test -p lockyard --test perf_budget -- --nocapture
 
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action
+      - run: cargo build --locked -p lockyard
+      - run: ./target/debug/lockyard.exe about
+  node-containers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action
+      - name: Require a local runtime with CPU, memory and process limits
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime="$(command -v docker)"
+          controls="$(env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH "$runtime" --host=unix:///var/run/docker.sock info --format '{{.MemoryLimit}} {{.CPUCfsQuota}} {{.PidsLimit}}')"
+          test "$controls" = 'true true true'
+          echo "LOCKYARD_NODE_EXECUTOR_RUNTIME=$runtime" >> "$GITHUB_ENV"
+      - name: Build the local executor fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker_local() {
+            env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH "$LOCKYARD_NODE_EXECUTOR_RUNTIME" --host=unix:///var/run/docker.sock "$@"
+          }
+          docker_local build -f tools/ci/node-executor.Dockerfile -t lockyard-node-ci:fixture tools/ci
+          fixture="$(docker_local image inspect lockyard-node-ci:fixture --format '{{.Id}}')"
+          echo "LOCKYARD_NODE_EXECUTOR_IMAGE=$fixture" >> "$GITHUB_ENV"
+      - name: Exercise every real-container executor case
+        run: cargo test --locked -p lockyard-node --test executor -- --include-ignored --test-threads=1
+
   packages:
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:

@@ -647,6 +647,188 @@ fn hook(dir: &Path, event: &Value) -> Output {
     child.wait_with_output().unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn required_e2ee_cloud_hooks_never_contact_a_legacy_agent() {
+    use std::io::Read;
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join(".lockyard");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(
+        state.join("config.toml"),
+        "mode = 'cloud'\nurl = 'https://example.test'\nworkspace = 'team'\n",
+    )
+    .unwrap();
+    let runtime = dir.path().join("runtime");
+    let socket_dir = runtime.join("lockyard");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(socket_dir.join("agent.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let run = |tool: &str, event: &Value, marker: Option<(&str, &str)>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lockyard"));
+        command
+            .args(["hook", tool])
+            .current_dir(dir.path())
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env_remove("LOCKYARD_AGENT")
+            .env_remove("LOCKYARD_REQUIRE_E2EE")
+            .env_remove("LOCKYARD_E2EE_WORKSPACE_ID")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some((name, value)) = marker {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(event.to_string().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    for tool in ["claude", "codex", "cursor"] {
+        for marker in [
+            ("LOCKYARD_REQUIRE_E2EE", ""),
+            ("LOCKYARD_REQUIRE_E2EE", "0"),
+            ("LOCKYARD_E2EE_WORKSPACE_ID", ""),
+            ("LOCKYARD_E2EE_WORKSPACE_ID", "invalid workspace"),
+        ] {
+            for event_name in ["PreToolUse", "UserPromptSubmit"] {
+                let event = json!({"hook_event_name":event_name,"session_id":"worker",
+                    "cwd":dir.path(),"tool_name":"Write",
+                    "tool_input":{"file_path":dir.path().join("src/file.rs")}});
+                let result = run(tool, &event, Some(marker));
+                assert!(result.status.success(), "{tool} {marker:?}");
+                if event_name == "PreToolUse" {
+                    let answer: Value = serde_json::from_slice(&result.stdout).unwrap();
+                    let decision = if tool == "cursor" {
+                        &answer["permission"]
+                    } else {
+                        &answer["hookSpecificOutput"]["permissionDecision"]
+                    };
+                    assert_eq!(decision, "deny", "{tool} {marker:?}");
+                    let reason = if tool == "cursor" {
+                        &answer["agent_message"]
+                    } else {
+                        &answer["hookSpecificOutput"]["permissionDecisionReason"]
+                    };
+                    assert!(
+                        reason.as_str().unwrap().contains("required E2EE"),
+                        "{tool} {marker:?}: {reason}"
+                    );
+                } else {
+                    assert!(result.stdout.is_empty(), "{tool} {marker:?}");
+                }
+                assert!(
+                    String::from_utf8_lossy(&result.stderr)
+                        .contains("cloud coordination unavailable in required E2EE mode")
+                );
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "unexpected socket contact for {tool} {marker:?} {event_name}"
+                );
+            }
+        }
+    }
+
+    // Positive control: the same socket is reachable without the required markers.
+    let peer = std::thread::spawn(move || {
+        let accept = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => return stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "socket was not contacted"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("socket accept failed: {error}"),
+                }
+            }
+        };
+        let read_request = |stream: &mut std::os::unix::net::UnixStream| {
+            // A tell closes immediately. Darwin can reject SO_RCVTIMEO after that close,
+            // so bound reads with nonblocking I/O rather than configuring a closed peer.
+            stream.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        bytes.extend_from_slice(&chunk[..count]);
+                        if bytes.contains(&b'\n') {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "socket request did not arrive"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("socket read failed: {error}"),
+                }
+            }
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        };
+        let mut stream = accept();
+        assert_eq!(read_request(&mut stream)["op"], "ping");
+        writeln!(stream, "{}", json!({"status": {"url":"https://example.test", "workspace":"team", "pid":1, "view_fresh":true, "view_age_ms":0, "claims":0, "board":0, "sessions":0, "outbox":0, "coordination_seq":0, "registry_seq":0}})).unwrap();
+        let mut stream = accept();
+        assert_eq!(read_request(&mut stream)["op"], "touch");
+    });
+    let result = run(
+        "claude",
+        &json!({"hook_event_name":"SessionEnd", "session_id":"worker", "cwd":dir.path()}),
+        None,
+    );
+    assert!(result.status.success());
+    peer.join().unwrap();
+}
+
+#[test]
+fn required_e2ee_marker_preserves_local_hook_coordination() {
+    let dir = project();
+    ok(dir.path(), "other", &["zone", "claim", "src"]);
+    for marker in ["LOCKYARD_REQUIRE_E2EE", "LOCKYARD_E2EE_WORKSPACE_ID"] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_lockyard"))
+            .args(["hook", "claude"])
+            .current_dir(dir.path())
+            .env_remove("LOCKYARD_AGENT")
+            .env_remove("LOCKYARD_REQUIRE_E2EE")
+            .env_remove("LOCKYARD_E2EE_WORKSPACE_ID")
+            .env(marker, "")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let event = json!({"hook_event_name":"PreToolUse", "session_id":"worker", "cwd":dir.path(), "tool_name":"Write", "tool_input":{"file_path":dir.path().join("src/file.rs")}});
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(event.to_string().as_bytes())
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(result.status.success());
+        let answer: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(answer["hookSpecificOutput"]["permissionDecision"], "deny");
+    }
+}
+
 #[test]
 fn the_hook_process_denies_a_held_path_in_the_shape_claude_code_reads() {
     let dir = project();

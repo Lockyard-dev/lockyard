@@ -1,0 +1,18 @@
+{
+  "note": "Public synthetic interoperability vector; never a production key.",
+  "workspace": "workspace",
+  "master_entropy_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+  "hkdf_salt_utf8": "lockyard-node-rpc-v2",
+  "expected_child_key_hex": "a5b1f8c19a56525b158a5ed10928f497b300426f6db3fff665682de28b91d954",
+  "authenticated_field": "node-rpc-v2|request|01ARZ3NDEKTSV4RRFFQ69G5FAV|source|target|node.ping|",
+  "frame": {
+    "v": 2,
+    "kind": "request",
+    "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "source": "source",
+    "target": "target",
+    "operation": "node.ping",
+    "payload": "lyenc1.ncbUZ77_Nso.AAECAwQFBgcICQoLjpsom-m8u46dVXCO5X6xizkEh5Pz6l6H6RkII0hTTv3X5Q"
+  },
+  "plaintext": {"probe":"vector"}
+}

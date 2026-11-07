@@ -15,7 +15,13 @@ lockyard-cloud-client.workspace = true
 lockyard-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 libc.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+lockyard-node.workspace = true
+tokio.workspace = true
+ring = "0.17"
 
 [dev-dependencies]
 tempfile.workspace = true

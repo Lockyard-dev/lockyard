@@ -1,0 +1,25 @@
+{
+  "note": "Public synthetic Python cryptography HKDF/AES-GCM interoperability vector; never production keys.",
+  "workspace": "workspace",
+  "master_entropy_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+  "expected_child_key_hex": "109328a20ee1de2810170b37196ff2ad5b12aa94ffc49cb24f2decb39ae5c2c9",
+  "authenticated_field": "node-rpc-v2|request|01ARZ3NDEKTSV4RRFFQ69G5FAV|source|target|job.submit||retention:60:1469922910259|certificates:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "frame": {
+    "v": 2,
+    "kind": "request",
+    "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "source": "source",
+    "target": "target",
+    "operation": "job.submit",
+    "retention": {
+      "content_ttl_seconds": 60,
+      "expires_at_ms": 1469922910259
+    },
+    "source_certificate_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "target_certificate_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "payload": "lyenc1.I4C95OPcCt0.AAECAwQFBgcICQoLUH6dMaadWJpM9V6TGkUbisxOxdPvCoxRoqcv3W2Hkc01vaLWkJrrLsZLCPNVNX45mCU"
+  },
+  "plaintext": {
+    "private": "pin-retention-vector"
+  }
+}

@@ -61,9 +61,23 @@ pub fn transform_fields(
     key: Option<&WorkspaceKey>,
     encrypt: bool,
 ) -> Result<(), String> {
+    transform_fields_policy(value, method, route, workspace, key, encrypt, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn transform_fields_policy(
+    value: &mut Value,
+    method: &str,
+    route: &str,
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    encrypt: bool,
+    require_encrypted: bool,
+) -> Result<(), String> {
     let (map, api) = parsed()?;
     let normalized = route.split('?').next().unwrap_or(route);
     let mut schemas = Vec::new();
+    let mut matched = false;
     for (path, ops) in api["paths"].as_object().ok_or("bad OpenAPI paths")? {
         if !openapi_path_matches(path, normalized) {
             continue;
@@ -71,6 +85,7 @@ pub fn transform_fields(
         let Some(op) = ops.get(method.to_ascii_lowercase()) else {
             continue;
         };
+        matched = true;
         if encrypt {
             let node = op
                 .get("requestBody")
@@ -97,6 +112,30 @@ pub fn transform_fields(
             }
         }
     }
+    if require_encrypted && !matched {
+        return Err("required node encryption does not support this API operation".into());
+    }
+    if require_encrypted
+        && !encrypt
+        && schemas.is_empty()
+        && !value.is_null()
+        && value != &serde_json::json!({})
+        && value != &serde_json::json!([])
+    {
+        return Err("required node response has no classified schema".into());
+    }
+    if require_encrypted && encrypt {
+        if schemas.is_empty() && !value.is_null() && value != &serde_json::json!({}) {
+            return Err("required node encryption does not support this request body".into());
+        }
+        for schema in &schemas {
+            validate_request_shape(
+                value,
+                &api["components"]["schemas"][schema],
+                &api["components"]["schemas"],
+            )?;
+        }
+    }
     let mut touched = Vec::new();
     for schema in schemas {
         visit(
@@ -107,6 +146,8 @@ pub fn transform_fields(
             workspace,
             key,
             encrypt,
+            require_encrypted,
+            false,
             &mut touched,
         )?;
     }
@@ -145,59 +186,1089 @@ fn visit(
     workspace: &str,
     key: Option<&WorkspaceKey>,
     enc: bool,
+    require_encrypted: bool,
+    event_payload: bool,
     touched: &mut Vec<String>,
 ) -> Result<(), String> {
     let Some(def) = schemas.get(schema) else {
-        return Ok(());
+        return if require_encrypted && !enc {
+            Err("required node response schema is unavailable".into())
+        } else {
+            Ok(())
+        };
     };
+    if v.is_null() {
+        return Ok(());
+    }
+    if let Some(values) = v.as_array_mut() {
+        for value in values {
+            visit(
+                value,
+                schema,
+                schemas,
+                fields,
+                workspace,
+                key,
+                enc,
+                require_encrypted,
+                event_payload,
+                touched,
+            )?;
+        }
+        return Ok(());
+    }
+    if require_encrypted && !enc && !def.get("properties").is_some_and(Value::is_object) {
+        return Err("required node response has an unclassified JSON schema".into());
+    }
+    if require_encrypted && !enc && !v.is_object() {
+        return Err("required node response must be a typed object".into());
+    }
+    if !enc && matches!(schema, "CoordinationEvent" | "RegistryEventDto") {
+        visit_event(
+            v,
+            schema,
+            schemas,
+            fields,
+            workspace,
+            key,
+            require_encrypted,
+            touched,
+        )?;
+    }
+    if !enc
+        && schema == "CoordinationLostEvent"
+        && let Some(reason) = v.get_mut("reason")
+        && reason.as_str() != Some("taken")
+    {
+        decrypt_event_field(reason, "reason", workspace, key, require_encrypted)?;
+    }
+    let owner_decision = schema == "RegistryEvidenceDto" && v["kind"] == "decision";
     if let (Some(obj), Some(props)) = (
         v.as_object_mut(),
         def.get("properties").and_then(Value::as_object),
     ) {
+        if !enc && require_encrypted {
+            for (property, value) in obj.iter() {
+                if !props.contains_key(property)
+                    && !(event_payload && event_payload_alias(schema, property, value))
+                {
+                    return Err("required node response contains an unsupported field".into());
+                }
+            }
+        }
         for (p, sch) in props {
             if let Some(slot) = obj.get_mut(p) {
-                if let Some(rule) = fields
+                if !enc
+                    && require_encrypted
+                    && schema == "CoordinationClaim"
+                    && p == "foreign_dirty_paths"
+                    && !slot.is_null()
+                {
+                    let entries = slot
+                        .as_array_mut()
+                        .ok_or("required node foreign dirty paths must be an array")?;
+                    for entry in entries {
+                        visit(
+                            entry,
+                            "CoordinationDirtyPathReply",
+                            schemas,
+                            fields,
+                            workspace,
+                            key,
+                            false,
+                            true,
+                            false,
+                            touched,
+                        )?;
+                    }
+                    continue;
+                }
+                if !enc
+                    && require_encrypted
+                    && matches!(
+                        (schema, p.as_str()),
+                        ("CoordinationDeliveryResult", "claimed")
+                            | ("CoordinationSeenResult", "seen")
+                    )
+                    && !slot.is_null()
+                {
+                    if !slot
+                        .as_array()
+                        .is_some_and(|entries| entries.iter().all(safe_response_id))
+                    {
+                        return Err(
+                            "required node response identifier list has an invalid type".into()
+                        );
+                    }
+                    continue;
+                }
+                if !enc
+                    && require_encrypted
+                    && !slot.is_null()
+                    && (p == "hold_until_ref"
+                        || (p == "meta"
+                            && !(matches!(
+                                schema,
+                                "CoordinationPresence" | "CoordinationPresenceActivity"
+                            ) && safe_activity_meta(slot))))
+                {
+                    return Err("required node response contains unclassified metadata".into());
+                }
+                if !enc
+                    && ((schema == "CoordinationCheckResult" && p == "holder")
+                        || (schema == "CoordinationClaim" && p == "conflicts"))
+                {
+                    if p == "holder" {
+                        transform_conflict_entry(slot, workspace, key, require_encrypted)?;
+                    } else {
+                        transform_conflict_array(slot, workspace, key, require_encrypted)?;
+                    }
+                    continue;
+                }
+                let content_name = fields
                     .iter()
                     .find(|f| f.schema == schema && f.property == *p)
-                {
+                    .map(|f| f.name.as_str())
+                    .or_else(|| {
+                        require_encrypted
+                            .then(|| additional_node_content(schema, p))
+                            .flatten()
+                    });
+                if let Some(content_name) = content_name {
+                    // Owner-close copies the word into Decision evidence without re-encryption.
+                    // Older CLI clients bind it to value; browser clients bind it to owner_word.
+                    let alternate = ((owner_decision && p == "value")
+                        || (schema == "RegistryOwnerCloseRequest" && p == "owner_word"))
+                        .then_some("owner_word");
                     if let Some(s) = slot.as_str() {
-                        if enc && !s.starts_with(PREFIX) {
+                        if enc && s.starts_with(PREFIX) && require_encrypted {
+                            decrypt_compatible(
+                                key.ok_or("required node encryption key is unavailable")?,
+                                workspace,
+                                content_name,
+                                alternate,
+                                s,
+                            )
+                            .map_err(|_| "required node content envelope failed authentication")?;
+                        } else if enc && !s.starts_with(PREFIX) {
                             let k = key.ok_or_else(|| {
                                 format!("workspace encryption is required but no local key is available; import the key with `lockyard cloud key import` before writing content ({schema}.{p})")
                             })?;
-                            *slot = Value::String(k.encrypt(workspace, &rule.name, s)?);
+                            *slot = Value::String(k.encrypt(workspace, content_name, s)?);
                             touched.push(format!("{schema}.{p}"));
+                        } else if !enc && require_encrypted {
+                            if !s.is_empty() {
+                                if !s.starts_with(PREFIX) {
+                                    return Err(
+                                        "required node content response contains plaintext".into(),
+                                    );
+                                }
+                                let key = key.ok_or("required node response key is unavailable")?;
+                                *slot = Value::String(
+                                    decrypt_compatible(key, workspace, content_name, alternate, s).map_err(
+                                        |_| "required node content response failed authentication",
+                                    )?,
+                                );
+                            }
                         } else if !enc && s.starts_with(PREFIX) {
                             *slot = Value::String(match key {
                                 None => "[locked]".into(),
-                                Some(k) => k
-                                    .decrypt(workspace, &rule.name, s)
-                                    .unwrap_or_else(|_| "[cannot decrypt]".into()),
+                                Some(k) => {
+                                    decrypt_compatible(k, workspace, content_name, alternate, s)
+                                        .unwrap_or_else(|_| "[cannot decrypt]".into())
+                                }
                             });
                         }
+                    } else if require_encrypted && !slot.is_null() {
+                        return Err("required node content must be text; structured content must be serialized locally".into());
                     }
+                    continue;
                 }
-                if let Some(r) = sch
-                    .get("$ref")
-                    .and_then(Value::as_str)
-                    .and_then(|r| r.strip_prefix("#/components/schemas/"))
+                if !enc
+                    && require_encrypted
+                    && (p == "meta"
+                        || (p == "payload"
+                            && matches!(schema, "CoordinationEvent" | "RegistryEventDto")))
                 {
-                    visit(slot, r, schemas, fields, workspace, key, enc, touched)?;
+                    continue; // These slots were explicitly classified above or by visit_event.
                 }
-                if let Some(items) = sch.get("items") {
-                    if let Some(r) = items
-                        .get("$ref")
-                        .and_then(Value::as_str)
-                        .and_then(|r| r.strip_prefix("#/components/schemas/"))
-                    {
-                        if let Some(a) = slot.as_array_mut() {
-                            for item in a {
-                                visit(item, r, schemas, fields, workspace, key, enc, touched)?
-                            }
-                        }
+                if !enc
+                    && require_encrypted
+                    && !slot.is_null()
+                    && matches!(
+                        p.as_str(),
+                        "id" | "claim_id"
+                            | "thread_id"
+                            | "in_reply_to"
+                            | "task_id"
+                            | "granted_from"
+                            | "priority_of"
+                            | "add_path_claim_id"
+                            | "version"
+                    )
+                    && schema_uses_opaque_json(sch)
+                {
+                    if !safe_response_id(slot) {
+                        return Err("required node response identifier has an invalid type".into());
                     }
+                    continue;
+                }
+                if !enc && require_encrypted && p == "sealed" && !slot.is_null() {
+                    if !slot.is_boolean() {
+                        return Err("required node response sealed flag must be boolean".into());
+                    }
+                    continue;
+                }
+                visit_shape(
+                    slot,
+                    sch,
+                    schemas,
+                    fields,
+                    workspace,
+                    key,
+                    enc,
+                    require_encrypted,
+                    touched,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn schema_uses_opaque_json(definition: &Value) -> bool {
+    definition.get("$ref").and_then(Value::as_str) == Some("#/components/schemas/JsonElement")
+        || definition
+            .get("oneOf")
+            .or_else(|| definition.get("anyOf"))
+            .and_then(Value::as_array)
+            .is_some_and(|variants| variants.iter().any(schema_uses_opaque_json))
+}
+
+fn safe_response_id(value: &Value) -> bool {
+    value.as_u64().is_some()
+        || value.as_str().is_some_and(|s| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_shape(
+    value: &mut Value,
+    definition: &Value,
+    schemas: &Value,
+    fields: &[Field],
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    enc: bool,
+    required: bool,
+    touched: &mut Vec<String>,
+) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    if definition.get("type").and_then(Value::as_str) == Some("null") {
+        return Err("non-null value does not match the nullable schema branch".into());
+    }
+    if let Some(name) = definition
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+    {
+        let definition = schemas
+            .get(name)
+            .ok_or("required node response schema is unavailable")?;
+        return if definition.get("properties").is_some_and(Value::is_object) {
+            visit(
+                value, name, schemas, fields, workspace, key, enc, required, false, touched,
+            )
+        } else {
+            visit_shape(
+                value, definition, schemas, fields, workspace, key, enc, required, touched,
+            )
+        };
+    }
+    if let Some(variants) = definition
+        .get("oneOf")
+        .or_else(|| definition.get("anyOf"))
+        .and_then(Value::as_array)
+    {
+        for variant in variants {
+            let mut candidate = value.clone();
+            let mut changed = Vec::new();
+            if visit_shape(
+                &mut candidate,
+                variant,
+                schemas,
+                fields,
+                workspace,
+                key,
+                enc,
+                required,
+                &mut changed,
+            )
+            .is_ok()
+            {
+                *value = candidate;
+                touched.extend(changed);
+                return Ok(());
+            }
+        }
+        return Err("required node response has an unsupported field type".into());
+    }
+    if let Some(items) = definition.get("items") {
+        if let Some(values) = value.as_array_mut() {
+            for item in values {
+                visit_shape(
+                    item, items, schemas, fields, workspace, key, enc, required, touched,
+                )?;
+            }
+            return Ok(());
+        }
+        return if required && !enc {
+            Err("required node response field must be an array".into())
+        } else {
+            Ok(())
+        };
+    }
+    if !required || enc {
+        return Ok(());
+    }
+    let matches_type = |kind: &str| match kind {
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        _ => false,
+    };
+    let valid = definition.get("type").is_some_and(|kind| {
+        kind.as_str().is_some_and(matches_type)
+            || kind
+                .as_array()
+                .is_some_and(|types| types.iter().filter_map(Value::as_str).any(matches_type))
+    });
+    if !valid
+        || definition
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_some_and(|values| !values.contains(value))
+    {
+        return Err(
+            "required node response contains an unclassified value or invalid field type".into(),
+        );
+    }
+    Ok(())
+}
+
+// Backend event payloads add these fixed aliases to their typed snapshots.
+// visit_event authenticates reason/note separately; IDs and fences stay metadata.
+fn event_payload_alias(schema: &str, property: &str, value: &Value) -> bool {
+    let known = match schema {
+        "CoordinationClaim" => matches!(property, "claim_id" | "reason"),
+        "CoordinationQueueEntry" => matches!(property, "claim_id" | "fence" | "reason"),
+        "CoordinationRequest" => matches!(property, "claim_id" | "fence" | "reason" | "note"),
+        _ => false,
+    };
+    known
+        && (value.is_null()
+            || match property {
+                "claim_id" => {
+                    value.as_u64().is_some()
+                        || value.as_str().is_some_and(|id| {
+                            !id.is_empty()
+                                && id.len() <= 128
+                                && id
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b"_-:.".contains(&b))
+                        })
+                }
+                "fence" => value.as_u64().is_some(),
+                "reason" | "note" => value.is_string(),
+                _ => false,
+            })
+}
+
+/// Conflict holders are compatibility JSON in the published contract, but their
+/// note is the original encrypted claim note. Never treat that slot as metadata.
+fn transform_conflict_entry(
+    value: &mut Value,
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    required: bool,
+) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let Some(object) = value.as_object_mut() else {
+        return if required {
+            Err("required node conflict holder must be an object".into())
+        } else {
+            Ok(())
+        };
+    };
+    if required {
+        for (name, slot) in object.iter() {
+            let valid = match name.as_str() {
+                "note" => slot.is_null() || slot.is_string(),
+                "paths" => {
+                    slot.is_null()
+                        || slot
+                            .as_array()
+                            .is_some_and(|values| values.iter().all(Value::is_string))
+                }
+                "claim_id" | "priority_of" => {
+                    slot.is_null() || slot.is_string() || slot.is_number()
+                }
+                "path" | "held_path" | "session" | "mode" | "purpose" | "expires_at" => {
+                    slot.is_null() || slot.is_string()
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err("required node conflict contains unclassified content".into());
+            }
+        }
+    }
+    if let Some(note) = object.get_mut("note") {
+        decrypt_event_field(note, "note", workspace, key, required)?;
+    }
+    Ok(())
+}
+fn transform_conflict_array(
+    value: &mut Value,
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    required: bool,
+) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let Some(values) = value.as_array_mut() else {
+        return if required {
+            Err("required node conflicts must be an array".into())
+        } else {
+            Ok(())
+        };
+    };
+    for value in values {
+        transform_conflict_entry(value, workspace, key, required)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn transform_error_details(
+    value: &mut Value,
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    required: bool,
+) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let Some(object) = value.as_object_mut() else {
+        return if required {
+            Err("required node error details must be classified metadata".into())
+        } else {
+            Ok(())
+        };
+    };
+    for (name, slot) in object {
+        match name.as_str() {
+            "conflicts" => transform_conflict_array(slot, workspace, key, required)?,
+            "priority_of" if slot.is_null() || slot.as_u64().is_some() => {}
+            "reason" => decrypt_event_field(slot, "reason", workspace, key, required)?,
+            "path" | "fence" | "current_fence" | "expected_version" | "current_version"
+            | "actual_version" | "version" | "retry_after" | "until" | "expires_at" | "session"
+            | "owner_session" | "owner" | "id" | "key" | "status" | "available" | "repository"
+                if slot.is_null() || slot.is_string() || slot.is_number() || slot.is_boolean() => {}
+            "paths" | "holders"
+                if slot.is_null()
+                    || slot
+                        .as_array()
+                        .is_some_and(|values| values.iter().all(Value::is_string)) => {}
+            _ if required => return Err("required node error contains unclassified details".into()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn additional_node_content(schema: &str, property: &str) -> Option<&'static str> {
+    match (schema, property) {
+        ("CoordinationRenewWrite" | "CoordinationClaim", "hold_reason") => Some("hold_reason"),
+        (
+            "CoordinationTakeoverWrite"
+            | "CoordinationDirtyPathsWrite"
+            | "CoordinationFreezeWrite"
+            | "CoordinationFreezeResult"
+            | "CoordinationDirtyPathReply"
+            | "CoordinationDirtyPath",
+            "reason",
+        ) => Some("reason"),
+        ("CoordinationClaim", "takeover_reason") => Some("reason"),
+        ("CoordinationBoardHistory", "value") => Some("value"),
+        ("CoordinationLostEvent", "note") => Some("note"),
+        ("RegistryItemDto", "legacy_raw") => Some("legacy_raw"),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_event(
+    value: &mut Value,
+    schema: &str,
+    schemas: &Value,
+    fields: &[Field],
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    required: bool,
+    touched: &mut Vec<String>,
+) -> Result<(), String> {
+    let kind = value[if schema == "RegistryEventDto" {
+        "op"
+    } else {
+        "type"
+    }]
+    .as_str()
+    .unwrap_or_default()
+    .to_string();
+    if schema == "RegistryEventDto" {
+        if let Some(reason) = value.get_mut("reason") {
+            let system_reason = match kind.as_str() {
+                "lease_expired" => Some("assignment lease expired"),
+                "verify_expired" => Some("verify_by expired"),
+                "legacy_verdict_expired" => Some("14 days without verdict"),
+                _ => None,
+            };
+            if !reason.is_null()
+                && !system_reason.is_some_and(|expected| reason.as_str() == Some(expected))
+            {
+                decrypt_event_field_alias(
+                    reason,
+                    if kind == "owner_closed" {
+                        "value"
+                    } else {
+                        "reason"
+                    },
+                    (kind == "owner_closed").then_some("owner_word"),
+                    workspace,
+                    key,
+                    required,
+                )?;
+            }
+        }
+        if let Some(payload) = value.get_mut("payload") {
+            visit(
+                payload,
+                "RegistryItemDto",
+                schemas,
+                fields,
+                workspace,
+                key,
+                false,
+                required,
+                false,
+                touched,
+            )?;
+        }
+        return Ok(());
+    }
+    let payload_schema = match kind.as_str() {
+        "task.offered" | "task.claim" | "task.beat" | "task.done" | "task.accept"
+        | "task.reject" | "task.fail" | "task.cancel" | "task.handoff" | "task.take"
+        | "task.decline" | "task.expired" => Some("CoordinationTask"),
+        "board.changed" => Some("CoordinationBoardValue"),
+        "zone.requested" | "zone.answered" => Some("CoordinationRequest"),
+        "zone.queued" | "zone.dequeued" => Some("CoordinationQueueEntry"),
+        "zone.claimed" | "zone.released" | "zone.expired" | "zone.lost" | "zone.granted"
+        | "zone.handover" | "zone.takeover" => Some("CoordinationClaim"),
+        "admin.freeze" => Some("CoordinationFreezeResult"),
+        "bus.message" | "bus.ack" => Some("CoordinationMessage"),
+        "bus.unread"
+        | "bus.seen"
+        | "bus.delivery_claimed"
+        | "bus.imported"
+        | "presence.activity"
+        | "presence.heartbeat"
+        | "presence.unavailable"
+        | "zone.catalog"
+        | "zone.dirty"
+        | "zone.dirty_adopted"
+        | "zone.dirty_disowned"
+        | "integration.github" => None,
+        _ if required => {
+            return Err("required node encryption does not support this event payload type".into());
+        }
+        _ => None,
+    };
+    if let Some(payload) = value.get_mut("payload") {
+        if let Some(payload_schema) = payload_schema {
+            visit(
+                payload,
+                payload_schema,
+                schemas,
+                fields,
+                workspace,
+                key,
+                false,
+                required,
+                true,
+                touched,
+            )?;
+            // The server's request event copies the already-encrypted text into its note alias.
+            if matches!(kind.as_str(), "zone.requested" | "zone.answered")
+                && let Some(note) = payload.get_mut("note")
+            {
+                decrypt_event_field(note, "text", workspace, key, required)?;
+            }
+            if kind.starts_with("zone.")
+                && let Some(reason) = payload.get_mut("reason")
+            {
+                let is_system = matches!(
+                    (kind.as_str(), reason.as_str().unwrap_or_default()),
+                    (
+                        "zone.claimed",
+                        "claimed" | "add_path" | "renewed" | "meta_updated"
+                    ) | (
+                        "zone.released",
+                        "narrowed" | "released" | "idle" | "expired" | "unused_grant"
+                    ) | ("zone.lost", "taken")
+                        | ("zone.granted", "granted")
+                        | ("zone.handover", "offered" | "accepted" | "returned")
+                        | ("zone.expired", "expired" | "unused_grant")
+                        | ("zone.queued", "short_wait" | "add_path" | "queued")
+                        | (
+                            "zone.dequeued",
+                            "left_queue" | "claim_ended" | "already_held" | "expired"
+                        )
+                        | ("zone.requested", "requested")
+                        | ("zone.answered", "answered")
+                );
+                if !is_system {
+                    decrypt_event_field(reason, "reason", workspace, key, required)?;
                 }
             }
+        } else if required {
+            validate_metadata_event(&kind, payload)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_metadata_event(kind: &str, value: &Value) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or("required node metadata event must be an object")?;
+    let fields: &[&str] = match kind {
+        "bus.unread" => &["to"],
+        "bus.seen" => &["seen"],
+        "bus.delivery_claimed" => &["ids"],
+        "bus.imported" => &["threads", "board", "tasks"],
+        "presence.activity" => &["session", "claim_id", "last_seen"],
+        "presence.heartbeat" => &["session", "state", "last_seen"],
+        "presence.unavailable" => &["session", "state"],
+        "zone.catalog" => &["updated_at", "repository"],
+        "zone.dirty" | "zone.dirty_adopted" | "zone.dirty_disowned" => {
+            &["session", "paths", "repository"]
+        }
+        "integration.github" => &[
+            "provider",
+            "to",
+            "item_id",
+            "repository",
+            "commit_sha",
+            "event_key",
+            "occurred_at",
+            "attention_required",
+            "delivery_mode",
+            "provider_url",
+        ],
+        _ => return Err("required node metadata event kind is unsupported".into()),
+    };
+    let id = |v: &Value| {
+        v.as_u64().is_some()
+            || v.as_str().is_some_and(|s| {
+                !s.is_empty()
+                    && s.len() <= 128
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_-:.".contains(&b))
+            })
+    };
+    let session = |v: &Value| {
+        v.as_str().is_some_and(|s| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+        })
+    };
+    let positive_decimal = |s: &str, max: usize| {
+        !s.is_empty()
+            && s.len() <= max
+            && s.as_bytes()[0] != b'0'
+            && s.bytes().all(|b| b.is_ascii_digit())
+    };
+    for (name, item) in object {
+        if !fields.contains(&name.as_str()) {
+            return Err("required node metadata event contains an unsupported field".into());
+        }
+        let valid = match name.as_str() {
+            "seen" | "ids" => item.as_array().is_some_and(|a| a.iter().all(id)),
+            "claim_id" => id(item),
+            "session" | "to" => session(item),
+            "item_id" => item
+                .as_str()
+                .and_then(|s| s.strip_prefix("D-"))
+                .is_some_and(|s| positive_decimal(s, 19)),
+            "commit_sha" => item.as_str().is_some_and(|s| {
+                s.len() == 40
+                    && s.bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            }),
+            "event_key" => item.as_str().is_some_and(|s| {
+                let parts = s.split(':').collect::<Vec<_>>();
+                matches!(
+                    parts.first().copied(),
+                    Some("workflow_run" | "check_run" | "pull_request_review")
+                ) && matches!(parts.len(), 2 | 3)
+                    && positive_decimal(parts[1], 19)
+                    && (parts.len() == 2 || positive_decimal(parts[2], 10))
+            }),
+            "provider_url" => item.as_str().is_some_and(|s| {
+                s == format!(
+                    "https://github.com/{}/commit/{}/checks",
+                    object
+                        .get("repository")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    object
+                        .get("commit_sha")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                )
+            }),
+            "threads" | "board" | "tasks" => item.as_u64().is_some(),
+            "paths" => item.as_array().is_some_and(|a| {
+                a.iter().all(|v| {
+                    v.as_str()
+                        .is_some_and(|s| s.len() <= 1024 && !s.chars().any(char::is_control))
+                })
+            }),
+            "last_seen" | "updated_at" | "occurred_at" => item
+                .as_str()
+                .is_some_and(|s| s.len() <= 40 && lockyard_core::proto::parse_rfc3339(s).is_some()),
+            "state" => matches!(
+                item.as_str(),
+                Some("working" | "idle" | "ended" | "api_failure")
+            ),
+            "provider" => item.as_str() == Some("github"),
+            "attention_required" => item.as_bool() == Some(true),
+            "delivery_mode" => item.as_str() == Some("metadata"),
+            "repository" => {
+                if kind == "integration.github" {
+                    item.as_str().is_some_and(|s| {
+                        s.len() <= 200
+                            && s.split('/').count() == 2
+                            && s.split('/').all(|part| {
+                                !part.is_empty()
+                                    && !matches!(part, "." | "..")
+                                    && part
+                                        .bytes()
+                                        .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+                            })
+                    })
+                } else {
+                    item.is_null()
+                        || item.as_str().is_some_and(|s| {
+                            !s.is_empty()
+                                && s.len() <= 255
+                                && s.bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+                        })
+                }
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err("required node metadata event contains an invalid field type".into());
+        }
+    }
+    Ok(())
+}
+
+fn decrypt_event_field(
+    value: &mut Value,
+    name: &str,
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    required: bool,
+) -> Result<(), String> {
+    decrypt_event_field_alias(value, name, None, workspace, key, required)
+}
+
+fn decrypt_compatible(
+    key: &WorkspaceKey,
+    workspace: &str,
+    name: &str,
+    alternate: Option<&str>,
+    text: &str,
+) -> Result<String, String> {
+    key.decrypt(workspace, name, text)
+        .or_else(|error| match alternate {
+            Some(alternate) => key.decrypt(workspace, alternate, text),
+            None => Err(error),
+        })
+}
+
+fn decrypt_event_field_alias(
+    value: &mut Value,
+    name: &str,
+    alternate: Option<&str>,
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    required: bool,
+) -> Result<(), String> {
+    if value.is_null() || value.as_str() == Some("") {
+        return Ok(());
+    }
+    let Some(text) = value.as_str() else {
+        return if required {
+            Err("required node event content must be text".into())
+        } else {
+            Ok(())
+        };
+    };
+    if text.starts_with(PREFIX) {
+        *value = Value::String(match key {
+            Some(key) => match decrypt_compatible(key, workspace, name, alternate, text) {
+                Ok(plain) => plain,
+                Err(_) if required => {
+                    return Err("required node event content failed authentication".into());
+                }
+                Err(_) => "[cannot decrypt]".into(),
+            },
+            None if required => return Err("required node event key is unavailable".into()),
+            None => "[locked]".into(),
+        });
+    } else if required {
+        return Err("required node event content contains plaintext".into());
+    }
+    Ok(())
+}
+
+/// Fail closed when a newer endpoint or an unclassified arbitrary JSON slot could bypass
+/// the embedded content map. Ordinary coordination identifiers remain routing metadata.
+fn validate_request_shape(
+    value: &Value,
+    definition: &Value,
+    schemas: &Value,
+) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    if definition.get("format").and_then(Value::as_str) == Some("date-time")
+        && !safe_timestamp(value)
+    {
+        return Err(
+            "required node timestamps must be canonical UTC text or bounded epoch milliseconds"
+                .into(),
+        );
+    }
+    if let Some(name) = definition
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+    {
+        return validate_request_shape(value, &schemas[name], schemas);
+    }
+    if let Some(variants) = definition
+        .get("oneOf")
+        .or_else(|| definition.get("anyOf"))
+        .and_then(Value::as_array)
+    {
+        return if variants
+            .iter()
+            .any(|variant| validate_request_shape(value, variant, schemas).is_ok())
+        {
+            Ok(())
+        } else {
+            Err("required node request has an unsupported field type".into())
+        };
+    }
+    if let Some(variants) = definition.get("enum").and_then(Value::as_array) {
+        return if variants.contains(value) {
+            Ok(())
+        } else {
+            Err("required node request has an unsupported enum value".into())
+        };
+    }
+    if let Some(items) = definition.get("items") {
+        let values = value
+            .as_array()
+            .ok_or("required node request has an unsupported field type")?;
+        for item in values {
+            validate_request_shape(item, items, schemas)?;
+        }
+        return Ok(());
+    }
+    if let Some(properties) = definition.get("properties").and_then(Value::as_object) {
+        let object = value
+            .as_object()
+            .ok_or("required node request must be an object")?;
+        for (name, item) in object {
+            let child = properties
+                .get(name)
+                .ok_or("required node request contains an unclassified field")?;
+            if matches!(name.as_str(), "meta" | "hold_until_ref" | "legacy_raw") && !item.is_null()
+            {
+                return Err("required node request cannot send unclassified metadata".into());
+            }
+            if name == "sealed" {
+                if !item.is_null() && !item.is_boolean() {
+                    return Err("required node request sealed flag must be boolean".into());
+                }
+                continue;
+            }
+            if name == "value" {
+                if !item.is_null() && !item.is_string() {
+                    return Err("required node content must be serialized to text locally".into());
+                }
+                continue;
+            }
+            if name == "ids" && child.get("items").is_none() && !item.is_null() {
+                if !item
+                    .as_array()
+                    .is_some_and(|entries| entries.iter().all(safe_response_id))
+                {
+                    return Err("required node request identifiers must be a typed list".into());
+                }
+                continue;
+            }
+            // This legacy DTO models activity as arbitrary JSON. Only the fixed public
+            // liveness fields are valid in a node job; tool arguments and metadata aren't.
+            if name == "activity" && !item.is_null() {
+                let object = item
+                    .as_object()
+                    .ok_or("required node activity must be an approved liveness object")?;
+                if object.iter().any(|(key, value)| match key.as_str() {
+                    "tool_running" => !value.is_boolean(),
+                    "tool_started_at" => !safe_timestamp(value),
+                    "state" => {
+                        !value.is_null()
+                            && !matches!(
+                                value.as_str(),
+                                Some("working" | "idle" | "ended" | "api_failure")
+                            )
+                    }
+                    "meta" => !safe_activity_meta(value),
+                    _ => true,
+                }) {
+                    return Err(
+                        "required node request cannot send arbitrary activity metadata".into(),
+                    );
+                }
+            } else {
+                validate_request_shape(item, child, schemas)?;
+            }
+        }
+    } else {
+        let supported_type = |kind: &str| match kind {
+            "string" => value.is_string(),
+            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            _ => false,
+        };
+        let valid = definition.get("type").is_some_and(|kind| {
+            kind.as_str().is_some_and(supported_type)
+                || kind
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().filter_map(Value::as_str).any(supported_type))
+        });
+        if !valid {
+            return Err("required node request cannot send unclassified metadata or an unsupported field type".into());
+        }
+    }
+    Ok(())
+}
+
+fn safe_timestamp(value: &Value) -> bool {
+    const MAX: i64 = 253_402_300_799_999;
+    value.is_null()
+        || value
+            .as_i64()
+            .is_some_and(|stamp| (0..=MAX).contains(&stamp))
+        || value.as_str().is_some_and(|text| {
+            text.len() <= 24
+                && lockyard_core::proto::parse_rfc3339(text).is_some_and(|stamp| {
+                    (0..=MAX).contains(&stamp) && lockyard_core::proto::rfc3339(stamp) == text
+                })
+        })
+}
+
+fn safe_activity_meta(value: &Value) -> bool {
+    value.is_null()
+        || value.as_object().is_some_and(|object| {
+            object.iter().all(|(key, value)| match key.as_str() {
+                "level" => matches!(value.as_str(), Some("ok" | "warn" | "hold" | "critical")),
+                "memory_available" | "memory_total" | "disk_free" | "temp_free" | "swap_used"
+                | "cpus" => value.is_null() || value.as_u64().is_some(),
+                "load" => value
+                    .as_f64()
+                    .is_some_and(|load| load.is_finite() && load >= 0.0),
+                _ => false,
+            })
+        })
+}
+
+pub(crate) fn validate_required_route(method: &str, route: &str) -> Result<(), String> {
+    let (_, api) = parsed()?;
+    let (normalized, query) = route.split_once('?').unwrap_or((route, ""));
+    // Legacy bulk imports contain untyped JSON/legacy_raw outside the content table.
+    // A remote job must use the typed, encrypted operations instead.
+    if normalized.starts_with("/api/v1/import/") || normalized == "/api/v1/registry/import" {
+        return Err("required node encryption does not support legacy bulk imports".into());
+    }
+    let operation = api["paths"]
+        .as_object()
+        .ok_or("bad OpenAPI paths")?
+        .iter()
+        .filter(|(path, _)| openapi_path_matches(path, normalized))
+        .find_map(|(_, operations)| operations.get(method.to_ascii_lowercase()))
+        .ok_or("required node encryption does not support this API operation")?;
+    let mut namespace_probe_seen = false;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let name = pair.split('=').next().unwrap_or_default();
+        if name == "namespace_probe" {
+            // RepositoryTransport uses this fixed capability marker for both HTTP and the
+            // local daemon. It carries no content and is intentionally absent from OpenAPI.
+            // Keep the daemon negotiation intact without opening arbitrary query metadata.
+            if method != "GET"
+                || normalized != "/api/v1/zones/claims"
+                || pair != "namespace_probe=1"
+                || namespace_probe_seen
+            {
+                return Err("required node request contains an invalid namespace probe".into());
+            }
+            namespace_probe_seen = true;
+            continue;
+        }
+        if name == "q" {
+            return Err("required node encryption forbids sending full-text searches to the cloud; filter decrypted items locally".into());
+        }
+        if !operation
+            .get("parameters")
+            .and_then(Value::as_array)
+            .is_some_and(|params| {
+                params
+                    .iter()
+                    .any(|parameter| parameter["in"] == "query" && parameter["name"] == name)
+            })
+        {
+            return Err("required node request contains an unclassified query parameter".into());
         }
     }
     Ok(())
@@ -253,7 +1324,55 @@ impl WorkspaceKey {
         entropy_to_phrase(&self.0)
     }
     pub fn store_for_workspace(&self, workspace: &str) -> Result<(), String> {
-        use std::{fs, io::Write, path::PathBuf};
+        use std::fs;
+        let destination = Self::storage_path(workspace)?;
+        let directory = destination.parent().ok_or("invalid key directory")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(directory)
+                .map_err(|_| "cannot create key directory")?;
+            for path in [
+                directory.parent().ok_or("invalid key directory")?,
+                directory,
+            ] {
+                let metadata =
+                    fs::symlink_metadata(path).map_err(|_| "cannot inspect key directory")?;
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || fs::canonicalize(path).map_err(|_| "cannot inspect key directory")? != path
+                {
+                    return Err(
+                        "key directory must be owned and cannot contain symbolic links".into(),
+                    );
+                }
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                    .map_err(|_| "cannot secure key directory")?;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Write;
+            fs::create_dir_all(directory).map_err(|_| "cannot create key directory")?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)
+                .map_err(|_| "cannot create workspace key")?;
+            file.write_all(&self.0)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| "cannot write workspace key")
+        }
+        #[cfg(unix)]
+        self.copy_to_private(&destination)
+    }
+    /// Location of the current workspace key; no key bytes or recovery words are returned.
+    pub fn storage_path(workspace: &str) -> Result<std::path::PathBuf, String> {
+        use std::path::PathBuf;
         if workspace.is_empty()
             || !workspace
                 .bytes()
@@ -265,73 +1384,143 @@ impl WorkspaceKey {
             Some(p) if !p.is_empty() => PathBuf::from(p),
             _ => PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(".config"),
         };
-        let dir = base.join("lockyard/keys");
-        fs::create_dir_all(&dir).map_err(|e| format!("cannot create key directory: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                dir.parent().ok_or("invalid key directory")?,
-                fs::Permissions::from_mode(0o700),
-            )
-            .map_err(|e| format!("cannot secure key directory: {e}"))?;
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("cannot secure key directory: {e}"))?;
+        if !base.is_absolute() {
+            return Err("workspace key directory must be absolute".into());
         }
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create_new(true);
+        Ok(base.join("lockyard/keys").join(format!("{workspace}.key")))
+    }
+    pub fn load_for_workspace(workspace: &str) -> Result<Option<Self>, String> {
+        Self::load_private(&Self::storage_path(workspace)?)
+    }
+    /// Bounded file-descriptor validation prevents symlink, FIFO and metadata replacement races.
+    pub fn load_private(path: &std::path::Path) -> Result<Option<Self>, String> {
+        use std::{fs, io::Read};
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
         }
-        let mut f = opts
-            .open(dir.join(format!("{workspace}.key")))
-            .map_err(|e| format!("cannot create workspace key: {e}"))?;
-        f.write_all(&self.0)
-            .map_err(|e| format!("cannot write workspace key: {e}"))
-    }
-    pub fn load_for_workspace(workspace: &str) -> Result<Option<Self>, String> {
-        use std::{fs, path::PathBuf};
-        if workspace.is_empty()
-            || !workspace
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-        {
-            return Err("invalid workspace id for local key storage".into());
-        }
-        let base = match std::env::var_os("XDG_CONFIG_HOME") {
-            Some(p) if !p.is_empty() => PathBuf::from(p),
-            _ => PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(".config"),
+        let file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("cannot read workspace key".into()),
         };
-        let path = base.join("lockyard/keys").join(format!("{workspace}.key"));
-        let b = match fs::read(&path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("cannot read workspace key: {e}")),
-        };
-        if b.len() != 32 {
-            return Err("workspace key file has an invalid length".into());
+        let metadata = file
+            .metadata()
+            .map_err(|_| "cannot inspect workspace key")?;
+        if !metadata.is_file() {
+            return Err("workspace key must be a regular file".into());
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&path)
-                .map_err(|e| format!("cannot inspect workspace key: {e}"))?
-                .permissions()
-                .mode()
-                & 0o777;
-            if mode != 0o600 {
-                return Err("workspace key file must have mode 0600".into());
+            use std::os::unix::fs::MetadataExt;
+            if metadata.mode() & 0o777 != 0o600 || metadata.uid() != unsafe { libc::geteuid() } {
+                return Err("workspace key must be owned by this user with mode 0600".into());
             }
         }
+        let mut bytes = Vec::with_capacity(33);
+        file.take(33)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "cannot read workspace key")?;
+        if bytes.len() != 32 {
+            return Err("workspace key file has an invalid length".into());
+        }
         let mut raw = [0; 32];
-        raw.copy_from_slice(&b);
+        raw.copy_from_slice(&bytes);
+        bytes.fill(0);
         Ok(Some(Self(raw)))
+    }
+
+    /// Stage a key for an explicitly authorized endpoint in a caller-created private directory.
+    /// The key is never returned as text, and an existing destination is never replaced.
+    #[cfg(unix)]
+    pub fn copy_to_private(&self, destination: &std::path::Path) -> Result<(), String> {
+        use std::{
+            fs,
+            io::Write,
+            os::unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+        if !destination.is_absolute() {
+            return Err("key destination must be absolute".into());
+        }
+        let parent = destination.parent().ok_or("invalid key destination")?;
+        let metadata =
+            fs::symlink_metadata(parent).map_err(|_| "key staging directory unavailable")?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.mode() & 0o077 != 0
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err("key staging directory must be private and owned".into());
+        }
+        let mut nonce = [0; 16];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| "key staging random source unavailable")?;
+        let staged = parent.join(format!(".lykey-stage-{}", base64url(&nonce)));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&staged)
+            .map_err(|_| "cannot create private key copy")?;
+        let result: Result<(), String> = (|| {
+            file.write_all(&self.0)
+                .map_err(|_| "cannot write private key copy")?;
+            file.sync_all()
+                .map_err(|_| "cannot sync private key copy")?;
+            // Only a complete, fsynced file can become the final name. link is atomic
+            // and create-only: another key at the destination is never overwritten.
+            fs::hard_link(&staged, destination).map_err(|_| "cannot publish private key copy")?;
+            fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|_| "cannot sync key staging directory")?;
+            Ok(())
+        })();
+        // A crash before publication can leave only a private, ignored temporary.
+        // After publication, even a directory-sync failure must retain the complete key.
+        let removed = fs::remove_file(&staged);
+        let synced = fs::File::open(parent).and_then(|dir| dir.sync_all());
+        result?;
+        removed.map_err(|_| "cannot remove private key staging file")?;
+        synced.map_err(|_| "cannot sync key staging directory")?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub fn copy_to_private(&self, _: &std::path::Path) -> Result<(), String> {
+        Err("private key staging requires Unix ownership checks".into())
     }
     pub fn key_id(&self) -> String {
         let k = hmac::Key::new(hmac::HMAC_SHA256, &self.0);
         base64url(&hmac::sign(&k, LABEL).as_ref()[..8])
+    }
+    /// Derive a purpose-bound child key without exposing master key bytes.
+    /// High-rate protocols must give every encrypted record its own unique context.
+    pub fn derive_context(&self, domain: &[u8], context: &[u8]) -> Result<Self, String> {
+        struct KeyLength;
+        impl ring::hkdf::KeyType for KeyLength {
+            fn len(&self) -> usize {
+                32
+            }
+        }
+        if domain.is_empty() || domain.len() > 128 || context.len() > 64 * 1024 {
+            return Err("invalid key derivation context".into());
+        }
+        let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, domain);
+        let prk = salt.extract(&self.0);
+        let info = [context];
+        let expanded = prk
+            .expand(&info, KeyLength)
+            .map_err(|_| "key derivation failed")?;
+        let mut key = [0; 32];
+        expanded
+            .fill(&mut key)
+            .map_err(|_| "key derivation failed")?;
+        Ok(Self(key))
     }
     pub fn encrypt(&self, w: &str, f: &str, p: &str) -> Result<String, String> {
         let mut n = [0; 12];
@@ -437,12 +1626,119 @@ fn unbase64url(s: &str) -> Result<Vec<u8>, String> {
             o.push((acc >> bits) as u8)
         }
     }
+    if base64url(&o) != s {
+        return Err("noncanonical base64".into());
+    }
     Ok(o)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn current_key_read_is_bounded_private_and_uses_opened_descriptor() {
+        use std::{
+            fs,
+            os::unix::fs::{DirBuilderExt, PermissionsExt, symlink},
+        };
+        let directory = std::env::temp_dir().join(format!("lockyard-key-read-{}", crate::ulid()));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let path = directory.join("key");
+        WorkspaceKey::from_entropy([91; 32])
+            .copy_to_private(&path)
+            .unwrap();
+        assert_eq!(
+            WorkspaceKey::load_private(&path).unwrap().unwrap().key_id(),
+            WorkspaceKey::from_entropy([91; 32]).key_id()
+        );
+        // A crash between final create-only link and temporary unlink must remain readable.
+        let orphan = directory.join("orphan");
+        fs::hard_link(&path, &orphan).unwrap();
+        assert!(WorkspaceKey::load_private(&path).unwrap().is_some());
+        let link = directory.join("link");
+        symlink(&path, &link).unwrap();
+        assert!(WorkspaceKey::load_private(&link).is_err());
+        assert!(WorkspaceKey::load_private(&directory).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(WorkspaceKey::load_private(&path).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&path, [1; 33]).unwrap();
+        assert!(WorkspaceKey::load_private(&path).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn key_copy_publishes_complete_bytes_once_and_ignores_interrupted_temporary() {
+        use std::{
+            fs,
+            os::unix::fs::{DirBuilderExt, PermissionsExt},
+        };
+        let directory =
+            std::env::temp_dir().join(format!("lockyard-key-publish-{}", crate::ulid()));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let orphan = directory.join(".lykey-stage-interrupted-fixture");
+        fs::write(&orphan, [1; 16]).unwrap();
+        fs::set_permissions(&orphan, fs::Permissions::from_mode(0o600)).unwrap();
+        let destination = directory.join("fixture-workspace.key");
+        let left = destination.clone();
+        let right = destination.clone();
+        let first =
+            std::thread::spawn(move || WorkspaceKey::from_entropy([94; 32]).copy_to_private(&left));
+        let second = std::thread::spawn(move || {
+            WorkspaceKey::from_entropy([95; 32]).copy_to_private(&right)
+        });
+        let (first, second) = (first.join().unwrap(), second.join().unwrap());
+        assert_ne!(first.is_ok(), second.is_ok());
+        let actual = fs::read(&destination).unwrap();
+        assert!(actual == [94; 32] || actual == [95; 32]);
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            WorkspaceKey::from_entropy([96; 32])
+                .copy_to_private(&destination)
+                .is_err()
+        );
+        assert_eq!(fs::read(&destination).unwrap(), actual);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn encrypted_envelopes_reject_alternate_unused_base64_bits() {
+        let key = WorkspaceKey::from_entropy([93; 32]);
+        let envelope = key.encrypt("fixture-workspace", "body", "a").unwrap();
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut altered = envelope.as_bytes().to_vec();
+        let last = altered.last_mut().unwrap();
+        let index = alphabet
+            .iter()
+            .position(|character| character == last)
+            .unwrap();
+        *last = alphabet[index | 1];
+        assert_ne!(altered, envelope.as_bytes());
+        assert_eq!(
+            key.decrypt("fixture-workspace", "body", &envelope).unwrap(),
+            "a"
+        );
+        assert!(
+            key.decrypt(
+                "fixture-workspace",
+                "body",
+                &String::from_utf8(altered).unwrap()
+            )
+            .is_err()
+        );
+        assert!(unbase64url("A").is_err());
+        assert!(unbase64url("AB").is_err());
+    }
     #[test]
     fn content_table_entries_exist_and_free_text_is_explicit() {
         let api: Value = serde_json::from_str(OPENAPI).unwrap();
@@ -502,6 +1798,125 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn owner_close_word_keeps_the_evidence_value_encryption_context() {
+        let key = WorkspaceKey::from_entropy([9; 32]);
+        let mut request = serde_json::json!({
+            "owner_word": "approved by owner", "expected_version": 1, "direct": true
+        });
+        transform_fields_policy(
+            &mut request,
+            "POST",
+            "/api/v1/registry/items/FE-1/owner-close",
+            "w",
+            Some(&key),
+            true,
+            true,
+        )
+        .unwrap();
+        let envelope = request["owner_word"].as_str().unwrap();
+        assert_eq!(
+            key.decrypt("w", "value", envelope).unwrap(),
+            "approved by owner"
+        );
+        assert!(key.decrypt("w", "owner_word", envelope).is_err());
+        let mut response = serde_json::json!({
+            "id": "FE-1", "evidence": [{"kind": "decision", "value": envelope}]
+        });
+        transform_fields_policy(
+            &mut response,
+            "GET",
+            "/api/v1/registry/items/FE-1",
+            "w",
+            Some(&key),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(response["evidence"][0]["value"], "approved by owner");
+    }
+
+    #[test]
+    fn owner_close_reads_both_cli_and_browser_contexts_without_aliasing_other_content() {
+        let key = WorkspaceKey::from_entropy([9; 32]);
+        let (map, api) = parsed().unwrap();
+        for context in ["value", "owner_word"] {
+            let envelope = key.encrypt("w", context, "owner approval").unwrap();
+            let mut response = serde_json::json!({
+                "id": "FE-1", "evidence": [{"kind": "decision", "value": envelope}]
+            });
+            transform_fields_policy(
+                &mut response,
+                "GET",
+                "/api/v1/registry/items/FE-1",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(response["evidence"][0]["value"], "owner approval");
+
+            let mut event = serde_json::json!({"op": "owner_closed", "reason": envelope});
+            visit_event(
+                &mut event,
+                "RegistryEventDto",
+                &api["components"]["schemas"],
+                &map.fields,
+                "w",
+                Some(&key),
+                true,
+                &mut Vec::new(),
+            )
+            .unwrap();
+            assert_eq!(event["reason"], "owner approval");
+        }
+
+        let envelope = key.encrypt("w", "owner_word", "owner approval").unwrap();
+        let mut request = serde_json::json!({"owner_word": envelope, "expected_version": 1});
+        transform_fields_policy(
+            &mut request,
+            "POST",
+            "/api/v1/registry/items/FE-1/owner-close",
+            "w",
+            Some(&key),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(request["owner_word"], envelope);
+
+        let mut unrelated = serde_json::json!({
+            "id": "FE-1", "evidence": [{"kind": "commit", "value": envelope}]
+        });
+        assert!(
+            transform_fields_policy(
+                &mut unrelated,
+                "GET",
+                "/api/v1/registry/items/FE-1",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+            .is_err()
+        );
+        let mut event = serde_json::json!({"op": "review_done", "reason": envelope});
+        assert!(
+            visit_event(
+                &mut event,
+                "RegistryEventDto",
+                &api["components"]["schemas"],
+                &map.fields,
+                "w",
+                Some(&key),
+                true,
+                &mut Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn schema_response_and_request_walks_use_web_aad_names() {
         let key = WorkspaceKey::from_entropy([9; 32]);

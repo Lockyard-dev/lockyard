@@ -1,10 +1,13 @@
 # Publishing
 
-Rust goes first because `lockyard` depends on `lockyard-core` and `lockyard-cloud-client`, then the GitHub release
+Rust goes first because `lockyard` depends on `lockyard-core`, `lockyard-cloud-client` and, on Unix, `lockyard-node`, then the GitHub release
 with the binaries, then npm, then PyPI. The release workflow builds the five supported native targets before
 publishing anything. The version in `Cargo.toml`, `packages/npm/package.json`, `packages/pypi/pyproject.toml` and
 `server.json` must be the same as the tag, and `CHANGELOG.md` must already have a section for it: the `versions` job
 checks all five and stops the release before a single artifact is built.
+
+The release workflow requires reusable CI, including real-container executor tests on a resource-capable Linux runner.
+Versions stay equal at `0.1.0` until an intentional version change.
 
 ## What the release workflow does
 
@@ -25,9 +28,10 @@ registry before the first release.
 ## By hand
 
 ```sh
-cargo publish -p lockyard-core
-cargo publish -p lockyard-cloud-client
-cargo publish -p lockyard
+cargo publish --locked -p lockyard-core
+cargo publish --locked -p lockyard-cloud-client
+cargo publish --locked -p lockyard-node
+cargo publish --locked -p lockyard
 cp LICENSE README.md packages/npm/
 node packages/npm/scripts/build-platform-packages.js <built-binaries-folder>
 (cd packages/npm && for package in ./dist/*; do npm publish "$package" --access public; done && npm publish --access public)
@@ -54,3 +58,7 @@ mcp-publisher publish
 `server.json` names both the npm and the PyPI package, each launched as `lockyard mcp`. Its `version` is part of the
 `versions` check, so the registry entry cannot quietly fall behind a release. Glama reads `glama.json` from the
 default branch; it has no publish step.
+
+Remote node and job commands currently require Unix. The Windows package continues to provide the existing coordination commands; its MCP node tools return an unsupported-platform error. Native Windows CI builds that package and runs its `about` command.
+
+The older cloud publishing instructions required `NPM_TOKEN` and `PYPI_TOKEN`; this merged release keeps the production OIDC Trusted Publishing flow instead.
