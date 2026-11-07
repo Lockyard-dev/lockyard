@@ -61,9 +61,23 @@ pub fn transform_fields(
     key: Option<&WorkspaceKey>,
     encrypt: bool,
 ) -> Result<(), String> {
+    transform_fields_policy(value, method, route, workspace, key, encrypt, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn transform_fields_policy(
+    value: &mut Value,
+    method: &str,
+    route: &str,
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    encrypt: bool,
+    require_encrypted: bool,
+) -> Result<(), String> {
     let (map, api) = parsed()?;
     let normalized = route.split('?').next().unwrap_or(route);
     let mut schemas = Vec::new();
+    let mut matched = false;
     for (path, ops) in api["paths"].as_object().ok_or("bad OpenAPI paths")? {
         if !openapi_path_matches(path, normalized) {
             continue;
@@ -71,6 +85,7 @@ pub fn transform_fields(
         let Some(op) = ops.get(method.to_ascii_lowercase()) else {
             continue;
         };
+        matched = true;
         if encrypt {
             let node = op
                 .get("requestBody")
@@ -97,6 +112,21 @@ pub fn transform_fields(
             }
         }
     }
+    if require_encrypted && !matched {
+        return Err("required node encryption does not support this API operation".into());
+    }
+    if require_encrypted && encrypt {
+        if schemas.is_empty() && !value.is_null() && value != &serde_json::json!({}) {
+            return Err("required node encryption does not support this request body".into());
+        }
+        for schema in &schemas {
+            validate_request_shape(
+                value,
+                &api["components"]["schemas"][schema],
+                &api["components"]["schemas"],
+            )?;
+        }
+    }
     let mut touched = Vec::new();
     for schema in schemas {
         visit(
@@ -107,6 +137,7 @@ pub fn transform_fields(
             workspace,
             key,
             encrypt,
+            require_encrypted,
             &mut touched,
         )?;
     }
@@ -145,36 +176,100 @@ fn visit(
     workspace: &str,
     key: Option<&WorkspaceKey>,
     enc: bool,
+    require_encrypted: bool,
     touched: &mut Vec<String>,
 ) -> Result<(), String> {
     let Some(def) = schemas.get(schema) else {
         return Ok(());
     };
+    if let Some(values) = v.as_array_mut() {
+        for value in values {
+            visit(
+                value,
+                schema,
+                schemas,
+                fields,
+                workspace,
+                key,
+                enc,
+                require_encrypted,
+                touched,
+            )?;
+        }
+        return Ok(());
+    }
+    if !enc && matches!(schema, "CoordinationEvent" | "RegistryEventDto") {
+        visit_event(
+            v,
+            schema,
+            schemas,
+            fields,
+            workspace,
+            key,
+            require_encrypted,
+            touched,
+        )?;
+    }
+    if !enc
+        && schema == "CoordinationLostEvent"
+        && let Some(reason) = v.get_mut("reason")
+        && reason.as_str() != Some("taken")
+    {
+        decrypt_event_field(reason, "reason", workspace, key, require_encrypted)?;
+    }
     if let (Some(obj), Some(props)) = (
         v.as_object_mut(),
         def.get("properties").and_then(Value::as_object),
     ) {
         for (p, sch) in props {
             if let Some(slot) = obj.get_mut(p) {
-                if let Some(rule) = fields
+                let content_name = fields
                     .iter()
                     .find(|f| f.schema == schema && f.property == *p)
-                {
+                    .map(|f| f.name.as_str())
+                    .or_else(|| {
+                        require_encrypted
+                            .then(|| additional_node_content(schema, p))
+                            .flatten()
+                    });
+                if let Some(content_name) = content_name {
                     if let Some(s) = slot.as_str() {
-                        if enc && !s.starts_with(PREFIX) {
+                        if enc && s.starts_with(PREFIX) && require_encrypted {
+                            key.ok_or("required node encryption key is unavailable")?
+                                .decrypt(workspace, content_name, s)
+                                .map_err(
+                                    |_| "required node content envelope failed authentication",
+                                )?;
+                        } else if enc && !s.starts_with(PREFIX) {
                             let k = key.ok_or_else(|| {
                                 format!("workspace encryption is required but no local key is available; import the key with `lockyard cloud key import` before writing content ({schema}.{p})")
                             })?;
-                            *slot = Value::String(k.encrypt(workspace, &rule.name, s)?);
+                            *slot = Value::String(k.encrypt(workspace, content_name, s)?);
                             touched.push(format!("{schema}.{p}"));
+                        } else if !enc && require_encrypted {
+                            if !s.is_empty() {
+                                if !s.starts_with(PREFIX) {
+                                    return Err(
+                                        "required node content response contains plaintext".into(),
+                                    );
+                                }
+                                let key = key.ok_or("required node response key is unavailable")?;
+                                *slot = Value::String(
+                                    key.decrypt(workspace, content_name, s).map_err(
+                                        |_| "required node content response failed authentication",
+                                    )?,
+                                );
+                            }
                         } else if !enc && s.starts_with(PREFIX) {
                             *slot = Value::String(match key {
                                 None => "[locked]".into(),
                                 Some(k) => k
-                                    .decrypt(workspace, &rule.name, s)
+                                    .decrypt(workspace, content_name, s)
                                     .unwrap_or_else(|_| "[cannot decrypt]".into()),
                             });
                         }
+                    } else if require_encrypted && !slot.is_null() {
+                        return Err("required node content must be text; structured content must be serialized locally".into());
                     }
                 }
                 if let Some(r) = sch
@@ -182,7 +277,17 @@ fn visit(
                     .and_then(Value::as_str)
                     .and_then(|r| r.strip_prefix("#/components/schemas/"))
                 {
-                    visit(slot, r, schemas, fields, workspace, key, enc, touched)?;
+                    visit(
+                        slot,
+                        r,
+                        schemas,
+                        fields,
+                        workspace,
+                        key,
+                        enc,
+                        require_encrypted,
+                        touched,
+                    )?;
                 }
                 if let Some(items) = sch.get("items") {
                     if let Some(r) = items
@@ -192,12 +297,443 @@ fn visit(
                     {
                         if let Some(a) = slot.as_array_mut() {
                             for item in a {
-                                visit(item, r, schemas, fields, workspace, key, enc, touched)?
+                                visit(
+                                    item,
+                                    r,
+                                    schemas,
+                                    fields,
+                                    workspace,
+                                    key,
+                                    enc,
+                                    require_encrypted,
+                                    touched,
+                                )?
                             }
                         }
                     }
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn additional_node_content(schema: &str, property: &str) -> Option<&'static str> {
+    match (schema, property) {
+        ("CoordinationRenewWrite" | "CoordinationClaim", "hold_reason") => Some("hold_reason"),
+        (
+            "CoordinationTakeoverWrite"
+            | "CoordinationDirtyPathsWrite"
+            | "CoordinationFreezeWrite"
+            | "CoordinationFreezeResult"
+            | "CoordinationDirtyPathReply"
+            | "CoordinationDirtyPath",
+            "reason",
+        ) => Some("reason"),
+        ("CoordinationClaim", "takeover_reason") => Some("reason"),
+        ("CoordinationBoardHistory", "value") => Some("value"),
+        ("CoordinationLostEvent", "note") => Some("note"),
+        ("RegistryItemDto", "legacy_raw") => Some("legacy_raw"),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_event(
+    value: &mut Value,
+    schema: &str,
+    schemas: &Value,
+    fields: &[Field],
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    required: bool,
+    touched: &mut Vec<String>,
+) -> Result<(), String> {
+    let kind = value[if schema == "RegistryEventDto" {
+        "op"
+    } else {
+        "type"
+    }]
+    .as_str()
+    .unwrap_or_default()
+    .to_string();
+    if schema == "RegistryEventDto" {
+        if let Some(reason) = value.get_mut("reason") {
+            let system_reason = match kind.as_str() {
+                "lease_expired" => Some("assignment lease expired"),
+                "verify_expired" => Some("verify_by expired"),
+                "legacy_verdict_expired" => Some("14 days without verdict"),
+                _ => None,
+            };
+            if !reason.is_null()
+                && !system_reason.is_some_and(|expected| reason.as_str() == Some(expected))
+            {
+                decrypt_event_field(
+                    reason,
+                    if kind == "owner_closed" {
+                        "value"
+                    } else {
+                        "reason"
+                    },
+                    workspace,
+                    key,
+                    required,
+                )?;
+            }
+        }
+        if let Some(payload) = value.get_mut("payload") {
+            visit(
+                payload,
+                "RegistryItemDto",
+                schemas,
+                fields,
+                workspace,
+                key,
+                false,
+                required,
+                touched,
+            )?;
+        }
+        return Ok(());
+    }
+    let payload_schema = match kind.as_str() {
+        "task.offered" | "task.claim" | "task.beat" | "task.done" | "task.accept"
+        | "task.reject" | "task.fail" | "task.cancel" | "task.handoff" | "task.take"
+        | "task.decline" | "task.expired" => Some("CoordinationTask"),
+        "board.changed" => Some("CoordinationBoardValue"),
+        "zone.requested" | "zone.answered" => Some("CoordinationRequest"),
+        "zone.queued" | "zone.dequeued" => Some("CoordinationQueueEntry"),
+        "zone.claimed" | "zone.released" | "zone.expired" | "zone.lost" | "zone.granted"
+        | "zone.handover" | "zone.takeover" => Some("CoordinationClaim"),
+        "admin.freeze" => Some("CoordinationFreezeResult"),
+        "bus.message" | "bus.ack" => Some("CoordinationMessage"),
+        "bus.unread"
+        | "bus.seen"
+        | "bus.delivery_claimed"
+        | "bus.imported"
+        | "presence.activity"
+        | "presence.heartbeat"
+        | "presence.unavailable"
+        | "zone.catalog"
+        | "zone.dirty"
+        | "zone.dirty_adopted"
+        | "zone.dirty_disowned"
+        | "integration.github" => None,
+        _ if required => {
+            return Err("required node encryption does not support this event payload type".into());
+        }
+        _ => None,
+    };
+    if let Some(payload) = value.get_mut("payload") {
+        if let Some(payload_schema) = payload_schema {
+            visit(
+                payload,
+                payload_schema,
+                schemas,
+                fields,
+                workspace,
+                key,
+                false,
+                required,
+                touched,
+            )?;
+            // The server's request event copies the already-encrypted text into its note alias.
+            if matches!(kind.as_str(), "zone.requested" | "zone.answered")
+                && let Some(note) = payload.get_mut("note")
+            {
+                decrypt_event_field(note, "text", workspace, key, required)?;
+            }
+            if kind.starts_with("zone.")
+                && let Some(reason) = payload.get_mut("reason")
+            {
+                let is_system = matches!(
+                    (kind.as_str(), reason.as_str().unwrap_or_default()),
+                    (
+                        "zone.claimed",
+                        "claimed" | "add_path" | "renewed" | "meta_updated"
+                    ) | (
+                        "zone.released",
+                        "narrowed" | "released" | "idle" | "expired" | "unused_grant"
+                    ) | ("zone.lost", "taken")
+                        | ("zone.granted", "granted")
+                        | ("zone.handover", "offered" | "accepted" | "returned")
+                        | ("zone.expired", "expired" | "unused_grant")
+                        | ("zone.queued", "short_wait" | "add_path" | "queued")
+                        | (
+                            "zone.dequeued",
+                            "left_queue" | "claim_ended" | "already_held" | "expired"
+                        )
+                        | ("zone.requested", "requested")
+                        | ("zone.answered", "answered")
+                );
+                if !is_system {
+                    decrypt_event_field(reason, "reason", workspace, key, required)?;
+                }
+            }
+        } else if required {
+            reject_unclassified_event_content(payload)?;
+        }
+    }
+    Ok(())
+}
+
+fn decrypt_event_field(
+    value: &mut Value,
+    name: &str,
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    required: bool,
+) -> Result<(), String> {
+    if value.is_null() || value.as_str() == Some("") {
+        return Ok(());
+    }
+    let Some(text) = value.as_str() else {
+        return if required {
+            Err("required node event content must be text".into())
+        } else {
+            Ok(())
+        };
+    };
+    if text.starts_with(PREFIX) {
+        *value = Value::String(match key {
+            Some(key) => match key.decrypt(workspace, name, text) {
+                Ok(plain) => plain,
+                Err(_) if required => {
+                    return Err("required node event content failed authentication".into());
+                }
+                Err(_) => "[cannot decrypt]".into(),
+            },
+            None if required => return Err("required node event key is unavailable".into()),
+            None => "[locked]".into(),
+        });
+    } else if required {
+        return Err("required node event content contains plaintext".into());
+    }
+    Ok(())
+}
+
+fn reject_unclassified_event_content(value: &Value) -> Result<(), String> {
+    match value {
+        Value::Object(object) => {
+            for (name, value) in object {
+                if matches!(
+                    name.as_str(),
+                    "body"
+                        | "title"
+                        | "brief"
+                        | "report"
+                        | "text"
+                        | "reply"
+                        | "value"
+                        | "note"
+                        | "accept"
+                ) && !value.is_null()
+                    && value.as_str() != Some("")
+                {
+                    return Err("required node event contains unclassified content".into());
+                }
+                reject_unclassified_event_content(value)?;
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                reject_unclassified_event_content(value)?;
+            }
+        }
+        Value::String(text) if text.starts_with(PREFIX) => {
+            return Err("required node event contains an unclassified envelope".into());
+        }
+        _ => (),
+    }
+    Ok(())
+}
+
+/// Fail closed when a newer endpoint or an unclassified arbitrary JSON slot could bypass
+/// the embedded content map. Ordinary coordination identifiers remain routing metadata.
+fn validate_request_shape(
+    value: &Value,
+    definition: &Value,
+    schemas: &Value,
+) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    if definition.get("format").and_then(Value::as_str) == Some("date-time")
+        && !safe_timestamp(value)
+    {
+        return Err(
+            "required node timestamps must be canonical UTC text or bounded epoch milliseconds"
+                .into(),
+        );
+    }
+    if let Some(name) = definition
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+    {
+        return validate_request_shape(value, &schemas[name], schemas);
+    }
+    if let Some(variants) = definition
+        .get("oneOf")
+        .or_else(|| definition.get("anyOf"))
+        .and_then(Value::as_array)
+    {
+        return if variants
+            .iter()
+            .any(|variant| validate_request_shape(value, variant, schemas).is_ok())
+        {
+            Ok(())
+        } else {
+            Err("required node request has an unsupported field type".into())
+        };
+    }
+    if let Some(variants) = definition.get("enum").and_then(Value::as_array) {
+        return if variants.contains(value) {
+            Ok(())
+        } else {
+            Err("required node request has an unsupported enum value".into())
+        };
+    }
+    if let Some(items) = definition.get("items") {
+        let values = value
+            .as_array()
+            .ok_or("required node request has an unsupported field type")?;
+        for item in values {
+            validate_request_shape(item, items, schemas)?;
+        }
+        return Ok(());
+    }
+    if let Some(properties) = definition.get("properties").and_then(Value::as_object) {
+        let object = value
+            .as_object()
+            .ok_or("required node request must be an object")?;
+        for (name, item) in object {
+            let child = properties
+                .get(name)
+                .ok_or("required node request contains an unclassified field")?;
+            if matches!(name.as_str(), "meta" | "hold_until_ref" | "legacy_raw") && !item.is_null()
+            {
+                return Err("required node request cannot send unclassified metadata".into());
+            }
+            if name == "sealed" {
+                if !item.is_null() && !item.is_boolean() {
+                    return Err("required node request sealed flag must be boolean".into());
+                }
+                continue;
+            }
+            if name == "value" {
+                if !item.is_null() && !item.is_string() {
+                    return Err("required node content must be serialized to text locally".into());
+                }
+                continue;
+            }
+            // This legacy DTO models activity as arbitrary JSON. Only the fixed public
+            // liveness fields are valid in a node job; tool arguments and metadata aren't.
+            if name == "activity" && !item.is_null() {
+                let object = item
+                    .as_object()
+                    .ok_or("required node activity must be an approved liveness object")?;
+                if object.iter().any(|(key, value)| match key.as_str() {
+                    "tool_running" => !value.is_boolean(),
+                    "tool_started_at" => !safe_timestamp(value),
+                    "state" => {
+                        !value.is_null()
+                            && !matches!(
+                                value.as_str(),
+                                Some("working" | "idle" | "ended" | "api_failure")
+                            )
+                    }
+                    "meta" => !safe_activity_meta(value),
+                    _ => true,
+                }) {
+                    return Err(
+                        "required node request cannot send arbitrary activity metadata".into(),
+                    );
+                }
+            } else {
+                validate_request_shape(item, child, schemas)?;
+            }
+        }
+    } else {
+        let supported_type = |kind: &str| match kind {
+            "string" => value.is_string(),
+            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            _ => false,
+        };
+        let valid = definition.get("type").is_some_and(|kind| {
+            kind.as_str().is_some_and(supported_type)
+                || kind
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().filter_map(Value::as_str).any(supported_type))
+        });
+        if !valid {
+            return Err("required node request cannot send unclassified metadata or an unsupported field type".into());
+        }
+    }
+    Ok(())
+}
+
+fn safe_timestamp(value: &Value) -> bool {
+    const MAX: i64 = 253_402_300_799_999;
+    value.is_null()
+        || value
+            .as_i64()
+            .is_some_and(|stamp| (0..=MAX).contains(&stamp))
+        || value.as_str().is_some_and(|text| {
+            text.len() <= 24
+                && lockyard_core::proto::parse_rfc3339(text).is_some_and(|stamp| {
+                    (0..=MAX).contains(&stamp) && lockyard_core::proto::rfc3339(stamp) == text
+                })
+        })
+}
+
+fn safe_activity_meta(value: &Value) -> bool {
+    value.is_null()
+        || value.as_object().is_some_and(|object| {
+            object.iter().all(|(key, value)| match key.as_str() {
+                "level" => matches!(value.as_str(), Some("ok" | "warn" | "hold" | "critical")),
+                "memory_available" | "memory_total" | "disk_free" | "temp_free" | "swap_used"
+                | "cpus" => value.is_null() || value.as_u64().is_some(),
+                "load" => value
+                    .as_f64()
+                    .is_some_and(|load| load.is_finite() && load >= 0.0),
+                _ => false,
+            })
+        })
+}
+
+pub(crate) fn validate_required_route(method: &str, route: &str) -> Result<(), String> {
+    let (_, api) = parsed()?;
+    let (normalized, query) = route.split_once('?').unwrap_or((route, ""));
+    // Legacy bulk imports contain untyped JSON/legacy_raw outside the content table.
+    // A remote job must use the typed, encrypted operations instead.
+    if normalized.starts_with("/api/v1/import/") || normalized == "/api/v1/registry/import" {
+        return Err("required node encryption does not support legacy bulk imports".into());
+    }
+    let operation = api["paths"]
+        .as_object()
+        .ok_or("bad OpenAPI paths")?
+        .iter()
+        .filter(|(path, _)| openapi_path_matches(path, normalized))
+        .find_map(|(_, operations)| operations.get(method.to_ascii_lowercase()))
+        .ok_or("required node encryption does not support this API operation")?;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let name = pair.split('=').next().unwrap_or_default();
+        if name == "q" {
+            return Err("required node encryption forbids sending full-text searches to the cloud; filter decrypted items locally".into());
+        }
+        if !operation
+            .get("parameters")
+            .and_then(Value::as_array)
+            .is_some_and(|params| {
+                params
+                    .iter()
+                    .any(|parameter| parameter["in"] == "query" && parameter["name"] == name)
+            })
+        {
+            return Err("required node request contains an unclassified query parameter".into());
         }
     }
     Ok(())
@@ -328,6 +864,56 @@ impl WorkspaceKey {
         let mut raw = [0; 32];
         raw.copy_from_slice(&b);
         Ok(Some(Self(raw)))
+    }
+
+    /// Stage a key for an explicitly authorized endpoint in a caller-created private directory.
+    /// The key is never returned as text, and an existing destination is never replaced.
+    #[cfg(unix)]
+    pub fn copy_to_private(&self, destination: &std::path::Path) -> Result<(), String> {
+        use std::{
+            fs,
+            io::Write,
+            os::unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+        if !destination.is_absolute() {
+            return Err("key destination must be absolute".into());
+        }
+        let parent = destination.parent().ok_or("invalid key destination")?;
+        let metadata =
+            fs::symlink_metadata(parent).map_err(|_| "key staging directory unavailable")?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.mode() & 0o077 != 0
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err("key staging directory must be private and owned".into());
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(destination)
+            .map_err(|_| "cannot create private key copy")?;
+        let result = (|| {
+            file.write_all(&self.0)
+                .map_err(|_| "cannot write private key copy")?;
+            file.sync_all()
+                .map_err(|_| "cannot sync private key copy")?;
+            fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|_| "cannot sync key staging directory")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(destination);
+        }
+        result
+    }
+
+    #[cfg(not(unix))]
+    pub fn copy_to_private(&self, _: &std::path::Path) -> Result<(), String> {
+        Err("private key staging requires Unix ownership checks".into())
     }
     pub fn key_id(&self) -> String {
         let k = hmac::Key::new(hmac::HMAC_SHA256, &self.0);

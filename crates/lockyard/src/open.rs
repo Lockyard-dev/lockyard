@@ -149,6 +149,13 @@ fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
     /// Long enough for a long poll passed through the agent.
     const CLI_TIMEOUT: Duration = Duration::from_secs(40);
     let (url, workspace) = endpoint(config)?;
+    // Legacy agent handshakes identify the URL/token but don't attest an encryption
+    // policy or key binding. Node jobs must use their own verified client context.
+    if std::env::var_os("LOCKYARD_REQUIRE_E2EE").is_some()
+        || std::env::var_os("LOCKYARD_E2EE_WORKSPACE_ID").is_some()
+    {
+        return direct(&url, session, config.repository.as_deref());
+    }
     let socket = AgentSocket::connect(&crate::agent::socket_path(), &url, &workspace, CLI_TIMEOUT);
     let token = Config::token().ok();
     match socket {
