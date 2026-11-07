@@ -583,7 +583,19 @@ impl Client {
                     .header("Retry-After")
                     .and_then(|value| value.parse::<u64>().ok());
                 let body = response.into_string().unwrap_or_default();
-                let error = ClientError::from_api(ApiError::parse(status, &body, retry_after));
+                let mut api_error=ApiError::parse(status,&body,retry_after);
+                if let Some(workspace)=self.workspace.as_deref() {
+                    crypto::transform_error_details(&mut api_error.details,workspace,self.content_key.as_ref(),self.expected_e2ee_workspace.is_some())
+                        .map_err(|message|Failure::Final(ClientError::Invalid(message)))?;
+                }
+                if self.expected_e2ee_workspace.is_some() {
+                    // Error messages are server-authored text, not authenticated application content.
+                    api_error.message=format!("Cloud request failed with HTTP {status}");
+                    if api_error.code.len()>64 || !api_error.code.bytes().all(|byte|byte.is_ascii_lowercase()||byte.is_ascii_digit()||byte==b'_') {
+                        api_error.code="cloud_error".into();
+                    }
+                }
+                let error = ClientError::from_api(api_error);
                 // A frozen server stays frozen for its whole window: the caller decides what to do.
                 let again = status == 429
                     || (300..400).contains(&status)
@@ -1130,6 +1142,175 @@ mod tests {
         }
         assert!(client.require_e2ee_for("another-workspace").is_err());
         assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn node_context_authenticates_conflict_notes_in_holders_queue_and_errors() {
+        let key = WorkspaceKey::from_entropy([83; 32]);
+        let note = key
+            .encrypt(NODE_WORKSPACE, "note", "private holder note")
+            .unwrap();
+        let holder = json!({"path":"src","held_path":"src","claim_id":"synthetic-id","session":"other",
+            "note":note,"paths":["src"],"mode":"exclusive","purpose":"work","expires_at":null,"priority_of":null});
+        let server = FakeServer::start(vec![
+            Reply::json(
+                200,
+                json!([{"path":"src","status":"held","holder":holder,"fence":0}]),
+            ),
+            Reply::json(200, json!({"queued":true,"conflicts":[holder]})),
+            Reply::json(
+                409,
+                json!({"error":{"code":"held","message":"SERVER-UNAUTHENTICATED-TEXT","details":{"conflicts":[holder],"priority_of":null}}}),
+            ),
+        ]);
+        let client = forced_client(&server, key);
+        let checked = client
+            .call(&Call {
+                method: "POST".into(),
+                path: "/api/v1/zones/check".into(),
+                body: Some(json!({"paths":["src"]})),
+                session: "node-job".into(),
+                ..Call::default()
+            })
+            .unwrap();
+        assert_eq!(checked[0]["holder"]["note"], "private holder note");
+        let queued = client
+            .call(&Call::write(
+                "node-job",
+                "POST",
+                "/api/v1/zones/claims".into(),
+                json!({"paths":["src"]}),
+            ))
+            .unwrap();
+        assert_eq!(queued["conflicts"][0]["note"], "private holder note");
+        let error = client
+            .call(&Call::write(
+                "node-job",
+                "POST",
+                "/api/v1/zones/claims".into(),
+                json!({"paths":["src"]}),
+            ))
+            .unwrap_err();
+        let ClientError::Conflict(error) = error else {
+            panic!("expected authenticated conflict")
+        };
+        assert_eq!(error.details["conflicts"][0]["note"], "private holder note");
+        assert!(!error.message.contains("SERVER-UNAUTHENTICATED-TEXT"));
+    }
+    #[test]
+    fn node_context_preserves_real_backend_error_metadata_shapes() {
+        let key = WorkspaceKey::from_entropy([85; 32]);
+        let reason = key
+            .encrypt(NODE_WORKSPACE, "reason", "private freeze reason")
+            .unwrap();
+        for (status, details, expected) in [
+            (
+                409,
+                json!({"conflicts":[],"priority_of":null}),
+                json!({"conflicts":[],"priority_of":null}),
+            ),
+            (
+                409,
+                json!({"conflicts":[],"priority_of":7}),
+                json!({"conflicts":[],"priority_of":7}),
+            ),
+            (
+                409,
+                json!({"path":"src","owner_session":"other"}),
+                json!({"path":"src","owner_session":"other"}),
+            ),
+            (
+                412,
+                json!({"path":"src","fence":7}),
+                json!({"path":"src","fence":7}),
+            ),
+            (412, json!({"version":7}), json!({"version":7})),
+            (
+                503,
+                json!({"reason":reason}),
+                json!({"reason":"private freeze reason"}),
+            ),
+            (503, json!({"reason":null}), json!({"reason":null})),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(
+                status,
+                json!({"error":{"code":"fixed","message":"server text","details":details}}),
+            )]);
+            let client = forced_client(&server, key.clone());
+            let error = client
+                .call(&Call::write(
+                    "node-job",
+                    "POST",
+                    "/api/v1/zones/claims".into(),
+                    json!({"paths":["src"]}),
+                ))
+                .unwrap_err();
+            let (ClientError::Conflict(error)
+            | ClientError::StaleFence(error)
+            | ClientError::Frozen(error)) = error
+            else {
+                panic!("unexpected classification: {error}")
+            };
+            assert_eq!(error.details, expected);
+            assert_eq!(server.requests().len(), 1);
+        }
+    }
+
+    #[test]
+    fn node_context_rejects_plaintext_tampered_and_untyped_conflict_notes() {
+        let key = WorkspaceKey::from_entropy([84; 32]);
+        let wrong = key.encrypt(NODE_WORKSPACE, "body", "wrong field").unwrap();
+        for note in [
+            json!("plaintext"),
+            json!(wrong),
+            json!({"nested":"untyped"}),
+        ] {
+            for response in [
+                json!([{"holder":{"note":note}}]),
+                json!({"queued":true,"conflicts":[{"note":note}]}),
+            ] {
+                let path = if response.is_array() {
+                    "/api/v1/zones/check"
+                } else {
+                    "/api/v1/zones/claims"
+                };
+                let server = FakeServer::start(vec![Reply::json(200, response)]);
+                let client = forced_client(&server, key.clone());
+                let call = Call::write("node-job", "POST", path.into(), json!({"paths":["src"]}));
+                assert!(client.call(&call).is_err());
+                assert_eq!(
+                    server.requests().len(),
+                    1,
+                    "response rejection must follow actual HTTP"
+                );
+            }
+            let server = FakeServer::start(vec![Reply::json(
+                409,
+                json!({"error":{"code":"held","message":"fixed","details":{"conflicts":[{"note":note}]}}}),
+            )]);
+            let client = forced_client(&server, key.clone());
+            assert!(matches!(
+                client.call(&Call::write(
+                    "node-job",
+                    "POST",
+                    "/api/v1/zones/claims".into(),
+                    json!({"paths":["src"]})
+                )),
+                Err(ClientError::Invalid(_))
+            ));
+        }
+        let server = FakeServer::start(vec![Reply::json(200, json!([{"holder":null}]))]);
+        let client = forced_client(&server, key);
+        assert!(
+            client
+                .call(&Call::write(
+                    "node-job",
+                    "POST",
+                    "/api/v1/zones/check".into(),
+                    json!({"paths":["src"]})
+                ))
+                .is_ok()
+        );
     }
 
     #[test]

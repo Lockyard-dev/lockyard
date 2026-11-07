@@ -223,6 +223,17 @@ fn visit(
     ) {
         for (p, sch) in props {
             if let Some(slot) = obj.get_mut(p) {
+                if !enc
+                    && ((schema == "CoordinationCheckResult" && p == "holder")
+                        || (schema == "CoordinationClaim" && p == "conflicts"))
+                {
+                    if p == "holder" {
+                        transform_conflict_entry(slot, workspace, key, require_encrypted)?;
+                    } else {
+                        transform_conflict_array(slot, workspace, key, require_encrypted)?;
+                    }
+                    continue;
+                }
                 let content_name = fields
                     .iter()
                     .find(|f| f.schema == schema && f.property == *p)
@@ -313,6 +324,111 @@ fn visit(
                     }
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Conflict holders are compatibility JSON in the published contract, but their
+/// note is the original encrypted claim note. Never treat that slot as metadata.
+fn transform_conflict_entry(
+    value: &mut Value,
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    required: bool,
+) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let Some(object) = value.as_object_mut() else {
+        return if required {
+            Err("required node conflict holder must be an object".into())
+        } else {
+            Ok(())
+        };
+    };
+    if required {
+        for (name, slot) in object.iter() {
+            let valid = match name.as_str() {
+                "note" => slot.is_null() || slot.is_string(),
+                "paths" => {
+                    slot.is_null()
+                        || slot
+                            .as_array()
+                            .is_some_and(|values| values.iter().all(Value::is_string))
+                }
+                "claim_id" | "priority_of" => {
+                    slot.is_null() || slot.is_string() || slot.is_number()
+                }
+                "path" | "held_path" | "session" | "mode" | "purpose" | "expires_at" => {
+                    slot.is_null() || slot.is_string()
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err("required node conflict contains unclassified content".into());
+            }
+        }
+    }
+    if let Some(note) = object.get_mut("note") {
+        decrypt_event_field(note, "note", workspace, key, required)?;
+    }
+    Ok(())
+}
+fn transform_conflict_array(
+    value: &mut Value,
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    required: bool,
+) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let Some(values) = value.as_array_mut() else {
+        return if required {
+            Err("required node conflicts must be an array".into())
+        } else {
+            Ok(())
+        };
+    };
+    for value in values {
+        transform_conflict_entry(value, workspace, key, required)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn transform_error_details(
+    value: &mut Value,
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    required: bool,
+) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let Some(object) = value.as_object_mut() else {
+        return if required {
+            Err("required node error details must be classified metadata".into())
+        } else {
+            Ok(())
+        };
+    };
+    for (name, slot) in object {
+        match name.as_str() {
+            "conflicts" => transform_conflict_array(slot, workspace, key, required)?,
+            "priority_of" if slot.is_null() || slot.as_u64().is_some() => {}
+            "reason" => decrypt_event_field(slot, "reason", workspace, key, required)?,
+            "path" | "fence" | "current_fence" | "expected_version" | "current_version"
+            | "actual_version" | "version" | "retry_after" | "until" | "expires_at" | "session"
+            | "owner_session" | "owner" | "id" | "key" | "status" | "available" | "repository"
+                if slot.is_null() || slot.is_string() || slot.is_number() || slot.is_boolean() => {}
+            "paths" | "holders"
+                if slot.is_null()
+                    || slot
+                        .as_array()
+                        .is_some_and(|values| values.iter().all(Value::is_string)) => {}
+            _ if required => return Err("required node error contains unclassified details".into()),
+            _ => {}
         }
     }
     Ok(())
@@ -789,7 +905,55 @@ impl WorkspaceKey {
         entropy_to_phrase(&self.0)
     }
     pub fn store_for_workspace(&self, workspace: &str) -> Result<(), String> {
-        use std::{fs, io::Write, path::PathBuf};
+        use std::fs;
+        let destination = Self::storage_path(workspace)?;
+        let directory = destination.parent().ok_or("invalid key directory")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(directory)
+                .map_err(|_| "cannot create key directory")?;
+            for path in [
+                directory.parent().ok_or("invalid key directory")?,
+                directory,
+            ] {
+                let metadata =
+                    fs::symlink_metadata(path).map_err(|_| "cannot inspect key directory")?;
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || fs::canonicalize(path).map_err(|_| "cannot inspect key directory")? != path
+                {
+                    return Err(
+                        "key directory must be owned and cannot contain symbolic links".into(),
+                    );
+                }
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                    .map_err(|_| "cannot secure key directory")?;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Write;
+            fs::create_dir_all(directory).map_err(|_| "cannot create key directory")?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)
+                .map_err(|_| "cannot create workspace key")?;
+            file.write_all(&self.0)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| "cannot write workspace key")
+        }
+        #[cfg(unix)]
+        self.copy_to_private(&destination)
+    }
+    /// Location of the current workspace key; no key bytes or recovery words are returned.
+    pub fn storage_path(workspace: &str) -> Result<std::path::PathBuf, String> {
+        use std::path::PathBuf;
         if workspace.is_empty()
             || !workspace
                 .bytes()
@@ -801,68 +965,52 @@ impl WorkspaceKey {
             Some(p) if !p.is_empty() => PathBuf::from(p),
             _ => PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(".config"),
         };
-        let dir = base.join("lockyard/keys");
-        fs::create_dir_all(&dir).map_err(|e| format!("cannot create key directory: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                dir.parent().ok_or("invalid key directory")?,
-                fs::Permissions::from_mode(0o700),
-            )
-            .map_err(|e| format!("cannot secure key directory: {e}"))?;
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("cannot secure key directory: {e}"))?;
+        if !base.is_absolute() {
+            return Err("workspace key directory must be absolute".into());
         }
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create_new(true);
+        Ok(base.join("lockyard/keys").join(format!("{workspace}.key")))
+    }
+    pub fn load_for_workspace(workspace: &str) -> Result<Option<Self>, String> {
+        Self::load_private(&Self::storage_path(workspace)?)
+    }
+    /// Bounded file-descriptor validation prevents symlink, FIFO and metadata replacement races.
+    pub fn load_private(path: &std::path::Path) -> Result<Option<Self>, String> {
+        use std::{fs, io::Read};
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
         }
-        let mut f = opts
-            .open(dir.join(format!("{workspace}.key")))
-            .map_err(|e| format!("cannot create workspace key: {e}"))?;
-        f.write_all(&self.0)
-            .map_err(|e| format!("cannot write workspace key: {e}"))
-    }
-    pub fn load_for_workspace(workspace: &str) -> Result<Option<Self>, String> {
-        use std::{fs, path::PathBuf};
-        if workspace.is_empty()
-            || !workspace
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-        {
-            return Err("invalid workspace id for local key storage".into());
-        }
-        let base = match std::env::var_os("XDG_CONFIG_HOME") {
-            Some(p) if !p.is_empty() => PathBuf::from(p),
-            _ => PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(".config"),
+        let file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("cannot read workspace key".into()),
         };
-        let path = base.join("lockyard/keys").join(format!("{workspace}.key"));
-        let b = match fs::read(&path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("cannot read workspace key: {e}")),
-        };
-        if b.len() != 32 {
-            return Err("workspace key file has an invalid length".into());
+        let metadata = file
+            .metadata()
+            .map_err(|_| "cannot inspect workspace key")?;
+        if !metadata.is_file() {
+            return Err("workspace key must be a regular file".into());
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&path)
-                .map_err(|e| format!("cannot inspect workspace key: {e}"))?
-                .permissions()
-                .mode()
-                & 0o777;
-            if mode != 0o600 {
-                return Err("workspace key file must have mode 0600".into());
+            use std::os::unix::fs::MetadataExt;
+            if metadata.mode() & 0o777 != 0o600 || metadata.uid() != unsafe { libc::geteuid() } {
+                return Err("workspace key must be owned by this user with mode 0600".into());
             }
         }
+        let mut bytes = Vec::with_capacity(33);
+        file.take(33)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "cannot read workspace key")?;
+        if bytes.len() != 32 {
+            return Err("workspace key file has an invalid length".into());
+        }
         let mut raw = [0; 32];
-        raw.copy_from_slice(&b);
+        raw.copy_from_slice(&bytes);
+        bytes.fill(0);
         Ok(Some(Self(raw)))
     }
 
@@ -930,6 +1078,30 @@ impl WorkspaceKey {
     pub fn key_id(&self) -> String {
         let k = hmac::Key::new(hmac::HMAC_SHA256, &self.0);
         base64url(&hmac::sign(&k, LABEL).as_ref()[..8])
+    }
+    /// Derive a purpose-bound child key without exposing master key bytes.
+    /// High-rate protocols must give every encrypted record its own unique context.
+    pub fn derive_context(&self, domain: &[u8], context: &[u8]) -> Result<Self, String> {
+        struct KeyLength;
+        impl ring::hkdf::KeyType for KeyLength {
+            fn len(&self) -> usize {
+                32
+            }
+        }
+        if domain.is_empty() || domain.len() > 128 || context.len() > 64 * 1024 {
+            return Err("invalid key derivation context".into());
+        }
+        let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, domain);
+        let prk = salt.extract(&self.0);
+        let info = [context];
+        let expanded = prk
+            .expand(&info, KeyLength)
+            .map_err(|_| "key derivation failed")?;
+        let mut key = [0; 32];
+        expanded
+            .fill(&mut key)
+            .map_err(|_| "key derivation failed")?;
+        Ok(Self(key))
     }
     pub fn encrypt(&self, w: &str, f: &str, p: &str) -> Result<String, String> {
         let mut n = [0; 12];
@@ -1044,6 +1216,41 @@ fn unbase64url(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn current_key_read_is_bounded_private_and_uses_opened_descriptor() {
+        use std::{
+            fs,
+            os::unix::fs::{DirBuilderExt, PermissionsExt, symlink},
+        };
+        let directory = std::env::temp_dir().join(format!("lockyard-key-read-{}", crate::ulid()));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let path = directory.join("key");
+        WorkspaceKey::from_entropy([91; 32])
+            .copy_to_private(&path)
+            .unwrap();
+        assert_eq!(
+            WorkspaceKey::load_private(&path).unwrap().unwrap().key_id(),
+            WorkspaceKey::from_entropy([91; 32]).key_id()
+        );
+        // A crash between final create-only link and temporary unlink must remain readable.
+        let orphan = directory.join("orphan");
+        fs::hard_link(&path, &orphan).unwrap();
+        assert!(WorkspaceKey::load_private(&path).unwrap().is_some());
+        let link = directory.join("link");
+        symlink(&path, &link).unwrap();
+        assert!(WorkspaceKey::load_private(&link).is_err());
+        assert!(WorkspaceKey::load_private(&directory).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(WorkspaceKey::load_private(&path).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&path, [1; 33]).unwrap();
+        assert!(WorkspaceKey::load_private(&path).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
     #[cfg(unix)]
     #[test]
     fn key_copy_publishes_complete_bytes_once_and_ignores_interrupted_temporary() {
