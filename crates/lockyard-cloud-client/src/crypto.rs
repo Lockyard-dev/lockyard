@@ -888,27 +888,39 @@ impl WorkspaceKey {
         {
             return Err("key staging directory must be private and owned".into());
         }
+        let mut nonce = [0; 16];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| "key staging random source unavailable")?;
+        let staged = parent.join(format!(".lykey-stage-{}", base64url(&nonce)));
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(destination)
+            .open(&staged)
             .map_err(|_| "cannot create private key copy")?;
-        let result = (|| {
+        let result: Result<(), String> = (|| {
             file.write_all(&self.0)
                 .map_err(|_| "cannot write private key copy")?;
             file.sync_all()
                 .map_err(|_| "cannot sync private key copy")?;
+            // Only a complete, fsynced file can become the final name. link is atomic
+            // and create-only: another key at the destination is never overwritten.
+            fs::hard_link(&staged, destination).map_err(|_| "cannot publish private key copy")?;
             fs::File::open(parent)
                 .and_then(|dir| dir.sync_all())
                 .map_err(|_| "cannot sync key staging directory")?;
             Ok(())
         })();
-        if result.is_err() {
-            let _ = fs::remove_file(destination);
-        }
-        result
+        // A crash before publication can leave only a private, ignored temporary.
+        // After publication, even a directory-sync failure must retain the complete key.
+        let removed = fs::remove_file(&staged);
+        let synced = fs::File::open(parent).and_then(|dir| dir.sync_all());
+        result?;
+        removed.map_err(|_| "cannot remove private key staging file")?;
+        synced.map_err(|_| "cannot sync key staging directory")?;
+        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -1023,12 +1035,84 @@ fn unbase64url(s: &str) -> Result<Vec<u8>, String> {
             o.push((acc >> bits) as u8)
         }
     }
+    if base64url(&o) != s {
+        return Err("noncanonical base64".into());
+    }
     Ok(o)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn key_copy_publishes_complete_bytes_once_and_ignores_interrupted_temporary() {
+        use std::{
+            fs,
+            os::unix::fs::{DirBuilderExt, PermissionsExt},
+        };
+        let directory =
+            std::env::temp_dir().join(format!("lockyard-key-publish-{}", crate::ulid()));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let orphan = directory.join(".lykey-stage-interrupted-fixture");
+        fs::write(&orphan, [1; 16]).unwrap();
+        fs::set_permissions(&orphan, fs::Permissions::from_mode(0o600)).unwrap();
+        let destination = directory.join("fixture-workspace.key");
+        let left = destination.clone();
+        let right = destination.clone();
+        let first =
+            std::thread::spawn(move || WorkspaceKey::from_entropy([94; 32]).copy_to_private(&left));
+        let second = std::thread::spawn(move || {
+            WorkspaceKey::from_entropy([95; 32]).copy_to_private(&right)
+        });
+        let (first, second) = (first.join().unwrap(), second.join().unwrap());
+        assert_ne!(first.is_ok(), second.is_ok());
+        let actual = fs::read(&destination).unwrap();
+        assert!(actual == [94; 32] || actual == [95; 32]);
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            WorkspaceKey::from_entropy([96; 32])
+                .copy_to_private(&destination)
+                .is_err()
+        );
+        assert_eq!(fs::read(&destination).unwrap(), actual);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn encrypted_envelopes_reject_alternate_unused_base64_bits() {
+        let key = WorkspaceKey::from_entropy([93; 32]);
+        let envelope = key.encrypt("fixture-workspace", "body", "a").unwrap();
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut altered = envelope.as_bytes().to_vec();
+        let last = altered.last_mut().unwrap();
+        let index = alphabet
+            .iter()
+            .position(|character| character == last)
+            .unwrap();
+        *last = alphabet[index | 1];
+        assert_ne!(altered, envelope.as_bytes());
+        assert_eq!(
+            key.decrypt("fixture-workspace", "body", &envelope).unwrap(),
+            "a"
+        );
+        assert!(
+            key.decrypt(
+                "fixture-workspace",
+                "body",
+                &String::from_utf8(altered).unwrap()
+            )
+            .is_err()
+        );
+        assert!(unbase64url("A").is_err());
+        assert!(unbase64url("AB").is_err());
+    }
     #[test]
     fn content_table_entries_exist_and_free_text_is_explicit() {
         let api: Value = serde_json::from_str(OPENAPI).unwrap();

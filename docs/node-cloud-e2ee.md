@@ -14,6 +14,6 @@ This protects the product's normal data paths. Execution hosts and their adminis
 
 ## Evidence
 
-The Cloud-client regression suite covers forced encryption with the old setting off, missing keys/policy, workspace binding, plaintext/invalid responses, query and JSON bypasses, existing-envelope authentication, arrays, event aliases and bounded liveness timestamps. `tools/ci/required-e2ee-mcp.py` additionally runs the actual CLI MCP child against isolated synthetic HTTP and Unix fixtures. It verifies encryption, local reply decryption, refused writes and zero contacts to an unverified legacy agent.
+The Cloud-client regression suite covers forced encryption with the old setting off, missing keys/policy, workspace binding, plaintext/invalid responses, query and JSON bypasses, existing-envelope authentication, arrays, event aliases and bounded liveness timestamps. Envelopes require canonical base64 spelling. Local key copies publish a complete fsynced temporary file atomically without replacing an existing key; interrupted private temporaries do not block retry. `tools/ci/required-e2ee-mcp.py` additionally runs the actual CLI MCP child against isolated synthetic HTTP and Unix fixtures. It verifies encryption, local reply decryption, refused writes and zero contacts to an unverified legacy agent.
 
 These tests do not establish successful execution inside a resource-enforced container, a model-provider call, or production network SLOs. Those have separate acceptance evidence.
