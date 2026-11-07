@@ -9,6 +9,7 @@ homepage.workspace = true
 description.workspace = true
 
 [dependencies]
+lockyard-compat.workspace = true
 lockyard-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

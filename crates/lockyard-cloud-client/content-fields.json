@@ -22,6 +22,7 @@
     {"schema":"RegistryTransitionRequest","property":"reason","name":"reason"},
     {"schema":"RegistryBatchTransitionRequest","property":"reason","name":"reason"},
     {"schema":"RegistryReviewRequest","property":"reason","name":"reason"},
+    {"schema":"RegistryOwnerCloseRequest","property":"owner_word","name":"owner_word"},
     {"schema":"CoordinationMessage","property":"body","name":"body"},
     {"schema":"CoordinationClaim","property":"note","name":"note"},
     {"schema":"CoordinationBoardValue","property":"value","name":"value"},
@@ -40,11 +41,10 @@
     {"schema":"CoordinationQueueWrite","property":"note","name":"note"},
     {"schema":"CoordinationQueueEntry","property":"note","name":"note"},
     {"schema":"CoordinationReleaseWrite","property":"note","name":"note"},
-    {"schema":"RegistryOwnerCloseRequest","property":"owner_word","name":"value"},
-    {"schema":"RegistryGitHubEvidenceRequest","property":"value","name":"value"}
+    {"schema":"RegistryGitHubEvidenceRequest","property":"value","name":"value"},
+    {"schema":"CoordinationZoneCatalog","property":"content","name":"zone_catalog_content"}
   ],
   "clear": [
-    {"schema":"RegistryAssignmentDto","property":"lease_active"},
     {"schema":"CoordinationMessageWrite","property":"to"},
     {"schema":"CoordinationMessageWrite","property":"kind"},
     {"schema":"CoordinationMessageWrite","property":"needs"},
@@ -55,6 +55,7 @@
     {"schema":"RegistryEvidenceRequest","property":"verifier"},
     {"schema":"RegistryEvidenceRequest","property":"expected_version"},
     {"schema":"RegistryTransitionRequest","property":"to"},
+    {"schema":"RegistryTransitionRequest","property":"resolution"},
     {"schema":"RegistryTransitionRequest","property":"expected_version"},
     {"schema":"CoordinationClaimReleaseResult","property":"reason"},
     {"schema":"CoordinationDirtyPath","property":"reason"},
@@ -70,7 +71,7 @@
     {"schema":"CoordinationClaim","property":"purpose"},
     {"schema":"CoordinationQueueWrite","property":"purpose"},
     {"schema":"CoordinationQueueEntry","property":"purpose"},
-    {"schema":"RegistryTransitionRequest","property":"resolution"},
+    {"schema":"RegistryAssignmentDto","property":"lease_active"},
     {"schema":"RegistryOwnerCloseRequest","property":"expected_version"},
     {"schema":"RegistryOwnerCloseRequest","property":"direct"},
     {"schema":"RegistryEvidenceRequest","property":"repository"},
@@ -113,6 +114,15 @@
     {"schema":"RegistryGitHubReceiptDto","property":"occurred_at"},
     {"schema":"RegistryGitHubReceiptDto","property":"sent_at"},
     {"schema":"RegistryGitHubReceiptDto","property":"repository"},
-    {"schema":"RegistryGitHubReceiptDto","property":"commit_sha"}
+    {"schema":"RegistryGitHubReceiptDto","property":"commit_sha"},
+    {"schema":"CoordinationZoneCatalog","property":"format"},
+    {"schema":"CoordinationZoneCatalog","property":"workspace_id"},
+    {"schema":"CoordinationZoneCatalog","property":"repository"},
+    {"schema":"CoordinationZoneCatalog","property":"revision"},
+    {"schema":"CoordinationZoneCatalog","property":"key_id"},
+    {"schema":"CoordinationZoneCatalog","property":"case_insensitive_paths"},
+    {"schema":"CoordinationZoneCatalog","property":"content_sha256"},
+    {"schema":"CoordinationZoneCatalog","property":"metadata_hmac"},
+    {"schema":"CoordinationZoneCatalogWrite","property":"expected_revision"}
   ]
 }

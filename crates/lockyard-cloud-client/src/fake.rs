@@ -118,17 +118,50 @@ fn answer(mut stream: TcpStream, log: &Mutex<Vec<Seen>>, script: &Mutex<VecDeque
         }
     }
     let body = serde_json::from_slice(&bytes[header_end..]).unwrap_or(Value::Null);
+    let protocol = headers
+        .iter()
+        .find(|(name, _)| name == "lockyard-protocol")
+        .map(|(_, value)| value.clone());
+    let legacy_namespace = headers
+        .iter()
+        .any(|(name, value)| name == "x-lockyard-repository" && value == "-");
+    if path == "/api/v1/protocol" {
+        // Existing tests describe business traffic. EP-10 negotiation is exercised by the
+        // dedicated raw HTTP fixtures; upgrade this helper without changing those assertions.
+        let selected: u16 = protocol.as_deref().unwrap_or("2").parse().unwrap();
+        let reply = serde_json::json!({"selected_protocol":selected,"min_protocol":1,"max_protocol":2,"capabilities":["revocations_v1","zone_catalog_v1","drain_v1"]}).to_string();
+        let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nLockyard-Protocol: {selected}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len()).as_bytes());
+        return;
+    }
     log.lock().unwrap().push(Seen {
         method,
         path,
         headers,
         body,
     });
-    let reply = script.lock().unwrap().pop_front().unwrap_or(Reply {
+    let mut reply = script.lock().unwrap().pop_front().unwrap_or(Reply {
         status: 200,
         body: "{}".into(),
         headers: Vec::new(),
     });
+    if let Some(protocol) = protocol
+        && !reply
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("Lockyard-Protocol"))
+    {
+        reply.headers.push(("Lockyard-Protocol".into(), protocol));
+    }
+    if legacy_namespace
+        && !reply
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("X-Lockyard-Repository"))
+    {
+        reply
+            .headers
+            .push(("X-Lockyard-Repository".into(), "-".into()));
+    }
     let mut response = format!(
         "HTTP/1.1 {} Status\r\nContent-Length: {}\r\nConnection: close\r\n",
         reply.status,

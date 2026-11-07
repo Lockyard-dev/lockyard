@@ -6,22 +6,27 @@
 //! offers the same seam over its socket, and tests replace it with a fake.
 
 mod backend;
+pub mod catalog;
+mod catalog_client;
 mod crypto;
 pub mod device;
 #[cfg(test)]
 mod fake;
+pub mod protocol;
 mod registry;
 mod repository;
 pub mod revocations;
 
 pub use backend::CloudBackend;
 pub use crypto::{CONTENT_FIELDS, FieldRule, WorkspaceKey, route_matches, transform_fields};
+pub use protocol::{NegotiatedProtocol, PendingWrite, Problem, ProtocolRange};
 pub use repository::RepositoryTransport;
 
 const ENCRYPTION_PATH: &str = "/api/v1/workspace/encryption";
 
 /// Workspace-level content encryption state returned by the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceEncryption {
     pub encryption: String,
     pub key_id: Option<String>,
@@ -38,7 +43,6 @@ use std::fmt;
 use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A write is sent at most this many times with one key.
@@ -63,36 +67,13 @@ pub struct ApiError {
 impl ApiError {
     /// Reads a failed response. A body that is not the envelope becomes the message.
     pub fn parse(status: u16, body: &str, retry_after: Option<u64>) -> Self {
-        let parsed = serde_json::from_str::<Value>(body).ok();
-        let envelope = parsed.as_ref().and_then(|value| value.get("error"));
-        let text = |key: &str| {
-            envelope
-                .and_then(|error| error.get(key))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
-        // A registry 422 from model binding is `{message}` with no envelope around it.
-        let bare = parsed
-            .as_ref()
-            .and_then(|value| value.get("message"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let message = bare.unwrap_or_else(|| text("message"));
-        Self {
+        protocol::parse_api_error(status, body, retry_after).unwrap_or_else(|_| Self {
             status,
-            code: text("code"),
-            message: if message.is_empty() {
-                body.to_string()
-            } else {
-                message
-            },
-            details: envelope
-                .and_then(|error| error.get("details"))
-                .cloned()
-                .unwrap_or(Value::Null),
+            code: "protocol_response_invalid".into(),
+            message: "contradictory or malformed cloud error envelope".into(),
             retry_after,
-        }
+            ..Self::default()
+        })
     }
 }
 
@@ -110,6 +91,10 @@ impl fmt::Display for ApiError {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientError {
+    /// A stable protocol failure without an invented HTTP status.
+    Protocol(Problem),
+    /// The exact mutation is retained until its outcome can be reconciled.
+    OutcomeUnknown(Box<PendingWrite>),
     Invalid(String),
     /// 401.
     Unauthorized(ApiError),
@@ -136,6 +121,9 @@ pub enum ClientError {
 impl ClientError {
     /// Sorts a failed response by status.
     pub fn from_api(error: ApiError) -> Self {
+        if error.status == 429 && error.code != "rate_limited" {
+            return Self::Http(error);
+        }
         match error.status {
             401 => Self::Unauthorized(error),
             403 => Self::Denied(error),
@@ -151,8 +139,15 @@ impl ClientError {
     /// True when the same request may work later, so an outbox entry stays queued.
     pub fn is_outage(&self) -> bool {
         match self {
-            Self::Transport(_) | Self::Frozen(_) | Self::Unauthorized(_) => true,
-            Self::Http(error) => error.status >= 500 || (300..400).contains(&error.status),
+            Self::Transport(_) => true,
+            Self::Frozen(error) => matches!(
+                error.code.as_str(),
+                "" | "frozen" | "server_draining" | "temporarily_unavailable"
+            ),
+            Self::Unauthorized(_) => false,
+            Self::Http(error) => {
+                error.code.is_empty() && (error.status >= 500 || (300..400).contains(&error.status))
+            }
             Self::Decode(_) => true,
             _ => false,
         }
@@ -161,7 +156,7 @@ impl ClientError {
     /// Seconds the server asked to wait.
     pub fn retry_after(&self) -> Option<u64> {
         match self {
-            Self::Frozen(error) | Self::RateLimited(error) => error.retry_after,
+            Self::Frozen(error) | Self::RateLimited(error) | Self::Http(error) => error.retry_after,
             _ => None,
         }
     }
@@ -170,6 +165,8 @@ impl ClientError {
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Protocol(problem) => write!(f, "{}: {}", problem.code, problem.detail),
+            Self::OutcomeUnknown(pending) => write!(f, "outcome_unknown: {}", pending.cause_code),
             Self::Invalid(text) | Self::Transport(text) | Self::Decode(text) => f.write_str(text),
             Self::Unauthorized(error)
             | Self::Denied(error)
@@ -197,7 +194,18 @@ fn holders(error: &ApiError) -> Vec<Conflict> {
 
 impl From<ClientError> for CoreError {
     fn from(error: ClientError) -> Self {
+        if let Some(problem) = error.problem() {
+            return Self::Cloud {
+                code: problem.code,
+                status: problem.status,
+                details: problem.details,
+                message: problem.detail,
+            };
+        }
         match error {
+            ClientError::Protocol(_) | ClientError::OutcomeUnknown(_) => {
+                unreachable!("protocol problem handled above")
+            }
             ClientError::Invalid(text) => Self::Invalid(text),
             ClientError::Unauthorized(error) => {
                 Self::Denied(format!("the server refused the token: {error}"))
@@ -265,6 +273,9 @@ pub struct Call {
     /// How long the caller can wait for this call, including retries, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_ms: Option<u64>,
+    /// Keep frozen bytes until the caller has durably completed its outbox entry.
+    #[serde(default)]
+    pub defer_pending_ack: bool,
     /// Per-request timeout for internal transports such as the agent outbox.
     #[serde(skip)]
     pub attempt_timeout_ms: Option<u64>,
@@ -305,6 +316,23 @@ impl Call {
 pub trait Transport: Send + Sync {
     fn call(&self, call: &Call) -> Result<Value, ClientError>;
 
+    /// Called only after a durable caller has committed its successful outbox receipt.
+    fn acknowledge_write(&self, _call: &Call) -> Result<(), ClientError> {
+        Ok(())
+    }
+
+    /// Named zones are expanded at the same authenticated SDK boundary as their catalog.
+    fn catalog_expand(&self, call: &Call, names: &[String]) -> Result<Vec<String>, ClientError> {
+        let catalog = self.call(call)?;
+        // Transports must explicitly provide their authenticated/legacy adapter. The default
+        // accepts only the strict local schema and never infers trust from serialized markers.
+        let catalog = lockyard_core::catalog::ZoneCatalogV1::from_json(&catalog.to_string())
+            .map_err(|error| protocol::local(error.code(), error.code()))?;
+        catalog
+            .expand(names)
+            .map_err(|error| protocol::local(error.code(), error.code()))
+    }
+
     /// A check answered without a server round trip, when this transport can do that.
     fn fast_check(
         &self,
@@ -323,6 +351,14 @@ pub trait Transport: Send + Sync {
 impl<T: Transport + ?Sized> Transport for Arc<T> {
     fn call(&self, call: &Call) -> Result<Value, ClientError> {
         (**self).call(call)
+    }
+
+    fn acknowledge_write(&self, call: &Call) -> Result<(), ClientError> {
+        (**self).acknowledge_write(call)
+    }
+
+    fn catalog_expand(&self, call: &Call, names: &[String]) -> Result<Vec<String>, ClientError> {
+        (**self).catalog_expand(call, names)
     }
 
     fn fast_check(
@@ -348,6 +384,9 @@ pub struct Client {
     content_key: Option<WorkspaceKey>,
     encryption_enabled: bool,
     expected_e2ee_workspace: Option<String>,
+    protocol_state: std::sync::Mutex<protocol::ProtocolState>,
+    pending_journal: Option<std::path::PathBuf>,
+    catalog_cache_root: Option<std::path::PathBuf>,
 }
 
 impl Client {
@@ -406,6 +445,9 @@ impl Client {
             content_key: None,
             encryption_enabled: false,
             expected_e2ee_workspace,
+            protocol_state: std::sync::Mutex::new(protocol::ProtocolState::default()),
+            pending_journal: None,
+            catalog_cache_root: None,
         })
     }
 
@@ -534,6 +576,7 @@ impl Client {
         call: &Call,
         encoded: Option<&str>,
         remaining: Option<Duration>,
+        protocol: &NegotiatedProtocol,
     ) -> Result<Value, Failure> {
         let url = format!("{}{}", self.base_url, call.path);
         let client = if call.long_poll {
@@ -565,6 +608,9 @@ impl Client {
                 "User-Agent",
                 concat!("lockyard/", env!("CARGO_PKG_VERSION")),
             );
+        if !protocol.legacy {
+            request = request.set("Lockyard-Protocol", &protocol.selected.to_string());
+        }
         if let Some(key) = &call.key {
             request = request.set("Idempotency-Key", key);
         }
@@ -581,7 +627,9 @@ impl Client {
         // The caller's remaining wait decides whether a retry fits; it never cuts a request short.
         // A short per-request timeout broke TLS handshakes on macOS ("Resource temporarily
         // unavailable"), so only the outbox's own attempt limit bounds a single request.
-        let _ = remaining;
+        if let Some(limit) = remaining {
+            request = request.timeout(limit);
+        }
         if let Some(limit) = call.attempt_timeout_ms.map(Duration::from_millis) {
             request = request.timeout(limit);
         }
@@ -599,33 +647,53 @@ impl Client {
                     response.status()
                 ))))
             }
-            Ok(response) if call.repository.as_deref().is_some_and(|repository| !repository.is_empty()
-                && response.header("X-Lockyard-Repository") != Some(repository)) => {
-                Err(Failure::Final(ClientError::Invalid("this server does not confirm repository namespace support; upgrade the server before using repository-scoped coordination".into())))
+            Ok(response) => {
+                protocol::verify_echo(&response, protocol).map_err(Failure::Final)?;
+                protocol::verify_repository_echo(&response, call, protocol)
+                    .map_err(Failure::Final)?;
+                decode_for_call(response, call, self.encryption_enabled).map_err(Failure::Retry)
             }
-            Ok(response) => decode(response).map_err(Failure::Retry),
             Err(ureq::Error::Status(status, response)) => {
                 let retry_after = response
                     .header("Retry-After")
                     .and_then(|value| value.parse::<u64>().ok());
+                let echo = protocol::verify_echo(&response, protocol);
                 let body = response.into_string().unwrap_or_default();
-                let mut api_error=ApiError::parse(status,&body,retry_after);
-                if let Some(workspace)=self.workspace.as_deref() {
-                    crypto::transform_error_details(&mut api_error.details,workspace,self.content_key.as_ref(),self.expected_e2ee_workspace.is_some())
-                        .map_err(|message|Failure::Final(ClientError::Invalid(message)))?;
+                let mut api_error = protocol::parse_api_error(status, &body, retry_after)
+                    .map_err(Failure::Final)?;
+                if protocol.selected >= 2
+                    && !protocol.legacy
+                    && api_error.code.is_empty()
+                    && !(call.path == "/api/v1/protocol" && matches!(status, 404 | 405))
+                {
+                    return Err(Failure::Final(protocol::local(
+                        "protocol_response_invalid",
+                        "modern error response omits its stable code",
+                    )));
+                }
+                if !matches!(
+                    api_error.code.as_str(),
+                    "protocol_invalid" | "protocol_unsupported"
+                ) && !(call.path == "/api/v1/protocol" && matches!(status, 404 | 405))
+                {
+                    echo.map_err(Failure::Final)?;
+                }
+                if let Some(workspace) = self.workspace.as_deref() {
+                    crypto::transform_error_details(
+                        &mut api_error.details,
+                        workspace,
+                        self.content_key.as_ref(),
+                        self.expected_e2ee_workspace.is_some(),
+                    )
+                    .map_err(|message| Failure::Final(ClientError::Invalid(message)))?;
                 }
                 if self.expected_e2ee_workspace.is_some() {
                     // Error messages are server-authored text, not authenticated application content.
-                    api_error.message=format!("Cloud request failed with HTTP {status}");
-                    if api_error.code.len()>64 || !api_error.code.bytes().all(|byte|byte.is_ascii_lowercase()||byte.is_ascii_digit()||byte==b'_') {
-                        api_error.code="cloud_error".into();
-                    }
+                    api_error.message = format!("Cloud request failed with HTTP {status}");
                 }
                 let error = ClientError::from_api(api_error);
                 // A frozen server stays frozen for its whole window: the caller decides what to do.
-                let again = status == 429
-                    || (300..400).contains(&status)
-                    || (status >= 500 && status != 503);
+                let again = protocol::safe_retry(&error);
                 Err(if again {
                     Failure::Retry(error)
                 } else {
@@ -643,113 +711,56 @@ enum Failure {
 }
 
 impl Transport for Client {
-    fn call(&self, call: &Call) -> Result<Value, ClientError> {
-        if call.is_write() && call.key.as_deref().is_none_or(str::is_empty) {
-            return Err(ClientError::Invalid(
-                "writes require an Idempotency-Key".into(),
-            ));
-        }
-        let route = call.path.split('?').next().unwrap_or(&call.path);
-        if let Some(expected) = &self.expected_e2ee_workspace
-            && !(call.method == "GET" && route == ENCRYPTION_PATH)
-            && (!self.encryption_enabled
-                || self.content_key.is_none()
-                || self.workspace.as_deref() != Some(expected.as_str()))
-        {
-            return Err(ClientError::Invalid(
-                "node content request requires a verified encrypted workspace context".into(),
-            ));
-        }
-        if !route.starts_with('/') || route.split('/').any(|part| matches!(part, "." | "..")) {
-            return Err(ClientError::Invalid(
-                "request path must be an absolute API path".into(),
-            ));
-        }
-        if self.expected_e2ee_workspace.is_some() {
-            crypto::validate_required_route(&call.method, &call.path)
-                .map_err(ClientError::Invalid)?;
-        }
-        let mut body = call.body.clone();
-        if let (Some(value), Some(workspace)) = (&mut body, self.workspace.as_deref()) {
-            crypto::transform_fields_policy(
-                value,
-                &call.method,
-                &call.path,
-                workspace,
-                self.content_key.as_ref(),
-                self.encryption_enabled,
-                self.expected_e2ee_workspace.is_some(),
-            )
-            .map_err(ClientError::Invalid)?;
-        }
-        let encoded = body.as_ref().map(Value::to_string);
-        // Only writes have a key that makes repeating safe. A caller deadline controls which
-        // rate-limit retries fit; it does not disable them outright.
-        // A read may repeat once when the connection itself failed, before anything was sent.
-        let attempts = if call.is_write() { WRITE_ATTEMPTS } else { 2 };
-        let started = std::time::Instant::now();
-        let mut delay = Duration::from_millis(100);
-        for attempt in 1..=attempts {
-            let remaining = call
-                .deadline_ms
-                .map(|limit| Duration::from_millis(limit).saturating_sub(started.elapsed()));
-            if remaining.is_some_and(|remaining| remaining.is_zero()) {
-                return Err(ClientError::Transport("call deadline elapsed".into()));
-            }
-            match self.attempt(call, encoded.as_deref(), remaining) {
-                Ok(mut value) => {
-                    if let Some(workspace) = self.workspace.as_deref() {
-                        crypto::transform_fields_policy(
-                            &mut value,
-                            &call.method,
-                            &call.path,
-                            workspace,
-                            self.content_key.as_ref(),
-                            false,
-                            self.expected_e2ee_workspace.is_some(),
-                        )
-                        .map_err(ClientError::Invalid)?;
-                    }
-                    return Ok(value);
-                }
-                Err(Failure::Final(error))
-                    if call.deadline_ms.is_some()
-                        && call.is_write()
-                        && matches!(
-                            &error,
-                            ClientError::Frozen(_) | ClientError::RateLimited(_)
-                        )
-                        && attempt < attempts =>
-                {
-                    if !wait_fits_deadline(call.deadline_ms, started, &error, delay) {
-                        return Err(error);
-                    }
-                    let wait = retry_wait(&error, delay);
-                    thread::sleep(wait);
-                    delay *= 2;
-                }
-                Err(Failure::Final(error)) => return Err(error),
-                Err(Failure::Retry(error)) if attempt == attempts => return Err(error),
-                Err(Failure::Retry(error)) => {
-                    // Writes repeat under their idempotency key; a read repeats only a failed
-                    // connection. With a caller deadline, only a wait that fits is taken.
-                    let repeatable = match &error {
-                        ClientError::Transport(_) => true,
-                        _ => call.is_write(),
-                    };
-                    if !repeatable
-                        || (call.deadline_ms.is_some()
-                            && !wait_fits_deadline(call.deadline_ms, started, &error, delay))
-                    {
-                        return Err(error);
-                    }
-                    thread::sleep(retry_wait(&error, delay));
-                    delay *= 2;
-                }
-            }
-        }
-        Err(ClientError::Transport("request retry limit reached".into()))
+    fn catalog_expand(&self, call: &Call, names: &[String]) -> Result<Vec<String>, ClientError> {
+        self.expand_catalog_call(call, names)
     }
+    fn call(&self, call: &Call) -> Result<Value, ClientError> {
+        self.call_negotiated(call)
+    }
+
+    fn acknowledge_write(&self, call: &Call) -> Result<(), ClientError> {
+        let Some(key) = &call.key else {
+            return Ok(());
+        };
+        let _send = self.claim_pending_send(key)?;
+        let Some(pending) = self.pending_operation(key) else {
+            return Ok(());
+        };
+        let Some(request_digest) = pending.request_digest.as_deref() else {
+            // Older journals have only encrypted wire bytes. They cannot establish that an
+            // acknowledgement of a plaintext caller operation describes the same write.
+            return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+        };
+        if pending.method != call.method
+            || pending.request_path != call.path
+            || request_digest != request_identity(call)
+        {
+            return Err(protocol::local(
+                "idempotency_conflict",
+                "acknowledgement does not match the pending operation",
+            ));
+        }
+        self.resolve_pending(key)?;
+        Ok(())
+    }
+}
+
+/// Bind the caller's operation before content encryption or legacy wire adaptation. Operational
+/// timeout/defer settings may change after restart without changing the acknowledged mutation.
+pub(crate) fn request_identity(call: &Call) -> String {
+    let encoded = serde_json::to_vec(&(
+        &call.method,
+        &call.path,
+        &call.session,
+        &call.repository,
+        &call.body,
+    ))
+    .expect("request identity consists only of serializable JSON values");
+    ring::digest::digest(&ring::digest::SHA256, &encoded)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn retry_wait(error: &ClientError, fallback: Duration) -> Duration {
@@ -825,7 +836,11 @@ pub fn credential_fingerprint(token: &str) -> String {
         .collect()
 }
 
-fn decode(response: ureq::Response) -> Result<Value, ClientError> {
+fn decode_for_call(
+    response: ureq::Response,
+    call: &Call,
+    required_catalog: bool,
+) -> Result<Value, ClientError> {
     let lines = response
         .content_type()
         .eq_ignore_ascii_case("application/x-ndjson");
@@ -845,7 +860,15 @@ fn decode(response: ureq::Response) -> Result<Value, ClientError> {
             .map(Value::Array)
             .map_err(|error| ClientError::Decode(error.to_string()));
     }
-    serde_json::from_str(&text).map_err(|error| ClientError::Decode(error.to_string()))
+    let value: Value =
+        serde_json::from_str(&text).map_err(|error| ClientError::Decode(error.to_string()))?;
+    if call.path.split('?').next() == Some("/api/v1/zones/catalog")
+        && (required_catalog || value.get("format").is_some() || value.get("revision").is_some())
+    {
+        lockyard_core::catalog::CoordinationZoneCatalog::from_json(&text)
+            .map_err(|error| protocol::local("catalog_invalid", &error.to_string()))?;
+    }
+    Ok(value)
 }
 
 /// Makes a ULID: 48 bits of milliseconds, then 80 random bits, in Crockford base 32.
@@ -887,11 +910,168 @@ pub fn encode(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_catalog_transport_strictly_validates_complete_catalog_before_expansion() {
+        struct Catalog(Value);
+        impl Transport for Catalog {
+            fn call(&self, _: &Call) -> Result<Value, ClientError> {
+                Ok(self.0.clone())
+            }
+        }
+        let call = Call::get("me", "/api/v1/zones/catalog".into());
+        // A transport without the SDK's authentication override cannot interpret legacy objects
+        // or bless the SDK's serialized `verified` marker as an authenticated capability.
+        for value in [
+            json!({"zones":{"good":{"paths":["src"]}}}),
+            json!({"zones":{"good":["src"]}}),
+            json!({"version":1,"zones":{"good":["src",17]}}),
+            json!({"version":1,"zones":{"good":["src"],"bad":[]}}),
+            json!({"version":1,"zones":{"good":["src"]},"groups":{"all":["absent"]}}),
+            json!({"format":"lockyard.zone_catalog.v1","verified":true,"zones":{"good":["src"]}}),
+        ] {
+            assert_eq!(
+                Catalog(value)
+                    .catalog_expand(&call, &["good".into()])
+                    .unwrap_err()
+                    .code(),
+                Some("catalog_invalid")
+            );
+        }
+        let strict =
+            Catalog(json!({"version":1,"zones":{"good":["src"]},"groups":{"all":["good"]}}));
+        assert_eq!(
+            strict.catalog_expand(&call, &["all".into()]).unwrap(),
+            ["src"]
+        );
+        assert_eq!(
+            strict
+                .catalog_expand(&call, &["absent".into()])
+                .unwrap_err()
+                .code(),
+            Some("zone_unknown")
+        );
+    }
+
+    #[test]
+    fn default_catalog_transport_preserves_stable_expansion_errors() {
+        struct Catalog;
+        impl Transport for Catalog {
+            fn call(&self, _: &Call) -> Result<Value, ClientError> {
+                Ok(serde_json::json!({"version":1,"zones":{"good":["src"]}}))
+            }
+        }
+        let call = Call::get("me", "/api/v1/zones/catalog".into());
+        for (name, code) in [("missing", "zone_unknown"), ("bad", "catalog_invalid")] {
+            let server = FakeServer::start(vec![Reply::json(
+                200,
+                json!({"zones":{"good":["src"],"bad":{}}}),
+            )]);
+            let client = Client::new(&server.url(), "fixture".into()).unwrap();
+            let error = client.catalog_expand(&call, &[name.into()]).unwrap_err();
+            assert_eq!(error.code(), Some(code), "optional legacy Client branch");
+            assert_eq!(error.status(), None);
+        }
+        assert_eq!(
+            Catalog.catalog_expand(&call, &["good".into()]).unwrap(),
+            ["src"]
+        );
+        let error = Catalog
+            .catalog_expand(&call, &["missing".into()])
+            .unwrap_err();
+        assert_eq!(error.code(), Some("zone_unknown"));
+        assert_eq!(error.status(), None);
+    }
+
     use crate::fake::{FakeServer, Reply};
     use serde_json::json;
     use std::sync::Mutex;
 
     static KEY_ENV: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn encrypted_claims_and_queue_send_paths_without_catalog_labels() {
+        let workspace = "00000000-0000-0000-0000-000000000001";
+        for route in ["/api/v1/zones/claims", "/api/v1/zones/queue"] {
+            let server = FakeServer::start(vec![Reply::json(200, json!({}))]);
+            let client = Client::new(&server.url(), "fixture-token".into())
+                .unwrap()
+                .with_content_encryption(
+                    workspace,
+                    Some(WorkspaceKey::from_entropy([7; 32])),
+                    true,
+                );
+            client.call(&Call::write("session", "POST", route.into(), json!({
+                "paths":["src"],"note":"","zone":"PRIVATE-ZONE-CANARY","zones":["PRIVATE-GROUP-CANARY"]
+            }))).unwrap();
+            let request = &server.requests()[0];
+            assert_eq!(request.body["paths"], json!(["src"]));
+            assert!(
+                request.body.get("zone").is_none(),
+                "{route}: singular label must stay local"
+            );
+            assert!(
+                request.body.get("zones").is_none(),
+                "{route}: plural labels must stay local"
+            );
+        }
+    }
+
+    #[test]
+    fn required_node_accepts_typed_catalog_event_metadata_and_rejects_extra_content() {
+        let workspace = "00000000-0000-0000-0000-000000000001";
+        let key = WorkspaceKey::from_entropy([7; 32]);
+        for repository in ["api", ""] {
+            let event = json!({"seq":1,"type":"zone.catalog","payload":{
+                "repository":repository,"revision":1,"format":"lockyard.zone_catalog.v1",
+                "key_id":key.key_id(),"content_sha256":"11".repeat(32),"updated_at":"2026-11-07T00:00:00.000Z"
+            }});
+            for (extra, allowed) in [(false, true), (true, false)] {
+                let mut event = event.clone();
+                if extra {
+                    event["payload"]["future_content"] = json!("PRIVATE-CONTENT");
+                }
+                let server = FakeServer::start(vec![Reply::json(200, json!([event]))]);
+                let client = Client::new(&server.url(), "fixture-token".into())
+                    .unwrap()
+                    .require_e2ee_for(workspace)
+                    .unwrap()
+                    .with_content_encryption(workspace, Some(key.clone()), true);
+                assert_eq!(
+                    client
+                        .call(&Call::get("session", "/api/v1/events".into()))
+                        .is_ok(),
+                    allowed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn required_node_preserves_strict_protocol_and_catalog_error_metadata() {
+        for mut details in [
+            json!({"min_protocol":1,"max_protocol":2,"supported_protocols":[1,2],"selected_protocol":null}),
+            json!({"current_revision":7}),
+        ] {
+            let original = details.clone();
+            crypto::transform_error_details(&mut details, NODE_WORKSPACE, None, true).unwrap();
+            assert_eq!(details, original);
+            details["future_content"] = json!("PRIVATE-CONTENT");
+            assert!(
+                crypto::transform_error_details(&mut details, NODE_WORKSPACE, None, true).is_err()
+            );
+        }
+        for mut details in [
+            json!({"min_protocol":0}),
+            json!({"supported_protocols":[1,1]}),
+            json!({"supported_protocols":[1,2,3]}),
+            json!({"current_revision":9007199254740992_u64}),
+        ] {
+            assert!(
+                crypto::transform_error_details(&mut details, NODE_WORKSPACE, None, true).is_err()
+            );
+        }
+    }
 
     struct KeyEnv {
         previous: Option<std::ffi::OsString>,
@@ -1004,7 +1184,10 @@ mod tests {
         let _lock = KEY_ENV.lock().unwrap();
         let _env = KeyEnv::new();
         for reply in [
-            Reply::json(404, json!({})),
+            Reply::json(
+                404,
+                json!({"error":{"code":"not_found","message":"policy endpoint absent"}}),
+            ),
             setting("off", None),
             Reply::json(
                 200,
@@ -1051,17 +1234,25 @@ mod tests {
 
     #[test]
     fn node_context_refuses_plaintext_or_unauthenticated_content_responses() {
-        for body in [
-            json!({"messages":[{"body":"plaintext from cloud"}]}),
-            json!({"messages":[{"body":"lyenc1.invalid.envelope"}]}),
-            json!({"messages":[{"body":{"nested":"plaintext"}}]}),
+        for (body, authentication_failure) in [
+            (json!({"messages":[{"body":"plaintext from cloud"}]}), false),
+            (
+                json!({"messages":[{"body":"lyenc1.invalid.envelope"}]}),
+                true,
+            ),
+            (json!({"messages":[{"body":{"nested":"plaintext"}}]}), false),
         ] {
             let server = FakeServer::start(vec![Reply::json(200, body)]);
             let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
-            assert!(matches!(
-                client.call(&Call::get("node-job", "/api/v1/bus/inbox".into())),
-                Err(ClientError::Invalid(_))
-            ));
+            let error = client
+                .call(&Call::get("node-job", "/api/v1/bus/inbox".into()))
+                .expect_err("required content must never expose unverified plaintext");
+            if authentication_failure {
+                assert_eq!(error.code(), Some("content_authentication_failed"));
+                assert_eq!(error.status(), None);
+            } else {
+                assert!(matches!(error, ClientError::Invalid(_)), "{error:?}");
+            }
             assert_eq!(server.requests().len(), 1);
         }
     }
@@ -1142,15 +1333,21 @@ mod tests {
             ),
             ("/api/v1/zones/claims", json!("private")),
         ] {
-            let server = FakeServer::start(vec![Reply::json(200, body)]);
+            let reply = if path == "/api/v1/zones/catalog" {
+                Reply::json(200, body).header("X-Lockyard-Repository", "-")
+            } else {
+                Reply::json(200, body)
+            };
+            let server = FakeServer::start(vec![reply]);
             let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
-            assert!(
-                matches!(
-                    client.call(&Call::get("node-job", path.into())),
-                    Err(ClientError::Invalid(_))
-                ),
-                "{path}"
-            );
+            let result = client.call(&Call::get("node-job", path.into()));
+            // EP-07 gives the typed catalog its own stable validation code.
+            if path == "/api/v1/zones/catalog" {
+                assert_eq!(result.unwrap_err().code(), Some("catalog_invalid"));
+                assert_eq!(server.requests().len(), 1);
+                continue;
+            }
+            assert!(matches!(result, Err(ClientError::Invalid(_))), "{path}");
             assert_eq!(server.requests().len(), 1);
         }
         for event in [
@@ -1830,7 +2027,11 @@ mod tests {
     #[test]
     fn older_server_without_setting_route_keeps_cleartext_compatibility() {
         let server = FakeServer::start(vec![
-            Reply::json(404, json!({"message":"missing"})),
+            // The fixture advertises modern discovery, so its domain error needs a stable code.
+            Reply::json(
+                404,
+                json!({"error":{"code":"not_found","message":"missing"}}),
+            ),
             Reply::json(200, json!({"body":"plain"})),
         ]);
         let client = Client::new(&server.url(), "secret".into())
@@ -1982,7 +2183,8 @@ mod tests {
     #[test]
     fn a_frozen_write_is_not_retried_and_keeps_retry_after() {
         let server = FakeServer::start(vec![
-            Reply::json(503, json!({})).header("Retry-After", "120"),
+            Reply::json(503, json!({"error":{"code":"frozen","message":"frozen"}}))
+                .header("Retry-After", "120"),
         ]);
         let client = Client::new(&server.url(), "secret".into()).unwrap();
         let call = Call::write("a", "POST", "/api/v1/bus/messages".into(), json!({}));
@@ -1997,7 +2199,7 @@ mod tests {
         let server = FakeServer::start(vec![
             Reply::json(
                 429,
-                json!({"error": {"code": "limit", "message": "slow down"}}),
+                json!({"error": {"code": "rate_limited", "message": "slow down"}}),
             )
             .header("Retry-After", "0"),
             Reply::json(200, json!({"ok": true})),
@@ -2029,7 +2231,11 @@ mod tests {
     #[test]
     fn a_rate_limited_write_retries_when_retry_after_fits_the_callers_budget() {
         let server = FakeServer::start(vec![
-            Reply::json(429, json!({})).header("Retry-After", "1"),
+            Reply::json(
+                429,
+                json!({"error":{"code":"rate_limited","message":"slow down"}}),
+            )
+            .header("Retry-After", "1"),
             Reply::json(200, json!({"ok": true})),
         ]);
         let client = Client::new(&server.url(), "secret".into()).unwrap();
@@ -2064,7 +2270,7 @@ mod tests {
         let server = FakeServer::start(vec![
             Reply::json(
                 429,
-                json!({"error": {"code": "limit", "message": "slow down"}}),
+                json!({"error": {"code": "rate_limited", "message": "slow down"}}),
             )
             .header("Retry-After", "5"),
             Reply::json(200, json!({"ok": true})),
@@ -2129,21 +2335,34 @@ mod tests {
     }
 
     #[test]
-    fn a_redirect_is_never_followed_and_stays_retryable() {
+    fn a_redirect_is_never_followed_and_preserves_unknown_write() {
         let server = FakeServer::start(vec![
             Reply::text(307, "").header("Location", "http://example.test/moved"),
         ]);
         let client = Client::new(&server.url(), "secret".into()).unwrap();
         let call = Call::write("a", "POST", "/api/v1/bus/messages".into(), json!({}));
         let error = client.call(&call).unwrap_err();
-        assert!(error.is_outage(), "{error:?}");
+        // EP-10: an unconfirmed POST cannot become a fresh outbox mutation.
+        assert!(matches!(error, ClientError::OutcomeUnknown(_)), "{error:?}");
+        assert_eq!(
+            client
+                .pending_operation(call.key.as_deref().unwrap())
+                .unwrap()
+                .body,
+            Some("{}".into())
+        );
         assert_eq!(server.requests().len(), 1);
     }
 
     #[test]
-    fn a_failed_write_is_repeated_under_the_same_key() {
+    fn a_rejected_write_is_repeated_under_the_same_key() {
         let server = FakeServer::start(vec![
-            Reply::json(500, json!({})),
+            // ERRORS.md authorizes retry by stable pre-execution code, never bare HTTP 500.
+            Reply::json(
+                429,
+                json!({"error":{"code":"rate_limited","message":"slow down"}}),
+            )
+            .header("Retry-After", "0"),
             Reply::json(200, json!({"id": 1})),
         ]);
         let client = Client::new(&server.url(), "secret".into()).unwrap();

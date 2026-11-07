@@ -1,6 +1,109 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
     #[test]
+    fn compact_definitions_are_projection_of_full_registry() {
+        let full = tools(Surface::Full);
+        for compact in tools(Surface::Compact) {
+            let name = compact["name"].as_str().unwrap();
+            let canonical = full
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("compact tool {name} is absent from full registry"));
+            assert_eq!(&compact, canonical, "{name} has a second definition");
+        }
+        for name in ["zone_catalog_put", "cloud_drain", "cloud_drain_status"] {
+            assert!(full.iter().any(|tool| tool["name"] == name));
+            assert!(
+                !tools(Surface::Compact)
+                    .iter()
+                    .any(|tool| tool["name"] == name)
+            );
+        }
+        let check = full.iter().find(|tool| tool["name"] == "check").unwrap();
+        let zone_check = full
+            .iter()
+            .find(|tool| tool["name"] == "zone_check")
+            .unwrap();
+        assert_eq!(check["inputSchema"], zone_check["inputSchema"]);
+        assert_eq!(check["description"], zone_check["description"]);
+    }
+
+    #[test]
+    fn all_task_ingresses_share_legacy_conversion_and_counter() {
+        let metric = "lockyard_compat_conversions_total{kind=legacy_task_id,source=http,protocol=1}";
+        let before = lockyard_compat::counters()
+            .get(metric)
+            .copied()
+            .unwrap_or(0);
+        for raw in [json!("FE-0012"), json!("D-12")] {
+            lockyard_compat::LegacyCompatibilityV1::task_id(
+                &raw,
+                lockyard_compat::TaskDomain::Registry,
+                lockyard_compat::Source::Http,
+                1,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            lockyard_compat::counters()
+                .get(metric)
+                .copied()
+                .unwrap_or(0),
+            before
+        );
+        assert_eq!(
+            lockyard_compat::LegacyCompatibilityV1::task_id(
+                &json!(12),
+                lockyard_compat::TaskDomain::Registry,
+                lockyard_compat::Source::Http,
+                1
+            )
+            .unwrap(),
+            "D-12"
+        );
+        assert_eq!(lockyard_compat::counters()[metric], before + 1);
+        assert!(
+            lockyard_compat::LegacyCompatibilityV1::task_id(
+                &json!(0),
+                lockyard_compat::TaskDomain::Registry,
+                lockyard_compat::Source::Http,
+                1
+            )
+            .is_err()
+        );
+        assert_eq!(lockyard_compat::counters()[metric], before + 1);
+
+        for (input, expected) in [
+            (json!(12), "D-12"),
+            (json!("12"), "D-12"),
+            (json!("FE-0012"), "FE-0012"),
+        ] {
+            let args = json!({"id": input});
+            assert_eq!(Args(&args).task_key("id").unwrap(), expected);
+            assert_eq!(Args(&args).task_key("id").unwrap(), expected);
+            assert_eq!(Args(&args).task_key_for(false).unwrap(), expected);
+            assert_eq!(
+                crate::task_key(input.as_str().unwrap_or("12")).unwrap(),
+                expected
+            );
+        }
+        for input in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("1e2"),
+            json!(" 12"),
+            json!("D-0"),
+            json!("9007199254740992"),
+            json!("FE-9007199254740992"),
+        ] {
+            let args = json!({"id": input});
+            assert!(Args(&args).task_key("id").is_err(), "{input}");
+            assert!(Args(&args).task_key("id").is_err(), "{input}");
+        }
+    }
+
+    #[test]
     fn handoff_tool_exposes_and_preserves_context_and_commit_references() {
         let definitions = tools(Surface::Full);
         let tool = definitions
@@ -134,7 +237,7 @@
     fn cloud_status_work_is_only_active_and_relevant_to_the_agent() {
         let make = |id, status: &str, to: &str| {
             serde_json::from_value(json!({
-                "id": id, "title": "work", "to": to, "accept": "", "status": status,
+                "id": format!("BT-{id}"), "title": "work", "to": to, "accept": "", "status": status,
                 "version": 1
             }))
             .unwrap()
@@ -149,8 +252,8 @@
             ],
         );
         assert_eq!(
-            visible.iter().map(|item| item.id).collect::<Vec<_>>(),
-            vec![1]
+            visible.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            vec!["BT-1"]
         );
     }
 
@@ -251,7 +354,7 @@
             (json!("G-SG-0012"), "G-SG-0012"),
         ] {
             let arguments = json!({"id":argument});
-            let id = Args(&arguments).task_id_for(backend.is_cloud()).unwrap();
+            let id = Args(&arguments).task_key_for(backend.is_cloud()).unwrap();
             assert_eq!(id, expected_id);
             assert_eq!(backend.task(&id).unwrap().id, expected_id);
             assert!(backend.task_history(&id).unwrap().is_empty());
@@ -277,12 +380,12 @@
             assert_eq!(tail[3].body.as_ref().unwrap()["session"], "worker");
         }
         let integer = json!({"id":12});
-        assert!(Args(&integer).task_id_for(false).is_err());
-        assert!(Args(&integer).task_id().is_err());
+        assert_eq!(Args(&integer).task_key_for(false).unwrap(), "D-12");
+        assert_eq!(Args(&integer).task_key("id").unwrap(), "D-12");
         for value in [json!(0), json!(-1), json!(1.5)] {
-            assert!(Args(&json!({"id":value})).task_id_for(true).is_err());
+            assert!(Args(&json!({"id":value})).task_key_for(true).is_err());
         }
-        for tool in full_tools().into_iter().filter(|tool| {
+        for tool in tools(Surface::Full).into_iter().filter(|tool| {
             [
                 "task_show",
                 "task_plan",
@@ -297,15 +400,12 @@
             ]
             .contains(&tool["name"].as_str().unwrap())
         }) {
-            assert_eq!(
-                tool["inputSchema"]["properties"]["id"]["oneOf"][1]["minimum"],
-                1
-            );
+            assert_eq!(tool["inputSchema"]["properties"]["id"]["type"], "string");
         }
     }
 
     #[test]
-    fn raw_registry_inputs_accept_strings_and_legacy_numbers_without_relaxing_task_tools() {
+    fn raw_registry_inputs_and_task_tools_share_legacy_numeric_boundary() {
         for value in [
             json!(12),
             json!("D-12"),
@@ -313,7 +413,7 @@
             json!("G-SG-0012"),
         ] {
             let args = json!({"id":value});
-            assert!(Args(&args).registry_id("id").is_ok());
+            assert!(Args(&args).task_key("id").is_ok());
         }
         for value in [
             json!(-1),
@@ -323,10 +423,10 @@
             json!("../D-1"),
         ] {
             let args = json!({"id":value});
-            assert!(Args(&args).registry_id("id").is_err());
+            assert!(Args(&args).task_key("id").is_err());
         }
         let integer = json!({"id":12});
-        assert!(Args(&integer).task_id().is_err());
+        assert_eq!(Args(&integer).task_key("id").unwrap(), "D-12");
     }
 
     #[test]
@@ -356,8 +456,7 @@
         assert!(after.is_none());
         let answer = answer.unwrap();
         let content: Value =
-            serde_json::from_str(answer["result"]["contents"][0]["text"].as_str().unwrap())
-                .unwrap();
+            serde_json::from_str(answer["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(content["read_only"], true);
         assert_eq!(content["warning"], MAIL_WARNING);
         assert!(text(&call(&dir, "reader", "msg_unread", json!({}))).contains('1'));
@@ -387,7 +486,7 @@
 
     #[test]
     fn every_schema_is_an_object_with_a_required_array_of_its_own_properties() {
-        let tools = [compact_tools(), full_tools()].concat();
+        let tools = [tools(Surface::Compact), tools(Surface::Full)].concat();
         for tool in &tools {
             let schema = &tool["inputSchema"];
             assert_eq!(schema["type"], "object");
@@ -399,7 +498,7 @@
 
     #[test]
     fn every_command_of_the_brief_has_a_tool() {
-        let tools = full_tools();
+        let tools = tools(Surface::Full);
         let names: Vec<&str> = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -440,7 +539,7 @@
     #[test]
     fn every_listed_tool_is_implemented() {
         let dir = project();
-        for tool in [compact_tools(), full_tools()].concat() {
+        for tool in [tools(Surface::Compact), tools(Surface::Full)].concat() {
             let name = tool["name"].as_str().unwrap();
             let result = call(&dir, "a", name, json!({}));
             assert!(!text(&result).contains("unknown tool"), "{name}");
@@ -467,7 +566,7 @@
     #[test]
     fn board_write_tool_descriptions_name_the_required_cloud_roles() {
         for name in ["board_set", "board_remove"] {
-            let tool = full_tools()
+            let tool = tools(Surface::Full)
                 .into_iter()
                 .find(|tool| tool["name"] == name)
                 .unwrap();
@@ -545,4 +644,3 @@
         after.unwrap()().unwrap();
         assert!(unread(&dir).contains('0'));
     }
-

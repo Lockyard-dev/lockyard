@@ -71,25 +71,44 @@ pub fn run(settings: &Settings, ports: &mut Ports<'_>, out: &mut dyn Write) -> R
         backend: Some(watcher.as_ref().map_or("off", |w| w.backend().as_str())),
         ..Summary::default()
     };
-    let deadline = settings.timeout.map(|limit| Instant::now() + limit);
+    let started = Instant::now();
+    let deadline = settings.timeout.map(|limit| started + limit);
+    let mut next_reconcile = started + settings.reconcile;
     // Seen paths whose claim and announcement were already judged in this round set.
     let mut pending: Vec<String> = Vec::new();
     loop {
+        if crate::shutdown::requested() {
+            return Ok(summary);
+        }
         let left = deadline.map(|at| at.saturating_duration_since(Instant::now()));
         if left == Some(Duration::ZERO) {
             return Ok(summary);
         }
+        let wait = left
+            .unwrap_or(settings.reconcile)
+            .min(crate::shutdown::POLL_INTERVAL);
         let tick = match watcher.as_mut() {
-            Some(watcher) => watcher.wait(left.unwrap_or(settings.reconcile)),
+            Some(watcher) => watcher.wait(wait),
             // Without any watcher the reconcile interval is the whole mechanism.
             None => {
-                std::thread::sleep(settings.reconcile.min(left.unwrap_or(settings.reconcile)));
-                Tick::Reconcile
+                std::thread::sleep(
+                    wait.min(next_reconcile.saturating_duration_since(Instant::now())),
+                );
+                let now = Instant::now();
+                if now >= next_reconcile || deadline.is_some_and(|deadline| now >= deadline) {
+                    next_reconcile = now + settings.reconcile;
+                    Tick::Reconcile
+                } else {
+                    Tick::Idle
+                }
             }
         };
+        if crate::shutdown::requested() {
+            return Ok(summary);
+        }
         let reconcile = matches!(tick, Tick::Reconcile);
         match &tick {
-            Tick::Idle => return Ok(summary),
+            Tick::Idle => continue,
             Tick::Changed(paths) => pending.extend(project_paths(&settings.root, paths)),
             Tick::Reconcile => {}
         }

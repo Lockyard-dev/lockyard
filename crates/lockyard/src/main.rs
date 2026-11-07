@@ -13,6 +13,7 @@ mod open;
 #[cfg(unix)]
 mod revoke_access;
 mod setup;
+mod shutdown;
 mod workflow;
 
 use clap::{Args, Parser, Subcommand};
@@ -22,7 +23,7 @@ use lockyard_core::proto::{
     ClaimMode, ClaimQuery, ClaimRequest, DirtyPath, EventQuery, Freeze, InboxPage, InboxQuery,
     Message, PresenceBeat, Purpose, QueueRequest, ReleaseRequest, RenewRequest, SendRequest,
     SessionActivity, SessionState, Stamp, Stream, TokenRequest, WorkAction, WorkOffer, WorkStep,
-    WorkTask, expand_zones, rfc3339,
+    WorkTask, rfc3339,
 };
 use lockyard_core::tasks::{Status, Task, TaskPlan, TaskSpec};
 use lockyard_core::zones::{DEFAULT_TTL_MINUTES, validate_claim_path_count};
@@ -88,6 +89,9 @@ use cli_integration::*;
 #[path = "cli/agent.rs"]
 mod cli_agent;
 use cli_agent::*;
+#[path = "cli/db.rs"]
+mod cli_db;
+use cli_db::*;
 
 /// Accepts `12`, `T-12`, `D-12`, `Z-12`, `M-12`, `W-12` and `Q-12`.
 fn parse_id(text: &str) -> std::result::Result<i64, String> {
@@ -100,24 +104,22 @@ fn parse_id(text: &str) -> std::result::Result<i64, String> {
         .map_err(|_| format!("{text:?} is not an id, expected a number such as 12 or T-12"))
 }
 
-fn parse_task_id(text: &str) -> std::result::Result<String, String> {
-    let valid = text.rsplit_once('-').is_some_and(|(prefix, number)| {
-        !prefix.is_empty()
-            && prefix.split('-').all(|part| {
-                let mut chars = part.chars();
-                chars.next().is_some_and(|c| c.is_ascii_uppercase())
-                    && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-            })
-            && !number.is_empty()
-            && number.bytes().all(|c| c.is_ascii_digit())
-    });
-    if valid || (!text.is_empty() && text.bytes().all(|c| c.is_ascii_digit())) {
-        Ok(text.to_string())
-    } else {
-        Err(format!(
-            "{text:?} is not an id, expected PREFIX-number such as FE-0001"
-        ))
-    }
+fn task_key(text: &str) -> std::result::Result<String, String> {
+    lockyard_compat::LegacyCompatibilityV1::task_id(
+        &Value::String(text.into()),
+        lockyard_compat::TaskDomain::Registry,
+        lockyard_compat::Source::Cli,
+        2,
+    )
+}
+
+fn bus_key(text: &str) -> std::result::Result<String, String> {
+    lockyard_compat::LegacyCompatibilityV1::task_id(
+        &Value::String(text.into()),
+        lockyard_compat::TaskDomain::Bus,
+        lockyard_compat::Source::Cli,
+        2,
+    )
 }
 
 fn parse_status(text: &str) -> std::result::Result<Status, String> {
@@ -183,6 +185,7 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             &json!({ "version": lockyard_core::VERSION, "build": lockyard_core::build_info() }),
             lockyard_core::about(),
         ),
+        Command::Db(command) => run_db(command, cwd),
         Command::Machine => {
             guard::recover();
             let report = guard::report(guard::project_config(cwd)).map_err(Error::Io)?;
@@ -387,10 +390,20 @@ fn current_dir() -> Result<PathBuf> {
 
 fn report(error: &Error, json: bool) {
     if json {
-        eprintln!(
-            "{}",
-            json!({"error": {"kind": error.kind(), "message": error.to_string()}})
-        );
+        let mut detail =
+            json!({"code":error.kind(),"kind":error.kind(),"message":error.to_string()});
+        if let Error::Cloud {
+            code,
+            status,
+            details,
+            ..
+        } = error
+        {
+            detail["code"] = json!(code);
+            detail["status"] = json!(status);
+            detail["details"] = details.clone();
+        }
+        eprintln!("{}", json!({"error":detail}));
     } else {
         eprintln!("{error}");
     }
@@ -459,7 +472,13 @@ fn main() -> ExitCode {
             }
             ExitCode::from(out.exit)
         }
-        Err(error @ (Error::Conflict(_) | Error::Contended(_))) => {
+        Err(
+            error @ (Error::Conflict(_)
+            | Error::Contended(_)
+            | Error::Cloud {
+                status: Some(409), ..
+            }),
+        ) => {
             report(&error, json);
             ExitCode::from(EXIT_CONFLICT)
         }

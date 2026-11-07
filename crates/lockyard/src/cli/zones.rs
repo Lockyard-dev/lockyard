@@ -11,7 +11,7 @@ pub(super) fn with_zones(
 ) -> Result<Vec<String>> {
     let mut paths = opened.zone_paths(cwd, raw)?;
     if !zones.is_empty() {
-        for path in expand_zones(&opened.backend.catalog()?, zones)? {
+        for path in opened.backend.catalog_expand(zones)? {
             if !paths.contains(&path) {
                 paths.push(path);
             }
@@ -333,13 +333,17 @@ pub(super) fn run_dirty(
             task,
         } => {
             let paths = opened.zone_paths(cwd, &paths)?;
+            let task = task
+                .as_deref()
+                .map(lockyard_core::task_id::TaskId::parse)
+                .transpose()?;
             let report: Vec<DirtyPath> = paths
                 .into_iter()
                 .map(|path| DirtyPath {
                     path,
                     owner_session: owner.clone(),
                     reason: reason.clone(),
-                    task_id: task,
+                    task_id: task.clone(),
                 })
                 .collect();
             opened.backend.dirty_report(&agent, &report)?;

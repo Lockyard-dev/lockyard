@@ -345,6 +345,7 @@ fn equivalent_trailing_slash_url_cannot_bootstrap_a_rotated_signer() {
         .current_dir(root.path())
         .env("LOCKYARD_URL", &server.url)
         .env("LOCKYARD_TOKEN", "fixture-token")
+        .env("XDG_STATE_HOME", root.path().join("private-command-state"))
         .env_remove("LOCKYARD_REQUIRE_E2EE")
         .env_remove("LOCKYARD_E2EE_WORKSPACE_ID")
         .args([

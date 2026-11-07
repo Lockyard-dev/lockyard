@@ -96,7 +96,7 @@ fn work_handoff_accepts_context_and_commit_references() {
         "lockyard",
         "work",
         "handoff",
-        "W-12",
+        "BT-12",
         "--to",
         "next",
         "--if-version",
@@ -118,7 +118,7 @@ fn work_handoff_accepts_context_and_commit_references() {
     else {
         panic!("expected work handoff")
     };
-    assert_eq!(task.id, 12);
+    assert_eq!(task.id, "BT-12");
     assert_eq!(task.if_version, Some(3));
     assert_eq!(to, "next");
     assert_eq!(report.as_deref(), Some("Tests passed; next verify staging"));
@@ -154,7 +154,7 @@ fn raw_registry_commands_accept_native_and_legacy_task_identifiers() {
         let Command::Task(TaskCommand::Link { id: parsed, to, .. }) = cli.command else {
             panic!("expected task link")
         };
-        assert_eq!(parsed, id);
+        assert_eq!(parsed, if id == "12" { "D-12" } else { id });
         assert_eq!(to, "PA-0007");
     }
 }
@@ -162,10 +162,10 @@ fn raw_registry_commands_accept_native_and_legacy_task_identifiers() {
 #[test]
 fn registry_task_ids_keep_area_prefixes() {
     for id in ["FE-0001", "G-SG-0012", "D-3176"] {
-        assert_eq!(parse_task_id(id).unwrap(), id);
+        assert_eq!(task_key(id).unwrap(), id);
     }
     for id in ["fe-1", "FE-", "-1"] {
-        assert!(parse_task_id(id).is_err(), "{id}");
+        assert!(task_key(id).is_err(), "{id}");
     }
 }
 

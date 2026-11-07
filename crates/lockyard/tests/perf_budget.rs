@@ -92,6 +92,12 @@ fn hook_decision_p95_stays_within_budget() {
         );
     }
     let usual = p95(&mut times);
+    eprintln!(
+        "perf_budget hook_decision samples={SAMPLES} p50_us={} p95_us={} budget_us={}",
+        times[SAMPLES / 2].as_micros(),
+        usual.as_micros(),
+        HOOK_P95.as_micros()
+    );
     assert!(
         usual <= HOOK_P95,
         "hook decision p95 was {usual:?}, budget is {HOOK_P95:?}"
@@ -127,6 +133,12 @@ fn msg_send_p95_stays_within_budget() {
         );
     }
     let usual = p95(&mut times);
+    eprintln!(
+        "perf_budget msg_send samples={SAMPLES} p50_us={} p95_us={} budget_us={}",
+        times[SAMPLES / 2].as_micros(),
+        usual.as_micros(),
+        SEND_P95.as_micros()
+    );
     assert!(
         usual <= SEND_P95,
         "msg send p95 was {usual:?}, budget is {SEND_P95:?}"

@@ -15,12 +15,28 @@ use crate::proto::{
 use crate::{Error, Result, Store, ZonePath, bus, coordination, tasks, zones};
 use serde_json::Value;
 
-fn task_number(id: &str) -> Result<i64> {
-    id.rsplit_once('-')
-        .map(|(_, number)| number)
-        .unwrap_or(id)
-        .parse()
-        .map_err(|_| Error::Invalid(format!("{id:?} is not a task id")))
+#[cfg(test)]
+mod w4_contract_tests {
+    use super::*;
+
+    #[test]
+    fn local_task_lookup_never_discards_area_prefix() {
+        let (_dir, mut store) = crate::store::test_store();
+        let task = store.add_task("lead", "local", "", 0).unwrap();
+        assert!(Backend::task(&store, &task.id).is_ok());
+        for foreign in ["FE-1", "D-01", "FE-0001"] {
+            assert!(
+                matches!(Backend::task(&store, foreign), Err(Error::NotFound(_))),
+                "{foreign} must not resolve to {}",
+                task.id
+            );
+            assert!(Backend::claim_task(&mut store, "worker", foreign, 10, 1).is_err());
+        }
+        assert_eq!(
+            Backend::task(&store, &task.id).unwrap().status,
+            tasks::Status::Open
+        );
+    }
 }
 
 fn cloud<T>(feature: &str) -> Result<T> {
@@ -155,6 +171,28 @@ pub trait Backend {
         cloud("zone catalog")
     }
 
+    fn catalog_expand(&self, names: &[String]) -> Result<Vec<String>> {
+        crate::proto::expand_zones(&self.catalog()?, names)
+    }
+    fn catalog_put(
+        &mut self,
+        _agent: &str,
+        _catalog: &Value,
+        _expected_revision: u64,
+        _key: &str,
+    ) -> Result<Value> {
+        cloud("zone catalog publish")
+    }
+    fn cloud_protocol(&self) -> Result<Value> {
+        cloud("protocol discovery")
+    }
+    fn cloud_drain(&mut self, _agent: &str, _request: &Value, _key: &str) -> Result<Value> {
+        cloud("drain")
+    }
+    fn cloud_drain_status(&self, _id: &str) -> Result<Value> {
+        cloud("drain status")
+    }
+
     fn send(&mut self, agent: &str, request: &SendRequest, now: i64) -> Result<Message>;
     fn reply(&mut self, agent: &str, id: i64, body: &str, now: i64) -> Result<Message>;
     fn ack(&mut self, _agent: &str, _id: i64) -> Result<()> {
@@ -214,12 +252,7 @@ pub trait Backend {
     fn registry_ready(&self, _query: &Value) -> Result<Value> {
         cloud("task ready")
     }
-    fn registry_item(&self, _id: i64) -> Result<Value> {
-        cloud("task registry")
-    }
-    fn registry_blockers(&self, _id: i64) -> Result<Value> {
-        cloud("task why-blocked")
-    }
+
     /// Read a registry item without discarding its area prefix or number padding.
     fn registry_item_by_id(&self, _id: &str) -> Result<Value> {
         cloud("task registry")
@@ -227,18 +260,7 @@ pub trait Backend {
     fn registry_blockers_by_id(&self, _id: &str) -> Result<Value> {
         cloud("task why-blocked")
     }
-    #[allow(clippy::too_many_arguments)]
-    fn registry_link(
-        &mut self,
-        _agent: &str,
-        _id: i64,
-        _to: i64,
-        _kind: &str,
-        _version: i64,
-        _key: &str,
-    ) -> Result<Value> {
-        cloud("task link")
-    }
+
     #[allow(clippy::too_many_arguments)]
     fn registry_link_by_id(
         &mut self,
@@ -265,10 +287,7 @@ pub trait Backend {
     /// A workflow claim result, preserving ownership evidence from the mutation response itself.
     /// Cloud implementations must retain the assignment identity; a later read cannot establish
     /// which assignment this write created. Local tasks use their current-owner policy on resume.
-    fn claim_task_receipt(&mut self, agent: &str, id: i64, ttl: i64, now: i64) -> Result<Value> {
-        serde_json::to_value(self.claim_task(agent, &id.to_string(), ttl, now)?)
-            .map_err(|error| Error::Protocol(error.to_string()))
-    }
+    ///
     /// Preserve the full task identity in a workflow claim receipt.
     fn claim_task_receipt_by_id(
         &mut self,
@@ -351,13 +370,13 @@ pub trait Backend {
     fn work_list(&self, _agent: &str) -> Result<Vec<WorkTask>> {
         cloud("work")
     }
-    fn work_get(&self, _agent: &str, _id: i64) -> Result<WorkTask> {
+    fn work_get(&self, _agent: &str, _id: &str) -> Result<WorkTask> {
         cloud("work")
     }
     fn work_step(
         &mut self,
         _agent: &str,
-        _id: i64,
+        _id: &str,
         _action: WorkAction,
         _step: &WorkStep,
     ) -> Result<WorkTask> {
@@ -754,11 +773,11 @@ impl Backend for Store {
     }
 
     fn task(&self, id: &str) -> Result<tasks::Task> {
-        Store::task(self, task_number(id)?)
+        Store::task(self, id)
     }
 
     fn task_history(&self, id: &str) -> Result<Vec<tasks::TaskEvent>> {
-        Store::task_history(self, task_number(id)?)
+        Store::task_history(self, id)
     }
 
     fn add_task(&mut self, author: &str, spec: &tasks::TaskSpec, now: i64) -> Result<tasks::Task> {
@@ -769,15 +788,15 @@ impl Backend for Store {
     }
 
     fn claim_task(&mut self, agent: &str, id: &str, ttl: i64, now: i64) -> Result<tasks::Task> {
-        Store::claim_task(self, agent, task_number(id)?, ttl, now)
+        Store::claim_task(self, agent, id, ttl, now)
     }
 
     fn renew_task(&mut self, agent: &str, id: &str, ttl: i64, now: i64) -> Result<tasks::Task> {
-        Store::renew_task(self, agent, task_number(id)?, ttl, now)
+        Store::renew_task(self, agent, id, ttl, now)
     }
 
     fn release_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task> {
-        Store::release_task(self, agent, task_number(id)?, note, now)
+        Store::release_task(self, agent, id, note, now)
     }
 
     fn submit_task(
@@ -787,11 +806,11 @@ impl Backend for Store {
         evidence: &str,
         now: i64,
     ) -> Result<tasks::Task> {
-        Store::submit_task(self, agent, task_number(id)?, evidence, now)
+        Store::submit_task(self, agent, id, evidence, now)
     }
 
     fn accept_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task> {
-        Store::accept_task(self, agent, task_number(id)?, note, now)
+        Store::accept_task(self, agent, id, note, now)
     }
 
     fn review_task(
@@ -802,7 +821,7 @@ impl Backend for Store {
         reason: &str,
         now: i64,
     ) -> Result<tasks::Task> {
-        Store::review_task(self, agent, task_number(id)?, decision, reason, now)
+        Store::review_task(self, agent, id, decision, reason, now)
     }
 
     fn reject_task(
@@ -813,11 +832,11 @@ impl Backend for Store {
         evidence: &str,
         now: i64,
     ) -> Result<tasks::Task> {
-        Store::reject_task(self, agent, task_number(id)?, reason, evidence, now)
+        Store::reject_task(self, agent, id, reason, evidence, now)
     }
 
     fn cancel_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<tasks::Task> {
-        Store::cancel_task(self, agent, task_number(id)?, note, now)
+        Store::cancel_task(self, agent, id, note, now)
     }
 
     fn board_set(&mut self, _agent: &str, write: &BoardWrite, now: i64) -> Result<BoardEntry> {
@@ -937,9 +956,9 @@ mod tests {
             backend.undelivered("a", 0).map(|_| ()),
             backend.work_offer("a", &WorkOffer::default()).map(|_| ()),
             backend.work_list("a").map(|_| ()),
-            backend.work_get("a", 1).map(|_| ()),
+            backend.work_get("a", "BT-1").map(|_| ()),
             backend
-                .work_step("a", 1, WorkAction::Beat, &WorkStep::default())
+                .work_step("a", "BT-1", WorkAction::Beat, &WorkStep::default())
                 .map(|_| ()),
             backend.events(&EventQuery::default()).map(|_| ()),
             backend.export().map(|_| ()),
@@ -953,15 +972,15 @@ mod tests {
             backend.token_revoke("a", "x").map(|_| ()),
             backend.registry_search(&json!({})).map(|_| ()),
             backend.registry_ready(&json!({})).map(|_| ()),
-            backend.registry_item(1).map(|_| ()),
-            backend.registry_blockers(1).map(|_| ()),
+            backend.registry_item_by_id("D-1").map(|_| ()),
+            backend.registry_blockers_by_id("D-1").map(|_| ()),
             backend.registry_item_by_id("FE-0319").map(|_| ()),
             backend.registry_blockers_by_id("FE-0319").map(|_| ()),
             backend
                 .registry_link_by_id("a", "FE-0319", "G-SG-0012", "blocks", 1, "key")
                 .map(|_| ()),
             backend
-                .registry_link("a", 1, 2, "blocks", 1, "key")
+                .registry_link_by_id("a", "D-1", "D-2", "blocks", 1, "key")
                 .map(|_| ()),
             backend
                 .plan_task("a", "D-1", &tasks::TaskPlan::default())
@@ -998,8 +1017,10 @@ mod tests {
                 0,
             )
             .unwrap();
-        let id = task_number(&task.id).unwrap();
-        let receipt = backend.claim_task_receipt("worker", id, 10, 1).unwrap();
+        let id = task.id.as_str();
+        let receipt = backend
+            .claim_task_receipt_by_id("worker", id, 10, 1)
+            .unwrap();
         assert_eq!(receipt["id"], task.id);
         assert_eq!(receipt["status"], "claimed");
         assert_eq!(receipt["assignee"], "worker");

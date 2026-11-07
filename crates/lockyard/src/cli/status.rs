@@ -131,6 +131,7 @@ pub(super) fn run_monitor(
     json: bool,
 ) -> Result<Output> {
     let name = resolve_agent(agent)?;
+    let _shutdown = crate::shutdown::Guard::new(cwd)?;
     let mut opened = open::open(cwd, Some(&name))?;
     let store = Store::open(&opened.root)?;
     let settings = monitor::Settings {

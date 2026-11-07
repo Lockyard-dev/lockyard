@@ -197,7 +197,9 @@ fn a_full_conversation_and_task_cycle_over_json() {
         "codex",
         &["task", "review", &id, "--decision", "pass"],
     );
-    ok(root, "claude", &["task", "accept", &format!("T-{id}")]);
+    // EP-12 keeps T-n only as a local ingress alias; the returned ID is already D-n.
+    let local_alias = format!("T-{}", id.strip_prefix("D-").unwrap());
+    ok(root, "claude", &["task", "accept", &local_alias]);
     assert_eq!(ok(root, "lead", &["task", "list"]).trim(), "no tasks");
     assert!(ok(root, "lead", &["task", "show", &id]).contains("ran the tests"));
 }
@@ -219,7 +221,7 @@ fn status_only_shows_the_current_agents_claims_and_tasks() {
     let status = ok(root, "alice", &["--json", "status"]);
     let status: Value = serde_json::from_str(&status).unwrap();
     assert_eq!(status["claims"].as_array().unwrap().len(), 1);
-    assert_eq!(status["claims"][0]["agent"], "alice");
+    assert_eq!(status["claims"][0]["session"], "alice");
     assert_eq!(status["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(status["tasks"][0]["title"], "alice task");
     assert!(status["unannounced"].as_array().unwrap().is_empty());
@@ -237,14 +239,25 @@ fn cloud_status(claims: Value, work: Value, json_output: bool) -> String {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut first = String::new();
             reader.read_line(&mut first).unwrap();
+            let mut protocol = None;
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
                     break;
                 }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("Lockyard-Protocol")
+                {
+                    protocol = Some(value.trim().to_string());
+                }
             }
+            assert_eq!(protocol.as_deref(), Some("2"));
             let path = first.split_whitespace().nth(1).unwrap();
             let answer = match path.split('?').next().unwrap() {
+                // EP-10 requires discovery and selected-version/repository echoes before reads.
+                "/api/v1/protocol" => {
+                    json!({"selected_protocol":2,"min_protocol":1,"max_protocol":2,"capabilities":[]})
+                }
                 "/api/v1/workspace/encryption" => json!({"encryption":"off", "key_id":null,
                     "workspace_id":"00000000-0000-0000-0000-000000000001"}),
                 "/api/v1/zones/claims" => claims.clone(),
@@ -254,11 +267,16 @@ fn cloud_status(claims: Value, work: Value, json_output: bool) -> String {
                 other => panic!("unexpected status route: {other}"),
             };
             let body = answer.to_string();
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            write!(stream, "HTTP/1.1 200 OK\r\nLockyard-Protocol: 2\r\nX-Lockyard-Repository: -\r\nCache-Control: no-store\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         }
     });
     let dir = tempfile::tempdir().unwrap();
     let runtime = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     std::fs::create_dir(dir.path().join(".lockyard")).unwrap();
     std::fs::write(
         dir.path().join(".lockyard/config.toml"),
@@ -292,7 +310,7 @@ fn cloud_status(claims: Value, work: Value, json_output: bool) -> String {
 #[test]
 fn cloud_status_only_lists_active_relevant_work_in_json_and_text() {
     let task = |id, status, to, assignee| {
-        json!({"id":id, "title":format!("work-{id}"),
+        json!({"id":format!("BT-{id}"), "title":format!("work-{id}"),
         "status":status, "to":to, "assignee":assignee, "version":1})
     };
     let work = json!([
@@ -300,17 +318,17 @@ fn cloud_status_only_lists_active_relevant_work_in_json_and_text() {
         task(3, "claimed", "bob", "bob"), task(4, "accepted", "alice", "alice"),
         task(5, "offered", "*", ""), task(6, "failed", "alice", "alice"),
         task(7, "expired", "alice", "alice"), task(8, "cancelled", "alice", "alice"),
-        {"id":9, "title":"work-9", "status":"review", "to":"bob", "lead":"alice", "version":1},
-        {"id":10, "title":"work-10", "status":"claimed", "to":"*", "executor":"alice", "version":1}
+        {"id":"BT-9", "title":"work-9", "status":"review", "to":"bob", "lead":"alice", "version":1},
+        {"id":"BT-10", "title":"work-10", "status":"claimed", "to":"*", "executor":"alice", "version":1}
     ]);
     let status: Value = serde_json::from_str(&cloud_status(json!([]), work.clone(), true)).unwrap();
     let ids: Vec<_> = status["work"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|item| item["id"].as_i64().unwrap())
+        .map(|item| item["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec![1, 2, 9, 10]);
+    assert_eq!(ids, vec!["BT-1", "BT-2", "BT-9", "BT-10"]);
     let text = cloud_status(json!([]), work, false);
     for id in [1, 2, 9, 10] {
         assert!(text.contains(&format!("work-{id}")), "{text}");
@@ -322,17 +340,18 @@ fn cloud_status_only_lists_active_relevant_work_in_json_and_text() {
 
 #[test]
 fn cloud_status_bounds_work_after_filtering() {
-    let mut work =
-        vec![json!({"id":1, "title":"foreign-final", "status":"accepted", "to":"*", "version":1})];
+    let mut work = vec![
+        json!({"id":"BT-1", "title":"foreign-final", "status":"accepted", "to":"*", "version":1}),
+    ];
     work.extend((2..17).map(|id| {
-        json!({"id":id, "title":format!("work-{id}"),
+        json!({"id":format!("BT-{id}"), "title":format!("work-{id}"),
         "status":"offered", "to":"alice", "version":1})
     }));
     let status: Value = serde_json::from_str(&cloud_status(json!([]), json!(work), true)).unwrap();
     let work = status["work"].as_array().unwrap();
     assert_eq!(work.len(), 10);
-    assert_eq!(work[0]["id"], 2);
-    assert_eq!(work[9]["id"], 11);
+    assert_eq!(work[0]["id"], "BT-2");
+    assert_eq!(work[9]["id"], "BT-11");
 }
 
 #[test]
@@ -898,6 +917,15 @@ fn failed_hook_checks_deny_edits_for_every_client() {
     for failure in ["database", "path"] {
         let dir = project();
         if failure == "database" {
+            // A retained WAL is part of the database and can recover its main file. Break the
+            // entire fixture so the hook still exercises a genuinely unreadable database.
+            for sidecar in ["lockyard.db-wal", "lockyard.db-shm"] {
+                match std::fs::remove_file(dir.path().join(".lockyard").join(sidecar)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("failed to remove corruption-fixture sidecar: {error}"),
+                }
+            }
             std::fs::write(
                 dir.path().join(".lockyard/lockyard.db"),
                 "not a database, not at all",
@@ -1013,7 +1041,8 @@ fn mcp_stdio_initializes_lists_claims_and_reports_conflicts_and_parse_errors() {
             "registry_import",
             "area_list",
             "area_create",
-            "area_update"
+            "area_update",
+            "cloud_protocol"
         ],
         "the default surface is the short one"
     );
@@ -1063,8 +1092,8 @@ fn the_full_tool_surface_is_a_flag_or_an_environment_variable_away() {
         list,
     ));
     assert_eq!(
-        compact, 13,
-        "the compact surface includes the shared access revocation tool"
+        compact, 14,
+        "EP-10 adds discovery to the EP-12 compact surface, including revocation"
     );
     assert!(by_flag > 50, "the full surface keeps every tool: {by_flag}");
     assert_eq!(by_flag, by_env, "the flag and the variable agree");
@@ -1077,7 +1106,7 @@ fn the_full_tool_surface_is_a_flag_or_an_environment_variable_away() {
             &[("LOCKYARD_MCP_TOOLS", "full")],
             list,
         )),
-        13
+        compact
     );
     let bad = mcp_with(dir.path(), "a", &["--tools", "nope"], &[], list);
     assert!(!bad.status.success());

@@ -19,7 +19,8 @@
                 "registry_import",
                 "area_list",
                 "area_create",
-                "area_update"
+                "area_update",
+                "cloud_protocol"
             ]
         );
         let full = listed(Surface::Full, &dir);
@@ -32,7 +33,7 @@
             assert!(full.contains(&name.to_string()), "{name}");
         }
         // A compact description costs the model context on every turn; keep them one line.
-        for tool in compact_tools() {
+        for tool in tools(Surface::Compact) {
             let description = tool["description"].as_str().unwrap();
             assert!(description.len() <= 110, "{description}");
         }
@@ -109,16 +110,20 @@
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|c| c["agent"] == "a")
+                .all(|c| c["session"] == "a")
         );
     }
 
     #[test]
-    fn registry_task_ids_are_strings_and_integer_ids_are_refused() {
+    fn registry_task_ids_are_strings_after_legacy_integer_ingress() {
         let dir = project();
+        call(&dir, "lead", "task_add", json!({"title":"canonical"}));
+        let shown = call(&dir, "lead", "task_show", json!({"id":1}));
+        assert_eq!(shown["isError"], false);
+        assert_eq!(serde_json::from_str::<Value>(text(&shown)).unwrap()["task"]["id"], "D-1");
         let error = call(&dir, "lead", "task_show", json!({"id": 12}));
-        assert!(text(&error).contains("integers are not accepted"));
-        let compact = compact_tools();
+        assert!(text(&error).contains("D-12"));
+        let compact = tools(Surface::Compact);
         let start = compact
             .iter()
             .find(|tool| tool["name"] == "start_work")
@@ -159,7 +164,7 @@
 
     #[test]
     fn compact_handover_schema_allows_implicit_claim_selection() {
-        let definition = compact_tools()
+        let definition = tools(Surface::Compact)
             .into_iter()
             .find(|tool| tool["name"] == "handover")
             .unwrap();
@@ -187,7 +192,7 @@
 
     #[test]
     fn start_work_ttl_schema_names_minutes() {
-        let definition = compact_tools()
+        let definition = tools(Surface::Compact)
             .into_iter()
             .find(|tool| tool["name"] == "start_work")
             .unwrap();
@@ -498,7 +503,7 @@
         assert!(text(&own).contains("own work"));
         let self_cancel = call(&dir, "worker", "task_cancel", json!({"id": "1"}));
         assert_eq!(self_cancel["isError"], true);
-        assert!(text(&self_cancel).contains("only lead can cancel T-1"));
+        assert!(text(&self_cancel).contains("only lead can cancel D-1"));
         let early = call(&dir, "claude", "task_accept", json!({"id": "1"}));
         assert_eq!(early["isError"], true);
         call(
@@ -511,4 +516,15 @@
         assert!(text(&accepted).contains("\"accepted\""));
         let unknown = call(&dir, "lead", "task_list", json!({"status": "nope"}));
         assert_eq!(unknown["isError"], true);
+    }
+
+    #[test]
+    fn mcp_workflow_legacy_ids_are_counted_as_mcp_input() {
+        let dir = project();
+        call(&dir, "lead", "task_add", json!({"title":"metric source"}));
+        let metric = "lockyard_compat_conversions_total{kind=legacy_task_id,source=mcp,protocol=2}";
+        let before = lockyard_compat::counters().get(metric).copied().unwrap_or(0);
+        let response = call(&dir, "worker", "workflow_run", json!({"operation_id":"mcp-source","plan":{"steps":[{"kind":"task_claim","id":1}]}}));
+        assert_eq!(response["isError"], false);
+        assert!(lockyard_compat::counters().get(metric).copied().unwrap_or(0) > before);
     }

@@ -9,6 +9,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Why an operation did not happen.
 #[derive(Debug)]
 pub enum Error {
+    /// A stable cloud or local SDK error, preserving its contract without inventing an HTTP status.
+    Cloud {
+        code: String,
+        status: Option<u16>,
+        details: serde_json::Value,
+        message: String,
+    },
     /// No `.lockyard` directory in this folder or above it.
     NoProject,
     /// The input cannot be used as given.
@@ -46,8 +53,9 @@ impl Error {
     }
 
     /// A stable name for the failure, for `--json` output.
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &str {
         match self {
+            Self::Cloud { code, .. } => code,
             Self::NoProject => "no_project",
             Self::Invalid(_) => "invalid",
             Self::NotFound(_) => "not_found",
@@ -68,6 +76,13 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cloud { code, message, .. } => {
+                if message.is_empty() {
+                    f.write_str(code)
+                } else {
+                    f.write_str(message)
+                }
+            }
             Self::NoProject => write!(
                 f,
                 "no Lockyard project here. Next: run `lockyard init` in the repository root."
@@ -122,7 +137,8 @@ impl fmt::Display for Error {
             Self::Db(error) => write!(
                 f,
                 "database: {error}. Next: ensure no other process holds `.lockyard/lockyard.db` exclusively, \
-                 then retry; if it stays corrupt, restore from backup."
+                 then retry; if it stays corrupt, restore a snapshot created earlier with \
+                 `lockyard db backup <path>`."
             ),
         }
     }

@@ -388,7 +388,7 @@ impl World {
             .as_array()
             .unwrap()
             .iter()
-            .map(|claim| claim["agent"].as_str().unwrap().to_string())
+            .map(|claim| claim["session"].as_str().unwrap().to_string())
             .collect()
     }
 
@@ -573,7 +573,7 @@ fn zones(w: &World) {
         thread::sleep(Duration::from_secs(2));
         w.ly(&two, &["zone", "release", &grant]).ok();
         let claim = waiter.join().unwrap().ok();
-        assert_eq!(claim["agent"], json!(third.name));
+        assert_eq!(claim["session"], json!(third.name));
         w.ly(&third, &["zone", "release", &w.id(&claim)]).ok();
     });
 
@@ -592,7 +592,7 @@ fn handover_and_takeover(w: &World, one: &Who, two: &Who) {
     )
     .ok();
     let taken = w.ly(two, &["zone", "accept", &id]).ok();
-    assert_eq!(taken["agent"], json!(two.name));
+    assert_eq!(taken["session"], json!(two.name));
     assert_eq!(taken["return_to"], json!(one.name));
     assert!(taken["fence"].as_i64() > claim["fence"].as_i64());
     w.ly(one, &["zone", "renew", &id]).refused(1, "holder");
@@ -615,7 +615,7 @@ fn handover_and_takeover(w: &World, one: &Who, two: &Who) {
     let taken = w
         .ly(&lead, &["zone", "takeover", &id, "--reason", "stuck"])
         .ok();
-    assert_eq!(taken["agent"], json!(lead.name));
+    assert_eq!(taken["session"], json!(lead.name));
     let lost = w.ly(&gone, &["zone", "lost"]).ok();
     assert_eq!(lost[0]["claim_id"].to_string(), id);
     assert_eq!(lost[0]["reason"], "stuck");
@@ -1428,7 +1428,7 @@ fn outage(w: &World) {
     let rows = live.as_array().unwrap();
     let row = rows
         .iter()
-        .find(|row| row["agent"] == json!(one.name))
+        .find(|row| row["session"] == json!(one.name))
         .expect("the heartbeat");
     assert_eq!(row["client"], json!(tag));
     assert!(row["version"].is_string(), "{row}");
@@ -1699,7 +1699,7 @@ fn mcp(w: &World) {
         live.as_array()
             .unwrap()
             .iter()
-            .any(|row| row["agent"] == json!(one.name))
+            .any(|row| row["session"] == json!(one.name))
     );
     assert!(
         a.ok("who", json!({}))
@@ -1766,7 +1766,7 @@ fn mcp(w: &World) {
     b.ok("zone_dirty_disown", json!({"paths": [file]}));
     a.ok("zone_handover", json!({"id": id, "to": two.name}));
     assert_eq!(
-        b.ok("zone_accept", json!({"id": id}))["agent"],
+        b.ok("zone_accept", json!({"id": id}))["session"],
         json!(two.name)
     );
     assert_eq!(
@@ -1775,7 +1775,7 @@ fn mcp(w: &World) {
     );
     assert_eq!(a.ok("zone_release", json!({}))["released"], 1);
     let waited = a.ok("zone_wait", json!({"paths": [path], "seconds": 5}));
-    assert_eq!(waited["agent"], json!(one.name));
+    assert_eq!(waited["session"], json!(one.name));
     b.refused(
         "zone_takeover",
         json!({"id": waited["id"], "reason": "r"}),
@@ -1788,7 +1788,7 @@ fn mcp(w: &World) {
     );
     a.ok("presence_beat", json!({"state": "ended"}));
     let taken = l.ok("zone_takeover", json!({"id": waited["id"], "reason": "r"}));
-    assert_eq!(taken["agent"], json!(lead.name));
+    assert_eq!(taken["session"], json!(lead.name));
     assert_eq!(a.ok("zone_lost", json!({}))[0]["reason"], "r");
     l.ok("zone_release", json!({}));
     a.ok("presence_beat", json!({"state": "working"}));

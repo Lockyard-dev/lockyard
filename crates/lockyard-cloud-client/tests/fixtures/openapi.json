@@ -2044,124 +2044,700 @@
         "tags": [
           "Lockyard.Api"
         ],
+        "description": "Protocol 2 typed catalog. Read roles: agent, lead, owner, importer. Protocol 1 legacy/off behavior remains a separate compatibility projection.",
+        "parameters": [
+          {
+            "name": "Lockyard-Protocol",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "enum": [
+                2
+              ]
+            }
+          },
+          {
+            "name": "X-Lockyard-Session",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Lockyard-Repository",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:-|[a-z0-9][a-z0-9._-]{0,63})$"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "OK",
+            "description": "Authenticated typed catalog envelope.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/JsonElement"
+                  "$ref": "#/components/schemas/CoordinationZoneCatalog"
                 }
               }
             }
           },
           "400": {
-            "description": "Bad Request",
-            "content": {
-              "application/json": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinationApiError"
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
                 }
               }
             }
           },
           "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinationApiError"
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
                 }
               }
             }
           },
           "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinationApiError"
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
                 }
               }
-            }
-          },
-          "404": {
-            "description": "Not Found",
+            },
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinationApiError"
+                  "$ref": "#/components/schemas/ApiProblem"
                 }
               }
             }
           },
           "409": {
-            "description": "Conflict",
-            "content": {
-              "application/json": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinationApiError"
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
                 }
               }
-            }
-          },
-          "412": {
-            "description": "Precondition Failed",
+            },
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinationApiError"
+                  "$ref": "#/components/schemas/ApiProblem"
                 }
               }
             }
           },
           "413": {
-            "description": "Payload Too Large",
-            "content": {
-              "application/json": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinationApiError"
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
                 }
               }
             }
           },
           "422": {
-            "description": "Unprocessable Entity",
-            "content": {
-              "application/json": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinationApiError"
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
                 }
               }
             }
           },
           "429": {
-            "description": "Too Many Requests",
-            "content": {
-              "application/json": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinationApiError"
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
                 }
               }
-            }
-          },
-          "500": {
-            "description": "Internal Server Error",
+            },
             "content": {
-              "application/json": {
+              "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinationApiError"
+                  "$ref": "#/components/schemas/ApiProblem"
                 }
               }
             }
           },
           "503": {
-            "description": "Service Unavailable",
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Lockyard.Api"
+        ],
+        "description": "Protocol 2 typed CAS publication. Publisher roles: owner, importer. Candidate revision must equal expected_revision + 1.",
+        "parameters": [
+          {
+            "name": "Lockyard-Protocol",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "enum": [
+                2
+              ]
+            }
+          },
+          {
+            "name": "X-Lockyard-Session",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Lockyard-Repository",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:-|[a-z0-9][a-z0-9._-]{0,63})$"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authenticated typed catalog envelope.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinationApiError"
+                  "$ref": "#/components/schemas/CoordinationZoneCatalog"
                 }
+              }
+            }
+          },
+          "400": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "EP-07/EP-10 stable-code problem.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Typed catalogs are never cached by HTTP intermediaries.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Lockyard-Protocol": {
+                "schema": {
+                  "type": "integer",
+                  "enum": [
+                    2
+                  ]
+                }
+              },
+              "X-Lockyard-Repository": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CoordinationZoneCatalogWrite"
               }
             }
           }
@@ -2189,7 +2765,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinationClaim"
+                  "$ref": "#/components/schemas/CoordinationClaimReceipt"
                 }
               }
             }
@@ -14098,6 +14674,517 @@
         }
       }
     },
+    "/api/v1/revocations": {
+      "post": {
+        "tags": [
+          "Lockyard.Api"
+        ],
+        "operationId": "RevokeAccess",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevocationWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevocationReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Gone",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Lockyard.Api"
+        ],
+        "operationId": "GetRevocations",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "nonce",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevocationDocument"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Gone",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/revocations/key": {
+      "get": {
+        "tags": [
+          "Lockyard.Api"
+        ],
+        "operationId": "GetRevocationKey",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevocationKey"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Gone",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/revocations/events": {
+      "get": {
+        "tags": [
+          "Lockyard.Api"
+        ],
+        "operationId": "WatchRevocations",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Gone",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/registry/items": {
       "post": {
         "tags": [
@@ -19896,6 +20983,50 @@
           }
         }
       },
+      "ApiProblem": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ],
+            "format": "int32"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "instance": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "details": { },
+          "error": {
+            "$ref": "#/components/schemas/ApiProblemError"
+          }
+        }
+      },
+      "ApiProblemError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "details": { }
+        }
+      },
       "AuditEntry": {
         "type": "object",
         "properties": {
@@ -20683,6 +21814,280 @@
               {
                 "$ref": "#/components/schemas/JsonElement"
               }
+            ]
+          }
+        }
+      },
+      "CoordinationClaimReceipt": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/JsonElement"
+          },
+          "session": {
+            "type": "string"
+          },
+          "zone": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "mode": {
+            "type": "string"
+          },
+          "purpose": {
+            "type": "string"
+          },
+          "note": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "meta": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JsonElement"
+              }
+            ]
+          },
+          "fence": {
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "null",
+              "integer",
+              "string"
+            ],
+            "format": "int32"
+          },
+          "expires_at": {
+            "type": [
+              "null",
+              "string"
+            ],
+            "format": "date-time"
+          },
+          "holder_available": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          },
+          "created_at": {
+            "type": [
+              "null",
+              "string"
+            ],
+            "format": "date-time"
+          },
+          "version": {
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "null",
+              "integer",
+              "string"
+            ],
+            "format": "int32"
+          },
+          "actor": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "zones": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "excluded_paths": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "foreign_dirty_paths": {
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "hold_until": {
+            "type": [
+              "null",
+              "string"
+            ],
+            "format": "date-time"
+          },
+          "hold_reason": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "hold_until_ref": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JsonElement"
+              }
+            ]
+          },
+          "last_activity_at": {
+            "type": [
+              "null",
+              "string"
+            ],
+            "format": "date-time"
+          },
+          "last_write_at": {
+            "type": [
+              "null",
+              "string"
+            ],
+            "format": "date-time"
+          },
+          "handover_to": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "handover_from": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "handover_until": {
+            "type": [
+              "null",
+              "string"
+            ],
+            "format": "date-time"
+          },
+          "return_to": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "takeover_reason": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "lazy": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          },
+          "granted_from": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JsonElement"
+              }
+            ]
+          },
+          "queued": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          },
+          "priority_of": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JsonElement"
+              }
+            ]
+          },
+          "conflicts": {
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "ttl_after_action": {
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "null",
+              "integer",
+              "string"
+            ],
+            "format": "int32"
+          },
+          "first_action_until": {
+            "type": [
+              "null",
+              "string"
+            ],
+            "format": "date-time"
+          },
+          "activity_seen": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          },
+          "return_actor": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "on_behalf": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "lead": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "created": {
+            "type": "boolean"
+          },
+          "repository": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "case_insensitive_paths": {
+            "type": [
+              "null",
+              "boolean"
             ]
           }
         }
@@ -22937,6 +24342,47 @@
           },
           "history_truncated": {
             "type": "boolean"
+          },
+          "rate_limit_scope": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "relay_storage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RelayStorageDiagnostics"
+              }
+            ]
+          },
+          "revocations_enforced": {
+            "type": "boolean"
+          },
+          "revocation_epoch": {
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ],
+            "format": "int64"
+          },
+          "revocation_auth_cache_age_seconds": {
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ],
+            "format": "int32"
+          },
+          "revocation_signer_key_id": {
+            "type": [
+              "null",
+              "string"
+            ]
           }
         }
       },
@@ -25238,6 +26684,131 @@
           }
         }
       },
+      "RelayStorageDiagnostics": {
+        "type": "object",
+        "properties": {
+          "payloadBytes": {
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ],
+            "format": "int64"
+          },
+          "dedupBytes": {
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ],
+            "format": "int64"
+          },
+          "rejectedCount": {
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ],
+            "format": "int64"
+          },
+          "lastRejectedAt": {
+            "type": [
+              "null",
+              "string"
+            ],
+            "format": "date-time"
+          },
+          "workspaceLimitBytes": {
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ],
+            "format": "int64"
+          },
+          "globalLimitBytes": {
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ],
+            "format": "int64"
+          }
+        }
+      },
+      "RevocationDocument": {
+        "type": "object",
+        "properties": {
+          "version": {
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ],
+            "format": "int32"
+          },
+          "algorithm": {
+            "type": "string"
+          },
+          "key_id": {
+            "type": "string"
+          },
+          "payload": {
+            "type": "string"
+          },
+          "signature": {
+            "type": "string"
+          }
+        }
+      },
+      "RevocationKey": {
+        "type": "object",
+        "properties": {
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "key_id": {
+            "type": "string"
+          },
+          "algorithm": {
+            "type": "string"
+          },
+          "public_key": {
+            "type": "string"
+          }
+        }
+      },
+      "RevocationReceipt": {
+        "type": "object",
+        "properties": {
+          "epoch": {
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ],
+            "format": "int64"
+          },
+          "already_revoked": {
+            "type": "boolean"
+          },
+          "document": {
+            "$ref": "#/components/schemas/RevocationDocument"
+          }
+        }
+      },
+      "RevocationWrite": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "$ref": "#/components/schemas/JsonElement"
+          },
+          "reason_code": {
+            "type": "string"
+          }
+        }
+      },
       "WorkspaceEncryption": {
         "type": "object",
         "properties": {
@@ -25266,6 +26837,88 @@
               "null",
               "string"
             ]
+          }
+        }
+      },
+      "CoordinationZoneCatalog": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "format",
+          "workspace_id",
+          "repository",
+          "revision",
+          "key_id",
+          "case_insensitive_paths",
+          "content_sha256",
+          "content",
+          "metadata_hmac"
+        ],
+        "properties": {
+          "format": {
+            "type": "string",
+            "const": "lockyard.zone_catalog.v1"
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "repository": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^(?:[a-z0-9][a-z0-9._-]{0,63})?$"
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "key_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9_-]+$"
+          },
+          "case_insensitive_paths": {
+            "type": "boolean"
+          },
+          "content_sha256": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "content": {
+            "type": "string",
+            "maxLength": 737280,
+            "pattern": "^lyenc1\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$"
+          },
+          "metadata_hmac": {
+            "type": "string",
+            "minLength": 43,
+            "maxLength": 43,
+            "pattern": "^[A-Za-z0-9_-]{43}$"
+          }
+        }
+      },
+      "CoordinationZoneCatalogWrite": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "expected_revision",
+          "catalog"
+        ],
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9007199254740990
+          },
+          "catalog": {
+            "$ref": "#/components/schemas/CoordinationZoneCatalog"
           }
         }
       }

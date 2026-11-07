@@ -8,6 +8,43 @@ pub(super) fn run_task(
     agent: Option<&String>,
 ) -> Result<Output> {
     let now = now_ms();
+    let mut command = command;
+    if !opened.backend.is_cloud() {
+        let canonicalize = |id: &mut String| -> Result<()> {
+            *id = lockyard_compat::LegacyCompatibilityV1::task_id(
+                &json!(id),
+                lockyard_compat::TaskDomain::LegacyLocal,
+                lockyard_compat::Source::Cli,
+                2,
+            )
+            .map_err(|code| Error::Cloud {
+                code,
+                status: None,
+                details: Value::Null,
+                message: "invalid local task id".into(),
+            })?;
+            Ok(())
+        };
+        match &mut command {
+            TaskCommand::WhyBlocked { id }
+            | TaskCommand::Links { id }
+            | TaskCommand::Show { id }
+            | TaskCommand::Plan { id, .. }
+            | TaskCommand::Claim { id, .. }
+            | TaskCommand::Renew { id, .. }
+            | TaskCommand::Release { id, .. }
+            | TaskCommand::Submit { id, .. }
+            | TaskCommand::Review { id, .. }
+            | TaskCommand::Accept { id, .. }
+            | TaskCommand::Reject { id, .. }
+            | TaskCommand::Cancel { id, .. } => canonicalize(id)?,
+            TaskCommand::Link { id, to, .. } => {
+                canonicalize(id)?;
+                canonicalize(to)?;
+            }
+            _ => {}
+        }
+    }
     let store = opened.backend.as_mut();
     let changed = match command {
         TaskCommand::Ready {
@@ -235,18 +272,18 @@ pub(super) fn run_work(
             return output(&tasks, text);
         }
         WorkCommand::Show { id } => {
-            let task = backend.work_get(&agent, id)?;
+            let task = backend.work_get(&agent, &id)?;
             return output(&task, work_line(&task));
         }
-        WorkCommand::Claim(task) => (task.id, WorkAction::Claim, work_step(&task)),
-        WorkCommand::Beat(task) => (task.id, WorkAction::Beat, work_step(&task)),
-        WorkCommand::Accept(task) => (task.id, WorkAction::Accept, work_step(&task)),
+        WorkCommand::Claim(task) => (task.id.clone(), WorkAction::Claim, work_step(&task)),
+        WorkCommand::Beat(task) => (task.id.clone(), WorkAction::Beat, work_step(&task)),
+        WorkCommand::Accept(task) => (task.id.clone(), WorkAction::Accept, work_step(&task)),
         WorkCommand::Done {
             task,
             report,
             commits,
         } => (
-            task.id,
+            task.id.clone(),
             WorkAction::Done,
             WorkStep {
                 report,
@@ -255,7 +292,7 @@ pub(super) fn run_work(
             },
         ),
         WorkCommand::Reject { task, reason } => (
-            task.id,
+            task.id.clone(),
             WorkAction::Reject,
             WorkStep {
                 reason,
@@ -263,7 +300,7 @@ pub(super) fn run_work(
             },
         ),
         WorkCommand::Fail { task, reason } => (
-            task.id,
+            task.id.clone(),
             WorkAction::Fail,
             WorkStep {
                 reason,
@@ -271,7 +308,7 @@ pub(super) fn run_work(
             },
         ),
         WorkCommand::Cancel { task, reason } => (
-            task.id,
+            task.id.clone(),
             WorkAction::Cancel,
             WorkStep {
                 reason,
@@ -279,7 +316,7 @@ pub(super) fn run_work(
             },
         ),
         WorkCommand::Decline { task, reason } => (
-            task.id,
+            task.id.clone(),
             WorkAction::Decline,
             WorkStep {
                 reason,
@@ -292,7 +329,7 @@ pub(super) fn run_work(
             report,
             commits,
         } => (
-            task.id,
+            task.id.clone(),
             WorkAction::Handoff,
             WorkStep {
                 to: Some(to),
@@ -310,6 +347,6 @@ pub(super) fn run_work(
             },
         ),
     };
-    let task = backend.work_step(&agent, id, action, &step)?;
+    let task = backend.work_step(&agent, &id, action, &step)?;
     output(&task, work_line(&task))
 }

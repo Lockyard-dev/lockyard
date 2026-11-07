@@ -643,12 +643,25 @@ pub fn node(command: NodeCommand) -> Result<Value> {
             Ok(json!({"config":destination,"key_id":key_id,"restart_required":true}))
         }
         NodeCommand::Serve { config } => {
+            let _shutdown = crate::shutdown::Guard::new(&std::env::current_dir()?)?;
             let config = config_path(config)?;
             let config = host::NodeConfig::load(&config)
                 .map_err(|_| invalid("invalid node configuration"))?;
-            runtime()?
-                .block_on(host::serve(config))
-                .map_err(|_| invalid("node service failed"))?;
+            // Cancellation drops the host future and aborts its background tasks. Runtime
+            // shutdown then joins runtime workers before the outer checkpoint guard drops.
+            let runtime = runtime()?;
+            let outcome = runtime.block_on(async {
+                tokio::select! {
+                    outcome = host::serve(config) => outcome,
+                    _ = async {
+                        while !crate::shutdown::requested() {
+                            tokio::time::sleep(crate::shutdown::POLL_INTERVAL).await;
+                        }
+                    } => Ok(()),
+                }
+            });
+            drop(runtime);
+            outcome.map_err(|_| invalid("node service failed"))?;
             Ok(json!({"stopped":true}))
         }
         NodeCommand::Status { config } => {

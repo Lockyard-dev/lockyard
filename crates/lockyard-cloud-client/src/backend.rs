@@ -39,31 +39,67 @@ const DEFAULT_KIND: &str = "ask";
 /// `who` lists sessions seen in this window, the time mail is kept.
 const WHO_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 
-/// Reads a list from a bare array or from the first named field that holds one.
+fn compatibility_error(error: String) -> ClientError {
+    if matches!(
+        error.as_str(),
+        "invalid_task_id"
+            | "invalid_request"
+            | "legacy_input_removed"
+            | "legacy_task_id_unrepresentable"
+    ) {
+        crate::protocol::local(&error, "wire compatibility input rejected")
+    } else {
+        ClientError::Decode(error)
+    }
+}
+
+/// Reads only the endpoint-selected list wrappers, then projects its known DTO schema.
 pub fn list<T: DeserializeOwned>(
     value: Value,
     names: &[&str],
 ) -> std::result::Result<Vec<T>, ClientError> {
-    let items = match value {
-        Value::Array(_) => value,
-        Value::Null => Value::Array(Vec::new()),
-        other => names
-            .iter()
-            .find_map(|name| other.get(*name).filter(|field| field.is_array()).cloned())
-            .ok_or_else(|| {
-                ClientError::Decode(format!("expected a list under {names:?}, got {other}"))
-            })?,
-    };
-    serde_json::from_value(items).map_err(|error| ClientError::Decode(error.to_string()))
+    let items = lockyard_compat::LegacyCompatibilityV1::wire_list(
+        value,
+        names,
+        lockyard_compat::Source::Sdk,
+        2,
+    )
+    .map_err(compatibility_error)?;
+    let records = items
+        .as_array()
+        .expect("wire_list returns array")
+        .iter()
+        .map(|value| {
+            lockyard_compat::LegacyCompatibilityV1::wire_schema(
+                value.clone(),
+                std::any::type_name::<T>(),
+                lockyard_compat::Source::Sdk,
+                2,
+            )
+            .map_err(compatibility_error)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    serde_json::from_value(Value::Array(records))
+        .map_err(|error| ClientError::Decode(error.to_string()))
 }
 
-/// Reads one record, bare or under `name`.
+/// Reads only this record wrapper and schema; no field aliases live in domain serde models.
 pub fn one<T: DeserializeOwned>(value: Value, name: &str) -> std::result::Result<T, ClientError> {
-    let record = match value.get(name) {
-        Some(inner) if inner.is_object() => inner.clone(),
-        _ => value,
-    };
-    serde_json::from_value(record).map_err(|error| ClientError::Decode(error.to_string()))
+    let record = lockyard_compat::LegacyCompatibilityV1::wire_record(
+        value,
+        name,
+        lockyard_compat::Source::Sdk,
+        2,
+    )
+    .map_err(compatibility_error)?;
+    let canonical = lockyard_compat::LegacyCompatibilityV1::wire_schema(
+        record,
+        std::any::type_name::<T>(),
+        lockyard_compat::Source::Sdk,
+        2,
+    )
+    .map_err(compatibility_error)?;
+    serde_json::from_value(canonical).map_err(|error| ClientError::Decode(error.to_string()))
 }
 
 /// Reads the answer of `zones/check`: for each path, free, own, or the holder.
@@ -141,7 +177,7 @@ impl<T: Transport> CloudBackend<T> {
     }
 
     fn item(&self, session: &str, id: &str) -> Result<Value> {
-        self.get(session, format!("{ITEMS}/{}", item_id(id)))
+        self.get(session, format!("{ITEMS}/{}", id))
     }
 
     /// Tells the server how far a message got, for the sender's `lockyard msg sent`.
@@ -185,7 +221,7 @@ impl<T: Transport> CloudBackend<T> {
         item: &Value,
     ) -> Result<Value> {
         body["expected_version"] = item["version"].clone();
-        let route = format!("{ITEMS}/{}/{operation}", item_id(id));
+        let route = format!("{ITEMS}/{}/{operation}", id);
         self.post(agent, route, &body)
     }
 
@@ -339,17 +375,19 @@ fn message(value: Value) -> Result<Message> {
     Ok(one(value, "message")?)
 }
 
-fn item_id(id: &str) -> String {
-    // Legacy cloud callers can still use a bare D- item number. Area-prefixed IDs
-    // remain authoritative and retain every prefix component and padding digit.
-    if !id.is_empty()
-        && id.bytes().all(|byte| byte.is_ascii_digit())
-        && let Ok(number) = id.parse::<i64>()
-    {
-        format!("D-{number}")
-    } else {
-        id.to_string()
-    }
+fn canonical_sdk_task(raw: &str) -> Result<String> {
+    lockyard_compat::LegacyCompatibilityV1::task_id(
+        &json!(raw),
+        lockyard_compat::TaskDomain::Registry,
+        lockyard_compat::Source::Sdk,
+        2,
+    )
+    .map_err(|code| Error::Cloud {
+        code: code.clone(),
+        status: None,
+        details: Value::Null,
+        message: code,
+    })
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -548,19 +586,7 @@ fn stage_rank(stage: Option<&str>) -> u8 {
 /// A backlog item in the shape of a task. Open covers `ready`, `blocked` and `intake`.
 fn task_from(item: &Value) -> Result<tasks::Task> {
     let id = text(item, "id");
-    let valid_id = id.rsplit_once('-').is_some_and(|(prefix, number)| {
-        !prefix.is_empty()
-            && prefix.split('-').all(|part| {
-                let mut chars = part.chars();
-                chars.next().is_some_and(|ch| ch.is_ascii_uppercase())
-                    && chars.all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
-            })
-            && !number.is_empty()
-            && number.bytes().all(|byte| byte.is_ascii_digit())
-    });
-    if !valid_id {
-        return Err(Error::Protocol(format!("{id:?} is not a backlog id")));
-    }
+    lockyard_core::task_id::TaskId::parse(id)?;
     let assignment = item.get("assignment").filter(|found| found.is_object());
     let evidence: Vec<&str> = item
         .get("evidence")
@@ -570,7 +596,7 @@ fn task_from(item: &Value) -> Result<tasks::Task> {
         .map(|entry| text(entry, "value"))
         .collect();
     Ok(tasks::Task {
-        id: id.to_string(),
+        id: lockyard_core::task_id::TaskId::parse(id)?,
         title: text(item, "title").to_string(),
         body: text(item, "body").to_string(),
         status: task_status(text(item, "status")),
@@ -621,29 +647,12 @@ impl<T: Transport> Backend for CloudBackend<T> {
     fn registry_ready(&self, query: &Value) -> Result<Value> {
         crate::registry::search(self, query, true)
     }
-    fn registry_item(&self, id: i64) -> Result<Value> {
-        crate::registry::item(self, id, false)
-    }
-    fn registry_blockers(&self, id: i64) -> Result<Value> {
-        crate::registry::item(self, id, true)
-    }
+
     fn registry_item_by_id(&self, id: &str) -> Result<Value> {
         crate::registry::item_by_id(self, id, false)
     }
     fn registry_blockers_by_id(&self, id: &str) -> Result<Value> {
         crate::registry::item_by_id(self, id, true)
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn registry_link(
-        &mut self,
-        agent: &str,
-        id: i64,
-        to: i64,
-        kind: &str,
-        version: i64,
-        key: &str,
-    ) -> Result<Value> {
-        crate::registry::link(self, agent, id, to, kind, version, key)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -950,6 +959,47 @@ impl<T: Transport> Backend for CloudBackend<T> {
         self.get(&self.session, "/api/v1/zones/catalog".into())
     }
 
+    fn catalog_expand(&self, names: &[String]) -> Result<Vec<String>> {
+        Ok(self.transport.catalog_expand(
+            &Call::get(&self.session, "/api/v1/zones/catalog".into()),
+            names,
+        )?)
+    }
+    fn catalog_put(
+        &mut self,
+        agent: &str,
+        catalog: &Value,
+        expected_revision: u64,
+        key: &str,
+    ) -> Result<Value> {
+        let plaintext = lockyard_core::catalog::ZoneCatalogV1::from_json(&catalog.to_string())
+            .map_err(|e| Error::Cloud {
+                code: e.code().into(),
+                status: None,
+                details: Value::Null,
+                message: e.to_string(),
+            })?;
+        let mut call = Call::write(
+            agent,
+            "POST",
+            "/api/v1/zones/catalog".into(),
+            json!({"catalog":plaintext,"expected_revision":expected_revision}),
+        );
+        call.key = Some(key.into());
+        Ok(self.transport.call(&call)?)
+    }
+    fn cloud_protocol(&self) -> Result<Value> {
+        self.get(&self.session, "/api/v1/protocol".into())
+    }
+    fn cloud_drain(&mut self, agent: &str, request: &Value, key: &str) -> Result<Value> {
+        let mut call = Call::write(agent, "POST", "/api/v1/admin/drain".into(), request.clone());
+        call.key = Some(key.into());
+        Ok(self.transport.call(&call)?)
+    }
+    fn cloud_drain_status(&self, id: &str) -> Result<Value> {
+        self.get(&self.session, format!("/api/v1/admin/drain/{}", encode(id)))
+    }
+
     fn send(&mut self, agent: &str, request: &SendRequest, _now: i64) -> Result<Message> {
         let mut request = request.clone();
         request.kind.get_or_insert_with(|| DEFAULT_KIND.to_string());
@@ -1105,17 +1155,23 @@ impl<T: Transport> Backend for CloudBackend<T> {
         reason: &str,
         _now: i64,
     ) -> Result<tasks::Task> {
+        let canonical = canonical_sdk_task(id)?;
+        let id = canonical.as_str();
         let item = self.item(agent, id)?;
         let body = json!({"to": if blocked {"blocked"} else {"ready"}, "reason": reason_or(reason, if blocked {"blocked"} else {"unblocked"})});
         self.item_step(agent, id, "transition", body, &item)
     }
 
     fn task(&self, id: &str) -> Result<tasks::Task> {
+        let canonical = canonical_sdk_task(id)?;
+        let id = canonical.as_str();
         task_from(&self.item(&self.session, id)?)
     }
 
     fn task_history(&self, id: &str) -> Result<Vec<tasks::TaskEvent>> {
-        let value = self.get(&self.session, format!("{ITEMS}/{}/history", item_id(id)))?;
+        let canonical = canonical_sdk_task(id)?;
+        let id = canonical.as_str();
+        let value = self.get(&self.session, format!("{ITEMS}/{}/history", id))?;
         let rows: Vec<Value> = list(value, &["events", "items"])?;
         Ok(rows
             .iter()
@@ -1172,6 +1228,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
     }
 
     fn plan_task(&mut self, agent: &str, id: &str, plan: &tasks::TaskPlan) -> Result<tasks::Task> {
+        let canonical = canonical_sdk_task(id)?;
+        let id = canonical.as_str();
         let item = self.item(agent, id)?;
         let body = json!({
             "priority": plan.priority.as_deref().map_or(item["priority"].clone(), |p| json!(p)),
@@ -1181,25 +1239,15 @@ impl<T: Transport> Backend for CloudBackend<T> {
             "revisit_on": item["revisit_on"],
             "expected_version": item["version"],
         });
-        task_from(&self.post(agent, format!("{ITEMS}/{}/plan", item_id(id)), &body)?)
+        task_from(&self.post(agent, format!("{ITEMS}/{}/plan", id), &body)?)
     }
 
     /// The registry leases an item for two hours, so `ttl` has no meaning here.
     fn claim_task(&mut self, agent: &str, id: &str, _ttl: i64, _now: i64) -> Result<tasks::Task> {
+        let canonical = canonical_sdk_task(id)?;
+        let id = canonical.as_str();
         let item = self.item(agent, id)?;
         self.item_step(agent, id, "claim", json!({"session": agent}), &item)
-    }
-
-    fn claim_task_receipt(&mut self, agent: &str, id: i64, ttl: i64, now: i64) -> Result<Value> {
-        // Retain the numeric JSON identity used by the original workflow protocol.
-        let mut result = self.claim_task_receipt_by_id(agent, &format!("D-{id}"), ttl, now)?;
-        let task_id = result["id"].as_str().unwrap_or_default();
-        let number = task_id
-            .strip_prefix("D-")
-            .and_then(|digits| digits.parse::<i64>().ok())
-            .ok_or_else(|| Error::Protocol(format!("{task_id:?} is not a legacy backlog id")))?;
-        result["id"] = json!(number);
-        Ok(result)
     }
 
     fn claim_task_receipt_by_id(
@@ -1209,6 +1257,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
         _ttl: i64,
         _now: i64,
     ) -> Result<Value> {
+        let canonical = canonical_sdk_task(id)?;
+        let id = canonical.as_str();
         let item = self.item(agent, id)?;
         let claimed =
             self.item_step_response(agent, id, "claim", json!({"session": agent}), &item)?;
@@ -1222,6 +1272,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
     }
 
     fn renew_task(&mut self, agent: &str, id: &str, _ttl: i64, _now: i64) -> Result<tasks::Task> {
+        let canonical = canonical_sdk_task(id)?;
+        let id = canonical.as_str();
         let item = self.item(agent, id)?;
         self.item_step(agent, id, "heartbeat", json!({}), &item)
     }
@@ -1233,6 +1285,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
         _note: &str,
         _now: i64,
     ) -> Result<tasks::Task> {
+        let canonical = canonical_sdk_task(id)?;
+        let id = canonical.as_str();
         let item = self.item(agent, id)?;
         self.item_step(agent, id, "release", json!({}), &item)
     }
@@ -1244,6 +1298,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
         evidence: &str,
         now: i64,
     ) -> Result<tasks::Task> {
+        let canonical = canonical_sdk_task(id)?;
+        let id = canonical.as_str();
         validate_evidence(&[evidence.to_string()])?;
         let item = self.item(agent, id)?;
         let target = item["target"].as_str().unwrap_or(DEFAULT_TARGET);
@@ -1257,6 +1313,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
     }
 
     fn accept_task(&mut self, agent: &str, id: &str, note: &str, _now: i64) -> Result<tasks::Task> {
+        let canonical = canonical_sdk_task(id)?;
+        let id = canonical.as_str();
         let item = self.item(agent, id)?;
         let body =
             json!({"to": "done", "resolution": "completed", "reason": reason_or(note, "accepted")});
@@ -1271,6 +1329,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
         reason: &str,
         _now: i64,
     ) -> Result<tasks::Task> {
+        let canonical = canonical_sdk_task(id)?;
+        let id = canonical.as_str();
         let item = self.item(agent, id)?;
         let body = json!({"decision": decision, "reason": reason});
         self.item_step(agent, id, "review", body, &item)
@@ -1284,6 +1344,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
         evidence: &str,
         now: i64,
     ) -> Result<tasks::Task> {
+        let canonical = canonical_sdk_task(id)?;
+        let id = canonical.as_str();
         let item = self.item(agent, id)?;
         let mut body = json!({"to": "ready", "reason": reason_or(reason, "rejected")});
         if item["status"].as_str() == Some("done") {
@@ -1300,6 +1362,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
     }
 
     fn cancel_task(&mut self, agent: &str, id: &str, note: &str, _now: i64) -> Result<tasks::Task> {
+        let canonical = canonical_sdk_task(id)?;
+        let id = canonical.as_str();
         let item = self.item(agent, id)?;
         let body = json!({
             "to": "cancelled",
@@ -1401,7 +1465,12 @@ impl<T: Transport> Backend for CloudBackend<T> {
             &json!({}),
         ) {
             Ok(_) => Ok(true),
-            Err(Error::NotFound(_)) => Ok(false),
+            Err(
+                Error::NotFound(_)
+                | Error::Cloud {
+                    status: Some(404), ..
+                },
+            ) => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -1422,7 +1491,15 @@ impl<T: Transport> Backend for CloudBackend<T> {
         Ok(list(value, &["tasks", "items"])?)
     }
 
-    fn work_get(&self, agent: &str, id: i64) -> Result<WorkTask> {
+    fn work_get(&self, agent: &str, id: &str) -> Result<WorkTask> {
+        let canonical = lockyard_compat::LegacyCompatibilityV1::task_id(
+            &json!(id),
+            lockyard_compat::TaskDomain::Bus,
+            lockyard_compat::Source::Sdk,
+            2,
+        )
+        .map_err(compatibility_error)?;
+        let id = canonical.as_str();
         let value = self.get(agent, format!("/api/v1/bus/tasks/{id}"))?;
         Ok(one(value, "task")?)
     }
@@ -1430,10 +1507,18 @@ impl<T: Transport> Backend for CloudBackend<T> {
     fn work_step(
         &mut self,
         agent: &str,
-        id: i64,
+        id: &str,
         action: WorkAction,
         step: &WorkStep,
     ) -> Result<WorkTask> {
+        let canonical = lockyard_compat::LegacyCompatibilityV1::task_id(
+            &json!(id),
+            lockyard_compat::TaskDomain::Bus,
+            lockyard_compat::Source::Sdk,
+            2,
+        )
+        .map_err(compatibility_error)?;
+        let id = canonical.as_str();
         if action == WorkAction::Take && step.version.is_none() {
             return Err(Error::Invalid("take needs the task's version".into()));
         }
@@ -1617,6 +1702,43 @@ mod tests {
     use crate::fake::{FakeServer, Reply, Seen};
     use lockyard_core::proto::{ClaimMode, Purpose, SessionActivity, SessionState, WorkStatus};
     use std::collections::HashSet;
+
+    #[test]
+    fn legacy_nested_and_bare_task_fields_are_normalized_once() {
+        for wire in [
+            json!([{"path":"a","task_id":12}]),
+            json!({"paths":[{"path":"a","task_id":12}]}),
+        ] {
+            let paths: Vec<DirtyPath> = list(wire, &["paths", "dirty", "items"]).unwrap();
+            assert_eq!(paths[0].task_id.as_ref().unwrap().as_str(), "D-12");
+        }
+        let claim: Claim = one(
+            json!({"id":1,"session":"me","foreign_dirty_paths":[{"path":"a","task_id":12}]}),
+            "claim",
+        )
+        .unwrap();
+        assert_eq!(
+            claim.foreign_dirty_paths[0]
+                .task_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "D-12"
+        );
+        let work: Vec<WorkTask> =
+            list(json!([{"id":12,"status":"offered"}]), &["tasks", "items"]).unwrap();
+        assert_eq!(work[0].id.as_str(), "BT-12");
+    }
+
+    #[test]
+    fn session_wire_aliases_are_canonicalized_at_one_boundary() {
+        let claim: Claim = one(json!({"id":1,"agent":"me"}), "claim").unwrap();
+        assert_eq!(serde_json::to_value(claim).unwrap()["session"], "me");
+        let queue: QueueEntry = one(json!({"id":1,"agent":"me"}), "entry").unwrap();
+        assert_eq!(serde_json::to_value(queue).unwrap()["session"], "me");
+        let presence: Presence = one(json!({"agent":"me"}), "presence").unwrap();
+        assert_eq!(serde_json::to_value(presence).unwrap()["session"], "me");
+    }
 
     fn backend(script: Vec<Value>) -> (FakeServer, CloudBackend<Client>) {
         let replies = script
@@ -2122,7 +2244,7 @@ mod tests {
             path: "a".into(),
             owner_session: Some("bob".into()),
             reason: None,
-            task_id: Some(2),
+            task_id: Some(lockyard_core::task_id::TaskId::parse("D-2").unwrap()),
         };
         cloud
             .dirty_report("me", std::slice::from_ref(&report))
@@ -2321,7 +2443,10 @@ mod tests {
 
     #[test]
     fn removing_an_absent_board_key_reads_as_false() {
-        let server = FakeServer::start(vec![Reply::json(404, json!({"error": {"message": "no"}}))]);
+        let server = FakeServer::start(vec![Reply::json(
+            404,
+            json!({"error": {"code":"not_found", "message": "no"}}),
+        )]);
         let client = Client::new(&server.url(), "t".into()).unwrap();
         assert!(
             !CloudBackend::new(client, "me")
@@ -2381,18 +2506,18 @@ mod tests {
                     Vec::new()
                 },
             };
-            cloud.work_step("me", 6, action, &step).unwrap();
+            cloud.work_step("me", "BT-6", action, &step).unwrap();
             let tail = if action == WorkAction::Take {
                 "?version=4"
             } else {
                 ""
             };
-            routes.push(format!("/api/v1/bus/tasks/6/{}{tail}", action.as_str()));
+            routes.push(format!("/api/v1/bus/tasks/BT-6/{}{tail}", action.as_str()));
         }
         assert_eq!(cloud.work_list("me").unwrap().len(), 1);
-        assert_eq!(cloud.work_get("me", 6).unwrap().title, "t");
+        assert_eq!(cloud.work_get("me", "BT-6").unwrap().title, "t");
         routes.push("/api/v1/bus/tasks".into());
-        routes.push("/api/v1/bus/tasks/6".into());
+        routes.push("/api/v1/bus/tasks/BT-6".into());
         let expected: Vec<(&str, &str)> = routes
             .iter()
             .enumerate()
@@ -2418,7 +2543,7 @@ mod tests {
         let (server, mut cloud) = backend(vec![]);
         assert!(
             cloud
-                .work_step("me", 1, WorkAction::Take, &WorkStep::default())
+                .work_step("me", "BT-1", WorkAction::Take, &WorkStep::default())
                 .is_err()
         );
         assert!(server.requests().is_empty());
@@ -2426,8 +2551,7 @@ mod tests {
 
     #[test]
     fn a_stale_version_is_a_conflict_that_names_it() {
-        let body =
-            json!({"error": {"code": "conflict", "message": "stale", "details": {"version": 9}}});
+        let body = json!({"error": {"code": "version_conflict", "message": "stale", "details": {"version": 9}}});
         let server = FakeServer::start(vec![Reply::json(409, body)]);
         let client = Client::new(&server.url(), "t".into()).unwrap();
         let mut cloud = CloudBackend::new(client, "me");
@@ -2436,9 +2560,11 @@ mod tests {
             ..WorkStep::default()
         };
         let error = cloud
-            .work_step("me", 1, WorkAction::Claim, &step)
+            .work_step("me", "BT-1", WorkAction::Claim, &step)
             .unwrap_err();
-        assert!(matches!(&error, Error::Contended(text) if text.contains("version 9")));
+        assert!(
+            matches!(&error, Error::Cloud { code,status:Some(409),message,.. } if code=="version_conflict" && message.contains("version 9"))
+        );
     }
 
     #[test]
@@ -2683,8 +2809,8 @@ mod tests {
         });
         let assignment = claimed["assignment"].clone();
         let (server, mut cloud) = backend(vec![before, claimed]);
-        let receipt = cloud.claim_task_receipt("me", 12, 60, 0).unwrap();
-        assert_eq!(receipt["id"], 12);
+        let receipt = cloud.claim_task_receipt_by_id("me", "D-12", 60, 0).unwrap();
+        assert_eq!(receipt["id"], "D-12");
         assert_eq!(receipt["raw_status"], "active");
         assert_eq!(receipt["registry_assignment"], assignment);
         assert_eq!(receipt["registry_assignment_source"], "claim_response");
@@ -2750,8 +2876,8 @@ mod tests {
         let mut claimed = item("active", 4);
         claimed["id"] = json!("D-13");
         let (_server, mut cloud) = backend(vec![before, claimed]);
-        let receipt = cloud.claim_task_receipt("me", 12, 60, 0).unwrap();
-        assert_eq!(receipt["id"], 13);
+        let receipt = cloud.claim_task_receipt_by_id("me", "D-12", 60, 0).unwrap();
+        assert_eq!(receipt["id"], "D-13");
     }
 
     #[test]
@@ -2871,8 +2997,8 @@ mod tests {
         };
         let task = cloud.add_task("me", &spec, 0).unwrap();
         assert_eq!(
-            (task.id, task.priority.as_deref()),
-            ("G-SG-0012".to_string(), Some("P1"))
+            (task.id.as_str(), task.priority.as_deref()),
+            ("G-SG-0012", Some("P1"))
         );
         assert_eq!(task.status, tasks::Status::Open);
         assert_eq!(task.author, "writer");

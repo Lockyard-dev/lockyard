@@ -229,6 +229,26 @@ impl Transport for AgentSocket {
         Ok(value)
     }
 
+    fn catalog_expand(&self, call: &Call, names: &[String]) -> Result<Vec<String>, ClientError> {
+        let status = self
+            .ping()
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        if !status.catalog_expansion_v1 {
+            return Err(ClientError::Protocol(lockyard_cloud_client::Problem {
+                code: "feature_unsupported".into(),
+                status: None,
+                details: Value::Null,
+                detail: "restart or upgrade the local agent for verified catalog expansion".into(),
+            }));
+        }
+        let reply = self.ask_for(&Request::ExpandCatalog {
+            call: call.clone(),
+            names: names.to_vec(),
+        })?;
+        serde_json::from_value(reply.value.unwrap_or(Value::Null))
+            .map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
     fn fast_check(
         &self,
         session: &str,

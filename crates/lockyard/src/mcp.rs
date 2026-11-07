@@ -9,12 +9,12 @@ use lockyard_core::proto::{
     AccessAnswer, AccessRequest, ActivityRequest, BoardWrite, CheckStatus, Claim, ClaimMode,
     ClaimQuery, ClaimRequest, DirtyPath, EventQuery, Freeze, InboxQuery, PresenceBeat, Purpose,
     QueueRequest, ReleaseRequest, RenewRequest, SendRequest, SessionActivity, SessionState, Stamp,
-    Stream, WorkAction, WorkOffer, WorkStep, expand_zones,
+    Stream, WorkAction, WorkOffer, WorkStep,
 };
 use lockyard_core::tasks::{Status, TaskPlan, TaskSpec};
 use lockyard_core::zones::{DEFAULT_TTL_MINUTES, validate_claim_path_count};
 use lockyard_core::{Error, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
@@ -101,15 +101,35 @@ impl Surface {
 
 /// Reads one JSON-RPC message per line and writes one response for each request.
 pub fn serve(agent: Option<String>, cwd: &Path, surface: Surface) -> io::Result<()> {
-    let stdin = io::stdin();
+    let _shutdown = crate::shutdown::Guard::new(cwd)?;
+    // Reading on a separate thread lets the command finish even if stdin contains only
+    // part of a line. A signal may land on any thread, so EINTR alone is insufficient.
+    let (send, lines) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("mcp-stdin".into())
+        .spawn(move || {
+            for line in io::stdin().lock().lines() {
+                if send.send(line).is_err() {
+                    return;
+                }
+            }
+        })?;
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     let mut client: Option<String> = None;
-    for line in stdin.lock().lines() {
+    while !crate::shutdown::requested() {
+        let line = match lines.recv_timeout(crate::shutdown::POLL_INTERVAL) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if crate::shutdown::requested() {
+            break;
+        }
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let (response, after) = match serde_json::from_str::<Value>(&line) {
+        let (response, after) = match lockyard_cloud_client::protocol::strict_json(&line) {
             Ok(request) => {
                 if request.get("method").and_then(Value::as_str) == Some("initialize") {
                     client = request
@@ -119,7 +139,13 @@ pub fn serve(agent: Option<String>, cwd: &Path, surface: Surface) -> io::Result<
                 }
                 respond(&request, agent.as_deref(), cwd, surface, client.as_deref())
             }
-            Err(_) => (Some(error(Value::Null, -32700, "Parse error")), None),
+            Err(_) => (
+                Some(
+                    rejected_catalog_response(&line)
+                        .unwrap_or_else(|| error(Value::Null, -32700, "Parse error")),
+                ),
+                None,
+            ),
         };
         if let Some(response) = response {
             serde_json::to_writer(&mut stdout, &response)?;
@@ -134,6 +160,41 @@ pub fn serve(agent: Option<String>, cwd: &Path, surface: Surface) -> io::Result<
         }
     }
     Ok(())
+}
+
+/// Diagnostics may inspect the outer RPC routing fields only after strict decoding refused it.
+/// IgnoredAny consumes arguments without constructing a Value that could erase catalog duplicates.
+fn rejected_catalog_response(raw: &str) -> Option<Value> {
+    #[derive(Deserialize)]
+    struct RejectedCall {
+        jsonrpc: String,
+        id: Value,
+        method: String,
+        params: RejectedParams,
+    }
+    #[derive(Deserialize)]
+    struct RejectedParams {
+        name: String,
+        #[serde(rename = "arguments")]
+        _arguments: serde::de::IgnoredAny,
+    }
+    let request: RejectedCall = serde_json::from_str(raw).ok()?;
+    if request.jsonrpc != "2.0"
+        || request.method != "tools/call"
+        || request.params.name != "zone_catalog_put"
+        || !matches!(
+            request.id,
+            Value::Null | Value::Number(_) | Value::String(_)
+        )
+    {
+        return None;
+    }
+    let mut result = tool_result(
+        "catalog_invalid: catalog JSON failed strict decoding".into(),
+        true,
+    );
+    result["structuredContent"] = json!({"code":"catalog_invalid","status":null,"details":null});
+    Some(json!({"jsonrpc":"2.0","id":request.id,"result":result}))
 }
 
 /// Handles one decoded JSON-RPC message and runs its follow-up at once.
@@ -258,16 +319,18 @@ fn read_resource(uri: &str, agent: Option<&str>, cwd: &Path) -> Result<Vec<Value
         "lockyard://ready" => opened.backend.registry_ready(&json!({"limit":20}))?,
         _ => {
             if let Some(id) = uri.strip_prefix("lockyard://task/") {
-                let task_id = crate::parse_task_id(id).map_err(Error::Invalid)?;
+                let argument = json!({"id":id});
+                let task_id = Args(&argument).task_key_for(opened.backend.is_cloud())?;
                 if opened.backend.is_cloud() {
                     opened.backend.registry_item_by_id(&task_id)?
                 } else {
                     json!({"task":opened.backend.task(&task_id)?,"history":opened.backend.task_history(&task_id)?})
                 }
             } else if let Some(id) = uri.strip_prefix("lockyard://blockers/") {
+                let argument = json!({"id":id});
                 opened
                     .backend
-                    .registry_blockers_by_id(&crate::parse_task_id(id).map_err(Error::Invalid)?)?
+                    .registry_blockers_by_id(&Args(&argument).task_key("id")?)?
             } else {
                 return Err(Error::NotFound(format!("unknown resource {uri:?}")));
             }
@@ -342,12 +405,25 @@ fn call_tool(
             let failed = (name == "workflow_run" && result["ok"] != true)
                 || result.get("ok") == Some(&Value::Bool(false))
                 || result.pointer("/reply/ok") == Some(&Value::Bool(false));
-            tool_result(result.to_string(), failed)
+            let mut response = tool_result(result.to_string(), failed);
+            response["structuredContent"] = result;
+            response
         }
         Err(error) => {
             let args = params.get("arguments").unwrap_or(&empty);
             let message = tool_error_message(name, args, &error);
-            tool_result(message, true)
+            let mut response = tool_result(message, true);
+            if let Error::Cloud {
+                code,
+                status,
+                details,
+                ..
+            } = &error
+            {
+                response["structuredContent"] =
+                    json!({"code":code,"status":status,"details":details});
+            }
+            response
         }
     };
     (result, after)

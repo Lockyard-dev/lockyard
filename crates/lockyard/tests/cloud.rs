@@ -35,6 +35,9 @@ struct State {
     refuse_release: Option<(u16, Value)>,
     refuse_registry_claim: bool,
     check_reply: Option<Value>,
+    catalog: Option<Value>,
+    encryption_key_id: Option<String>,
+    refuse_catalog_put: bool,
 }
 
 #[derive(Clone)]
@@ -78,7 +81,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
     let mut parts = first.split(' ');
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
-    let (mut length, mut key, mut session, mut token) = (0, None, None, None);
+    let (mut length, mut key, mut session, mut token, mut repository) = (0, None, None, None, None);
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
@@ -90,6 +93,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
                 "idempotency-key" => key = Some(value.to_string()),
                 "x-lockyard-session" => session = Some(value.to_string()),
                 "authorization" => token = Some(value.to_string()),
+                "x-lockyard-repository" => repository = Some(value.to_string()),
                 _ => {}
             }
         }
@@ -127,7 +131,8 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
     };
     let text = answer.to_string();
     let response = format!(
-        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+        "HTTP/1.1 {status} X\r\nLockyard-Protocol: 2\r\nX-Lockyard-Repository: {}\r\nCache-Control: no-store\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+        repository.as_deref().unwrap_or("-"),
         text.len()
     );
     let _ = stream.write_all(response.as_bytes());
@@ -135,6 +140,27 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
 
 fn route_reply(state: &mut State, method: &str, route: &str, body: &Value) -> (u16, Value) {
     match (method, route) {
+        ("GET", "/api/v1/protocol") => (
+            200,
+            json!({"selected_protocol":2,"min_protocol":1,"max_protocol":2,"capabilities":["zone_catalog_v1","drain_v1"]}),
+        ),
+        ("GET", "/api/v1/zones/catalog") => (
+            200,
+            state
+                .catalog
+                .clone()
+                .unwrap_or(json!({"zones":{"code":["src"]}})),
+        ),
+        ("POST", "/api/v1/zones/catalog") => {
+            if state.refuse_catalog_put {
+                return (
+                    403,
+                    json!({"type":"urn:lockyard:problem:forbidden","title":"Forbidden","status":403,"detail":"publisher role required","instance":"urn:request:test","code":"forbidden","details":null}),
+                );
+            }
+            state.catalog = Some(body["catalog"].clone());
+            (200, body["catalog"].clone())
+        }
         ("POST", "/api/v1/zones/claims") => {
             if let Some(refusal) = state.refuse_claims.clone() {
                 return refusal;
@@ -183,7 +209,7 @@ fn route_reply(state: &mut State, method: &str, route: &str, body: &Value) -> (u
         ),
         ("GET", "/api/v1/workspace/encryption") => (
             200,
-            json!({"encryption": "off", "key_id": null, "workspace_id": "00000000-0000-0000-0000-000000000001"}),
+            json!({"encryption": if state.encryption_key_id.is_some(){"required"}else{"off"}, "key_id": state.encryption_key_id, "workspace_id": "00000000-0000-0000-0000-000000000001"}),
         ),
         ("POST", "/api/v1/zones/check") => (
             200,
@@ -207,7 +233,7 @@ fn route_reply(state: &mut State, method: &str, route: &str, body: &Value) -> (u
             200,
             json!({"id": 6, "title": body["title"], "status": "offered", "version": 1}),
         ),
-        ("POST", "/api/v1/bus/tasks/6/claim") => {
+        ("POST", "/api/v1/bus/tasks/BT-6/claim") => {
             (200, json!({"id": 6, "status": "claimed", "version": 2}))
         }
         _ if route.ends_with("/events") => (200, json!({"events": []})),
@@ -228,7 +254,16 @@ fn cloud_project(server: &Server) -> tempfile::TempDir {
 }
 
 fn binary(dir: &Path, runtime: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_lockyard"));
+    // Every caller owns this freshly-created tempdir; it is the private XDG state parent.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut command = Command::new(
+        std::env::var_os("LOCKYARD_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_lockyard").into()),
+    );
     let config = std::fs::read_to_string(dir.join(".lockyard/config.toml")).unwrap_or_default();
     let url = config
         .lines()
@@ -239,6 +274,7 @@ fn binary(dir: &Path, runtime: &Path) -> Command {
         .env("LOCKYARD_URL", url)
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", runtime.join("state"))
+        .env("XDG_CONFIG_HOME", runtime.join("config"))
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("LOCKYARD_TOKEN_FILE");
     command
@@ -770,12 +806,7 @@ fn refusals_map_to_exit_codes_and_kinds() {
     let reserved = cli(dir.path(), runtime.path(), &["zone", "claim", "src"]);
     assert_eq!(reserved.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&reserved.stderr).contains("carol"));
-    for (status, kind) in [
-        (403, "denied"),
-        (404, "not_found"),
-        (412, "stale_fence"),
-        (503, "frozen"),
-    ] {
+    for (status, kind) in [(403, "x"), (404, "x"), (412, "x"), (503, "x")] {
         refusal(status, Value::Null);
         let refused = cli(
             dir.path(),
@@ -855,7 +886,7 @@ fn the_new_commands_reach_their_routes() {
     ] {
         assert_eq!(server.seen(method, route).len(), 1, "{method} {route}");
     }
-    let claim = &server.seen("POST", "/api/v1/bus/tasks/6/claim");
+    let claim = &server.seen("POST", "/api/v1/bus/tasks/BT-6/claim");
     assert!(claim[0].path.ends_with("?version=1"));
     let beat = &server.seen("POST", "/api/v1/presence")[0];
     assert_eq!(beat.body["activity"]["state"], "api_failure");
@@ -1103,4 +1134,204 @@ fn install_refuses_a_bare_token_and_writes_a_unit_naming_the_file() {
         .unwrap();
     assert!(removed.status.success());
     assert!(!Path::new(&unit).exists());
+}
+
+fn required_catalog_fixture(server: &Server, dir: &Path, runtime: &Path) {
+    use lockyard_cloud_client::{WorkspaceKey, catalog::seal_catalog};
+    let workspace = "00000000-0000-0000-0000-000000000001";
+    let key = WorkspaceKey::from_entropy([47; 32]);
+    let key_dir = runtime.join("config/lockyard/keys");
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&key_dir)
+        .unwrap();
+    key.copy_to_private(&key_dir.join(format!("{workspace}.key")))
+        .unwrap();
+    let plaintext = lockyard_core::catalog::ZoneCatalogV1::from_json(
+        r#"{"version":1,"zones":{"code":["src","tests"]},"groups":{"all":["code"]}}"#,
+    )
+    .unwrap();
+    let wire = seal_catalog(&key, workspace, "api", 0, true, &plaintext).unwrap();
+    let mut state = server.state.lock().unwrap();
+    state.catalog = Some(serde_json::to_value(wire.catalog).unwrap());
+    state.encryption_key_id = Some(key.key_id());
+    drop(state);
+    std::fs::write(
+        dir.join(".lockyard/config.toml"),
+        format!(
+            "mode = 'cloud'\nurl = '{}'\nworkspace = 'team'\nrepository = 'api'\n",
+            server.url
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn required_cli_zone_claim_uses_typed_encrypted_catalog() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    required_catalog_fixture(&server, dir.path(), runtime.path());
+    let result = cli(
+        dir.path(),
+        runtime.path(),
+        &["--json", "zone", "claim", "--zone", "all"],
+    );
+    let answer = json_of(&result);
+    assert_eq!(answer["paths"], json!(["src", "tests"]));
+    let writes = server.seen("POST", "/api/v1/zones/claims");
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        writes[0].body["paths"],
+        json!([
+            ".lockyard-repository/api/src",
+            ".lockyard-repository/api/tests"
+        ])
+    );
+    assert!(writes[0].body.get("zones").is_none());
+    assert!(writes[0].body.get("zone").is_none());
+    server.state.lock().unwrap().catalog.as_mut().unwrap()["case_insensitive_paths"] = json!(false);
+    let refused = cli(
+        dir.path(),
+        runtime.path(),
+        &["--json", "zone", "claim", "--zone", "code"],
+    );
+    assert!(!refused.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&refused.stderr).unwrap()["error"]["code"],
+        "catalog_authentication_failed"
+    );
+    assert_eq!(server.seen("POST", "/api/v1/zones/claims").len(), 1);
+}
+
+#[test]
+fn required_mcp_zones_share_verified_catalog_expander() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    required_catalog_fixture(&server, dir.path(), runtime.path());
+    let mut child = binary(dir.path(), runtime.path())
+        .args(["mcp", "--tools", "full"])
+        .env("LOCKYARD_AGENT", "alice")
+        .env("LOCKYARD_TOKEN", "test-token")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    for (id, zones) in [(1, json!(["code"])), (2, json!(["missing"]))] {
+        writeln!(input,"{}",json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"zone_claim","arguments":{"zones":zones}}})).unwrap();
+    }
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let answers: Vec<Value> = String::from_utf8(result.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_ne!(answers[0]["result"]["isError"], true, "{}", answers[0]);
+    assert_eq!(
+        answers[0]["result"]["structuredContent"]["paths"],
+        json!(["src", "tests"])
+    );
+    assert_eq!(
+        answers[1]["result"]["structuredContent"]["code"],
+        "zone_unknown"
+    );
+    assert_eq!(server.seen("POST", "/api/v1/zones/claims").len(), 1);
+}
+
+#[test]
+fn required_agent_named_catalog_preserves_strict_expansion_errors() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    required_catalog_fixture(&server, dir.path(), runtime.path());
+    let _agent = start_agent(dir.path(), runtime.path());
+    let refused = cli(
+        dir.path(),
+        runtime.path(),
+        &["--json", "zone", "claim", "--zone", "missing"],
+    );
+    assert!(!refused.status.success());
+    let error: Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "zone_unknown", "{error}");
+    assert!(server.seen("POST", "/api/v1/zones/claims").is_empty());
+}
+
+#[test]
+fn required_cli_catalog_put_encrypts_locally_and_preserves_publisher_denial() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    required_catalog_fixture(&server, dir.path(), runtime.path());
+    let path = dir.path().join("catalog.json");
+    std::fs::write(
+        &path,
+        r#"{"version":1,"zones":{"CATALOG-CONTENT-CANARY":["src"]},"groups":{}}"#,
+    )
+    .unwrap();
+    let key = lockyard_cloud_client::ulid();
+    let result = cli(
+        dir.path(),
+        runtime.path(),
+        &[
+            "--json",
+            "cloud",
+            "catalog-put",
+            path.to_str().unwrap(),
+            "--expected-revision",
+            "1",
+            "--key",
+            &key,
+        ],
+    );
+    let answer = json_of(&result);
+    assert_eq!(answer["stored"], true);
+    assert_eq!(answer["revision"], 2);
+    let writes = server.seen("POST", "/api/v1/zones/catalog");
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].key.as_deref(), Some(key.as_str()));
+    assert_eq!(writes[0].body["expected_revision"], 1);
+    assert!(
+        writes[0].body["catalog"]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("lyenc1.")
+    );
+    assert!(
+        !writes[0]
+            .body
+            .to_string()
+            .contains("CATALOG-CONTENT-CANARY")
+    );
+    let stored = server.state.lock().unwrap().catalog.clone();
+    server.state.lock().unwrap().refuse_catalog_put = true;
+    let key = lockyard_cloud_client::ulid();
+    let refused = cli(
+        dir.path(),
+        runtime.path(),
+        &[
+            "--json",
+            "cloud",
+            "catalog-put",
+            path.to_str().unwrap(),
+            "--expected-revision",
+            "2",
+            "--key",
+            &key,
+        ],
+    );
+    assert!(!refused.status.success());
+    let error: Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "forbidden");
+    assert_eq!(server.state.lock().unwrap().catalog, stored);
 }

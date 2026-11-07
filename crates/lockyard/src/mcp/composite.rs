@@ -2,9 +2,6 @@
 
 use super::*;
 
-/// Names only the compact surface answers.
-pub(super) const COMPOSITES: [&str; 4] = ["start_work", "update", "handover", "finish_work"];
-
 /// Runs one composite tool as the full tools it stands for, in order.
 ///
 /// Each step is the same call an agent on the full surface would make, so a conflict is still a

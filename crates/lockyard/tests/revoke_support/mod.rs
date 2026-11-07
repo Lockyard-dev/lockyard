@@ -295,7 +295,15 @@ pub fn trust_path(root: &std::path::Path, url: &str) -> std::path::PathBuf {
     root.join(format!(".lockyard/private-revocations/trust-{id}.json"))
 }
 pub fn project_without_trust(url: &str) -> tempfile::TempDir {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Each subprocess persists its mandatory HTTP recovery journal inside this fixture.
+    // An explicit private mode also keeps Linux's group-writable test umask irrelevant.
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.path().join("private-command-state"))
+        .unwrap();
     std::fs::create_dir(root.path().join(".lockyard")).unwrap();
     std::fs::write(
         root.path().join(".lockyard/config.toml"),
@@ -340,6 +348,7 @@ pub fn invoke_with_node_config(
     cmd.current_dir(root)
         .env("LOCKYARD_URL", url)
         .env("LOCKYARD_TOKEN", "fixture-token")
+        .env("XDG_STATE_HOME", root.join("private-command-state"))
         .env_remove("LOCKYARD_REQUIRE_E2EE")
         .env_remove("LOCKYARD_E2EE_WORKSPACE_ID")
         .env_remove("LOCKYARD_AGENT")

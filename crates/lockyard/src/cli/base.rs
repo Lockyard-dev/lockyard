@@ -22,6 +22,9 @@ pub(super) enum Command {
     Init,
     /// Show the version and the homepage.
     About,
+    /// Maintain the local coordination database.
+    #[command(subcommand)]
+    Db(DbCommand),
     /// List the agents seen in this project.
     Who,
     /// Show this agent's mail count, all active claims and unfinished tasks.
@@ -98,6 +101,15 @@ pub(super) enum Command {
     Revoke(crate::revoke_access::RevokeCommand),
     /// Run the MCP server over standard input and output.
     Mcp(McpArgs),
+}
+
+#[derive(Subcommand)]
+pub(super) enum DbCommand {
+    /// Create a private, standalone snapshot without replacing an existing path.
+    Backup {
+        /// Destination file, relative to the current working directory unless absolute.
+        path: PathBuf,
+    },
 }
 
 #[derive(Args)]

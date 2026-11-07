@@ -10,8 +10,7 @@ use serde::Serialize;
 use std::fmt;
 
 const MINUTE_MS: i64 = 60_000;
-const COLUMNS: &str =
-    "id, title, body, status, author, assignee, lease_until, evidence, created_at, updated_at";
+const COLUMNS: &str = "task_key, title, body, status, author, assignee, lease_until, evidence, created_at, updated_at";
 
 /// Where a task stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -64,7 +63,7 @@ impl fmt::Display for Status {
 /// One task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Task {
-    pub id: String,
+    pub id: crate::task_id::TaskId,
     pub title: String,
     pub body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -166,11 +165,13 @@ impl Store {
         self.touch(author, now)?;
         let transaction = self.write()?;
         transaction.execute(
-            "INSERT INTO tasks (title, body, status, author, created_at, updated_at)
-             VALUES (?1, ?2, 'open', ?3, ?4, ?4)",
+            "INSERT INTO tasks (id, task_key, title, body, status, author, created_at, updated_at)
+             VALUES (COALESCE((SELECT seq FROM sqlite_sequence WHERE name='tasks'),0)+1,
+             'D-' || (COALESCE((SELECT seq FROM sqlite_sequence WHERE name='tasks'),0)+1), ?1, ?2, 'open', ?3, ?4, ?4)",
             params![title, body, author, now],
         )?;
-        let id = transaction.last_insert_rowid();
+        let id = format!("D-{}", transaction.last_insert_rowid());
+        let id = id.as_str();
         log(&transaction, id, author, "add", "", now)?;
         let task = load(&transaction, id)?;
         transaction.commit()?;
@@ -178,7 +179,7 @@ impl Store {
     }
 
     /// One task.
-    pub fn task(&self, id: i64) -> Result<Task> {
+    pub fn task(&self, id: &str) -> Result<Task> {
         load(&self.conn, id)
     }
 
@@ -198,10 +199,10 @@ impl Store {
     }
 
     /// What happened to a task, oldest first.
-    pub fn task_history(&self, id: i64) -> Result<Vec<TaskEvent>> {
+    pub fn task_history(&self, id: &str) -> Result<Vec<TaskEvent>> {
         load(&self.conn, id)?;
         let mut statement = self.conn.prepare(
-            "SELECT agent, action, note, at FROM task_events WHERE task_id = ?1 ORDER BY id",
+            "SELECT agent, action, note, at FROM task_events WHERE task_key = ?1 ORDER BY id",
         )?;
         let rows = statement.query_map([id], |row| {
             Ok(TaskEvent {
@@ -215,7 +216,13 @@ impl Store {
     }
 
     /// Takes an open task, or one whose previous assignee let the lease run out.
-    pub fn claim_task(&mut self, agent: &str, id: i64, ttl_minutes: i64, now: i64) -> Result<Task> {
+    pub fn claim_task(
+        &mut self,
+        agent: &str,
+        id: &str,
+        ttl_minutes: i64,
+        now: i64,
+    ) -> Result<Task> {
         let lease = lease_ms(ttl_minutes)?;
         self.touch(agent, now)?;
         let transaction = self.write()?;
@@ -228,7 +235,7 @@ impl Store {
         }
         transaction.execute(
             "UPDATE tasks SET status = 'claimed', assignee = ?1, lease_until = ?2, updated_at = ?3
-             WHERE id = ?4",
+             WHERE task_key = ?4",
             params![agent, now + lease, now, id],
         )?;
         log(&transaction, id, agent, "claim", "", now)?;
@@ -238,14 +245,20 @@ impl Store {
     }
 
     /// Extends the lease on a task `agent` holds.
-    pub fn renew_task(&mut self, agent: &str, id: i64, ttl_minutes: i64, now: i64) -> Result<Task> {
+    pub fn renew_task(
+        &mut self,
+        agent: &str,
+        id: &str,
+        ttl_minutes: i64,
+        now: i64,
+    ) -> Result<Task> {
         let lease = lease_ms(ttl_minutes)?;
         self.touch(agent, now)?;
         let transaction = self.write()?;
         let task = load(&transaction, id)?;
         require_assignee(&task, agent)?;
         transaction.execute(
-            "UPDATE tasks SET lease_until = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE tasks SET lease_until = ?1, updated_at = ?2 WHERE task_key = ?3",
             params![now + lease, now, id],
         )?;
         log(&transaction, id, agent, "renew", "", now)?;
@@ -255,14 +268,14 @@ impl Store {
     }
 
     /// Gives a held task back.
-    pub fn release_task(&mut self, agent: &str, id: i64, note: &str, now: i64) -> Result<Task> {
+    pub fn release_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<Task> {
         self.touch(agent, now)?;
         let transaction = self.write()?;
         let task = load(&transaction, id)?;
         require_assignee(&task, agent)?;
         transaction.execute(
             "UPDATE tasks SET status = 'open', assignee = NULL, lease_until = NULL, updated_at = ?1
-             WHERE id = ?2",
+             WHERE task_key = ?2",
             params![now, id],
         )?;
         log(&transaction, id, agent, "release", note, now)?;
@@ -272,7 +285,7 @@ impl Store {
     }
 
     /// Hands a held task to review. Evidence is required, a claim of success alone is not enough.
-    pub fn submit_task(&mut self, agent: &str, id: i64, evidence: &str, now: i64) -> Result<Task> {
+    pub fn submit_task(&mut self, agent: &str, id: &str, evidence: &str, now: i64) -> Result<Task> {
         if evidence.trim().is_empty() {
             return Err(Error::Invalid("submitting a task needs evidence".into()));
         }
@@ -282,7 +295,7 @@ impl Store {
         require_assignee(&task, agent)?;
         transaction.execute(
             "UPDATE tasks SET status = 'review', evidence = ?1, lease_until = NULL, updated_at = ?2
-             WHERE id = ?3",
+             WHERE task_key = ?3",
             params![evidence, now, id],
         )?;
         log(&transaction, id, agent, "submit", evidence, now)?;
@@ -295,7 +308,7 @@ impl Store {
     pub fn review_task(
         &mut self,
         agent: &str,
-        id: i64,
+        id: &str,
         decision: &str,
         reason: &str,
         now: i64,
@@ -306,7 +319,7 @@ impl Store {
         let task = load(&transaction, id)?;
         if task.status != Status::Review {
             return Err(Error::Denied(format!(
-                "T-{} is {}, not in review",
+                "{} is {}, not in review",
                 task.id, task.status
             )));
         }
@@ -325,7 +338,7 @@ impl Store {
             log(&transaction, id, agent, "review_pass", reason, now)?;
         } else {
             transaction.execute(
-                "UPDATE tasks SET status = 'claimed', lease_until = ?1, updated_at = ?2 WHERE id = ?3",
+                "UPDATE tasks SET status = 'claimed', lease_until = ?1, updated_at = ?2 WHERE task_key = ?3",
                 params![now + DEFAULT_TTL_MINUTES * MINUTE_MS, now, id],
             )?;
             log(&transaction, id, agent, "review_reject", reason, now)?;
@@ -336,13 +349,13 @@ impl Store {
     }
 
     /// Accepts a submitted task. Only Claude, and only after a Codex PASS.
-    pub fn accept_task(&mut self, agent: &str, id: i64, note: &str, now: i64) -> Result<Task> {
+    pub fn accept_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<Task> {
         self.touch(agent, now)?;
         let transaction = self.write()?;
         let task = load(&transaction, id)?;
         if task.status != Status::Review {
             return Err(Error::Denied(format!(
-                "T-{} is {}, not in review",
+                "{} is {}, not in review",
                 task.id, task.status
             )));
         }
@@ -352,7 +365,7 @@ impl Store {
             return Err(Error::Denied(message));
         }
         transaction.execute(
-            "UPDATE tasks SET status = 'accepted', updated_at = ?1 WHERE id = ?2",
+            "UPDATE tasks SET status = 'accepted', updated_at = ?1 WHERE task_key = ?2",
             params![now, id],
         )?;
         log(&transaction, id, agent, "accept", note, now)?;
@@ -365,7 +378,7 @@ impl Store {
     pub fn reject_task(
         &mut self,
         agent: &str,
-        id: i64,
+        id: &str,
         reason: &str,
         evidence: &str,
         now: i64,
@@ -378,7 +391,7 @@ impl Store {
         let task = load(&transaction, id)?;
         if task.assignee.as_deref() == Some(agent) {
             return Err(Error::Denied(format!(
-                "only a reviewer other than the assignee {agent} can accept or reject T-{id}"
+                "only a reviewer other than the assignee {agent} can accept or reject {id}"
             )));
         }
         if task.status == Status::Review {
@@ -394,7 +407,7 @@ impl Store {
             let previous = task.evidence.unwrap_or_default();
             transaction.execute(
                 "UPDATE tasks SET status = 'claimed', evidence = ?1, lease_until = ?2, updated_at = ?3
-                 WHERE id = ?4",
+                 WHERE task_key = ?4",
                 params![evidence, now + DEFAULT_TTL_MINUTES * MINUTE_MS, now, id],
             )?;
             // The submit row still holds `previous`. This row records the reason and the new proof.
@@ -409,7 +422,7 @@ impl Store {
         } else {
             require_reviewer(&task, agent)?;
             transaction.execute(
-                "UPDATE tasks SET status = 'claimed', lease_until = ?1, updated_at = ?2 WHERE id = ?3",
+                "UPDATE tasks SET status = 'claimed', lease_until = ?1, updated_at = ?2 WHERE task_key = ?3",
                 params![now + DEFAULT_TTL_MINUTES * MINUTE_MS, now, id],
             )?;
             log(&transaction, id, agent, "reject", reason, now)?;
@@ -420,22 +433,22 @@ impl Store {
     }
 
     /// Cancels a task. Only its author can, and only before it is final.
-    pub fn cancel_task(&mut self, agent: &str, id: i64, note: &str, now: i64) -> Result<Task> {
+    pub fn cancel_task(&mut self, agent: &str, id: &str, note: &str, now: i64) -> Result<Task> {
         self.touch(agent, now)?;
         let transaction = self.write()?;
         let task = load(&transaction, id)?;
         if task.author != agent {
             return Err(Error::Denied(format!(
-                "only {} can cancel T-{id}",
+                "only {} can cancel {id}",
                 task.author
             )));
         }
         if task.status.is_final() {
-            return Err(Error::Denied(format!("T-{id} is {}", task.status)));
+            return Err(Error::Denied(format!("{id} is {}", task.status)));
         }
         transaction.execute(
             "UPDATE tasks SET status = 'cancelled', lease_until = NULL, updated_at = ?1
-             WHERE id = ?2",
+             WHERE task_key = ?2",
             params![now, id],
         )?;
         log(&transaction, id, agent, "cancel", note, now)?;
@@ -445,19 +458,20 @@ impl Store {
     }
 }
 
-fn load(conn: &Connection, id: i64) -> Result<Task> {
+fn load(conn: &Connection, id: &str) -> Result<Task> {
+    crate::task_id::TaskId::parse(id)?;
     conn.query_row(
-        &format!("SELECT {COLUMNS} FROM tasks WHERE id = ?1"),
+        &format!("SELECT {COLUMNS} FROM tasks WHERE task_key = ?1"),
         [id],
         read_task,
     )
     .optional()?
-    .ok_or_else(|| Error::NotFound(format!("T-{id} does not exist")))
+    .ok_or_else(|| Error::NotFound(format!("{id} does not exist")))
 }
 
-fn log(conn: &Connection, id: i64, agent: &str, action: &str, note: &str, at: i64) -> Result<()> {
+fn log(conn: &Connection, id: &str, agent: &str, action: &str, note: &str, at: i64) -> Result<()> {
     conn.execute(
-        "INSERT INTO task_events (task_id, agent, action, note, at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO task_events (task_id, task_key, agent, action, note, at) VALUES ((SELECT id FROM tasks WHERE task_key=?1), ?1, ?2, ?3, ?4, ?5)",
         params![id, agent, action, note, at],
     )?;
     Ok(())
@@ -466,7 +480,9 @@ fn log(conn: &Connection, id: i64, agent: &str, action: &str, note: &str, at: i6
 fn read_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let status: String = row.get(3)?;
     Ok(Task {
-        id: format!("D-{}", row.get::<_, i64>(0)?),
+        id: crate::task_id::TaskId::parse(&row.get::<_, String>(0)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
+        })?,
         title: row.get(1)?,
         body: row.get(2)?,
         status: Status::parse(&status).ok_or_else(|| {
@@ -493,11 +509,11 @@ fn read_task(row: &Row<'_>) -> rusqlite::Result<Task> {
 }
 
 /// A Codex PASS is current when it is the latest review-or-submit event and the reviewer is not the executor.
-fn codex_passed(conn: &Connection, id: i64, executor: &str) -> Result<bool> {
+fn codex_passed(conn: &Connection, id: &str, executor: &str) -> Result<bool> {
     let found = conn
         .query_row(
             "SELECT agent, action FROM task_events
-             WHERE task_id = ?1 AND action IN ('submit', 'review_pass', 'review_reject')
+             WHERE task_key = ?1 AND action IN ('submit', 'review_pass', 'review_reject')
              ORDER BY id DESC LIMIT 1",
             [id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -518,7 +534,7 @@ fn require_assignee(task: &Task, agent: &str) -> Result<()> {
         return Ok(());
     }
     Err(Error::Denied(format!(
-        "T-{} is {} and not held by this agent",
+        "{} is {} and not held by this agent",
         task.id, task.status
     )))
 }
@@ -526,13 +542,13 @@ fn require_assignee(task: &Task, agent: &str) -> Result<()> {
 fn require_reviewer(task: &Task, agent: &str) -> Result<()> {
     if task.status != Status::Review {
         return Err(Error::Denied(format!(
-            "T-{} is {}, not in review",
+            "{} is {}, not in review",
             task.id, task.status
         )));
     }
     if task.assignee.as_deref() == Some(agent) {
         return Err(Error::Denied(format!(
-            "only a reviewer other than the assignee {} can accept or reject T-{}",
+            "only a reviewer other than the assignee {} can accept or reject {}",
             agent, task.id
         )));
     }
@@ -542,9 +558,9 @@ fn require_reviewer(task: &Task, agent: &str) -> Result<()> {
 fn describe_block(task: &Task, verb: &str) -> String {
     match (&task.status, &task.assignee) {
         (Status::Claimed, Some(assignee)) => {
-            format!("T-{} cannot be {verb}: {assignee} holds it", task.id)
+            format!("{} cannot be {verb}: {assignee} holds it", task.id)
         }
-        (status, _) => format!("T-{} cannot be {verb}: it is {status}", task.id),
+        (status, _) => format!("{} cannot be {verb}: it is {status}", task.id),
     }
 }
 
@@ -585,22 +601,14 @@ mod tests {
         assert_eq!(value["registry_evidence"][0]["value"], "test report");
     }
 
-    fn task_in_review(store: &mut Store) -> i64 {
-        let id = store
-            .add_task("lead", "ship", "", 0)
-            .unwrap()
-            .id
-            .rsplit_once('-')
-            .unwrap()
-            .1
-            .parse()
-            .unwrap();
-        store.claim_task("worker", id, TTL, 1).unwrap();
-        store.submit_task("worker", id, "tests pass", 2).unwrap();
+    fn task_in_review(store: &mut Store) -> crate::task_id::TaskId {
+        let id = store.add_task("lead", "ship", "", 0).unwrap().id;
+        store.claim_task("worker", &id, TTL, 1).unwrap();
+        store.submit_task("worker", &id, "tests pass", 2).unwrap();
         id
     }
 
-    fn pass_and_accept(store: &mut Store, id: i64, now: i64) -> Task {
+    fn pass_and_accept(store: &mut Store, id: &str, now: i64) -> Task {
         store.review_task("codex", id, "pass", "", now).unwrap();
         store.accept_task("claude", id, "good", now + 1).unwrap()
     }
@@ -609,7 +617,7 @@ mod tests {
     fn only_claude_accepts_and_only_after_a_codex_pass() {
         let (_dir, mut store) = test_store();
         let id = store.add_task("lead", "ship", "", 0).unwrap().id;
-        let number = id.rsplit_once('-').unwrap().1.parse().unwrap();
+        let number = id.as_str();
         store
             .claim_task("cursor-grok-4.7-high", number, TTL, 1)
             .unwrap();
@@ -640,7 +648,7 @@ mod tests {
     fn a_second_flag_of_the_same_model_cannot_review_or_accept_its_own_work() {
         let (_dir, mut store) = test_store();
         let id = store.add_task("lead", "ship", "", 0).unwrap().id;
-        let number = id.rsplit_once('-').unwrap().1.parse().unwrap();
+        let number = id.as_str();
         let executor = "codex-gpt-5.6-sol-high";
         store.claim_task(executor, number, TTL, 1).unwrap();
         store
@@ -653,7 +661,7 @@ mod tests {
 
         let (_dir, mut store) = test_store();
         let id = store.add_task("lead", "ship", "", 0).unwrap().id;
-        let number = id.rsplit_once('-').unwrap().1.parse().unwrap();
+        let number = id.as_str();
         let executor = "claude-opus-5-5-high";
         store.claim_task(executor, number, TTL, 1).unwrap();
         store
@@ -672,11 +680,11 @@ mod tests {
     fn a_task_walks_from_open_to_accepted_and_keeps_its_history() {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
-        let task = pass_and_accept(&mut store, id, 3);
+        let task = pass_and_accept(&mut store, &id, 3);
         assert_eq!(task.status, Status::Accepted);
         assert_eq!(task.evidence.as_deref(), Some("tests pass"));
         let actions: Vec<_> = store
-            .task_history(id)
+            .task_history(&id)
             .unwrap()
             .into_iter()
             .map(|event| event.action)
@@ -688,54 +696,38 @@ mod tests {
     fn the_worker_cannot_accept_its_own_work() {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
-        let cannot_accept = store.accept_task("worker", id, "", 3).unwrap_err();
+        let cannot_accept = store.accept_task("worker", &id, "", 3).unwrap_err();
         assert!(cannot_accept.to_string().contains("own work"));
-        let cannot_reject = store.reject_task("worker", id, "no", "", 3).unwrap_err();
+        let cannot_reject = store.reject_task("worker", &id, "no", "", 3).unwrap_err();
         assert!(
             cannot_reject
                 .to_string()
                 .contains("reviewer other than the assignee")
         );
-        assert_eq!(store.task(id).unwrap().status, Status::Review);
+        assert_eq!(store.task(&id).unwrap().status, Status::Review);
     }
 
     #[test]
     fn submitting_needs_evidence() {
         let (_dir, mut store) = test_store();
-        let id = store
-            .add_task("lead", "x", "", 0)
-            .unwrap()
-            .id
-            .rsplit_once('-')
-            .unwrap()
-            .1
-            .parse()
-            .unwrap();
-        store.claim_task("worker", id, TTL, 1).unwrap();
-        assert!(store.submit_task("worker", id, "  ", 2).is_err());
-        assert_eq!(store.task(id).unwrap().status, Status::Claimed);
+        let id = store.add_task("lead", "x", "", 0).unwrap().id;
+        store.claim_task("worker", &id, TTL, 1).unwrap();
+        assert!(store.submit_task("worker", &id, "  ", 2).is_err());
+        assert_eq!(store.task(&id).unwrap().status, Status::Claimed);
     }
 
     #[test]
     fn a_living_lease_keeps_others_out_and_an_expired_one_does_not() {
         let (_dir, mut store) = test_store();
-        let id = store
-            .add_task("lead", "x", "", 0)
-            .unwrap()
-            .id
-            .rsplit_once('-')
-            .unwrap()
-            .1
-            .parse()
-            .unwrap();
-        store.claim_task("a", id, TTL, 0).unwrap();
+        let id = store.add_task("lead", "x", "", 0).unwrap().id;
+        store.claim_task("a", &id, TTL, 0).unwrap();
         assert!(matches!(
-            store.claim_task("b", id, TTL, TTL_MS - 1),
+            store.claim_task("b", &id, TTL, TTL_MS - 1),
             Err(Error::Denied(_))
         ));
-        let taken = store.claim_task("b", id, TTL, TTL_MS).unwrap();
+        let taken = store.claim_task("b", &id, TTL, TTL_MS).unwrap();
         assert_eq!(taken.assignee.as_deref(), Some("b"));
-        assert!(store.submit_task("a", id, "late", TTL_MS + 1).is_err());
+        assert!(store.submit_task("a", &id, "late", TTL_MS + 1).is_err());
     }
 
     #[test]
@@ -743,50 +735,50 @@ mod tests {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
         let task = store
-            .reject_task("codex", id, "test is empty", "", 3)
+            .reject_task("codex", &id, "test is empty", "", 3)
             .unwrap();
         assert_eq!(task.status, Status::Claimed);
         assert_eq!(task.assignee.as_deref(), Some("worker"));
         assert_eq!(task.lease_until, Some(3 + DEFAULT_TTL_MINUTES * MINUTE_MS));
         assert!(
             store
-                .task_history(id)
+                .task_history(&id)
                 .unwrap()
                 .iter()
                 .any(|event| event.note == "test is empty")
         );
-        store.submit_task("worker", id, "fixed", 4).unwrap();
+        store.submit_task("worker", &id, "fixed", 4).unwrap();
     }
 
     #[test]
     fn rejecting_needs_a_reason() {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
-        assert!(store.reject_task("codex", id, " ", "", 3).is_err());
+        assert!(store.reject_task("codex", &id, " ", "", 3).is_err());
     }
 
     #[test]
     fn accepted_work_can_be_revoked_with_a_reason_and_new_evidence() {
         let (_dir, mut store) = test_store();
         let id = task_in_review(&mut store);
-        pass_and_accept(&mut store, id, 3);
+        pass_and_accept(&mut store, &id, 3);
         assert!(
             store
-                .reject_task("lead", id, "empty delivery", "", 4)
+                .reject_task("lead", &id, "empty delivery", "", 4)
                 .is_err()
         );
         assert!(
             store
-                .reject_task("worker", id, "empty delivery", "48bbf9a:src/Game.cs", 4)
+                .reject_task("worker", &id, "empty delivery", "48bbf9a:src/Game.cs", 4)
                 .is_err()
         );
         let task = store
-            .reject_task("lead", id, "empty delivery", "48bbf9a:src/Game.cs", 4)
+            .reject_task("lead", &id, "empty delivery", "48bbf9a:src/Game.cs", 4)
             .unwrap();
         assert_eq!(task.status, Status::Claimed);
         assert_eq!(task.evidence.as_deref(), Some("48bbf9a:src/Game.cs"));
         let notes: Vec<_> = store
-            .task_history(id)
+            .task_history(&id)
             .unwrap()
             .into_iter()
             .map(|event| event.note)
@@ -800,70 +792,44 @@ mod tests {
     #[test]
     fn only_the_assignee_renews_or_releases() {
         let (_dir, mut store) = test_store();
-        let id = store
-            .add_task("lead", "x", "", 0)
-            .unwrap()
-            .id
-            .rsplit_once('-')
-            .unwrap()
-            .1
-            .parse()
-            .unwrap();
-        store.claim_task("a", id, TTL, 0).unwrap();
-        assert!(store.renew_task("b", id, TTL, 1).is_err());
-        assert!(store.release_task("b", id, "", 1).is_err());
+        let id = store.add_task("lead", "x", "", 0).unwrap().id;
+        store.claim_task("a", &id, TTL, 0).unwrap();
+        assert!(store.renew_task("b", &id, TTL, 1).is_err());
+        assert!(store.release_task("b", &id, "", 1).is_err());
         assert_eq!(
-            store.renew_task("a", id, TTL, 5).unwrap().lease_until,
+            store.renew_task("a", &id, TTL, 5).unwrap().lease_until,
             Some(5 + TTL_MS)
         );
-        let open = store.release_task("a", id, "blocked", 6).unwrap();
+        let open = store.release_task("a", &id, "blocked", 6).unwrap();
         assert_eq!((open.status, open.assignee), (Status::Open, None));
     }
 
     #[test]
     fn cancel_belongs_to_the_author_and_stops_at_a_final_state() {
         let (_dir, mut store) = test_store();
-        let id = store
-            .add_task("lead", "x", "", 0)
-            .unwrap()
-            .id
-            .rsplit_once('-')
-            .unwrap()
-            .1
-            .parse()
-            .unwrap();
-        assert!(store.cancel_task("other", id, "", 1).is_err());
-        store.cancel_task("lead", id, "dropped", 1).unwrap();
-        assert!(store.cancel_task("lead", id, "", 2).is_err());
-        assert!(store.claim_task("a", id, TTL, 2).is_err());
+        let id = store.add_task("lead", "x", "", 0).unwrap().id;
+        assert!(store.cancel_task("other", &id, "", 1).is_err());
+        store.cancel_task("lead", &id, "dropped", 1).unwrap();
+        assert!(store.cancel_task("lead", &id, "", 2).is_err());
+        assert!(store.claim_task("a", &id, TTL, 2).is_err());
 
         let done = task_in_review(&mut store);
-        pass_and_accept(&mut store, done, 3);
-        assert!(store.cancel_task("lead", done, "", 5).is_err());
+        pass_and_accept(&mut store, &done, 3);
+        assert!(store.cancel_task("lead", &done, "", 5).is_err());
     }
 
     #[test]
     fn the_list_hides_finished_tasks_unless_asked() {
         let (_dir, mut store) = test_store();
-        let open = store
-            .add_task("lead", "open", "", 0)
-            .unwrap()
-            .id
-            .rsplit_once('-')
-            .unwrap()
-            .1
-            .parse()
-            .unwrap();
+        let open = store.add_task("lead", "open", "", 0).unwrap().id;
         let done = task_in_review(&mut store);
-        pass_and_accept(&mut store, done, 3);
-        let ids = |tasks: Vec<Task>| {
-            tasks
-                .into_iter()
-                .map(|t| t.id.rsplit_once('-').unwrap().1.parse::<i64>().unwrap())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(ids(store.tasks(None, false).unwrap()), [open]);
-        assert_eq!(ids(store.tasks(None, true).unwrap()), [open, done]);
+        pass_and_accept(&mut store, &done, 3);
+        let ids = |tasks: Vec<Task>| tasks.into_iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(store.tasks(None, false).unwrap()).as_slice(),
+            std::slice::from_ref(&open)
+        );
+        assert_eq!(ids(store.tasks(None, true).unwrap()), [open, done.clone()]);
         assert_eq!(
             ids(store.tasks(Some(Status::Accepted), false).unwrap()),
             [done]
@@ -873,10 +839,10 @@ mod tests {
     #[test]
     fn a_missing_task_is_reported() {
         let (_dir, mut store) = test_store();
-        assert!(matches!(store.task(9), Err(Error::NotFound(_))));
-        assert!(matches!(store.task_history(9), Err(Error::NotFound(_))));
+        assert!(matches!(store.task("D-9"), Err(Error::NotFound(_))));
+        assert!(matches!(store.task_history("D-9"), Err(Error::NotFound(_))));
         assert!(matches!(
-            store.claim_task("a", 9, TTL, 0),
+            store.claim_task("a", "D-9", TTL, 0),
             Err(Error::NotFound(_))
         ));
     }
@@ -884,22 +850,15 @@ mod tests {
     #[test]
     fn only_one_of_many_racing_connections_takes_a_task() {
         let (dir, mut store) = test_store();
-        let id = store
-            .add_task("lead", "x", "", 0)
-            .unwrap()
-            .id
-            .rsplit_once('-')
-            .unwrap()
-            .1
-            .parse()
-            .unwrap();
+        let id = store.add_task("lead", "x", "", 0).unwrap().id;
         let racers: Vec<_> = (0..16)
             .map(|index| {
                 let root = dir.path().to_path_buf();
+                let id = id.clone();
                 std::thread::spawn(move || {
                     let mut store = Store::open(&root).unwrap();
                     store
-                        .claim_task(&format!("agent-{index}"), id, TTL, 1)
+                        .claim_task(&format!("agent-{index}"), &id, TTL, 1)
                         .is_ok()
                 })
             })

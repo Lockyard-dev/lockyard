@@ -74,6 +74,31 @@ pub(crate) fn transform_fields_policy(
     encrypt: bool,
     require_encrypted: bool,
 ) -> Result<(), String> {
+    if route.split('?').next() == Some("/api/v1/zones/catalog")
+        && (require_encrypted || value.get("format").is_some() || value.get("catalog").is_some())
+    {
+        // The typed catalog is signed over its wire ciphertext. Never run the generic
+        // field transformer over content or metadata after the MAC has been computed.
+        use lockyard_core::catalog::{CoordinationZoneCatalog, CoordinationZoneCatalogWrite};
+        let wire = if value.get("catalog").is_some() {
+            let write: CoordinationZoneCatalogWrite =
+                serde_json::from_value(value.clone()).map_err(|_| "catalog_invalid".to_string())?;
+            write.validate().map_err(|error| error.to_string())?;
+            write.catalog
+        } else {
+            CoordinationZoneCatalog::from_json(&value.to_string())
+                .map_err(|error| error.to_string())?
+        };
+        crate::catalog::verify_catalog(
+            key.ok_or("catalog_key_unavailable")?,
+            workspace,
+            &wire.repository,
+            &wire,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
     // Acquisition receipts are operation metadata, absent from the legacy shared
     // claim schema. Admit only this boolean on the exact POST reply, then run the
     // complete existing claim/content validation without changing that schema.
@@ -220,6 +245,13 @@ fn visit(
             Ok(())
         };
     };
+    // The additive claim receipt repeats the claim DTO and adds only creation metadata.
+    // Keep one content classification/decoder for both response schemas.
+    let schema = if schema == "CoordinationClaimReceipt" {
+        "CoordinationClaim"
+    } else {
+        schema
+    };
     if v.is_null() {
         return Ok(());
     }
@@ -265,7 +297,9 @@ fn visit(
     {
         decrypt_event_field(reason, "reason", workspace, key, require_encrypted)?;
     }
-    let owner_decision = schema == "RegistryEvidenceDto" && v["kind"] == "decision";
+    let owner_decision = schema == "RegistryEvidenceDto"
+        && v["kind"] == "decision"
+        && matches!(v["source"].as_str(), Some("direct_owner" | "relayed_owner"));
     if let (Some(obj), Some(props)) = (
         v.as_object_mut(),
         def.get("properties").and_then(Value::as_object),
@@ -349,31 +383,32 @@ fn visit(
                     }
                     continue;
                 }
-                let content_name = fields
-                    .iter()
-                    .find(|f| f.schema == schema && f.property == *p)
-                    .map(|f| f.name.as_str())
-                    .or_else(|| {
-                        require_encrypted
-                            .then(|| additional_node_content(schema, p))
-                            .flatten()
-                    });
+                let canonical_owner = (owner_decision && p == "value")
+                    || (schema == "RegistryOwnerCloseRequest" && p == "owner_word");
+                let content_name = if canonical_owner {
+                    Some("owner_word")
+                } else {
+                    fields
+                        .iter()
+                        .find(|f| f.schema == schema && f.property == *p)
+                        .map(|f| f.name.as_str())
+                        .or_else(|| {
+                            require_encrypted
+                                .then(|| additional_node_content(schema, p))
+                                .flatten()
+                        })
+                };
                 if let Some(content_name) = content_name {
-                    // Owner-close copies the word into Decision evidence without re-encryption.
-                    // Older CLI clients bind it to value; browser clients bind it to owner_word.
-                    let alternate = ((owner_decision && p == "value")
-                        || (schema == "RegistryOwnerCloseRequest" && p == "owner_word"))
-                        .then_some("owner_word");
+                    let alternate = canonical_owner.then_some("value");
                     if let Some(s) = slot.as_str() {
-                        if enc && s.starts_with(PREFIX) && require_encrypted {
-                            decrypt_compatible(
-                                key.ok_or("required node encryption key is unavailable")?,
-                                workspace,
-                                content_name,
-                                alternate,
-                                s,
-                            )
-                            .map_err(|_| "required node content envelope failed authentication")?;
+                        if enc && s.starts_with(PREFIX) && (require_encrypted || canonical_owner) {
+                            let key = key.ok_or("required node encryption key is unavailable")?;
+                            let plain =
+                                decrypt_compatible(key, workspace, content_name, alternate, s)?;
+                            if canonical_owner && key.decrypt(workspace, "owner_word", s).is_err() {
+                                *slot =
+                                    Value::String(key.encrypt(workspace, "owner_word", &plain)?);
+                            }
                         } else if enc && !s.starts_with(PREFIX) {
                             let k = key.ok_or_else(|| {
                                 format!("workspace encryption is required but no local key is available; import the key with `lockyard cloud key import` before writing content ({schema}.{p})")
@@ -394,6 +429,14 @@ fn visit(
                                     )?,
                                 );
                             }
+                        } else if !enc && s.starts_with(PREFIX) && canonical_owner {
+                            *slot = Value::String(decrypt_compatible(
+                                key.ok_or("content_authentication_failed")?,
+                                workspace,
+                                content_name,
+                                alternate,
+                                s,
+                            )?);
                         } else if !enc && s.starts_with(PREFIX) {
                             *slot = Value::String(match key {
                                 None => "[locked]".into(),
@@ -701,6 +744,28 @@ pub(crate) fn transform_error_details(
     };
     for (name, slot) in object {
         match name.as_str() {
+            "min_protocol" | "max_protocol"
+                if slot
+                    .as_u64()
+                    .is_some_and(|version| (1..=u64::from(u16::MAX)).contains(&version)) => {}
+            "supported_protocols"
+                if slot.as_array().is_some_and(|versions| {
+                    (1..=2).contains(&versions.len())
+                        && versions.iter().enumerate().all(|(index, version)| {
+                            version.as_u64().is_some_and(|version| {
+                                (1..=u64::from(u16::MAX)).contains(&version)
+                                    && (index == 0
+                                        || versions[index - 1]
+                                            .as_u64()
+                                            .is_some_and(|previous| previous < version))
+                            })
+                        })
+                }) => {}
+            "selected_protocol" if slot.is_null() => {}
+            "current_revision"
+                if slot.as_u64().is_some_and(|revision| {
+                    (1..=lockyard_core::catalog::MAX_CATALOG_REVISION).contains(&revision)
+                }) => {}
             "conflicts" => transform_conflict_array(slot, workspace, key, required)?,
             "priority_of" if slot.is_null() || slot.as_u64().is_some() => {}
             "reason" => decrypt_event_field(slot, "reason", workspace, key, required)?,
@@ -773,11 +838,11 @@ fn visit_event(
                 decrypt_event_field_alias(
                     reason,
                     if kind == "owner_closed" {
-                        "value"
+                        "owner_word"
                     } else {
                         "reason"
                     },
-                    (kind == "owner_closed").then_some("owner_word"),
+                    (kind == "owner_closed").then_some("value"),
                     workspace,
                     key,
                     required,
@@ -894,7 +959,14 @@ fn validate_metadata_event(kind: &str, value: &Value) -> Result<(), String> {
         "presence.activity" => &["session", "claim_id", "last_seen"],
         "presence.heartbeat" => &["session", "state", "last_seen"],
         "presence.unavailable" => &["session", "state"],
-        "zone.catalog" => &["updated_at", "repository"],
+        "zone.catalog" => &[
+            "updated_at",
+            "repository",
+            "revision",
+            "format",
+            "key_id",
+            "content_sha256",
+        ],
         "zone.dirty" | "zone.dirty_adopted" | "zone.dirty_disowned" => {
             &["session", "paths", "repository"]
         }
@@ -940,6 +1012,23 @@ fn validate_metadata_event(kind: &str, value: &Value) -> Result<(), String> {
             return Err("required node metadata event contains an unsupported field".into());
         }
         let valid = match name.as_str() {
+            "revision" => item.as_u64().is_some_and(|revision| {
+                (1..=lockyard_core::catalog::MAX_CATALOG_REVISION).contains(&revision)
+            }),
+            "format" => item.as_str() == Some(lockyard_core::catalog::CATALOG_FORMAT),
+            "key_id" => item.as_str().is_some_and(|id| {
+                !id.is_empty()
+                    && id.len() <= 128
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            }),
+            "content_sha256" => item.as_str().is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }),
             "seen" | "ids" => item.as_array().is_some_and(|a| a.iter().all(id)),
             "claim_id" => id(item),
             "session" | "to" => session(item),
@@ -992,7 +1081,13 @@ fn validate_metadata_event(kind: &str, value: &Value) -> Result<(), String> {
             "attention_required" => item.as_bool() == Some(true),
             "delivery_mode" => item.as_str() == Some("metadata"),
             "repository" => {
-                if kind == "integration.github" {
+                if kind == "zone.catalog" {
+                    item.is_null()
+                        || item.as_str().is_some_and(|repository| {
+                            repository.is_empty()
+                                || lockyard_core::repository::validate_id(repository).is_ok()
+                        })
+                } else if kind == "integration.github" {
                     item.as_str().is_some_and(|s| {
                         s.len() <= 200
                             && s.split('/').count() == 2
@@ -1040,11 +1135,75 @@ fn decrypt_compatible(
     alternate: Option<&str>,
     text: &str,
 ) -> Result<String, String> {
-    key.decrypt(workspace, name, text)
-        .or_else(|error| match alternate {
-            Some(alternate) => key.decrypt(workspace, alternate, text),
-            None => Err(error),
+    if name == "owner_word" && alternate == Some("value") {
+        lockyard_compat::OwnerDecisionV1Reader::read(lockyard_compat::Source::Sdk, |field| {
+            key.decrypt(workspace, field, text)
+                .map_err(|_| "content_authentication_failed".into())
         })
+    } else {
+        key.decrypt(workspace, name, text)
+            .map_err(|_| "content_authentication_failed".into())
+    }
+}
+
+#[cfg(test)]
+mod w4_owner_contract_tests {
+    use super::*;
+
+    #[test]
+    fn owner_close_canonical_aad_round_trips_across_rust_and_web() {
+        let key = WorkspaceKey::from_entropy([18; 32]);
+        let mut value =
+            serde_json::json!({"owner_word":"owner approved", "expected_version":1, "direct":true});
+        transform_fields_policy(
+            &mut value,
+            "POST",
+            "/api/v1/registry/items/FE-1/owner-close",
+            "w",
+            Some(&key),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            key.decrypt("w", "owner_word", value["owner_word"].as_str().unwrap())
+                .unwrap(),
+            "owner approved"
+        );
+        let wrong = WorkspaceKey::from_entropy([19; 32]);
+        let mut tampered = serde_json::json!({"id":"FE-1","evidence":[{"kind":"decision","source":"direct_owner","value":wrong.encrypt("w","owner_word","private").unwrap()}]});
+        assert!(
+            transform_fields_policy(
+                &mut tampered,
+                "GET",
+                "/api/v1/registry/items/FE-1",
+                "w",
+                Some(&key),
+                false,
+                false
+            )
+            .is_err(),
+            "owner-context auth failures must not become display placeholders"
+        );
+        decision_without_owner_source_never_reads_owner_word_aad();
+    }
+
+    fn decision_without_owner_source_never_reads_owner_word_aad() {
+        let key = WorkspaceKey::from_entropy([18; 32]);
+        let mut value = serde_json::json!({"id":"FE-1", "evidence":[{"kind":"decision", "source":"agent", "value":key.encrypt("w", "owner_word", "private").unwrap()}]});
+        assert!(
+            transform_fields_policy(
+                &mut value,
+                "GET",
+                "/api/v1/registry/items/FE-1",
+                "w",
+                Some(&key),
+                false,
+                true
+            )
+            .is_err()
+        );
+    }
 }
 
 fn decrypt_event_field_alias(
@@ -1276,6 +1435,13 @@ fn safe_activity_meta(value: &Value) -> bool {
 pub(crate) fn validate_required_route(method: &str, route: &str) -> Result<(), String> {
     let (_, api) = parsed()?;
     let (normalized, query) = route.split_once('?').unwrap_or((route, ""));
+    if normalized == "/api/v1/zones/catalog" {
+        return if matches!(method, "GET" | "POST") && query.is_empty() {
+            Ok(())
+        } else {
+            Err("catalog_invalid".into())
+        };
+    }
     // Legacy bulk imports contain untyped JSON/legacy_raw outside the content table.
     // A remote job must use the typed, encrypted operations instead.
     if normalized.starts_with("/api/v1/import/") || normalized == "/api/v1/registry/import" {
@@ -1590,6 +1756,19 @@ impl WorkspaceKey {
         x.extend(b);
         Ok(format!("{PREFIX}{}.{}", self.key_id(), base64url(&x)))
     }
+    /// Authenticate with this purpose-derived key without exposing its bytes.
+    pub fn sign_hmac(&self, message: &[u8]) -> String {
+        base64url(hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &self.0), message).as_ref())
+    }
+    /// Verify the full canonical 32-byte tag in constant time.
+    pub fn verify_hmac(&self, message: &[u8], tag: &str) -> Result<(), String> {
+        let tag = unbase64url(tag)?;
+        if tag.len() != 32 {
+            return Err("invalid authentication tag".into());
+        }
+        hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256, &self.0), message, &tag)
+            .map_err(|_| "authentication failed".into())
+    }
     pub fn decrypt(&self, w: &str, f: &str, v: &str) -> Result<String, String> {
         let x = v.strip_prefix(PREFIX).ok_or("not encrypted")?;
         let (id, b) = x.split_once('.').ok_or("invalid envelope")?;
@@ -1805,7 +1984,7 @@ mod tests {
                 "missing {schema}.{prop}"
             );
         }
-        let covered = fields
+        let mut covered = fields
             .iter()
             .chain(clear)
             .map(|e| {
@@ -1815,6 +1994,18 @@ mod tests {
                 )
             })
             .collect::<std::collections::HashSet<_>>();
+        // EP-10 ProblemDetails is explicit clear protocol metadata, outside content transforms.
+        covered.extend([
+            ("ApiProblem", "title"),
+            ("ApiProblem", "detail"),
+            ("ApiProblemError", "message"),
+        ]);
+        let inherited = covered
+            .iter()
+            .filter(|(schema, _)| *schema == "CoordinationClaim")
+            .map(|(_, property)| ("CoordinationClaimReceipt", *property))
+            .collect::<Vec<_>>();
+        covered.extend(inherited);
         let likely_free = [
             "body",
             "text",
@@ -1848,7 +2039,7 @@ mod tests {
         }
     }
     #[test]
-    fn owner_close_word_keeps_the_evidence_value_encryption_context() {
+    fn owner_close_word_uses_canonical_owner_context() {
         let key = WorkspaceKey::from_entropy([9; 32]);
         let mut request = serde_json::json!({
             "owner_word": "approved by owner", "expected_version": 1, "direct": true
@@ -1865,12 +2056,12 @@ mod tests {
         .unwrap();
         let envelope = request["owner_word"].as_str().unwrap();
         assert_eq!(
-            key.decrypt("w", "value", envelope).unwrap(),
+            key.decrypt("w", "owner_word", envelope).unwrap(),
             "approved by owner"
         );
-        assert!(key.decrypt("w", "owner_word", envelope).is_err());
+        assert!(key.decrypt("w", "value", envelope).is_err());
         let mut response = serde_json::json!({
-            "id": "FE-1", "evidence": [{"kind": "decision", "value": envelope}]
+            "id": "FE-1", "evidence": [{"kind": "decision", "source":"direct_owner", "value": envelope}]
         });
         transform_fields_policy(
             &mut response,
@@ -1892,7 +2083,7 @@ mod tests {
         for context in ["value", "owner_word"] {
             let envelope = key.encrypt("w", context, "owner approval").unwrap();
             let mut response = serde_json::json!({
-                "id": "FE-1", "evidence": [{"kind": "decision", "value": envelope}]
+                "id": "FE-1", "evidence": [{"kind": "decision", "source":"direct_owner", "value": envelope}]
             });
             transform_fields_policy(
                 &mut response,

@@ -10,13 +10,14 @@ pub(super) fn run_tool(
     client: Option<&str>,
     after: &mut Option<After>,
 ) -> Result<Value> {
-    if COMPOSITES.contains(&name) {
-        return run_composite(name, args, agent, cwd, client, after);
-    }
-    // The compact surface's short names for tools that need no composing.
-    let name = match name {
-        "check" => "zone_check",
-        other => other,
+    let handler = tool_registry()
+        .handler(name)
+        .ok_or_else(|| Error::Invalid(format!("unknown tool {name:?}")))?;
+    let name = match &handler {
+        ToolHandler::Composite(name) => {
+            return run_composite(name, args, agent, cwd, client, after);
+        }
+        ToolHandler::Primitive(name) => name.as_str(),
     };
     if uses_node_transport(name) {
         return node_tool(name, args);
@@ -35,10 +36,30 @@ pub(super) fn run_tool(
         encode(
             &opened
                 .backend
-                .work_step(me()?, args.id()?, action, &args.step()?)?,
+                .work_step(me()?, &args.bus_key()?, action, &args.step()?)?,
         )
     };
     match name {
+        "cloud_protocol" => opened.backend.cloud_protocol(),
+        "cloud_drain" => {
+            let request = json!({"scope":args.text("scope")?,"instance_id":args.text("instance_id")?,"timeout_seconds":args.some_int("timeout_seconds")?.unwrap_or(30)});
+            opened
+                .backend
+                .cloud_drain(me()?, &request, args.text("idempotency_key")?)
+        }
+        "cloud_drain_status" => opened.backend.cloud_drain_status(args.text("id")?),
+        "zone_catalog_put" => {
+            let revision = args.int("expected_revision").and_then(|value| {
+                u64::try_from(value)
+                    .map_err(|_| wrong_type("expected_revision", "a nonnegative integer"))
+            })?;
+            opened.backend.catalog_put(
+                me()?,
+                &args.required_object("catalog")?,
+                revision,
+                args.text("idempotency_key")?,
+            )
+        }
         "tasks" => {
             let backend = &mut opened.backend;
             let action = args.some_text("action")?.ok_or_else(|| Error::Invalid(
@@ -53,46 +74,54 @@ pub(super) fn run_tool(
                     encode(&tasks)
                 }
                 "show" => {
-                    let id = args.task_id()?;
+                    let id = args.task_key_for(is_cloud)?;
                     Ok(json!({"task": backend.task(&id)?, "history": backend.task_history(&id)?}))
                 }
-                "claim" => {
-                    encode(&backend.claim_task(me()?, &args.task_id()?, args.ttl()?, now)?)
-                }
+                "claim" => encode(&backend.claim_task(
+                    me()?,
+                    &args.task_key_for(is_cloud)?,
+                    args.ttl()?,
+                    now,
+                )?),
                 "submit" => {
                     let evidence = executor_evidence(args.text("evidence")?);
-                    encode(&backend.submit_task(me()?, &args.task_id()?, &evidence, now)?)
+                    encode(&backend.submit_task(
+                        me()?,
+                        &args.task_key_for(is_cloud)?,
+                        &evidence,
+                        now,
+                    )?)
                 }
                 "block" | "unblock" => encode(&backend.block_task(
                     me()?,
-                    &args.task_id()?,
+                    &args.task_key_for(is_cloud)?,
                     args.text("action")? == "block",
                     args.optional_text("reason")?,
                     now,
                 )?),
                 "review" => encode(&backend.review_task(
                     me()?,
-                    &args.task_id()?,
+                    &args.task_key_for(is_cloud)?,
                     args.text("decision")?,
                     args.optional_text("reason")?,
                     now,
                 )?),
                 "accept" => encode(&backend.accept_task(
                     me()?,
-                    &args.task_id()?,
+                    &args.task_key_for(is_cloud)?,
                     args.optional_text("note")?,
                     now,
                 )?),
                 "reject" => encode(&backend.reject_task(
                     me()?,
-                    &args.task_id()?,
+                    &args.task_key_for(is_cloud)?,
                     args.text("reason")?,
                     args.optional_text("evidence")?,
                     now,
                 )?),
                 "cancel" | "close" => encode(&backend.cancel_task(
                     me()?,
-                    &args.task_id()?,
+                    &args.task_key_for(is_cloud)?,
                     args.optional_text("note")?,
                     now,
                 )?),
@@ -100,7 +129,7 @@ pub(super) fn run_tool(
             }
         }
         "task_bulk" => {
-            let ids = args.strings("ids")?;
+            let ids = args.task_keys("ids")?;
             let evidence = args.optional_text("evidence")?;
             let note = if evidence.is_empty() {
                 args.optional_text("note")?
@@ -140,7 +169,7 @@ pub(super) fn run_tool(
             }
             opened.backend.area_update(me()?, key, &request)
         }
-        "workflow_run" => crate::workflow::run(
+        "workflow_run" => crate::workflow::run_with_source(
             &opened.root,
             opened.backend.as_mut(),
             me()?,
@@ -148,6 +177,7 @@ pub(super) fn run_tool(
             args.text("operation_id")?,
             args.get("plan")
                 .ok_or_else(|| Error::Invalid("plan is required".into()))?,
+            lockyard_compat::Source::Mcp,
         ),
         "workflow_inspect" => crate::workflow::inspect(&opened.root, args.text("operation_id")?),
         "context" => crate::context::snapshot(
@@ -166,19 +196,17 @@ pub(super) fn run_tool(
         "task_search" => opened.backend.registry_search(args.0),
         "task_why_blocked" => opened
             .backend
-            .registry_blockers_by_id(&args.registry_id("id")?),
+            .registry_blockers_by_id(&args.task_key("id")?),
         "task_links" => {
-            let item = opened
-                .backend
-                .registry_item_by_id(&args.registry_id("id")?)?;
+            let item = opened.backend.registry_item_by_id(&args.task_key("id")?)?;
             Ok(
                 json!({"id":item["id"],"status":item["status"],"version":item["version"],"links":item["links"]}),
             )
         }
         "task_link" => opened.backend.registry_link_by_id(
             me()?,
-            &args.registry_id("id")?,
-            &args.registry_id("to")?,
+            &args.task_key("id")?,
+            &args.task_key("to")?,
             args.text("kind")?,
             args.int("if_version")?,
             args.text("key")?,
@@ -311,7 +339,10 @@ pub(super) fn run_tool(
         )?),
         "zone_dirty" => {
             let (owner, reason) = (args.some_text("owner")?, args.some_text("reason")?);
-            let task = args.some_int("task")?;
+            let task = args
+                .some_task_id("task")?
+                .map(|id| lockyard_core::task_id::TaskId::parse(&id))
+                .transpose()?;
             let paths = opened.zone_paths(cwd, &args.strings("paths")?)?;
             let report: Vec<DirtyPath> = paths
                 .into_iter()
@@ -319,7 +350,7 @@ pub(super) fn run_tool(
                     path,
                     owner_session: owner.clone(),
                     reason: reason.clone(),
-                    task_id: task,
+                    task_id: task.clone(),
                 })
                 .collect();
             opened.backend.dirty_report(me()?, &report)?;
@@ -527,7 +558,7 @@ pub(super) fn run_tool(
             encode(
                 &opened
                     .backend
-                    .plan_task(me()?, &args.task_id_for(is_cloud)?, &plan)?,
+                    .plan_task(me()?, &args.task_key_for(is_cloud)?, &plan)?,
             )
         }
         "task_list" => {
@@ -556,20 +587,20 @@ pub(super) fn run_tool(
             encode(&opened.backend.tasks(status, args.flag("all")?)?)
         }
         "task_show" => {
-            let id = args.task_id_for(is_cloud)?;
+            let id = args.task_key_for(is_cloud)?;
             let task = opened.backend.task(&id)?;
             let history = opened.backend.task_history(&id)?;
             Ok(json!({"task": task, "history": history}))
         }
         "task_claim" => encode(&opened.backend.claim_task(
             me()?,
-            &args.task_id_for(is_cloud)?,
+            &args.task_key_for(is_cloud)?,
             args.ttl()?,
             now,
         )?),
         "task_renew" => encode(&opened.backend.renew_task(
             me()?,
-            &args.task_id_for(is_cloud)?,
+            &args.task_key_for(is_cloud)?,
             args.ttl()?,
             now,
         )?),
@@ -578,21 +609,21 @@ pub(super) fn run_tool(
             encode(
                 &opened
                     .backend
-                    .release_task(me()?, &args.task_id_for(is_cloud)?, note, now)?,
+                    .release_task(me()?, &args.task_key_for(is_cloud)?, note, now)?,
             )
         }
         "task_submit" => {
             let evidence = executor_evidence(args.text("evidence")?);
             encode(&opened.backend.submit_task(
                 me()?,
-                &args.task_id_for(is_cloud)?,
+                &args.task_key_for(is_cloud)?,
                 &evidence,
                 now,
             )?)
         }
         "task_review" => encode(&opened.backend.review_task(
             me()?,
-            &args.task_id_for(is_cloud)?,
+            &args.task_key_for(is_cloud)?,
             args.text("decision")?,
             args.optional_text("reason")?,
             now,
@@ -602,7 +633,7 @@ pub(super) fn run_tool(
             encode(
                 &opened
                     .backend
-                    .accept_task(me()?, &args.task_id_for(is_cloud)?, note, now)?,
+                    .accept_task(me()?, &args.task_key_for(is_cloud)?, note, now)?,
             )
         }
         "task_reject" => {
@@ -610,7 +641,7 @@ pub(super) fn run_tool(
             let evidence = args.optional_text("evidence")?;
             encode(&opened.backend.reject_task(
                 me()?,
-                &args.task_id_for(is_cloud)?,
+                &args.task_key_for(is_cloud)?,
                 reason,
                 evidence,
                 now,
@@ -621,7 +652,7 @@ pub(super) fn run_tool(
             encode(
                 &opened
                     .backend
-                    .cancel_task(me()?, &args.task_id_for(is_cloud)?, note, now)?,
+                    .cancel_task(me()?, &args.task_key_for(is_cloud)?, note, now)?,
             )
         }
         "board_set" => {
@@ -660,7 +691,7 @@ pub(super) fn run_tool(
             encode(&opened.backend.work_offer(me()?, &offer)?)
         }
         "work_list" => encode(&opened.backend.work_list(me()?)?),
-        "work_show" => encode(&opened.backend.work_get(me()?, args.id()?)?),
+        "work_show" => encode(&opened.backend.work_get(me()?, &args.bus_key()?)?),
         "work_claim" => work(WorkAction::Claim, &mut opened),
         "work_beat" => work(WorkAction::Beat, &mut opened),
         "work_done" => work(WorkAction::Done, &mut opened),

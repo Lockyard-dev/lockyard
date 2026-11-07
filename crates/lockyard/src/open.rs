@@ -129,18 +129,36 @@ pub fn open(cwd: &Path, agent: Option<&str>) -> Result<Opened> {
 
 fn direct(url: &str, session: &str, repository: Option<&str>) -> Result<Box<dyn Backend>> {
     trusted_url(url)?;
-    let client =
-        Client::new(url, Config::token_for(url)?)?.configure_content_encryption(session)?;
+    let client = journal_client(Client::new(url, Config::token_for(url)?)?)?
+        .configure_content_encryption(session)?;
     Ok(Box::new(CloudBackend::new(
         RepositoryTransport::new(client, repository)?,
         session,
     )))
 }
 
+/// Freeze wire writes privately before the network so a process restart cannot re-encrypt a pending key.
+pub(crate) fn journal_client(client: Client) -> Result<Client> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .ok_or_else(|| Error::Invalid("private state directory is unavailable".into()))?;
+    let mut directories = fs::DirBuilder::new();
+    directories.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directories.mode(0o700);
+    }
+    directories.create(&state)?;
+    let state = state.canonicalize()?;
+    Ok(client.with_pending_journal(state.join("lockyard/pending-writes"))?)
+}
+
 /// A trusted direct client for workspace administration commands.
 pub(crate) fn direct_client(url: &str) -> Result<Client> {
     trusted_url(url)?;
-    Ok(Client::new(url, Config::token_for(url)?)?)
+    journal_client(Client::new(url, Config::token_for(url)?)?)
 }
 
 #[cfg(unix)]

@@ -92,6 +92,29 @@ pub(super) enum AgentCommand {
 #[derive(Subcommand)]
 #[command(defer = true)]
 pub(super) enum CloudCommand {
+    /// Discover the negotiated cloud protocol and capabilities.
+    Protocol,
+    /// Encrypt and publish a typed zone catalog using compare-and-swap.
+    CatalogPut {
+        file: PathBuf,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        key: String,
+    },
+    /// Drain work admitted on a specific server instance.
+    Drain {
+        #[arg(long, value_parser=["workspace","instance"])]
+        scope: String,
+        #[arg(long)]
+        instance_id: String,
+        #[arg(long, default_value_t = 30)]
+        timeout: u32,
+        #[arg(long)]
+        key: String,
+    },
+    /// Read a previously requested drain operation.
+    DrainStatus { id: String },
     /// Trust a server URL before sending a user token to it.
     Trust { url: String },
     /// Sign in to a cloud workspace from the browser and store the token for this machine.

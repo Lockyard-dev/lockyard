@@ -5,39 +5,19 @@ use crate::{Call, CloudBackend, Transport, encode};
 use lockyard_core::{Error, Result};
 use serde_json::{Value, json};
 
-fn checked_id(id: i64) -> Result<String> {
-    if id <= 0 {
-        return Err(Error::Invalid("registry id must be positive".into()));
-    }
-    Ok(format!("D-{id}"))
-}
-
 fn checked_string_id(id: &str) -> Result<String> {
-    if !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) {
-        return id
-            .parse::<i64>()
-            .ok()
-            .and_then(|number| checked_id(number).ok())
-            .ok_or_else(|| Error::Invalid("registry id must be positive".into()));
-    }
-    let valid = id.rsplit_once('-').is_some_and(|(prefix, number)| {
-        !prefix.is_empty()
-            && prefix.split('-').all(|part| {
-                let mut chars = part.chars();
-                chars.next().is_some_and(|ch| ch.is_ascii_uppercase())
-                    && chars.all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
-            })
-            && !number.is_empty()
-            && number.bytes().all(|byte| byte.is_ascii_digit())
-            && number.bytes().any(|byte| byte != b'0')
-    });
-    if valid {
-        Ok(id.to_string())
-    } else {
-        Err(Error::Invalid(
-            "registry id must be a positive number or PREFIX-number such as FE-0001".into(),
-        ))
-    }
+    lockyard_compat::LegacyCompatibilityV1::task_id(
+        &json!(id),
+        lockyard_compat::TaskDomain::Registry,
+        lockyard_compat::Source::Sdk,
+        2,
+    )
+    .map_err(|code| Error::Cloud {
+        code: code.clone(),
+        status: None,
+        details: Value::Null,
+        message: code,
+    })
 }
 
 pub(crate) fn search<T: Transport>(
@@ -91,14 +71,6 @@ pub(crate) fn search<T: Transport>(
     ))?)
 }
 
-pub(crate) fn item<T: Transport>(
-    backend: &CloudBackend<T>,
-    id: i64,
-    blockers: bool,
-) -> Result<Value> {
-    item_by_id(backend, &checked_id(id)?, blockers)
-}
-
 pub(crate) fn item_by_id<T: Transport>(
     backend: &CloudBackend<T>,
     id: &str,
@@ -109,28 +81,6 @@ pub(crate) fn item_by_id<T: Transport>(
         &backend.session,
         format!("/api/v1/registry/items/{}{tail}", checked_string_id(id)?),
     ))?)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn link<T: Transport>(
-    backend: &CloudBackend<T>,
-    agent: &str,
-    id: i64,
-    to: i64,
-    kind: &str,
-    version: i64,
-    key: &str,
-) -> Result<Value> {
-    validate_link(kind, version, key)?;
-    link_by_id(
-        backend,
-        agent,
-        &checked_id(id)?,
-        &checked_id(to)?,
-        kind,
-        version,
-        key,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -255,7 +205,7 @@ mod tests {
     fn link_preserves_idempotency_and_version() {
         let backend = CloudBackend::new(Recording::default(), "agent");
         let key = "01K00000000000000000000000";
-        link(&backend, "me", 1, 2, "blocks", 4, key).unwrap();
+        link_by_id(&backend, "me", "D-1", "D-2", "blocks", 4, key).unwrap();
         let calls = backend.transport.0.lock().unwrap();
         assert_eq!(calls[0].key.as_deref(), Some(key));
         assert_eq!(calls[0].body.as_ref().unwrap()["expected_version"], 4);

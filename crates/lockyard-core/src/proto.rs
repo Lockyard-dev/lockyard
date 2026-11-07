@@ -137,11 +137,7 @@ pub enum Purpose {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Claim {
     pub id: i64,
-    #[serde(
-        rename(serialize = "agent", deserialize = "session"),
-        alias = "agent",
-        default
-    )]
+    #[serde(default)]
     pub session: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
@@ -272,11 +268,7 @@ pub struct QueueRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueueEntry {
     pub id: i64,
-    #[serde(
-        rename(serialize = "agent", deserialize = "session"),
-        alias = "agent",
-        default
-    )]
+    #[serde(default)]
     pub session: String,
     #[serde(default)]
     pub paths: Vec<String>,
@@ -353,7 +345,7 @@ pub struct DirtyPath {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<i64>,
+    pub task_id: Option<crate::task_id::TaskId>,
 }
 
 /// A claim taken away from its session.
@@ -515,7 +507,7 @@ pub enum WorkStatus {
 /// A task offer between agents.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkTask {
-    pub id: i64,
+    pub id: crate::task_id::BusTaskId,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -655,7 +647,6 @@ pub struct PresenceBeat {
 /// One live session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Presence {
-    #[serde(rename(serialize = "agent", deserialize = "session"), alias = "agent")]
     pub session: String,
     #[serde(default)]
     pub client: String,
@@ -803,7 +794,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn a_claim_reads_the_wire_names_and_prints_the_local_ones() {
+    fn a_claim_keeps_canonical_session_names_in_the_domain() {
         let claim: Claim = serde_json::from_value(json!({
             "id": 7, "session": "s", "paths": ["src"], "mode": "shared", "purpose": "deploy", "lazy": true,
             "fence": 3, "created_at": "2026-11-02T10:00:00Z", "expires_at": 1000, "excluded_paths": ["src/x"],
@@ -815,7 +806,7 @@ mod tests {
         assert_eq!(claim.created_at, Stamp::Text("2026-11-02T10:00:00Z".into()));
         assert_eq!(claim.expires_at, Stamp::Millis(1000));
         let printed = serde_json::to_value(&claim).unwrap();
-        assert_eq!(printed["agent"], "s");
+        assert_eq!(printed["session"], "s");
         let again: Claim = serde_json::from_value(printed).unwrap();
         assert_eq!(again, claim);
     }
@@ -919,7 +910,9 @@ mod tests {
 
     #[test]
     fn offered_is_the_status_spelling() {
-        let task: WorkTask = serde_json::from_value(json!({"id": 1, "status": "offered"})).unwrap();
+        let task: WorkTask =
+            serde_json::from_value(json!({"id": "BT-1", "status": "offered"})).unwrap();
         assert_eq!(task.status, WorkStatus::Offered);
+        assert_eq!(serde_json::to_value(task).unwrap()["status"], "offered");
     }
 }

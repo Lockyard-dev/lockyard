@@ -8,6 +8,7 @@
 mod admission;
 mod backend;
 pub mod bus;
+pub mod catalog;
 pub mod config;
 pub mod coordination;
 pub mod credentials;
@@ -19,6 +20,7 @@ pub mod paths;
 pub mod proto;
 pub mod repository;
 mod store;
+pub mod task_id;
 pub mod tasks;
 pub mod watch;
 pub mod zones;

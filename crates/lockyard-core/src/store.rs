@@ -2,7 +2,9 @@
 
 use crate::paths::find_root;
 use crate::{Error, Result};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, config::DbConfig, params,
+};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,7 +14,7 @@ use std::time::Duration;
 pub const DIR_NAME: &str = ".lockyard";
 
 const DB_NAME: &str = "lockyard.db";
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_AGENT_LEN: usize = 128;
 const TOUCH_INTERVAL_MS: i64 = 60_000;
@@ -206,6 +208,25 @@ CREATE TABLE unannounced_writes (
 CREATE INDEX unannounced_writes_by_time ON unannounced_writes(last_at);
 ";
 
+// Canonical keys are additive; integer columns remain storage surrogates for old readers.
+const SCHEMA_V7: &str = "
+ALTER TABLE tasks ADD COLUMN task_key TEXT;
+UPDATE tasks SET task_key = 'D-' || id;
+CREATE UNIQUE INDEX tasks_by_key ON tasks(task_key);
+ALTER TABLE task_events ADD COLUMN task_key TEXT REFERENCES tasks(task_key);
+UPDATE task_events SET task_key = (SELECT task_key FROM tasks WHERE tasks.id = task_events.task_id);
+CREATE INDEX task_events_by_key ON task_events(task_key, id);
+CREATE TRIGGER task_key_required_insert BEFORE INSERT ON tasks
+WHEN NEW.task_key IS NULL OR NEW.task_key != 'D-' || NEW.id
+BEGIN SELECT RAISE(ABORT, 'task generation requires canonical key'); END;
+CREATE TRIGGER task_key_immutable BEFORE UPDATE OF task_key ON tasks
+WHEN NEW.task_key IS NOT OLD.task_key
+BEGIN SELECT RAISE(ABORT, 'task key is immutable'); END;
+CREATE TRIGGER task_event_key_required BEFORE INSERT ON task_events
+WHEN NEW.task_key IS NULL OR NEW.task_key IS NOT (SELECT task_key FROM tasks WHERE id=NEW.task_id)
+BEGIN SELECT RAISE(ABORT, 'task generation requires canonical event key'); END;
+";
+
 /// An agent that has acted in this project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Agent {
@@ -241,10 +262,21 @@ impl Store {
         }
         let conn = Connection::open(dir.join(DB_NAME))?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
+        // Triggers distinguish a connection from this generation from an already-open old binary.
+        conn.create_scalar_function(
+            "lockyard_writer_generation",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
+                | rusqlite::functions::FunctionFlags::SQLITE_INNOCUOUS,
+            |_| Ok(SCHEMA_VERSION),
+        )?;
         conn.pragma_update(None, "foreign_keys", true)?;
-        // In WAL mode a power cut can then lose the last writes, which for leases and mail is cheap,
-        // and it cannot damage the file.
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Short-lived CLI writers must not checkpoint, unlink and recreate WAL/SHM on every
+        // command. Keep the normal automatic checkpoints, and sync each commit before returning
+        // success: retaining a NORMAL-synchronous WAL would extend the power-loss window.
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
         let mut store = Self { conn, root };
         store.migrate()?;
         Ok(store)
@@ -253,6 +285,125 @@ impl Store {
     /// Opens the project that contains `cwd`.
     pub fn discover(cwd: &Path) -> Result<Self> {
         Self::open(&find_root(cwd).ok_or(Error::NoProject)?)
+    }
+
+    /// Folds committed WAL frames into the existing database at a long-lived process's shutdown.
+    /// SQLite arbitrates concurrent writers/readers; a busy checkpoint leaves the WAL intact.
+    /// This never creates a local database for a cloud-only project or migrates its schema.
+    pub fn checkpoint_on_shutdown(cwd: &Path) -> Result<()> {
+        use rusqlite::OpenFlags;
+        let Some(root) = find_root(cwd) else {
+            return Ok(());
+        };
+        let path = root.join(DIR_NAME).join(DB_NAME);
+        match fs::metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        // A failed explicit checkpoint must not turn into another implicit checkpoint on close.
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+        conn.busy_timeout(Duration::from_millis(250))?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let (busy, frames, checkpointed): (i32, i32, i32) =
+            conn.query_row("PRAGMA main.wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        if busy != 0 {
+            return Err(Error::Unavailable(format!(
+                "WAL checkpoint busy ({checkpointed}/{frames} frames); committed data remains in the WAL"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Publishes a complete, private SQLite snapshot without replacing any existing path.
+    pub fn backup(&self, destination: &Path) -> Result<()> {
+        use rusqlite::{
+            OpenFlags,
+            backup::{Backup, StepResult},
+        };
+        use std::io;
+
+        if !self.conn.is_autocommit() {
+            return Err(Error::Invalid(
+                "database backup requires no active transaction".into(),
+            ));
+        }
+        let name = destination
+            .file_name()
+            .ok_or_else(|| Error::Invalid("backup destination must name a file".into()))?;
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()?;
+        let destination = parent.join(name);
+        // This preflight improves the error; hard_link below provides race-free no-clobber.
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "backup destination already exists: {}",
+                        destination.display()
+                    ),
+                )
+                .into());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut staging_options = tempfile::Builder::new();
+        staging_options.prefix(".lockyard-backup-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            staging_options.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let staging = staging_options.tempdir_in(&parent)?;
+        let file = tempfile::NamedTempFile::new_in(staging.path())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        let mut target = Connection::open_with_flags(
+            file.path(),
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        target.busy_timeout(BUSY_TIMEOUT)?;
+        target.pragma_update(None, "synchronous", "FULL")?;
+        {
+            let backup = Backup::new(&self.conn, &mut target)?;
+            if backup.step(-1)? != StepResult::Done {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "source database remained busy during backup; retry",
+                )
+                .into());
+            }
+        }
+        // The backup copies a WAL-mode header too. Normalize it before exposing the snapshot.
+        let mode: String = target.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
+        if mode != "delete" {
+            return Err(Error::Invalid(
+                "could not finalize standalone database backup".into(),
+            ));
+        }
+        target.close().map_err(|(_, error)| Error::Db(error))?;
+        file.as_file().sync_all()?;
+        fs::hard_link(file.path(), &destination)?;
+        #[cfg(unix)]
+        fs::File::open(&parent)?.sync_all()?;
+        Ok(())
     }
 
     /// The canonical project root.
@@ -367,6 +518,31 @@ impl Store {
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version == 5 {
             transaction.execute_batch(SCHEMA_V6)?;
+            transaction.pragma_update(None, "user_version", 6)?;
+        }
+        let version: i32 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == 6 {
+            transaction.execute_batch(SCHEMA_V7)?;
+            let tables = {
+                let mut query=transaction.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
+                query
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for table in tables {
+                if !table
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    return Err(Error::Invalid(
+                        "unsupported local table name during generation cutover".into(),
+                    ));
+                }
+                for operation in ["INSERT", "UPDATE", "DELETE"] {
+                    transaction.execute_batch(&format!("CREATE TRIGGER writer_generation_{table}_{operation} BEFORE {operation} ON {table} WHEN lockyard_writer_generation() != {SCHEMA_VERSION} BEGIN SELECT RAISE(ABORT, 'incompatible writer generation'); END;"))?;
+                }
+            }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         transaction.commit()?;
@@ -417,6 +593,171 @@ pub(crate) fn test_store() -> (tempfile::TempDir, Store) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_lived_writers_reuse_durable_wal_and_keep_auto_checkpointing() {
+        let (dir, mut store) = test_store();
+        store.send("alice", "*", "before close", 0).unwrap();
+        let wal = dir.path().join(DIR_NAME).join("lockyard.db-wal");
+        let bytes_before_close = fs::metadata(&wal).unwrap().len();
+        drop(store);
+        assert_eq!(
+            fs::metadata(&wal)
+                .expect("closing a CLI writer must retain the WAL")
+                .len(),
+            bytes_before_close
+        );
+
+        // Repeated independent connections must see the committed messages in the retained WAL.
+        for now in 1..=16 {
+            let mut store = Store::open(dir.path()).unwrap();
+            assert_eq!(
+                store
+                    .conn
+                    .pragma_query_value(None, "synchronous", |row| row.get::<_, i32>(0))
+                    .unwrap(),
+                2,
+                "retaining the WAL requires FULL durability at each commit"
+            );
+            store.send("alice", "*", "after reopen", now).unwrap();
+        }
+        let mut store = Store::open(dir.path()).unwrap();
+        let checkpoint_pages: u32 = store
+            .conn
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            checkpoint_pages, 1000,
+            "automatic checkpoints must stay enabled"
+        );
+        let page_bytes: u32 = store
+            .conn
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        // Enough small commits to cross the normal checkpoint threshold repeatedly. Without
+        // automatic checkpoints this workload grows the WAL beyond the bound below.
+        for now in 17..=1116 {
+            store
+                .send("alice", "*", "checkpoint workload", now)
+                .unwrap();
+        }
+        assert!(
+            fs::metadata(&wal).unwrap().len()
+                <= 32 + u64::from(checkpoint_pages + 32) * u64::from(page_bytes + 24)
+        );
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1117);
+        let integrity: String = store
+            .conn
+            .pragma_query_value(None, "integrity_check", |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn shutdown_checkpoint_reports_busy_writer_without_losing_commits() {
+        let (dir, mut store) = test_store();
+        store
+            .send("alice", "*", "committed before busy writer", 0)
+            .unwrap();
+        let writer = Store::open(dir.path()).unwrap();
+        writer.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let wal = dir.path().join(DIR_NAME).join("lockyard.db-wal");
+        assert!(fs::metadata(&wal).unwrap().len() > 0);
+        let error = Store::checkpoint_on_shutdown(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("checkpoint"), "{error}");
+        assert!(fs::metadata(&wal).unwrap().len() > 0);
+        writer.conn.execute_batch("ROLLBACK").unwrap();
+        drop(writer);
+        drop(store);
+        Store::checkpoint_on_shutdown(dir.path()).unwrap();
+        let copy = tempfile::tempdir().unwrap();
+        fs::copy(
+            dir.path().join(DIR_NAME).join(DB_NAME),
+            copy.path().join(DB_NAME),
+        )
+        .unwrap();
+        let standalone = Connection::open(copy.path().join(DB_NAME)).unwrap();
+        assert_eq!(
+            standalone
+                .query_row("SELECT body FROM messages", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "committed before busy writer"
+        );
+    }
+
+    #[test]
+    fn shutdown_checkpoint_reports_busy_reader_without_losing_newer_commits() {
+        let (dir, mut store) = test_store();
+        store.send("alice", "*", "before reader", 0).unwrap();
+        let reader = Store::open(dir.path()).unwrap();
+        reader
+            .conn
+            .execute_batch("BEGIN; SELECT count(*) FROM messages;")
+            .unwrap();
+        store.send("alice", "*", "after reader", 1).unwrap();
+        let wal = dir.path().join(DIR_NAME).join("lockyard.db-wal");
+        assert!(Store::checkpoint_on_shutdown(dir.path()).is_err());
+        assert!(fs::metadata(&wal).unwrap().len() > 0);
+        reader.conn.execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        drop(store);
+        Store::checkpoint_on_shutdown(dir.path()).unwrap();
+        let copy = tempfile::tempdir().unwrap();
+        fs::copy(
+            dir.path().join(DIR_NAME).join(DB_NAME),
+            copy.path().join(DB_NAME),
+        )
+        .unwrap();
+        let standalone = Connection::open(copy.path().join(DB_NAME)).unwrap();
+        assert_eq!(
+            standalone
+                .query_row("SELECT count(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn shutdown_checkpoint_outside_a_project_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        if find_root(dir.path()).is_some() {
+            return;
+        }
+        Store::checkpoint_on_shutdown(dir.path()).unwrap();
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        fs::create_dir(dir.path().join(DIR_NAME)).unwrap();
+        Store::checkpoint_on_shutdown(dir.path()).unwrap();
+        assert_eq!(fs::read_dir(dir.path().join(DIR_NAME)).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn previous_generation_connection_cannot_write_after_cutover() {
+        let (dir, mut store) = test_store();
+        let task = store.add_task("lead", "original", "", 0).unwrap();
+        let old = Connection::open(dir.path().join(DIR_NAME).join(DB_NAME)).unwrap();
+        for sql in [
+            "UPDATE tasks SET title='old writer' WHERE id=1",
+            "INSERT INTO agents VALUES ('old',0,0)",
+            "DELETE FROM agents",
+        ] {
+            assert!(
+                old.execute(sql, []).is_err(),
+                "old generation wrote with {sql}"
+            );
+        }
+        assert_eq!(store.task(&task.id).unwrap().title, "original");
+        store
+            .cancel_task("lead", &task.id, "new writer", 1)
+            .unwrap();
+    }
 
     #[test]
     fn opening_without_init_is_refused() {

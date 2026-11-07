@@ -25,6 +25,39 @@ pub(super) fn run_cloud(
         CloudCommand::Trust { .. } | CloudCommand::Login { .. } | CloudCommand::Logout { .. } => {
             unreachable!("these are handled before opening the project")
         }
+        CloudCommand::Protocol => backend.cloud_protocol()?,
+        CloudCommand::CatalogPut {
+            file,
+            expected_revision,
+            key,
+        } => {
+            let raw = std::fs::read_to_string(file)?;
+            let catalog = lockyard_core::catalog::ZoneCatalogV1::from_json(&raw).map_err(|e| {
+                Error::Cloud {
+                    code: e.code().into(),
+                    status: None,
+                    details: Value::Null,
+                    message: e.to_string(),
+                }
+            })?;
+            backend.catalog_put(
+                &agent,
+                &serde_json::to_value(catalog).map_err(|e| Error::Invalid(e.to_string()))?,
+                expected_revision,
+                &key,
+            )?
+        }
+        CloudCommand::Drain {
+            scope,
+            instance_id,
+            timeout,
+            key,
+        } => backend.cloud_drain(
+            &agent,
+            &json!({"scope":scope,"instance_id":instance_id,"timeout_seconds":timeout}),
+            &key,
+        )?,
+        CloudCommand::DrainStatus { id } => backend.cloud_drain_status(&id)?,
         CloudCommand::Export => backend.export()?,
         CloudCommand::Freeze { state, reason } => {
             backend.freeze(&agent, &Freeze { on: state, reason })?

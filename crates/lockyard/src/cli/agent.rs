@@ -30,12 +30,13 @@ pub(super) fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
     };
     match args.command {
         None => {
+            let _shutdown = crate::shutdown::Guard::new(cwd)?;
             let (_, config) = project()?;
             let (url, workspace) = open::endpoint(&config)?;
             open::trusted_url(&url)?;
             let token = Config::token_for(&url)?;
             let token_id = lockyard_cloud_client::token_id(&token);
-            let client = agent_client(Client::new(&url, token)?)?;
+            let client = agent_client(open::journal_client(Client::new(&url, token)?)?)?;
             let settings = AgentConfig {
                 url,
                 workspace,

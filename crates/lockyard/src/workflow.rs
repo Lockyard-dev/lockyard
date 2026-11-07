@@ -4,6 +4,7 @@
 //! transaction or a rollback. An uncertain write is never automatically repeated.
 
 use lockyard_core::proto::{ClaimRequest, SendRequest, WorkAction, WorkStep};
+use lockyard_core::task_id::{BusTaskId, TaskId};
 use lockyard_core::{Backend, Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,54 +21,55 @@ struct Plan {
     steps: Vec<Step>,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(untagged)]
-enum TaskId {
-    Number(i64),
-    Text(String),
+/// Decode task fields once at the workflow input boundary; stored domain steps contain strings.
+#[cfg(test)]
+fn decode_plan(plan: &Value, local: bool) -> Result<Plan> {
+    decode_plan_from(plan, local, lockyard_compat::Source::Cli)
 }
 
-impl TaskId {
-    fn input(&self) -> String {
-        match self {
-            Self::Number(id) => id.to_string(),
-            Self::Text(id) => id.clone(),
-        }
-    }
-
-    fn valid(&self) -> bool {
-        match self {
-            Self::Number(id) => *id > 0,
-            Self::Text(id) => {
-                if id.bytes().all(|byte| byte.is_ascii_digit()) {
-                    id.parse::<i64>().is_ok_and(|id| id > 0)
+fn decode_plan_from(plan: &Value, local: bool, source: lockyard_compat::Source) -> Result<Plan> {
+    let mut canonical = plan.clone();
+    if let Some(steps) = canonical["steps"].as_array_mut() {
+        for step in steps {
+            let domain = match step["kind"].as_str() {
+                Some("task_claim") => Some(if local {
+                    lockyard_compat::TaskDomain::LegacyLocal
                 } else {
-                    crate::parse_task_id(id).is_ok()
-                        && id
-                            .rsplit('-')
-                            .next()
-                            .is_some_and(|digits| digits.bytes().any(|byte| byte != b'0'))
-                }
+                    lockyard_compat::TaskDomain::Registry
+                }),
+                Some("work_handoff") => Some(lockyard_compat::TaskDomain::Bus),
+                _ => None,
+            };
+            if let Some(domain) = domain {
+                let id =
+                    lockyard_compat::LegacyCompatibilityV1::task_id(&step["id"], domain, source, 2)
+                        .map_err(|code| Error::Cloud {
+                            code,
+                            status: None,
+                            details: Value::Null,
+                            message: "invalid workflow task id".into(),
+                        })?;
+                step["id"] = json!(id);
             }
         }
     }
+    serde_json::from_value(canonical)
+        .map_err(|e| Error::Invalid(format!("invalid workflow plan: {e}")))
+}
 
-    fn matches_receipt(&self, value: &Value) -> bool {
-        match self {
-            Self::Number(id) => value == *id,
-            Self::Text(id) => {
-                let expected = if id.bytes().all(|byte| byte.is_ascii_digit()) {
-                    match id.parse::<i64>() {
-                        Ok(number) if number > 0 => format!("D-{number}"),
-                        _ => return false,
-                    }
-                } else {
-                    id.clone()
-                };
-                value.as_str() == Some(expected.as_str())
-            }
-        }
-    }
+#[cfg(test)]
+fn matches_task_receipt(id: &TaskId, value: &Value) -> bool {
+    matches_task_receipt_from(id, value, lockyard_compat::Source::Cli)
+}
+
+fn matches_task_receipt_from(id: &TaskId, value: &Value, source: lockyard_compat::Source) -> bool {
+    lockyard_compat::LegacyCompatibilityV1::task_id(
+        value,
+        lockyard_compat::TaskDomain::Registry,
+        source,
+        1,
+    )
+    .is_ok_and(|value| id.as_str() == value)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -86,7 +88,7 @@ enum Step {
         ttl: i64,
     },
     WorkHandoff {
-        id: i64,
+        id: BusTaskId,
         to: String,
         report: String,
         #[serde(default)]
@@ -106,7 +108,7 @@ fn default_ttl() -> i64 {
 impl Step {
     fn validate(&self) -> Result<()> {
         let valid = match self {
-            Self::TaskClaim { id, ttl } => id.valid() && (1..=240).contains(ttl),
+            Self::TaskClaim { ttl, .. } => (1..=240).contains(ttl),
             Self::ZoneClaim { paths, ttl, .. } => {
                 !paths.is_empty()
                     && paths.len() <= 100
@@ -120,7 +122,7 @@ impl Step {
                 if_version,
                 commits,
             } => {
-                *id > 0
+                !id.as_str().is_empty()
                     && !to.trim().is_empty()
                     && !report.trim().is_empty()
                     && *if_version >= 0
@@ -135,18 +137,67 @@ impl Step {
         }
     }
 
-    fn execute(&self, backend: &mut dyn Backend, agent: &str, now: i64) -> Result<Value> {
+    /// A new attempt after a known version refusal needs a fresh authoritative snapshot.
+    /// A changed pinned plan or existing ownership requires a separately chosen operation.
+    fn revalidate_refused(&self, backend: &dyn Backend, agent: &str, now: i64) -> Result<bool> {
+        match self {
+            Self::TaskClaim { id, .. } => {
+                let item = backend.registry_item_by_id(id.as_str())?;
+                let assignment = &item["assignment"];
+                Ok(item["id"] == id.as_str()
+                    && item["version"].as_i64().is_some_and(|version| version >= 0)
+                    && match item["status"].as_str() {
+                        Some("ready" | "blocked") => {
+                            assignment.is_null() || assignment["lease_active"] == false
+                        }
+                        Some("active") => assignment["lease_active"] == false,
+                        _ => false,
+                    })
+            }
+            Self::ZoneClaim { paths, .. } => {
+                for path in paths {
+                    if !backend
+                        .claims(
+                            &lockyard_core::proto::ClaimQuery {
+                                session: None,
+                                path: Some(path.clone()),
+                            },
+                            now,
+                        )?
+                        .is_empty()
+                    {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Self::WorkHandoff { id, if_version, .. } => {
+                let task = backend.work_get(agent, id.as_str())?;
+                Ok(task.id == *id
+                    && task.version == *if_version
+                    && task.status == lockyard_core::proto::WorkStatus::Claimed
+                    && task.assignee.as_deref() == Some(agent))
+            }
+            // No authoritative message-version read can establish a safe new operation here.
+            Self::MessageSend { .. } => Ok(false),
+        }
+    }
+
+    fn execute(
+        &self,
+        backend: &mut dyn Backend,
+        agent: &str,
+        now: i64,
+        source: lockyard_compat::Source,
+    ) -> Result<Value> {
         fn encode(value: impl serde::Serialize) -> Result<Value> {
             serde_json::to_value(value).map_err(|e| Error::Protocol(e.to_string()))
         }
         match self {
             Self::TaskClaim { id, ttl } => {
-                let result = match id {
-                    TaskId::Number(id) => backend.claim_task_receipt(agent, *id, *ttl, now)?,
-                    TaskId::Text(id) => backend.claim_task_receipt_by_id(agent, id, *ttl, now)?,
-                };
+                let result = backend.claim_task_receipt_by_id(agent, id.as_str(), *ttl, now)?;
                 if backend.is_cloud()
-                    && (!id.matches_receipt(&result["id"])
+                    && (!matches_task_receipt_from(id, &result["id"], source)
                         || result["raw_status"] != "active"
                         || result["registry_assignment_source"] != "claim_response"
                         || !assignment_identity(&result["registry_assignment"], agent))
@@ -177,7 +228,7 @@ impl Step {
                 if_version,
             } => encode(backend.work_step(
                 agent,
-                *id,
+                id.as_str(),
                 WorkAction::Handoff,
                 &WorkStep {
                     to: Some(to.clone()),
@@ -219,14 +270,35 @@ pub fn run(
     operation_id: &str,
     plan: &Value,
 ) -> Result<Value> {
+    run_with_source(
+        cwd,
+        backend,
+        agent,
+        now,
+        operation_id,
+        plan,
+        lockyard_compat::Source::Cli,
+    )
+}
+
+/// The transport boundary supplies only a diagnostics source; operation identity is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_source(
+    cwd: &Path,
+    backend: &mut dyn Backend,
+    agent: &str,
+    now: i64,
+    operation_id: &str,
+    plan: &Value,
+    source: lockyard_compat::Source,
+) -> Result<Value> {
     if agent.trim().is_empty() {
         return Err(Error::Invalid("workflow needs an agent name".into()));
     }
     if serde_json::to_vec(plan).map_or(true, |p| p.len() > MAX_PLAN_BYTES) {
         return Err(Error::Invalid("workflow plan exceeds 65536 bytes".into()));
     }
-    let mut parsed: Plan = serde_json::from_value(plan.clone())
-        .map_err(|e| Error::Invalid(format!("invalid workflow plan: {e}")))?;
+    let mut parsed = decode_plan_from(plan, !backend.is_cloud(), source)?;
     if parsed.steps.is_empty() || parsed.steps.len() > 32 {
         return Err(Error::Invalid("workflow needs 1..32 steps".into()));
     }
@@ -265,7 +337,7 @@ pub fn run(
         },
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let mut receipt = read_receipt(&receipt_path)?;
-            verify(&receipt, &identity)?;
+            verify(&receipt, &identity, source)?;
             uncertain(&mut receipt);
             receipt["ok"] = json!(false);
             receipt["locked"] = json!(true);
@@ -280,7 +352,7 @@ pub fn run(
     lock._file.sync_all()?;
     let mut receipt = match read_receipt(&receipt_path) {
         Ok(mut stored) => {
-            verify(&stored, &identity)?;
+            verify(&stored, &identity, source)?;
             if uncertain(&mut stored) {
                 save(&dir, &receipt_path, &stored)?;
             }
@@ -323,18 +395,58 @@ pub fn run(
         if status != "not_started" && status != "failed" {
             return Err(Error::Invalid("invalid workflow receipt status".into()));
         }
-        let key = receipt["steps"][i]["idempotency_key"]
+        let mut key = receipt["steps"][i]["idempotency_key"]
             .as_str()
             .ok_or_else(|| Error::Invalid("workflow receipt lacks idempotency key".into()))?
             .to_owned();
         if key.len() != 26 || !key.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return Err(Error::Invalid("invalid workflow idempotency key".into()));
         }
+        if status == "failed"
+            && backend.is_cloud()
+            && matches!(
+                receipt["steps"][i]["error"]["kind"].as_str(),
+                Some("version_conflict" | "task_already_claimed")
+            )
+        {
+            let refreshed = if receipt["steps"][i]["error"]["status"] == 409 {
+                step.revalidate_refused(backend, agent, now)
+            } else {
+                // Older receipts lack matching HTTP evidence. Do not infer a refusal from text.
+                Ok(false)
+            };
+            let problem = match refreshed {
+                Ok(true) => None,
+                Ok(false) => Some(
+                    json!({"step_index":i,"kind":"new_operation_required","reason":"The refused step's current state or saved response does not permit this unchanged plan. Read the current state and explicitly choose a new workflow operation and plan; no write was attempted."}),
+                ),
+                Err(error) => Some(
+                    json!({"step_index":i,"kind":"refused_step_state_unverified","reason":"The refused step's current state could not be read; no new write was attempted.","read_error":error.kind()}),
+                ),
+            };
+            if let Some(problem) = problem {
+                receipt["ok"] = json!(false);
+                receipt["needs_reconciliation"] = problem;
+                receipt["updated_at"] = json!(now);
+                save(&dir, &receipt_path, &receipt)?;
+                return Ok(receipt);
+            }
+            let rejected = json!({"idempotency_key":receipt["steps"][i]["idempotency_key"],"error":receipt["steps"][i]["error"]});
+            if receipt["steps"][i]["rejected_attempts"].is_null() {
+                receipt["steps"][i]["rejected_attempts"] = json!([]);
+            }
+            receipt["steps"][i]["rejected_attempts"]
+                .as_array_mut()
+                .ok_or_else(|| Error::Invalid("invalid workflow rejected-attempt history".into()))?
+                .push(rejected);
+            key = lockyard_cloud_client::ulid();
+            receipt["steps"][i]["idempotency_key"] = json!(key);
+        }
         receipt["steps"][i]["status"] = json!("in_flight");
         receipt["updated_at"] = json!(now);
         save(&dir, &receipt_path, &receipt)?;
         backend.set_write_idempotency_key(Some(key));
-        let result = step.execute(backend, agent, now);
+        let result = step.execute(backend, agent, now, source);
         backend.set_write_idempotency_key(None);
         match result {
             Ok(value) => {
@@ -345,21 +457,14 @@ pub fn run(
                 }
             }
             Err(error) => {
-                let certain = matches!(
-                    error,
-                    Error::Invalid(_)
-                        | Error::Denied(_)
-                        | Error::Conflict(_)
-                        | Error::Contended(_)
-                        | Error::NotFound(_)
-                        | Error::NeedsCloud(_)
-                        | Error::NeedsLocal(_)
-                        | Error::Frozen(_)
-                        | Error::StaleFence(_)
-                );
+                let certain = definite_step_failure(&error);
                 receipt["steps"][i]["status"] = json!(if certain { "failed" } else { "unknown" });
                 receipt["steps"][i]["error"] =
                     json!({"kind":error.kind(),"message":error.to_string()});
+                if let Error::Cloud { code, status, .. } = &error {
+                    receipt["steps"][i]["error"]["code"] = json!(code);
+                    receipt["steps"][i]["error"]["status"] = json!(status);
+                }
                 receipt["ok"] = json!(false);
                 save(&dir, &receipt_path, &receipt)?;
                 return Ok(receipt);
@@ -389,30 +494,29 @@ fn stale_completed_ownership(
         }
         let saved = &receipt["steps"][index]["result"];
         let result: Result<bool> = match step {
-            Step::TaskClaim { id, .. } if backend.is_cloud() => match match id {
-                TaskId::Number(id) => backend.registry_item(*id),
-                TaskId::Text(id) => backend.registry_item_by_id(id),
-            } {
-                Ok(item) => {
-                    let current = &item["assignment"];
-                    let previous = &saved["registry_assignment"];
-                    if !current["lease_active"].is_boolean()
-                        || saved["registry_assignment_source"] != "claim_response"
-                        || !assignment_identity(previous, agent)
-                    {
-                        return Some(
-                            json!({"step_index":index,"kind":"current_ownership_unverified","reason":"The server or saved receipt lacks an authoritative claim response and assignment lease check for this agent; reconcile this task before continuing."}),
-                        );
+            Step::TaskClaim { id, .. } if backend.is_cloud() => {
+                match backend.registry_item_by_id(id.as_str()) {
+                    Ok(item) => {
+                        let current = &item["assignment"];
+                        let previous = &saved["registry_assignment"];
+                        if !current["lease_active"].is_boolean()
+                            || saved["registry_assignment_source"] != "claim_response"
+                            || !assignment_identity(previous, agent)
+                        {
+                            return Some(
+                                json!({"step_index":index,"kind":"current_ownership_unverified","reason":"The server or saved receipt lacks an authoritative claim response and assignment lease check for this agent; reconcile this task before continuing."}),
+                            );
+                        }
+                        Ok(item["status"] == "active"
+                            && current["lease_active"] == true
+                            && current["executor"] == previous["executor"]
+                            && current["session"] == previous["session"]
+                            && current["claimed_at"] == previous["claimed_at"])
                     }
-                    Ok(item["status"] == "active"
-                        && current["lease_active"] == true
-                        && current["executor"] == previous["executor"]
-                        && current["session"] == previous["session"]
-                        && current["claimed_at"] == previous["claimed_at"])
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
-            },
-            Step::TaskClaim { id, .. } => backend.task(&id.input()).map(|task| {
+            }
+            Step::TaskClaim { id, .. } => backend.task(id.as_str()).map(|task| {
                 task.status == lockyard_core::tasks::Status::Claimed
                     && task.assignee.as_deref() == Some(agent)
                     && task.lease_until.is_some_and(|until| until > now)
@@ -461,8 +565,21 @@ pub fn inspect(cwd: &Path, operation_id: &str) -> Result<Value> {
     Ok(receipt)
 }
 
-fn verify(receipt: &Value, identity: &Value) -> Result<()> {
-    if receipt.get("identity") != Some(identity) {
+fn verify(receipt: &Value, identity: &Value, source: lockyard_compat::Source) -> Result<()> {
+    let mut stored = receipt["identity"].clone();
+    let mut current = identity.clone();
+    let local = current["cloud"] == false;
+    // Legacy receipts keep their original bytes/key/result. Comparison alone projects the old
+    // resolved plan into the new string-only schema, leaving the raw input plan exact.
+    if let Some(old) = stored.get("resolved_plan").cloned() {
+        stored["resolved_plan"] = serde_json::to_value(decode_plan_from(&old, local, source)?)
+            .map_err(|error| Error::Protocol(error.to_string()))?;
+    }
+    if let Some(new) = current.get("resolved_plan").cloned() {
+        current["resolved_plan"] = serde_json::to_value(decode_plan_from(&new, local, source)?)
+            .map_err(|error| Error::Protocol(error.to_string()))?;
+    }
+    if stored != current {
         return Err(Error::Invalid(
             "workflow operation belongs to a different agent, project, backend or plan".into(),
         ));
@@ -597,12 +714,83 @@ impl Drop for Lock {
     }
 }
 
+// A validated, known refusal proves the requested effect was refused; queue admission
+// can still be an ancillary effect of a refused legacy zone claim.
+// Unknown codes and response authentication failures retain the reconciliation barrier.
+fn definite_step_failure(error: &Error) -> bool {
+    match error {
+        Error::Cloud { code, status, .. } => matches!(
+            (status, code.as_str()),
+            (
+                Some(400),
+                "invalid_request"
+                    | "invalid_task_id"
+                    | "session_header_conflict"
+                    | "legacy_input_removed"
+            ) | (Some(401), "unauthorized")
+                | (Some(403), "forbidden" | "session_name_bound")
+                | (
+                    Some(404),
+                    "task_not_found" | "session_not_found" | "not_found"
+                )
+                | (
+                    Some(409),
+                    "conflict" | "version_conflict" | "task_already_claimed"
+                )
+                | (
+                    Some(422),
+                    "invalid_task_state" | "content_encryption_required"
+                )
+        ),
+        Error::Invalid(_)
+        | Error::Denied(_)
+        | Error::Conflict(_)
+        | Error::Contended(_)
+        | Error::NotFound(_)
+        | Error::NeedsCloud(_)
+        | Error::NeedsLocal(_)
+        | Error::Frozen(_)
+        | Error::StaleFence(_) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use lockyard_cloud_client::{Call, ClientError, CloudBackend, Transport};
     use lockyard_core::proto::ReleaseRequest;
     use lockyard_core::{Store, tasks::TaskSpec};
+
+    #[test]
+    fn cloud_step_refusals_require_known_codes_and_matching_status() {
+        let cloud = |code: &str, status| Error::Cloud {
+            code: code.into(),
+            status,
+            details: Value::Null,
+            message: "refused".into(),
+        };
+        for (code, status) in [
+            ("conflict", 409),
+            ("version_conflict", 409),
+            ("task_already_claimed", 409),
+            ("invalid_task_id", 400),
+            ("forbidden", 403),
+            ("task_not_found", 404),
+        ] {
+            assert!(definite_step_failure(&cloud(code, Some(status))), "{code}");
+        }
+        for (code, status) in [
+            ("new_unknown_code", Some(409)),
+            ("version_conflict", Some(500)),
+            ("outcome_unknown", Some(409)),
+            ("protocol_response_invalid", Some(400)),
+            ("idempotency_conflict", Some(409)),
+            ("content_authentication_failed", None),
+        ] {
+            assert!(!definite_step_failure(&cloud(code, status)), "{code}");
+        }
+    }
 
     struct AssignmentLease {
         id: &'static str,
@@ -623,8 +811,8 @@ mod tests {
     fn cloud_resume_requires_server_active_lease_and_the_original_assignment_epoch() {
         let epoch = "2026-11-06T12:00:00Z";
         for (id, registry_id) in [
-            (TaskId::Number(1), "D-1"),
-            (TaskId::Text("FE-0319".into()), "FE-0319"),
+            (TaskId::parse("D-1").unwrap(), "D-1"),
+            (TaskId::parse("FE-0319").unwrap(), "FE-0319"),
         ] {
             let steps = vec![
                 Step::TaskClaim { id, ttl: 30 },
@@ -710,24 +898,28 @@ mod tests {
 
     #[test]
     fn task_claim_id_types_preserve_legacy_numbers_and_require_exact_native_receipts() {
-        for value in [
-            json!(1),
-            json!("D-0001"),
-            json!("FE-0319"),
-            json!("G-SG-0012"),
-            json!("0012"),
+        // EP-12: numeric syntax is retained only at decode_plan; the domain and JSON2 use strings.
+        for (input, expected) in [
+            (json!(1), "D-1"),
+            (json!("0012"), "D-12"),
+            (json!("FE-0319"), "FE-0319"),
         ] {
-            let id: TaskId = serde_json::from_value(value.clone()).unwrap();
-            assert!(id.valid());
-            assert_eq!(serde_json::to_value(&id).unwrap(), value);
+            let plan =
+                decode_plan(&json!({"steps":[{"kind":"task_claim","id":input}]}), false).unwrap();
+            assert_eq!(
+                serde_json::to_value(plan).unwrap()["steps"][0]["id"],
+                expected
+            );
         }
-        let native: TaskId = serde_json::from_value(json!("FE-0319")).unwrap();
-        assert!(native.matches_receipt(&json!("FE-0319")));
-        assert!(!native.matches_receipt(&json!("D-319")));
-        assert!(!native.matches_receipt(&json!(319)));
-        let decimal: TaskId = serde_json::from_value(json!("0012")).unwrap();
-        assert!(decimal.matches_receipt(&json!("D-12")));
-        for value in [
+        let native = TaskId::parse("FE-0319").unwrap();
+        assert!(matches_task_receipt(&native, &json!("FE-0319")));
+        assert!(!matches_task_receipt(&native, &json!("D-319")));
+        assert!(!matches_task_receipt(&native, &json!(319)));
+        assert!(matches_task_receipt(
+            &TaskId::parse("D-12").unwrap(),
+            &json!(12)
+        ));
+        for input in [
             json!(0),
             json!(-1),
             json!("0"),
@@ -736,8 +928,9 @@ mod tests {
             json!("../D-1"),
             json!("999999999999999999999999"),
         ] {
-            let id: TaskId = serde_json::from_value(value).unwrap();
-            assert!(!id.valid());
+            assert!(
+                decode_plan(&json!({"steps":[{"kind":"task_claim","id":input}]}), false).is_err()
+            );
         }
     }
 
@@ -811,6 +1004,11 @@ mod tests {
         );
         let again = run(dir.path(), &mut store, "me", 1002, "interrupted", &plan).unwrap();
         assert_eq!(again["steps"][0]["status"], "unknown");
+        assert_eq!(
+            again["steps"][0]["idempotency_key"],
+            receipt["steps"][0]["idempotency_key"]
+        );
+        assert_eq!(again["identity"], receipt["identity"]);
         assert_eq!(again["ok"], false);
     }
 

@@ -5,6 +5,13 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-07
+
+- Authenticate and decrypt typed zone catalogs locally with persistent revision protection.
+- Negotiate HTTP protocol generations and preserve uncertain writes without changing their wire bytes.
+- Unify task identities, compatibility diagnostics, owner-decision AAD and MCP tool definitions.
+- Gate compatibility boundaries with AST checks and a production symbol scan.
+
 ## [Unreleased]
 
 ### Added

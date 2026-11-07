@@ -176,6 +176,15 @@ impl Outbox {
         self.ready.notify_all();
     }
 
+    /// Tell a waiting caller the outcome is unknown without recording a final receipt.
+    /// Its original call stays durable and remains the only operation eligible for replay.
+    pub fn report_unknown(&self, n: u64, error: ClientError) {
+        debug_assert!(matches!(error, ClientError::OutcomeUnknown(_)));
+        if let Some(waiter) = self.lock().waiters.remove(&n) {
+            let _ = waiter.send(Err(error));
+        }
+    }
+
     /// Removes the head after a final answer and tells whoever waits for it.
     pub fn finish(&self, n: u64, outcome: Outcome) -> io::Result<()> {
         let mut queue = self.lock();

@@ -49,6 +49,8 @@ pub enum Request {
         phase: Phase,
         write_paths: Vec<String>,
     },
+    /// Expand names inside the authenticated client, retaining its verified catalog type.
+    ExpandCatalog { call: Call, names: Vec<String> },
     /// Any protocol request.
     Call { call: Call },
 }
@@ -81,6 +83,8 @@ pub struct AgentStatus {
     /// Which token the process runs under. See `lockyard_cloud_client::token_id`.
     #[serde(default)]
     pub token_id: String,
+    #[serde(default)]
+    pub catalog_expansion_v1: bool,
     pub pid: u32,
     pub view_fresh: bool,
     pub view_age_ms: Option<u64>,

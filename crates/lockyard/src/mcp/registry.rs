@@ -20,101 +20,167 @@ pub(super) fn tool_def(
     })
 }
 
-/// The tools the server lists for this surface.
-pub(super) fn tools(surface: Surface) -> Vec<Value> {
-    match surface {
-        Surface::Compact => compact_tools(),
-        Surface::Full => full_tools(),
+/// One definition supplies schema, description, dispatch and surface visibility.
+#[derive(Clone)]
+pub(super) enum ToolHandler {
+    Primitive(String),
+    Composite(String),
+}
+
+pub(super) struct ToolDefinition {
+    wire: Value,
+    handler: ToolHandler,
+    compact: Option<usize>,
+}
+
+pub(super) struct ToolRegistry {
+    definitions: Vec<ToolDefinition>,
+}
+
+impl ToolRegistry {
+    fn build() -> Self {
+        let mut definitions: Vec<_> = primitive_definitions()
+            .into_iter()
+            .map(|wire| {
+                let name = wire["name"].as_str().unwrap().to_string();
+                ToolDefinition {
+                    compact: compact_visibility(&name),
+                    handler: ToolHandler::Primitive(name),
+                    wire,
+                }
+            })
+            .collect();
+        let int = json!({"type":"integer"});
+        let text = json!({"type":"string"});
+        let flag = json!({"type":"boolean"});
+        let names = json!({"type":"array","items":{"type":"string"}});
+        let task_identifier = canonical_task_schema();
+        let ttl_minutes = json!({"type":"integer","minimum":1,"maximum":240,"description":"Lease length in minutes, from 1 through 240."});
+        for wire in [
+            tool_def(
+                "start_work",
+                "Claim paths before editing; ttl is in minutes. Accept an offered zone with handover_id, or take a task.",
+                json!({"paths": names, "note": text, "ttl": ttl_minutes, "shared": flag, "zones": names, "task": task_identifier, "handover_id": int}),
+                &[],
+            ),
+            tool_def(
+                "update",
+                "Read your mail, and send a note first when to and body are given.",
+                json!({"to": text, "body": text, "peek": flag, "all": flag}),
+                &[],
+            ),
+            tool_def(
+                "handover",
+                "Offer your claim to another agent and tell them why.",
+                json!({"to": text, "id": int, "note": text}),
+                &["to"],
+            ),
+            tool_def(
+                "finish_work",
+                "Submit evidence; without id or task, releases all your claims.",
+                json!({"task": task_identifier, "evidence": text, "id": text, "note": text}),
+                &[],
+            ),
+            tool_def(
+                "tasks",
+                "Compact registry workflow: list, show, claim, submit, accept, reject, block, unblock, or cancel tasks.",
+                json!({"action": text, "id": task_identifier, "area": text, "prefix": text, "evidence": text, "reason": text, "note": text, "status": text}),
+                &["action"],
+            ),
+            tool_def(
+                "task_bulk",
+                "Close multiple registry tasks with the same owner decision; reports each result.",
+                json!({"ids": {"type":"array","items":task_identifier}, "note": text, "evidence": text}),
+                &["ids"],
+            ),
+        ] {
+            let name = wire["name"].as_str().unwrap().to_string();
+            let handler = if matches!(
+                name.as_str(),
+                "start_work" | "update" | "handover" | "finish_work"
+            ) {
+                ToolHandler::Composite(name.clone())
+            } else {
+                ToolHandler::Primitive(name.clone())
+            };
+            definitions.push(ToolDefinition {
+                compact: compact_visibility(&name),
+                handler,
+                wire,
+            });
+        }
+        let original = definitions
+            .iter()
+            .find(|definition| definition.wire["name"] == "zone_check")
+            .unwrap();
+        let mut alias = original.wire.clone();
+        alias["name"] = json!("check");
+        let handler = original.handler.clone();
+        definitions.push(ToolDefinition {
+            wire: alias,
+            handler,
+            compact: compact_visibility("check"),
+        });
+        Self { definitions }
+    }
+
+    pub(super) fn handler(&self, name: &str) -> Option<ToolHandler> {
+        self.definitions
+            .iter()
+            .find(|definition| definition.wire["name"] == name)
+            .map(|definition| definition.handler.clone())
+    }
+
+    fn project(&self, surface: Surface) -> Vec<Value> {
+        let mut definitions: Vec<_> = self
+            .definitions
+            .iter()
+            .filter(|definition| surface == Surface::Full || definition.compact.is_some())
+            .collect();
+        if surface == Surface::Compact {
+            definitions.sort_by_key(|definition| definition.compact);
+        }
+        definitions
+            .into_iter()
+            .map(|definition| definition.wire.clone())
+            .collect()
     }
 }
 
-/// The whole working loop in six tools. Every one of them is a few of the full tools in order,
-/// so nothing here can do what the full surface cannot: a claim is still refused on conflict.
-pub(super) fn compact_tools() -> Vec<Value> {
-    let int = json!({"type": "integer"});
-    let text = json!({"type": "string"});
-    let flag = json!({"type": "boolean"});
-    let names = json!({"type": "array", "items": {"type": "string"}});
-    // The unit lives on the field. A sentence in the tool description is not enough.
-    let ttl_minutes = json!({
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 240,
-        "description": "Lease length in minutes, from 1 through 240."
-    });
-    vec![
-        revoke_tool(),
-        tool_def(
-            "start_work",
-            "Claim paths before editing; ttl is in minutes. Accept an offered zone with handover_id, or take a task.",
-            json!({"paths": names, "note": text, "ttl": ttl_minutes, "shared": flag, "zones": names, "task": text, "handover_id": int}),
-            &[],
-        ),
-        tool_def(
-            "check",
-            "Is this path free to edit? Reports when you or another agent holds it.",
-            json!({"path": text}),
-            &["path"],
-        ),
-        tool_def(
-            "update",
-            "Read your mail, and send a note first when to and body are given.",
-            json!({"to": text, "body": text, "peek": flag, "all": flag}),
-            &[],
-        ),
-        tool_def(
-            "handover",
-            "Offer your claim to another agent and tell them why.",
-            json!({"to": text, "id": int, "note": text}),
-            &["to"],
-        ),
-        tool_def(
-            "finish_work",
-            "Submit evidence; without id or task, releases all your claims.",
-            json!({"task": text, "evidence": text, "id": text, "note": text}),
-            &[],
-        ),
-        tool_def(
-            "status",
-            "Your claims, unfinished tasks and unread mail count.",
-            json!({}),
-            &[],
-        ),
-        tool_def(
-            "tasks",
-            "Compact registry workflow: list, show, claim, submit, accept, reject, block, unblock, or cancel tasks.",
-            json!({"action": text, "id": text, "area": text, "prefix": text, "evidence": text, "reason": text, "note": text, "status": text}),
-            &["action"],
-        ),
-        tool_def(
-            "task_bulk",
-            "Close multiple registry tasks with the same owner decision; reports each result.",
-            json!({"ids": names, "note": text, "evidence": text}),
-            &["ids"],
-        ),
-        tool_def(
-            "registry_import",
-            "Import registry items with this session's configured cloud role.",
-            json!({"dump": {"type": "object"}}),
-            &["dump"],
-        ),
-        tool_def("area_list", "List registry areas.", json!({}), &[]),
-        tool_def(
-            "area_create",
-            "Create a registry area.",
-            json!({"key": text, "name": text, "prefix": text, "pad": int}),
-            &["key", "name", "prefix"],
-        ),
-        tool_def(
-            "area_update",
-            "Update a registry area.",
-            json!({"key": text, "name": text, "prefix": text, "pad": int}),
-            &["key"],
-        ),
-    ]
+fn compact_visibility(name: &str) -> Option<usize> {
+    Some(match name {
+        "revoke_access" => 0,
+        "start_work" => 1,
+        "check" => 2,
+        "update" => 3,
+        "handover" => 4,
+        "finish_work" => 5,
+        "status" => 6,
+        "tasks" => 7,
+        "task_bulk" => 8,
+        "registry_import" => 9,
+        "area_list" => 10,
+        "area_create" => 11,
+        "area_update" => 12,
+        "cloud_protocol" => 13,
+        _ => return None,
+    })
 }
 
-pub(super) fn full_tools() -> Vec<Value> {
+pub(super) fn tool_registry() -> &'static ToolRegistry {
+    static REGISTRY: std::sync::OnceLock<ToolRegistry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(ToolRegistry::build)
+}
+
+pub(super) fn tools(surface: Surface) -> Vec<Value> {
+    tool_registry().project(surface)
+}
+
+fn canonical_task_schema() -> Value {
+    json!({"type":"string","maxLength":32,"pattern":"^[A-Z][A-Z0-9]*(?:-[A-Z][A-Z0-9]*)*-[0-9]+$"})
+}
+
+fn primitive_definitions() -> Vec<Value> {
     let int = json!({"type": "integer"});
     let text = json!({"type": "string"});
     let flag = json!({"type": "boolean"});
@@ -123,14 +189,42 @@ pub(super) fn full_tools() -> Vec<Value> {
     let names = json!({"type": "array", "items": {"type": "string"}});
     let id_only =
         |name: &str, description: &str| tool_def(name, description, json!({"id": int}), &["id"]);
-    let task_identifier = json!({"oneOf": [{"type":"string"}, {"type":"integer", "minimum":1}]});
+    let task_identifier = canonical_task_schema();
+    let bus_identifier = json!({"type":"string","maxLength":32,"pattern":"^BT-[0-9]+$"});
+    let bus_id_only = |name: &str, description: &str| {
+        tool_def(name, description, json!({"id":bus_identifier}), &["id"])
+    };
     let task_id_only = |name: &str, description: &str| {
         tool_def(name, description, json!({"id": task_identifier}), &["id"])
     };
-    let registry_id = json!({"oneOf": [{"type":"string"}, {"type":"integer"}]});
-    let step = || json!({"id": int, "if_version": int, "reason": text});
+    let registry_key = canonical_task_schema();
+    let step = || json!({"id": bus_identifier, "if_version": int, "reason": text});
     vec![
         revoke_tool(),
+        tool_def(
+            "cloud_protocol",
+            "Read negotiated Cloud protocol and supported capabilities.",
+            json!({}),
+            &[],
+        ),
+        tool_def(
+            "cloud_drain",
+            "Drain a permitted scope on one instance with a stable idempotency key.",
+            json!({"scope":{"enum":["workspace","instance"]},"instance_id":text,"timeout_seconds":{"type":"integer","minimum":1,"maximum":120},"idempotency_key":text}),
+            &["scope", "instance_id", "idempotency_key"],
+        ),
+        tool_def(
+            "cloud_drain_status",
+            "Read the state of a permitted Cloud drain.",
+            json!({"id":text}),
+            &["id"],
+        ),
+        tool_def(
+            "zone_catalog_put",
+            "Encrypt and publish a typed zone catalog with a revision check.",
+            json!({"catalog":object,"expected_revision":{"type":"integer","minimum":0},"idempotency_key":text}),
+            &["catalog", "expected_revision", "idempotency_key"],
+        ),
         tool_def(
             "node_status",
             "Inspect the local node service",
@@ -278,19 +372,19 @@ pub(super) fn full_tools() -> Vec<Value> {
         tool_def(
             "task_links",
             "Read cloud dependency links and native registry status",
-            json!({"id":registry_id}),
+            json!({"id":registry_key}),
             &["id"],
         ),
         tool_def(
             "task_why_blocked",
             "Explain visible dependency and scheduling blockers",
-            json!({"id":registry_id}),
+            json!({"id":registry_key}),
             &["id"],
         ),
         tool_def(
             "task_link",
             "Add a typed registry link at an explicit version; retain key for retries",
-            json!({"id":registry_id,"to":registry_id,"kind":text,"if_version":int,"key":text}),
+            json!({"id":registry_key,"to":registry_key,"kind":text,"if_version":int,"key":text}),
             &["id", "to", "kind", "if_version", "key"],
         ),
         tool_def("who", "List agents seen in this project", json!({}), &[]),
@@ -359,7 +453,7 @@ pub(super) fn full_tools() -> Vec<Value> {
         tool_def(
             "zone_dirty",
             "Report paths with uncommitted changes",
-            json!({"paths": paths, "owner": text, "reason": text, "task": int}),
+            json!({"paths": paths, "owner": text, "reason": text, "task": task_identifier}),
             &["paths"],
         ),
         tool_def(
@@ -408,7 +502,7 @@ pub(super) fn full_tools() -> Vec<Value> {
         ),
         tool_def(
             "zone_check",
-            "Check whether another agent holds a path",
+            "Is this path free to edit? Reports when you or another agent holds it.",
             json!({"path": text}),
             &["path"],
         ),
@@ -572,29 +666,29 @@ pub(super) fn full_tools() -> Vec<Value> {
             &["title", "to", "accept"],
         ),
         tool_def("work_list", "List work tasks", json!({}), &[]),
-        id_only("work_show", "Show one work task"),
+        bus_id_only("work_show", "Show one work task"),
         tool_def(
             "work_claim",
             "Take an offered work task",
-            json!({"id": int, "if_version": int}),
+            json!({"id": bus_identifier, "if_version": int}),
             &["id"],
         ),
         tool_def(
             "work_beat",
             "Renew the lease on a held work task",
-            json!({"id": int, "if_version": int}),
+            json!({"id": bus_identifier, "if_version": int}),
             &["id"],
         ),
         tool_def(
             "work_done",
             "Send a held work task to review",
-            json!({"id": int, "if_version": int, "report": text, "commits": names}),
+            json!({"id": bus_identifier, "if_version": int, "report": text, "commits": names}),
             &["id"],
         ),
         tool_def(
             "work_accept",
             "Accept reviewed work",
-            json!({"id": int, "if_version": int}),
+            json!({"id": bus_identifier, "if_version": int}),
             &["id"],
         ),
         tool_def(
@@ -619,13 +713,13 @@ pub(super) fn full_tools() -> Vec<Value> {
         tool_def(
             "work_handoff",
             "Offer held work with context, checks, risks and next steps to another agent; zone handover remains separate",
-            json!({"id": int, "if_version": int, "to": text, "report": text, "commits": names}),
+            json!({"id": bus_identifier, "if_version": int, "to": text, "report": text, "commits": names}),
             &["id", "to"],
         ),
         tool_def(
             "work_take",
             "Take a work task handed to this agent",
-            json!({"id": int, "if_version": int}),
+            json!({"id": bus_identifier, "if_version": int}),
             &["id", "if_version"],
         ),
         tool_def(

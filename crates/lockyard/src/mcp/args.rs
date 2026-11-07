@@ -55,52 +55,42 @@ impl<'a> Args<'a> {
         self.int("id")
     }
 
-    pub(super) fn registry_id(self, key: &str) -> Result<String> {
-        let text = match self.get(key) {
-            Some(Value::String(id)) => id.clone(),
-            Some(Value::Number(id)) => id
-                .as_i64()
-                .filter(|id| *id > 0)
-                .map(|id| id.to_string())
-                .ok_or_else(|| wrong_type(key, "a positive registry id"))?,
-            _ => return Err(wrong_type(key, "a registry id string or positive integer")),
-        };
-        crate::parse_task_id(&text).map_err(Error::Invalid)
+    pub(super) fn task_key(self, key: &str) -> Result<String> {
+        self.task_value(key, lockyard_compat::TaskDomain::Registry)
     }
 
-    pub(super) fn task_id(self) -> Result<String> {
-        match self.get("id") {
-            Some(Value::String(id)) => Ok(id.clone()),
-            Some(Value::Number(_)) => Err(Error::Invalid(
-                "id must be a task id string such as FE-0001; integers are not accepted".into(),
-            )),
-            _ => Err(wrong_type("id", "a task id string such as FE-0001")),
-        }
+    fn task_value(self, key: &str, domain: lockyard_compat::TaskDomain) -> Result<String> {
+        lockyard_compat::LegacyCompatibilityV1::task_id(
+            self.get(key).ok_or_else(|| wrong_type(key, "a task id"))?,
+            domain,
+            lockyard_compat::Source::Mcp,
+            2,
+        )
+        .map_err(|code| Error::Cloud {
+            code,
+            status: None,
+            details: Value::Null,
+            message: format!("invalid {key}"),
+        })
     }
 
-    pub(super) fn task_id_for(self, cloud: bool) -> Result<String> {
-        if cloud && let Some(Value::Number(id)) = self.get("id") {
-            return id
-                .as_i64()
-                .filter(|id| *id > 0)
-                .map(|id| format!("D-{id}"))
-                .ok_or_else(|| {
-                    wrong_type("id", "a positive legacy registry integer or task id string")
-                });
-        }
-        self.task_id()
+    pub(super) fn task_key_for(self, cloud: bool) -> Result<String> {
+        self.task_value(
+            "id",
+            if cloud {
+                lockyard_compat::TaskDomain::Registry
+            } else {
+                lockyard_compat::TaskDomain::LegacyLocal
+            },
+        )
     }
 
     pub(super) fn some_task_id(self, key: &str) -> Result<Option<String>> {
-        self.get(key)
-            .map(|value| match value {
-                Value::String(id) => Ok(id.clone()),
-                Value::Number(_) => Err(Error::Invalid(format!(
-                    "{key} must be a task id string such as FE-0001; integers are not accepted"
-                ))),
-                _ => Err(wrong_type(key, "a task id string such as FE-0001")),
-            })
-            .transpose()
+        self.get(key).map(|_| self.task_key(key)).transpose()
+    }
+
+    pub(super) fn bus_key(self) -> Result<String> {
+        self.task_value("id", lockyard_compat::TaskDomain::Bus)
     }
 
     pub(super) fn optional_id(self) -> Result<Option<i64>> {
@@ -144,6 +134,30 @@ impl<'a> Args<'a> {
                 item.as_str()
                     .map(str::to_string)
                     .ok_or_else(|| wrong_type(key, "an array of strings"))
+            })
+            .collect()
+    }
+
+    pub(super) fn task_keys(self, key: &str) -> Result<Vec<String>> {
+        let values = self
+            .get(key)
+            .and_then(Value::as_array)
+            .ok_or_else(|| wrong_type(key, "an array of task ids"))?;
+        values
+            .iter()
+            .map(|raw| {
+                lockyard_compat::LegacyCompatibilityV1::task_id(
+                    raw,
+                    lockyard_compat::TaskDomain::Registry,
+                    lockyard_compat::Source::Mcp,
+                    2,
+                )
+                .map_err(|code| Error::Cloud {
+                    code,
+                    status: None,
+                    details: Value::Null,
+                    message: format!("invalid {key}"),
+                })
             })
             .collect()
     }
@@ -225,29 +239,16 @@ pub(super) fn claim_paths(
     let zones = args.strings("zones")?;
     let mut paths = opened.zone_paths(cwd, &args.strings("paths")?)?;
     if !zones.is_empty() {
-        let catalog = opened.backend.catalog().map_err(|error| match error {
-            Error::NeedsCloud(_) => Error::Invalid(format!(
-                "unknown zone {}; catalog: unavailable in local mode",
-                zones.join(", ")
-            )),
-            other => other,
-        })?;
-        let expanded = expand_zones(&catalog, &zones).map_err(|error| {
-            if let Error::NotFound(_) = error {
-                let names = catalog
-                    .get("zones")
-                    .and_then(Value::as_object)
-                    .map(|zones| zones.keys().cloned().collect::<Vec<_>>())
-                    .unwrap_or_default();
-                Error::Invalid(format!(
-                    "unknown zone {}; catalog: {}",
-                    zones.join(", "),
-                    names.join(", ")
-                ))
-            } else {
-                error
-            }
-        })?;
+        let expanded = opened
+            .backend
+            .catalog_expand(&zones)
+            .map_err(|error| match error {
+                Error::NeedsCloud(_) => Error::Invalid(format!(
+                    "unknown zone {}; catalog: unavailable in local mode",
+                    zones.join(", ")
+                )),
+                other => other,
+            })?;
         for path in expanded {
             if !paths.contains(&path) {
                 paths.push(path);

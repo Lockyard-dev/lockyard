@@ -181,8 +181,8 @@ pub(super) enum DirtyCommand {
         owner: Option<String>,
         #[arg(long)]
         reason: Option<String>,
-        #[arg(long, value_parser = parse_id)]
-        task: Option<i64>,
+        #[arg(long, value_parser = task_key)]
+        task: Option<String>,
     },
     /// List reported paths.
     List { path: Option<String> },
@@ -301,19 +301,19 @@ pub(super) enum TaskCommand {
     },
     /// Explain dependency and scheduling blockers using the server's visibility rules.
     WhyBlocked {
-        #[arg(value_parser=parse_task_id)]
+        #[arg(value_parser=task_key)]
         id: String,
     },
     /// Show full cloud registry dependency links, without reducing statuses.
     Links {
-        #[arg(value_parser=parse_task_id)]
+        #[arg(value_parser=task_key)]
         id: String,
     },
     /// Add a typed dependency link at an explicitly observed version.
     Link {
-        #[arg(value_parser=parse_task_id)]
+        #[arg(value_parser=task_key)]
         id: String,
-        #[arg(value_parser=parse_task_id)]
+        #[arg(value_parser=task_key)]
         to: String,
         #[arg(long, default_value = "blocks")]
         kind: String,
@@ -364,7 +364,7 @@ pub(super) enum TaskCommand {
     },
     /// Change the urgency of a task. Needs cloud mode.
     Plan {
-        #[arg(value_parser = parse_task_id)]
+        #[arg(value_parser = task_key)]
         id: String,
         #[arg(long)]
         priority: Option<String>,
@@ -388,33 +388,33 @@ pub(super) enum TaskCommand {
     },
     /// Show a task and its history.
     Show {
-        #[arg(value_parser = parse_task_id)]
+        #[arg(value_parser = task_key)]
         id: String,
     },
     /// Take a task.
     Claim {
-        #[arg(value_parser = parse_task_id)]
+        #[arg(value_parser = task_key)]
         id: String,
         #[command(flatten)]
         ttl: Ttl,
     },
     /// Extend the lease on a held task.
     Renew {
-        #[arg(value_parser = parse_task_id)]
+        #[arg(value_parser = task_key)]
         id: String,
         #[command(flatten)]
         ttl: Ttl,
     },
     /// Give a held task back.
     Release {
-        #[arg(value_parser = parse_task_id)]
+        #[arg(value_parser = task_key)]
         id: String,
         #[arg(long, default_value = "")]
         note: String,
     },
     /// Hand a held task to review.
     Submit {
-        #[arg(value_parser = parse_task_id)]
+        #[arg(value_parser = task_key)]
         id: String,
         /// What proves the work is done.
         #[arg(long)]
@@ -422,7 +422,7 @@ pub(super) enum TaskCommand {
     },
     /// Record a Codex review. PASS stays in review. REJECT returns the task.
     Review {
-        #[arg(value_parser = parse_task_id)]
+        #[arg(value_parser = task_key)]
         id: String,
         /// `pass` or `reject`.
         #[arg(long)]
@@ -432,14 +432,14 @@ pub(super) enum TaskCommand {
     },
     /// Accept another agent's submitted work. Only Claude, after a Codex PASS.
     Accept {
-        #[arg(value_parser = parse_task_id)]
+        #[arg(value_parser = task_key)]
         id: String,
         #[arg(long, default_value = "")]
         note: String,
     },
     /// Return submitted work to its assignee.
     Reject {
-        #[arg(value_parser = parse_task_id)]
+        #[arg(value_parser = task_key)]
         id: String,
         #[arg(long)]
         reason: String,
@@ -449,7 +449,7 @@ pub(super) enum TaskCommand {
     },
     /// Cancel a task you wrote.
     Cancel {
-        #[arg(value_parser = parse_task_id)]
+        #[arg(value_parser = task_key)]
         id: String,
         #[arg(long, default_value = "")]
         note: String,
@@ -458,8 +458,8 @@ pub(super) enum TaskCommand {
 
 #[derive(Args)]
 pub(super) struct WorkRef {
-    #[arg(value_parser = parse_id)]
-    pub(super) id: i64,
+    #[arg(value_parser = bus_key)]
+    pub(super) id: String,
     /// Act only if the task is still at this version.
     #[arg(long)]
     pub(super) if_version: Option<i64>,
@@ -487,8 +487,8 @@ pub(super) enum WorkCommand {
     List,
     /// Show one work task.
     Show {
-        #[arg(value_parser = parse_id)]
-        id: i64,
+        #[arg(value_parser = bus_key)]
+        id: String,
     },
     /// Take an offered task.
     Claim(WorkRef),
@@ -542,8 +542,8 @@ pub(super) enum WorkCommand {
     },
     /// Take a task handed to this agent. Needs the version.
     Take {
-        #[arg(value_parser = parse_id)]
-        id: i64,
+        #[arg(value_parser = bus_key)]
+        id: String,
         /// The version seen in `work show`.
         #[arg(long)]
         if_version: i64,

@@ -1064,6 +1064,7 @@ impl<T: Transport + 'static> Shared<T> {
             url: self.config.url.clone(),
             workspace: self.config.workspace.clone(),
             token_id: self.config.token_id.clone(),
+            catalog_expansion_v1: true,
             pid: std::process::id(),
             view_fresh: view.fresh(self.timing().fresh),
             view_age_ms: view
@@ -1106,6 +1107,24 @@ impl<T: Transport + 'static> Shared<T> {
                 phase,
                 write_paths,
             } => self.touch(&session, &client, phase, write_paths),
+            Request::ExpandCatalog { call, names } => {
+                if call.method != "GET"
+                    || call.path != "/api/v1/zones/catalog"
+                    || call.body.is_some()
+                    || call.key.is_some()
+                {
+                    return Reply::failed(ClientError::Invalid(
+                        "catalog expansion requires a catalog read".into(),
+                    ));
+                }
+                match self.transport.catalog_expand(&call, &names) {
+                    Ok(paths) => Reply {
+                        value: Some(json!(paths)),
+                        ..Reply::default()
+                    },
+                    Err(error) => Reply::failed(error),
+                }
+            }
             Request::Call { call } => self.forward(call),
         }
     }
@@ -1386,10 +1405,18 @@ impl<T: Transport + 'static> Shared<T> {
     fn drain(&self) {
         let mut pause = self.timing().retry_min;
         while !self.stopped() {
-            let Some(entry) = self.outbox.head(self.timing().retry_max) else {
+            // Outbox readiness has its own condvar, so Shared::stop cannot wake this wait.
+            let Some(entry) = self
+                .outbox
+                .head(self.timing().retry_max.min(crate::shutdown::POLL_INTERVAL))
+            else {
                 continue;
             };
+            if self.stopped() {
+                break;
+            }
             let mut call = entry.call.clone();
+            call.defer_pending_ack = true;
             call.attempt_timeout_ms =
                 Some(u64::try_from(self.timing().send_limit.as_millis()).unwrap_or(u64::MAX));
             match self.transport.call(&call) {
@@ -1401,6 +1428,11 @@ impl<T: Transport + 'static> Shared<T> {
                         .min(MAX_RETRY_AFTER);
                     self.outbox.defer(entry.n, delay);
                 }
+                Err(error @ ClientError::OutcomeUnknown(_)) => {
+                    self.outbox.report_unknown(entry.n, error);
+                    self.outbox.defer(entry.n, pause);
+                    pause = (pause * 2).min(self.timing().retry_max);
+                }
                 Err(error) if error.is_outage() => {
                     let asked = error
                         .retry_after()
@@ -1410,8 +1442,14 @@ impl<T: Transport + 'static> Shared<T> {
                 }
                 outcome => {
                     pause = self.timing().retry_min;
+                    let succeeded = outcome.is_ok();
                     if let Err(error) = self.outbox.finish(entry.n, outcome) {
                         eprintln!("lockyard agent: cannot update the outbox: {error}");
+                    } else if succeeded && let Err(error) = self.transport.acknowledge_write(&call)
+                    {
+                        eprintln!(
+                            "lockyard agent: cannot acknowledge the completed write: {error}"
+                        );
                     }
                 }
             }
@@ -1596,11 +1634,12 @@ impl<T: Transport + 'static> Daemon<T> {
         })
     }
 
-    /// Runs until the process is killed. The outbox is on disk, so that needs no ceremony.
+    /// Waits for a normal stop signal, then joins the bounded background operations.
     pub fn wait(mut self) {
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
+        while !crate::shutdown::requested() && !self.shared.stopped() {
+            thread::sleep(crate::shutdown::POLL_INTERVAL);
         }
+        self.shutdown();
     }
 
     /// Stops the workers and waits for their current bounded transport operations to finish.
@@ -2453,6 +2492,180 @@ mod tests {
         let sent = server.writes_to("/bus/messages");
         assert_eq!(bodies(&sent), ["one", "two"]);
         assert_eq!(sent[0].key, key);
+    }
+
+    #[test]
+    fn disconnected_write_survives_agent_restart_and_replays_exact_wire_operation() {
+        unknown_wire_operation_survives_restart(false);
+    }
+
+    #[test]
+    fn unrecognized_server_error_survives_agent_restart_and_keeps_original_operation() {
+        unknown_wire_operation_survives_restart(true);
+    }
+
+    fn unknown_wire_operation_survives_restart(initial_server_error: bool) {
+        use lockyard_cloud_client::{Client, WorkspaceKey};
+        use std::net::TcpListener;
+
+        // The server commits the first POST but drops its response. All subsequent POSTs
+        // return that receipt: the request log proves that recovery uses the original nonce.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let writes = Arc::new(Mutex::new(
+            Vec::<(String, String, String, String, String)>::new(),
+        ));
+        let stop = Arc::new(AtomicBool::new(false));
+        let recorded = Arc::clone(&writes);
+        let stopped = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 4096];
+                let end = loop {
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert_ne!(count, 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                };
+                let headers = String::from_utf8(bytes[..end].to_vec()).unwrap();
+                let mut lines = headers.split("\r\n");
+                let request = lines.next().unwrap().split_whitespace().collect::<Vec<_>>();
+                let headers = lines
+                    .filter_map(|line| line.split_once(':'))
+                    .map(|(key, value)| (key.to_ascii_lowercase(), value.trim().to_owned()))
+                    .collect::<HashMap<_, _>>();
+                let length: usize = headers
+                    .get("content-length")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                while bytes.len() < end + length {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert_ne!(count, 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let mut status = 200;
+                let response = if request[0] == "POST" && request[1] == "/api/v1/bus/messages" {
+                    let mut writes = recorded.lock().unwrap();
+                    writes.push((
+                        headers["idempotency-key"].clone(),
+                        String::from_utf8(bytes[end..end + length].to_vec()).unwrap(),
+                        headers["lockyard-protocol"].clone(),
+                        request[0].to_owned(),
+                        request[1].to_owned(),
+                    ));
+                    if writes.len() == 1 {
+                        if !initial_server_error {
+                            continue; // The entire POST arrived; its receipt is lost.
+                        }
+                        status = 503;
+                        json!({"type":"urn:lockyard:problem:future_server_code", "title":"Unknown failure",
+                            "status":503,"detail":"commit uncertain","instance":"urn:request:fixture",
+                            "code":"future_server_code","details":{}})
+                    } else {
+                        json!({"id": 7})
+                    }
+                } else if request[1] == "/api/v1/protocol" {
+                    json!({"selected_protocol":2,"min_protocol":1,"max_protocol":2,"capabilities":[]})
+                } else if request[1].contains("/events") {
+                    json!({"events":[]})
+                } else {
+                    json!({"claims":[],"queue":[],"requests":[],"lost":[],"messages":[]})
+                }.to_string();
+                let reply = format!(
+                    "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nLockyard-Protocol: 2\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let make_client = || {
+            Client::new(&url, "fixture-token".into())
+                .unwrap()
+                .with_content_encryption("team", Some(WorkspaceKey::from_entropy([71; 32])), true)
+                .with_pending_journal(root.join("pending"))
+                .unwrap()
+        };
+        let mut config = config(
+            &root,
+            Timing {
+                retry_min: Duration::from_secs(1),
+                retry_max: Duration::from_secs(1),
+                mail_wait: Duration::from_secs(2),
+                ..timing()
+            },
+        );
+        config.url = url.clone();
+        let call = Call::write(
+            "me",
+            "POST",
+            "/api/v1/bus/messages".into(),
+            json!({"to":"other","body":"must keep the encrypted nonce"}),
+        );
+        let key = call.key.clone().unwrap();
+        let client = Arc::new(make_client());
+        let mut daemon = Daemon::start(config.clone(), Arc::clone(&client)).unwrap();
+        let reply = daemon.handle(Request::Call { call: call.clone() });
+        assert_eq!(
+            reply.error.as_ref().and_then(ClientError::code),
+            Some("outcome_unknown")
+        );
+        daemon.stop_workers();
+        assert_eq!(daemon.shared.outbox.len(), 1, "unknown is still queued");
+        assert_eq!(
+            daemon.shared.outbox.rejected(),
+            0,
+            "unknown is not a final refusal"
+        );
+        let pending = client.pending_operation(&key).unwrap();
+        assert_eq!(writes.lock().unwrap().len(), 1);
+        assert_eq!(
+            pending.body.as_deref(),
+            Some(writes.lock().unwrap()[0].1.as_str())
+        );
+        drop(daemon);
+        drop(client);
+
+        let restored = Arc::new(make_client());
+        assert_eq!(restored.pending_operation(&key).unwrap().body, pending.body);
+        let again = Daemon::start(config, Arc::clone(&restored)).unwrap();
+        wait_for("exact pending replay after restart", || {
+            again.shared.outbox.len() == 0
+        });
+        let sent = writes.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "one initial POST and one exact replay");
+        assert_eq!(
+            sent[0], sent[1],
+            "key, ciphertext bytes, protocol, method and path must be identical"
+        );
+        assert_eq!(sent[0].0, key);
+        assert!(!sent[0].1.contains("must keep the encrypted nonce"));
+        wait_for(
+            "durable outbox completion to release the pending journal",
+            || restored.pending_operation(&key).is_none(),
+        );
+        assert_eq!(again.shared.outbox.rejected(), 0);
+        drop(again);
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
     }
 
     #[test]

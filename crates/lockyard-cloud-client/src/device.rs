@@ -166,7 +166,12 @@ fn status_error(status: u16, body: &Value) -> ClientError {
         .unwrap_or_else(|| format!("the device endpoint answered {status}"));
     ClientError::from_api(crate::ApiError {
         status,
-        code: String::new(),
+        // Device bootstrap precedes bearer/protocol discovery and has its own status contract.
+        code: if status == 429 {
+            "rate_limited".into()
+        } else {
+            String::new()
+        },
         message,
         details: Value::Null,
         retry_after: None,

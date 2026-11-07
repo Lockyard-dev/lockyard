@@ -85,6 +85,13 @@ impl<T> RepositoryTransport<T> {
         } else {
             value
         };
+        // Typed plaintext is local input; typed wire metadata is authenticated; both stay relative.
+        if catalog.get("format").is_some()
+            || catalog.get("version") == Some(&Value::from(1))
+            || catalog.get("verified") == Some(&Value::Bool(true))
+        {
+            return Ok(());
+        }
         if let Some(zones) = catalog.get_mut("zones").and_then(Value::as_object_mut) {
             for zone in zones.values_mut() {
                 let paths = if zone.is_array() {
@@ -109,33 +116,17 @@ impl<T> RepositoryTransport<T> {
         }
         Ok(())
     }
-}
 
-impl<T: Transport> Transport for RepositoryTransport<T> {
-    fn call(&self, call: &Call) -> Result<Value, ClientError> {
-        let zones = call.path.starts_with("/api/v1/zones/")
-            || call.path.starts_with("/api/v1/import/zones");
-        let catalog = call.path.starts_with("/api/v1/zones/catalog")
-            || call.path.starts_with("/api/v1/import/zones");
-        let events = call.path.starts_with("/api/v1/events");
+    /// Apply the same pure scope transformation to sends and their durable acknowledgements.
+    fn qualified_call(&self, call: &Call) -> Result<Call, ClientError> {
         let mut qualified = call.clone();
-        if zones {
+        if call.path.starts_with("/api/v1/zones/") || call.path.starts_with("/api/v1/import/zones")
+        {
             qualified.repository = Some(self.repository.clone().unwrap_or_default());
-            if self.repository.is_some() && !self.verified.load(Ordering::Acquire) {
-                // Negotiate through a read before a write can acquire a zone on an older server.
-                let mut probe = Call::get(
-                    &call.session,
-                    format!(
-                        "/api/v1/zones/claims?path={}&namespace_probe=1",
-                        encode(&self.path(".")?)
-                    ),
-                );
-                probe.repository = self.repository.clone();
-                self.inner.call(&probe)?;
-                self.verified.store(true, Ordering::Release);
-            }
             if let Some(body) = qualified.body.as_mut() {
-                if catalog {
+                if call.path.starts_with("/api/v1/zones/catalog")
+                    || call.path.starts_with("/api/v1/import/zones")
+                {
                     self.catalog(body, true)?;
                 } else {
                     self.transform(body, true)?;
@@ -156,6 +147,31 @@ impl<T: Transport> Transport for RepositoryTransport<T> {
                 qualified.path = format!("{route}?{}", pairs.join("&"));
             }
         }
+        Ok(qualified)
+    }
+}
+
+impl<T: Transport> Transport for RepositoryTransport<T> {
+    fn call(&self, call: &Call) -> Result<Value, ClientError> {
+        let zones = call.path.starts_with("/api/v1/zones/")
+            || call.path.starts_with("/api/v1/import/zones");
+        let catalog = call.path.starts_with("/api/v1/zones/catalog")
+            || call.path.starts_with("/api/v1/import/zones");
+        let events = call.path.starts_with("/api/v1/events");
+        if zones && self.repository.is_some() && !self.verified.load(Ordering::Acquire) {
+            // Negotiate through a read before a write can acquire a zone on an older server.
+            let mut probe = Call::get(
+                &call.session,
+                format!(
+                    "/api/v1/zones/claims?path={}&namespace_probe=1",
+                    encode(&self.path(".")?)
+                ),
+            );
+            probe.repository = self.repository.clone();
+            self.inner.call(&probe)?;
+            self.verified.store(true, Ordering::Release);
+        }
+        let qualified = self.qualified_call(call)?;
         let answer = self.inner.call(&qualified);
         let mut answer = match answer {
             Err(ClientError::Conflict(mut error)) => {
@@ -170,6 +186,16 @@ impl<T: Transport> Transport for RepositoryTransport<T> {
             self.transform(&mut answer, false)?;
         }
         Ok(answer)
+    }
+
+    fn acknowledge_write(&self, call: &Call) -> Result<(), ClientError> {
+        self.inner.acknowledge_write(&self.qualified_call(call)?)
+    }
+
+    fn catalog_expand(&self, call: &Call, names: &[String]) -> Result<Vec<String>, ClientError> {
+        let mut scoped = call.clone();
+        scoped.repository = Some(self.repository.clone().unwrap_or_default());
+        self.inner.catalog_expand(&scoped, names)
     }
 
     fn fast_check(
@@ -425,6 +451,44 @@ mod tests {
             4,
             "the capability read is reused for this transport"
         );
+    }
+
+    #[test]
+    fn acknowledging_a_repository_write_uses_the_same_qualified_operation_without_a_probe() {
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<Call>>);
+        impl Transport for Recorder {
+            fn call(&self, call: &Call) -> Result<Value, ClientError> {
+                self.0.lock().unwrap().push(call.clone());
+                Ok(Value::Null)
+            }
+            fn acknowledge_write(&self, call: &Call) -> Result<(), ClientError> {
+                assert_eq!(
+                    call,
+                    self.0.lock().unwrap().last().unwrap(),
+                    "acknowledgement must identify exactly the operation sent to the inner transport"
+                );
+                Ok(())
+            }
+        }
+        for repository in [Some("api"), None] {
+            let recorder = std::sync::Arc::new(Recorder::default());
+            let transport = RepositoryTransport::new(recorder.clone(), repository).unwrap();
+            let call = Call::write(
+                "alice",
+                "POST",
+                "/api/v1/zones/claims?path=src%2Ffile".into(),
+                json!({"paths":["src/file"],"note":"private"}),
+            );
+            transport.call(&call).unwrap();
+            let calls_before = recorder.0.lock().unwrap().len();
+            transport.acknowledge_write(&call).unwrap();
+            assert_eq!(
+                recorder.0.lock().unwrap().len(),
+                calls_before,
+                "acknowledgement must not issue a network probe"
+            );
+        }
     }
 
     #[test]

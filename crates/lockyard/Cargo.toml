@@ -10,6 +10,7 @@ description.workspace = true
 readme = "../../README.md"
 
 [dependencies]
+lockyard-compat.workspace = true
 clap.workspace = true
 lockyard-cloud-client.workspace = true
 lockyard-core.workspace = true
