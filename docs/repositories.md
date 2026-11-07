@@ -23,9 +23,9 @@ coordination namespace; release active leases and update collaborating clients t
 all participants consistently rather than mixing explicit IDs with legacy coordination for one checkout.
 
 Repository-scoped calls check server capability before accepting a cache result. An old server or
-daemon cannot assert that a namespaced path is free. Hooks retain their documented behavior of
-allowing an edit with a warning when coordination is unknown; this is cooperative coordination,
-not filesystem access control. Token roles and workspace authorization remain separate.
+daemon cannot assert that a namespaced path is free. Hooks deny edits when coordination is unknown
+or a zone check fails. Mail and presence failures remain nonblocking. This is cooperative
+coordination, not filesystem access control. Token roles and workspace authorization remain separate.
 
 The `.lockyard-repository` top-level path is reserved for protocol addresses and cannot be selected
 as an ordinary physical project path. CLI and web views display repository labels and project-relative paths.

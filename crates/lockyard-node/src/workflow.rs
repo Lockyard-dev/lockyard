@@ -2427,6 +2427,8 @@ mod tests {
     }
     impl FixtureDriver {
         fn new(root: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
             Self {
                 root: root.into(),
                 key: SigningKey::generate(&root.join("signing.pk8")).unwrap(),

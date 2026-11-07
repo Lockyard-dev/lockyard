@@ -863,6 +863,60 @@ fn a_broken_project_never_blocks_the_agent() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("lockyard hook"));
 }
 
+#[test]
+fn failed_hook_checks_deny_edits_for_every_client() {
+    for failure in ["database", "path"] {
+        let dir = project();
+        if failure == "database" {
+            std::fs::write(
+                dir.path().join(".lockyard/lockyard.db"),
+                "not a database, not at all",
+            )
+            .unwrap();
+        }
+        for tool in ["claude", "codex", "cursor"] {
+            let event = json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "worker",
+                "cwd": dir.path(),
+                "tool_name": "Write",
+                "tool_input": {"file_path": if failure == "path" {
+                    String::new()
+                } else {
+                    dir.path().join("src/new.rs").to_str().unwrap().to_string()
+                }},
+            });
+            let mut child = Command::new(env!("CARGO_BIN_EXE_lockyard"))
+                .args(["hook", tool])
+                .current_dir(dir.path())
+                .env_remove("LOCKYARD_AGENT")
+                .env_remove("CLAUDE_CODE_SESSION_ID")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(event.to_string().as_bytes())
+                .unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(result.status.success(), "{tool} {failure}: {result:?}");
+            let answer: Value = serde_json::from_slice(&result.stdout).unwrap_or_else(|error| {
+                panic!("{tool} {failure}: edit received no denial: {error}; {result:?}")
+            });
+            let decision = if tool == "cursor" {
+                &answer["permission"]
+            } else {
+                &answer["hookSpecificOutput"]["permissionDecision"]
+            };
+            assert_eq!(decision, "deny", "{tool} {failure}: {answer}");
+        }
+    }
+}
+
 fn mcp(dir: &Path, agent: &str, input: &str) -> Output {
     mcp_with(dir, agent, &[], &[], input)
 }

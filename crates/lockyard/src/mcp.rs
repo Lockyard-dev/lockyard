@@ -1361,9 +1361,11 @@ fn run_composite(
             if let Some(id) = args.some_int("handover_id")? {
                 return Ok(json!({"accepted": step("zone_accept", json!({"id": id}), after)?}));
             }
+            // Reject malformed task arguments before creating any lease.
+            let task = args.some_task_id("task")?;
             if args.get("task").is_some() && paths.is_empty() && args.strings("zones")?.is_empty() {
                 // A registry task claim does not need a path claim.
-                let id = args.some_task_id("task")?.expect("checked above");
+                let id = task.expect("checked above");
                 return Ok(json!({"task": step("task_claim", json!({"id": id}), after)?}));
             }
             let zones = args.strings("zones")?;
@@ -1372,28 +1374,55 @@ fn run_composite(
                     "start_work needs paths or zones (or handover_id to accept an offer)".into(),
                 ));
             }
-            let claim = if paths.is_empty() && zones.is_empty() {
-                Value::Null
-            } else {
-                step(
-                    "zone_claim",
-                    json!({
-                        "paths": paths,
-                        "note": args.optional_text("note")?,
-                        "ttl": args.get("ttl").cloned(),
-                        "shared": args.flag("shared")?,
-                        "zones": zones,
-                    }),
-                    after,
-                )?
+            let arguments = json!({
+                "paths": paths,
+                "note": args.optional_text("note")?,
+                "ttl": args.get("ttl").cloned(),
+                "shared": args.flag("shared")?,
+                "zones": zones,
+            });
+            let (claim, rollback) = {
+                let me =
+                    agent.ok_or_else(|| Error::Invalid("this write needs an agent name".into()))?;
+                let mut opened = open(cwd, agent)?;
+                let mut request = claim_request(&opened, Args(&arguments), cwd)?;
+                let cloud = opened.backend.is_cloud();
+                let nonce = (cloud && task.is_some()).then(lockyard_cloud_client::ulid);
+                if let Some(nonce) = nonce.as_ref() {
+                    request.meta = Some(json!({"lockyard_start_work_nonce": nonce}));
+                }
+                let (claim, submitted) = lockyard_core::claim_or_reuse_with_status(
+                    opened.backend.as_mut(),
+                    me,
+                    &request,
+                    crate::now_ms(),
+                )?;
+                // Cloud POST may reuse a claim created by a concurrent call.
+                // Only an echoed per-attempt marker proves this call created it.
+                let created = submitted
+                    && (!cloud
+                        || nonce.as_deref().is_some_and(|nonce| {
+                            claim
+                                .meta
+                                .as_ref()
+                                .and_then(|meta| meta.get("lockyard_start_work_nonce"))
+                                .and_then(Value::as_str)
+                                == Some(nonce)
+                        }));
+                let rollback = created.then_some((claim.id, cloud.then_some(claim.fence)));
+                (encode(&claim)?, rollback)
             };
             let mut answer = json!({"claim": claim});
-            if let Some(id) = args.some_task_id("task")? {
+            if let Some(id) = task {
                 match step("task_claim", json!({"id": id}), after) {
                     Ok(task) => answer["task"] = task,
                     Err(failure) => {
-                        if !claim.is_null() {
-                            let _ = step("zone_release", json!({}), after);
+                        if let Some((id, fence)) = rollback {
+                            let mut release = json!({"id": id});
+                            if let Some(fence) = fence {
+                                release["fence"] = json!(fence);
+                            }
+                            let _ = step("zone_release", release, after);
                         }
                         return Err(failure);
                     }
@@ -3294,6 +3323,59 @@ mod tests {
         assert_eq!(refused["isError"], true);
         let free = call(&dir, "third", "zone_claim", json!({"paths": ["src"]}));
         assert_eq!(free["isError"], false, "the rolled-back zone is free again");
+    }
+
+    #[test]
+    fn start_work_failure_preserves_unrelated_and_reused_claims() {
+        for (held, requested) in [("docs", "src"), ("src", "src/sub")] {
+            let dir = project();
+            call(&dir, "lead", "task_add", json!({"title": "ship"}));
+            call(&dir, "first", "task_claim", json!({"id": "1"}));
+            let original = call(&dir, "second", "zone_claim", json!({"paths": [held]}));
+            assert_eq!(original["isError"], false);
+            let original: Value = serde_json::from_str(text(&original)).unwrap();
+            let refused = call(
+                &dir,
+                "second",
+                "start_work",
+                json!({"paths": [requested], "task": "1"}),
+            );
+            assert_eq!(refused["isError"], true);
+            let status = call(&dir, "second", "status", json!({}));
+            let status: Value = serde_json::from_str(text(&status)).unwrap();
+            assert!(
+                status["claims"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|claim| claim["id"] == original["id"]),
+                "failed start_work removed the pre-existing {held} claim: {status}"
+            );
+            if held == "docs" {
+                let free = call(&dir, "third", "zone_claim", json!({"paths": [requested]}));
+                assert_eq!(
+                    free["isError"], false,
+                    "only the newly created claim rolls back"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn start_work_validates_task_before_acquiring_a_zone() {
+        let dir = project();
+        let refused = call(
+            &dir,
+            "worker",
+            "start_work",
+            json!({"paths": ["src"], "task": []}),
+        );
+        assert_eq!(refused["isError"], true);
+        let free = call(&dir, "other", "zone_claim", json!({"paths": ["src"]}));
+        assert_eq!(
+            free["isError"], false,
+            "invalid arguments must leave no claim behind"
+        );
     }
 
     #[test]

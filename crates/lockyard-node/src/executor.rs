@@ -6403,6 +6403,9 @@ pub(crate) mod regression_tests {
         private_dir_new(&job).unwrap();
         fs::write(job.join("output.log"), []).unwrap();
         fs::write(job.join("result.patch"), []).unwrap();
+        for name in ["output.log", "result.patch"] {
+            fs::set_permissions(job.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+        }
         persist(&config.state_dir, &record).unwrap();
         executor.inner.jobs.lock().unwrap().insert(
             record.spec.id.clone(),

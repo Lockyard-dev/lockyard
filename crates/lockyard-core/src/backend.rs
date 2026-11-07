@@ -398,13 +398,24 @@ pub trait Backend {
 }
 
 /// Reuses an agent's existing claim when it already covers every requested path.
-/// This makes equivalent case and Unicode spellings idempotent across backends.
+/// Equivalent spellings use the claim's server-selected repository path policy.
 pub fn claim_or_reuse(
     backend: &mut dyn Backend,
     agent: &str,
     request: &ClaimRequest,
     now: i64,
 ) -> Result<Claim> {
+    claim_or_reuse_with_status(backend, agent, request, now).map(|(claim, _)| claim)
+}
+
+/// Returns the claim and whether a claim request was submitted to the backend.
+/// A submitted cloud request may itself reuse a claim, so this flag does not prove creation.
+pub fn claim_or_reuse_with_status(
+    backend: &mut dyn Backend,
+    agent: &str,
+    request: &ClaimRequest,
+    now: i64,
+) -> Result<(Claim, bool)> {
     if !request.paths.is_empty() {
         let existing = backend.claims(
             &ClaimQuery {
@@ -413,19 +424,36 @@ pub fn claim_or_reuse(
             },
             now,
         )?;
-        if let Some(claim) = existing.into_iter().find(|claim| {
-            claim.mode == request.mode
-                && request.paths.iter().all(|requested| {
-                    let requested = crate::paths::ZonePath::stored(requested.clone());
-                    claim.paths.iter().any(|held| {
-                        crate::paths::ZonePath::stored(held.clone()).contains(&requested)
-                    })
-                })
-        }) {
-            return Ok(claim);
+        if let Some(claim) = existing
+            .into_iter()
+            .find(|claim| claim_covers_request(claim, agent, request))
+        {
+            return Ok((claim, false));
         }
     }
-    backend.claim(agent, request, now)
+    let claim = backend.claim(agent, request, now)?;
+    if !claim_covers_request(&claim, agent, request) {
+        return Err(Error::Protocol(
+            "claim response did not grant the requested paths to this session".into(),
+        ));
+    }
+    Ok((claim, true))
+}
+
+fn claim_covers_request(claim: &Claim, agent: &str, request: &ClaimRequest) -> bool {
+    let fold_case = claim.case_insensitive_paths.unwrap_or(true);
+    claim.session == agent
+        && claim.mode == request.mode
+        && request.paths.iter().all(|requested| {
+            let requested = crate::paths::ZonePath::stored(requested.clone());
+            claim.paths.iter().any(|held| {
+                crate::paths::ZonePath::stored(held.clone())
+                    .contains_with_case(&requested, fold_case)
+            }) && !claim.excluded_paths.iter().any(|excluded| {
+                crate::paths::ZonePath::stored(excluded.clone())
+                    .overlaps_with_case(&requested, fold_case)
+            })
+        })
 }
 
 fn claim_record(claim: zones::Claim) -> Claim {

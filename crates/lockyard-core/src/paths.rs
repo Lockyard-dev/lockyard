@@ -68,13 +68,18 @@ impl ZonePath {
 
     /// True when this path is the requested path or one of its parent directories.
     pub fn contains(&self, other: &Self) -> bool {
+        self.contains_with_case(other, true)
+    }
+
+    /// Coverage under the repository path policy, independent of this machine's OS.
+    pub fn contains_with_case(&self, other: &Self, fold_case: bool) -> bool {
         let (repository_outer, outer) = crate::repository::split(self.as_str());
         let (repository_inner, inner) = crate::repository::split(other.as_str());
         if repository_outer != repository_inner {
             return false;
         }
-        let outer = comparable(outer, true);
-        let inner = comparable(inner, true);
+        let outer = comparable(outer, fold_case);
+        let inner = comparable(inner, fold_case);
         outer == ROOT || inner == outer || is_inside(&inner, &outer)
     }
 

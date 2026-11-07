@@ -2748,6 +2748,7 @@ mod tests {
         let rig = start_with(
             Timing {
                 fresh: Duration::from_secs(30),
+                activity_every: Duration::from_secs(30),
                 ..timing()
             },
             |server| server.claim(7, "me", "src"),
@@ -2779,8 +2780,15 @@ mod tests {
             dirty[0].body.as_ref().unwrap()["paths"][0]["owner_session"],
             "me"
         );
-        // A busy machine may flush between src/b and src/c, so the later writes can arrive in one batch or
-        // two: what must hold is that every claimed path arrives, from this session, and nothing unclaimed.
+        // Advance the batching deadline explicitly: fsync and scheduler delays
+        // must not decide how many flush windows the test crosses.
+        let flush_due = || {
+            rig.daemon.shared.activity().get_mut(&7).unwrap().sent =
+                Some(Instant::now() - rig.daemon.shared.timing().activity_every);
+            rig.daemon.shared.flush_activity();
+        };
+        assert_eq!(rig.server.writes_to("/activity").len(), 1);
+        flush_due();
         let later = || -> String {
             rig.server.writes_to("/activity")[1..]
                 .iter()
@@ -2794,19 +2802,28 @@ mod tests {
         });
         let batches = rig.server.writes_to("/activity");
         assert_eq!(batches[0].body.as_ref().unwrap()["paths"], json!(["src/a"]));
-        assert!(
-            batches.len() <= 3,
-            "writes are batched, not sent one by one"
-        );
+        assert_eq!(batches.len(), 2, "pending writes form one later batch");
+        let mut paths: Vec<String> =
+            serde_json::from_value(batches[1].body.as_ref().unwrap()["paths"].clone()).unwrap();
+        paths.sort();
+        assert_eq!(paths, ["src/a", "src/b", "src/c"]);
         assert!(batches.iter().all(|batch| batch.session == "me"));
         assert!(!later().contains("elsewhere"), "{}", later());
         // Activity keeps counting repeated writes of src/a, which only the dirty report folds.
         let before = batches.len();
         rig.daemon.handle(write("src/a"));
+        flush_due();
         wait_for("the next activity batch", || {
             rig.server.writes_to("/activity").len() == before + 1
         });
         assert_eq!(rig.server.writes_to("/zones/dirty").len(), 3);
+        assert_eq!(
+            rig.server.writes_to("/activity")[before]
+                .body
+                .as_ref()
+                .unwrap()["paths"],
+            json!(["src/a"])
+        );
     }
 
     #[test]

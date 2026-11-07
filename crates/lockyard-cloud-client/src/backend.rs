@@ -1643,6 +1643,125 @@ mod tests {
     }
 
     #[test]
+    fn claim_reuse_does_not_treat_an_incoming_handover_as_owned() {
+        let mut offered = claim_json(7);
+        offered["session"] = json!("bob");
+        offered["handover_to"] = json!("me");
+        offered["offered_to_you"] = json!(true);
+        let (server, mut cloud) = backend(vec![json!([offered]), claim_json(8)]);
+        let request = ClaimRequest {
+            paths: vec!["src/file.rs".into()],
+            ..ClaimRequest::default()
+        };
+        let claim = lockyard_core::claim_or_reuse(&mut cloud, "me", &request, 0).unwrap();
+        assert_eq!(claim.id, 8, "an offered claim must still be acquired");
+        assert_eq!(claim.session, "me");
+        sees(
+            &server,
+            &[
+                ("GET", "/api/v1/zones/claims?session=me"),
+                ("POST", "/api/v1/zones/claims"),
+            ],
+        );
+    }
+
+    #[test]
+    fn claim_reuse_does_not_cover_excluded_paths_or_their_parents() {
+        for requested in ["src/private/file.rs", "src/private", "src"] {
+            let mut held = claim_json(7);
+            held["excluded_paths"] = json!(["src/private"]);
+            let (server, mut cloud) = backend(vec![json!([held]), claim_json(8)]);
+            let request = ClaimRequest {
+                paths: vec![requested.into()],
+                ..ClaimRequest::default()
+            };
+            let claim = lockyard_core::claim_or_reuse(&mut cloud, "me", &request, 0).unwrap();
+            assert_eq!(claim.id, 8, "excluded coverage was reused for {requested}");
+            sees(
+                &server,
+                &[
+                    ("GET", "/api/v1/zones/claims?session=me"),
+                    ("POST", "/api/v1/zones/claims"),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn claim_reuse_respects_the_server_case_sensitive_repository_policy() {
+        let mut held = claim_json(7);
+        held["paths"] = json!(["SRC"]);
+        held["case_insensitive_paths"] = json!(false);
+        let (server, mut cloud) = backend(vec![json!([held]), claim_json(8)]);
+        let request = ClaimRequest {
+            paths: vec!["src/file.rs".into()],
+            ..ClaimRequest::default()
+        };
+        let claim = lockyard_core::claim_or_reuse(&mut cloud, "me", &request, 0).unwrap();
+        assert_eq!(claim.id, 8, "SRC does not hold src in this repository");
+        sees(
+            &server,
+            &[
+                ("GET", "/api/v1/zones/claims?session=me"),
+                ("POST", "/api/v1/zones/claims"),
+            ],
+        );
+    }
+
+    #[test]
+    fn claim_reuse_keeps_owned_coverage_under_the_server_case_policy() {
+        for case_policy in [None, Some(true), Some(false)] {
+            let mut held = claim_json(7);
+            held["paths"] = json!(["SRC"]);
+            held["excluded_paths"] = json!(["SRC/private"]);
+            if let Some(fold_case) = case_policy {
+                held["case_insensitive_paths"] = json!(fold_case);
+            }
+            let (server, mut cloud) = backend(vec![json!([held])]);
+            let request = ClaimRequest {
+                paths: vec![if case_policy == Some(false) {
+                    "SRC/public/file.rs".into()
+                } else {
+                    "src/public/file.rs".into()
+                }],
+                ..ClaimRequest::default()
+            };
+            let claim = lockyard_core::claim_or_reuse(&mut cloud, "me", &request, 0).unwrap();
+            assert_eq!(claim.id, 7);
+            sees(&server, &[("GET", "/api/v1/zones/claims?session=me")]);
+        }
+    }
+
+    #[test]
+    fn claim_reuse_rejects_an_acquisition_receipt_without_owned_full_coverage() {
+        let mut foreign = claim_json(8);
+        foreign["session"] = json!("bob");
+        let mut excluded = claim_json(8);
+        excluded["excluded_paths"] = json!(["src/private"]);
+        let mut different_case = claim_json(8);
+        different_case["paths"] = json!(["SRC"]);
+        different_case["case_insensitive_paths"] = json!(false);
+        for receipt in [foreign, excluded, different_case] {
+            let (server, mut cloud) = backend(vec![json!([]), receipt.clone()]);
+            let request = ClaimRequest {
+                paths: vec!["src".into()],
+                ..ClaimRequest::default()
+            };
+            assert!(
+                lockyard_core::claim_or_reuse(&mut cloud, "me", &request, 0).is_err(),
+                "invalid acquisition receipt accepted: {receipt}"
+            );
+            sees(
+                &server,
+                &[
+                    ("GET", "/api/v1/zones/claims?session=me"),
+                    ("POST", "/api/v1/zones/claims"),
+                ],
+            );
+        }
+    }
+
+    #[test]
     fn claims_carry_lazy_mode_purpose_meta_and_short_waits() {
         let (server, mut cloud) = backend(vec![json!({"claim": claim_json(1)}), claim_json(2)]);
         let request = ClaimRequest {

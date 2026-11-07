@@ -133,6 +133,7 @@ pub(crate) fn transform_fields_policy(
                 value,
                 &api["components"]["schemas"][schema],
                 &api["components"]["schemas"],
+                Some(schema),
             )?;
         }
     }
@@ -307,10 +308,11 @@ fn visit(
                     && !slot.is_null()
                     && (p == "hold_until_ref"
                         || (p == "meta"
-                            && !(matches!(
+                            && !((matches!(
                                 schema,
                                 "CoordinationPresence" | "CoordinationPresenceActivity"
-                            ) && safe_activity_meta(slot))))
+                            ) && safe_activity_meta(slot))
+                                || (schema == "CoordinationClaim" && safe_start_work_meta(slot)))))
                 {
                     return Err("required node response contains unclassified metadata".into());
                 }
@@ -1065,6 +1067,7 @@ fn validate_request_shape(
     value: &Value,
     definition: &Value,
     schemas: &Value,
+    schema_name: Option<&str>,
 ) -> Result<(), String> {
     if value.is_null() {
         return Ok(());
@@ -1082,7 +1085,7 @@ fn validate_request_shape(
         .and_then(Value::as_str)
         .and_then(|r| r.strip_prefix("#/components/schemas/"))
     {
-        return validate_request_shape(value, &schemas[name], schemas);
+        return validate_request_shape(value, &schemas[name], schemas, Some(name));
     }
     if let Some(variants) = definition
         .get("oneOf")
@@ -1091,7 +1094,7 @@ fn validate_request_shape(
     {
         return if variants
             .iter()
-            .any(|variant| validate_request_shape(value, variant, schemas).is_ok())
+            .any(|variant| validate_request_shape(value, variant, schemas, schema_name).is_ok())
         {
             Ok(())
         } else {
@@ -1110,7 +1113,7 @@ fn validate_request_shape(
             .as_array()
             .ok_or("required node request has an unsupported field type")?;
         for item in values {
-            validate_request_shape(item, items, schemas)?;
+            validate_request_shape(item, items, schemas, None)?;
         }
         return Ok(());
     }
@@ -1122,6 +1125,12 @@ fn validate_request_shape(
             let child = properties
                 .get(name)
                 .ok_or("required node request contains an unclassified field")?;
+            if name == "meta"
+                && schema_name == Some("CoordinationClaimWrite")
+                && safe_start_work_meta(item)
+            {
+                continue;
+            }
             if matches!(name.as_str(), "meta" | "hold_until_ref" | "legacy_raw") && !item.is_null()
             {
                 return Err("required node request cannot send unclassified metadata".into());
@@ -1171,7 +1180,7 @@ fn validate_request_shape(
                     );
                 }
             } else {
-                validate_request_shape(item, child, schemas)?;
+                validate_request_shape(item, child, schemas, None)?;
             }
         }
     } else {
@@ -1207,6 +1216,24 @@ fn safe_timestamp(value: &Value) -> bool {
                     (0..=MAX).contains(&stamp) && lockyard_core::proto::rfc3339(stamp) == text
                 })
         })
+}
+
+/// A composite claim attempt's random correlation marker is structural metadata.
+/// No other claim metadata is classified by this exception.
+fn safe_start_work_meta(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == 1
+            && object
+                .get("lockyard_start_work_nonce")
+                .and_then(Value::as_str)
+                .is_some_and(|nonce| {
+                    nonce.len() == 26
+                        && nonce.as_bytes()[0] <= b'7'
+                        && nonce
+                            .bytes()
+                            .all(|byte| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&byte))
+                })
+    })
 }
 
 fn safe_activity_meta(value: &Value) -> bool {
@@ -1912,6 +1939,145 @@ mod tests {
                 Some(&key),
                 true,
                 &mut Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn start_work_nonce_is_classified_only_on_required_claim_requests() {
+        let key = WorkspaceKey::from_entropy([9; 32]);
+        let meta = serde_json::json!({"lockyard_start_work_nonce":"01K00000000000000000000000"});
+        let mut request = serde_json::json!({
+            "paths":["src"], "note":"private work", "ttl_minutes":30,
+            "mode":"exclusive", "purpose":"work", "lazy":false, "meta":meta
+        });
+        transform_fields_policy(
+            &mut request,
+            "POST",
+            "/api/v1/zones/claims",
+            "w",
+            Some(&key),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(request["meta"], meta);
+        assert_eq!(
+            key.decrypt("w", "note", request["note"].as_str().unwrap())
+                .unwrap(),
+            "private work"
+        );
+    }
+
+    #[test]
+    fn start_work_nonce_survives_required_claim_replies_and_events() {
+        let key = WorkspaceKey::from_entropy([9; 32]);
+        let meta = serde_json::json!({"lockyard_start_work_nonce":"01K00000000000000000000000"});
+        let note = key.encrypt("w", "note", "private work").unwrap();
+        let claim = serde_json::json!({
+            "id":7, "session":"me", "paths":["src"], "note":note, "meta":meta
+        });
+        let mut response = serde_json::json!([claim]);
+        transform_fields_policy(
+            &mut response,
+            "GET",
+            "/api/v1/zones/claims",
+            "w",
+            Some(&key),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(response[0]["meta"], meta);
+        assert_eq!(response[0]["note"], "private work");
+
+        let mut event = serde_json::json!([{
+            "seq":1, "type":"zone.claimed", "payload":claim
+        }]);
+        transform_fields_policy(
+            &mut event,
+            "GET",
+            "/api/v1/events",
+            "w",
+            Some(&key),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(event[0]["payload"]["meta"], meta);
+        assert_eq!(event[0]["payload"]["note"], "private work");
+    }
+
+    #[test]
+    fn start_work_nonce_does_not_classify_arbitrary_or_invalid_claim_metadata() {
+        let key = WorkspaceKey::from_entropy([9; 32]);
+        for meta in [
+            serde_json::json!({"lockyard_start_work_nonce":"01K00000000000000000000000", "secret":"private"}),
+            serde_json::json!({"lockyard_start_work_nonce":"private plaintext"}),
+            serde_json::json!({"lockyard_start_work_nonce":"Z1K00000000000000000000000"}),
+            serde_json::json!({"lockyard_start_work_nonce":12}),
+            serde_json::json!({"secret":"private"}),
+            serde_json::json!({}),
+        ] {
+            let mut request = serde_json::json!({"paths":["src"], "meta":meta});
+            assert!(
+                transform_fields_policy(
+                    &mut request,
+                    "POST",
+                    "/api/v1/zones/claims",
+                    "w",
+                    Some(&key),
+                    true,
+                    true,
+                )
+                .is_err(),
+                "request metadata accepted: {meta}"
+            );
+            let mut response = serde_json::json!([{"id":7, "meta":meta}]);
+            assert!(
+                transform_fields_policy(
+                    &mut response,
+                    "GET",
+                    "/api/v1/zones/claims",
+                    "w",
+                    Some(&key),
+                    false,
+                    true,
+                )
+                .is_err(),
+                "response metadata accepted: {meta}"
+            );
+        }
+    }
+
+    #[test]
+    fn start_work_nonce_does_not_classify_metadata_on_other_schemas() {
+        let key = WorkspaceKey::from_entropy([9; 32]);
+        let meta = serde_json::json!({"lockyard_start_work_nonce":"01K00000000000000000000000"});
+        let mut request = serde_json::json!({"paths":["src"], "meta":meta});
+        assert!(
+            transform_fields_policy(
+                &mut request,
+                "POST",
+                "/api/v1/zones/queue",
+                "w",
+                Some(&key),
+                true,
+                true,
+            )
+            .is_err()
+        );
+        let mut response = serde_json::json!([{"id":7, "meta":meta}]);
+        assert!(
+            transform_fields_policy(
+                &mut response,
+                "GET",
+                "/api/v1/zones/queue",
+                "w",
+                Some(&key),
+                false,
+                true,
             )
             .is_err()
         );

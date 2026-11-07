@@ -154,6 +154,7 @@ fn security_fixture(path: &Path) -> (String, ResultSigningConfig, SupplyChainPol
     (image, signer, policy)
 }
 fn fixture(path: &Path) -> ExecutorConfig {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     let checkout = path.join("checkout");
     fs::create_dir(&checkout).unwrap();
     git(&checkout, &["init", "-q"]);

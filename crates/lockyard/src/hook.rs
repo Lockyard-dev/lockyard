@@ -388,12 +388,26 @@ pub fn run(
     if tool == Tool::Cursor {
         normalize_cursor(&mut event);
     }
+    match run_event(tool, &event, agent_override, fallback_cwd, now, out) {
+        Err(error) if is_pre_tool_edit(&event) => deny_failed_check(tool, &event, error, out),
+        answer => answer,
+    }
+}
+
+fn run_event(
+    tool: Tool,
+    event: &Value,
+    agent_override: Option<String>,
+    fallback_cwd: &Path,
+    now: i64,
+    out: &mut dyn Write,
+) -> Result<()> {
     let text = |key: &str| event.get(key).and_then(Value::as_str);
     let cwd = text("cwd").map_or_else(|| fallback_cwd.to_path_buf(), PathBuf::from);
     let Some(root) = lockyard_core::paths::find_root(&cwd) else {
         return deny_unchecked_edit(
             tool,
-            &event,
+            event,
             "Lockyard cannot check this edit because no project root is available. Run the client from the project, then retry.",
             out,
         );
@@ -401,7 +415,7 @@ pub fn run(
     let Some(agent) = agent_override.or_else(|| text("session_id").map(str::to_string)) else {
         return deny_unchecked_edit(
             tool,
-            &event,
+            event,
             "Lockyard cannot check this edit because the client did not provide a session identity. Restart the client session, then retry.",
             out,
         );
@@ -412,29 +426,47 @@ pub fn run(
             eprintln!("lockyard hook: config unavailable ({error}).");
             return deny_unchecked_edit(
                 tool,
-                &event,
+                event,
                 "Lockyard: project configuration is unavailable, so this edit cannot be checked. Fix `.lockyard/config.toml` or run `lockyard doctor`, then retry.",
                 out,
             );
         }
     };
     if config.mode == Mode::Cloud {
-        return run_cloud(tool, &event, &agent, &cwd, root, &config, now, out);
+        return run_cloud(tool, event, &agent, &cwd, root, &config, now, out);
     }
     let store = Store::open(&root)?;
     let mut port = LocalPort { store, root, now };
     let machine = lockyard_core::machine::MachineConfig::load_user();
-    handle(tool, &mut port, &event, &agent, &cwd, now, &machine, out)
+    handle(tool, &mut port, event, &agent, &cwd, now, &machine, out)
+}
+
+fn is_pre_tool_edit(event: &Value) -> bool {
+    event.get("hook_event_name").and_then(Value::as_str) == Some("PreToolUse")
+        && event
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| EDIT_TOOLS.contains(&name))
+}
+
+fn deny_failed_check(
+    tool: Tool,
+    event: &Value,
+    error: lockyard_core::Error,
+    out: &mut dyn Write,
+) -> Result<()> {
+    eprintln!("lockyard hook: edit check unavailable ({error}).");
+    deny_unchecked_edit(
+        tool,
+        event,
+        "Lockyard cannot check this edit because its zone check failed. Run `lockyard doctor` and retry when coordination is available.",
+        out,
+    )
 }
 
 /// Refuses an edit when the hook lacks information required to check its lock.
 fn deny_unchecked_edit(tool: Tool, event: &Value, reason: &str, out: &mut dyn Write) -> Result<()> {
-    if event.get("hook_event_name").and_then(Value::as_str) != Some("PreToolUse")
-        || !event
-            .get("tool_name")
-            .and_then(Value::as_str)
-            .is_some_and(|name| EDIT_TOOLS.contains(&name))
-    {
+    if !is_pre_tool_edit(event) {
         return Ok(());
     }
     let text = if tool == Tool::Cursor {
@@ -591,11 +623,14 @@ fn handle(
 ) -> Result<()> {
     match event.get("hook_event_name").and_then(Value::as_str) {
         Some("PreToolUse") => {
-            let answer = pre_tool_use(port, event, agent, cwd, now, machine);
-            if !matches!(&answer, Ok(Some(_))) {
+            let answer = match pre_tool_use(port, event, agent, cwd, now, machine) {
+                Ok(answer) => answer,
+                Err(error) => return deny_failed_check(tool, event, error, out),
+            };
+            if answer.is_none() {
                 port.report(agent, Moment::Before, Vec::new());
             }
-            match answer? {
+            match answer {
                 Some(text) if tool == Tool::Cursor => {
                     let decision: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                     let reason = decision
@@ -1596,6 +1631,38 @@ mod tests {
                 .contains("not fresh enough")
         );
         assert_eq!(*log.borrow(), ["check src/a.rs"]);
+    }
+
+    #[test]
+    fn failed_hook_zone_checks_deny_without_reporting_a_running_tool() {
+        for tool in [Tool::Claude, Tool::Codex, Tool::Cursor] {
+            let (mut port, log) = recording(None, None);
+            let event = json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "tool_input": {"file_path": "/src/a.rs"},
+            });
+            let mut out = Vec::new();
+            handle(
+                tool,
+                &mut port,
+                &event,
+                "me",
+                Path::new("/"),
+                1,
+                &lockyard_core::machine::MachineConfig::default(),
+                &mut out,
+            )
+            .unwrap();
+            let answer: Value = serde_json::from_slice(&out).unwrap();
+            let decision = if tool == Tool::Cursor {
+                &answer["permission"]
+            } else {
+                &answer["hookSpecificOutput"]["permissionDecision"]
+            };
+            assert_eq!(decision, "deny");
+            assert_eq!(*log.borrow(), ["check src/a.rs"]);
+        }
     }
 
     #[test]

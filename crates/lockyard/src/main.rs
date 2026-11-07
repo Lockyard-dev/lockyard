@@ -2795,11 +2795,25 @@ fn run_hook(command: HookCommand, agent: Option<String>, cwd: &Path) -> Result<O
             opened
                 .backend
                 .check(&agent, std::slice::from_ref(&path), None, now_ms())?;
-        if let Some(check) = checks.pop()
-            && check.status == CheckStatus::Held
-            && let Some(holder) = check.holder
-        {
-            return Err(Error::Conflict(vec![holder]));
+        if checks.len() != 1 || checks[0].path != path {
+            return Err(Error::Unavailable(
+                "the zone check did not answer this path".into(),
+            ));
+        }
+        let check = checks.pop().expect("one path checked above");
+        match check.status {
+            CheckStatus::Held => {
+                return match check.holder {
+                    Some(holder) => Err(Error::Conflict(vec![holder])),
+                    None => Err(Error::Contended(format!("{path} is held"))),
+                };
+            }
+            CheckStatus::Unknown => {
+                return Err(Error::Unavailable(
+                    "the zone view is not fresh enough to check this edit".into(),
+                ));
+            }
+            CheckStatus::Free | CheckStatus::Own => {}
         }
         return output(&json!({"free": true}), "free");
     }
@@ -2822,8 +2836,8 @@ fn run_hook(command: HookCommand, agent: Option<String>, cwd: &Path) -> Result<O
             &mut out,
         )
     });
-    // Hooks are advisory integrations: a damaged or unavailable Lockyard database must never
-    // prevent the agent from continuing its work. Keep the diagnostic for troubleshooting.
+    // Parsed PreToolUse edits turn failed checks into permission denials in hook::run.
+    // Mail and presence stay advisory; keep their failures visible for troubleshooting.
     if let Err(error) = answer {
         eprintln!("lockyard hook: {error}");
     }

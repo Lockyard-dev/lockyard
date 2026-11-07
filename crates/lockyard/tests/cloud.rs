@@ -28,6 +28,9 @@ struct State {
     claims: Vec<Value>,
     inbox: Vec<Value>,
     refuse_claims: Option<(u16, Value)>,
+    claim_reused_on_post: Option<Value>,
+    refuse_registry_claim: bool,
+    check_reply: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -132,19 +135,33 @@ fn route_reply(state: &mut State, method: &str, route: &str, body: &Value) -> (u
             if let Some(refusal) = state.refuse_claims.clone() {
                 return refusal;
             }
+            if let Some(claim) = state.claim_reused_on_post.clone() {
+                return (200, claim);
+            }
             let id = state.claims.len() as i64 + 1;
-            let claim = json!({"id": id, "session": "alice", "paths": body["paths"], "fence": 1, "expires_at": "later"});
+            let claim = json!({"id": id, "session": "alice", "paths": body["paths"], "meta": body["meta"], "fence": 1, "expires_at": "later"});
             state.claims.push(claim.clone());
             (200, claim)
         }
         ("GET", "/api/v1/zones/claims") => (200, json!({"claims": state.claims})),
+        ("GET", "/api/v1/presence") => (200, json!({"sessions":[]})),
+        ("GET", "/api/v1/registry/items/D-1") if state.refuse_registry_claim => (
+            200,
+            json!({"id":"D-1", "title":"taken", "status":"claimed", "version":1}),
+        ),
+        ("POST", "/api/v1/registry/items/D-1/claim") if state.refuse_registry_claim => (
+            409,
+            json!({"error":{"code":"conflict", "message":"task is already taken"}}),
+        ),
         ("GET", "/api/v1/workspace/encryption") => (
             200,
             json!({"encryption": "off", "key_id": null, "workspace_id": "00000000-0000-0000-0000-000000000001"}),
         ),
         ("POST", "/api/v1/zones/check") => (
             200,
-            json!({"paths": [{"path": body["paths"][0], "status": "free"}]}),
+            state.check_reply.clone().unwrap_or_else(
+                || json!({"paths": [{"path": body["paths"][0], "status": "free"}]}),
+            ),
         ),
         ("GET", "/api/v1/bus/inbox") => (200, json!({"messages": state.inbox, "skipped": 0})),
         ("POST", "/api/v1/bus/inbox/claim") => (200, json!({"claimed": body["ids"]})),
@@ -263,6 +280,181 @@ fn json_of(result: &Output) -> Value {
         String::from_utf8_lossy(&result.stderr)
     );
     serde_json::from_slice(&result.stdout).unwrap()
+}
+
+#[test]
+fn start_work_cloud_rollback_releases_only_its_own_acquisition() {
+    for concurrent_reuse in [false, true] {
+        let server = Server::start();
+        {
+            let mut state = server.state.lock().unwrap();
+            state.refuse_registry_claim = true;
+            if concurrent_reuse {
+                // The GET snapshot was empty, but another same-session request
+                // acquired this claim before our POST reached the server.
+                state.claim_reused_on_post = Some(json!({
+                    "id":42, "session":"alice", "paths":["src"], "fence":7,
+                    "meta":{"lockyard_start_work_nonce":"01K00000000000000000000000"}
+                }));
+            }
+        }
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        let mut child = binary(dir.path(), runtime.path())
+            .args(["mcp"])
+            .env("LOCKYARD_AGENT", "alice")
+            .env("LOCKYARD_TOKEN", "test-token")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.take().unwrap(),
+            "{}",
+            json!({
+                "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"start_work", "arguments":{"paths":["src"], "task":"D-1"}}
+            })
+        )
+        .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let answer: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(answer["result"]["isError"], true);
+        assert_eq!(
+            server.seen("POST", "/api/v1/zones/claims").len(),
+            1,
+            "{answer}; seen={:?}",
+            server.state.lock().unwrap().seen
+        );
+        assert_eq!(
+            server
+                .seen("POST", "/api/v1/registry/items/D-1/claim")
+                .len(),
+            1
+        );
+        let deletes: Vec<_> = server
+            .state
+            .lock()
+            .unwrap()
+            .seen
+            .iter()
+            .filter(|seen| seen.method == "DELETE")
+            .cloned()
+            .collect();
+        if concurrent_reuse {
+            assert!(
+                deletes.is_empty(),
+                "another attempt's claim was released: {deletes:?}"
+            );
+        } else {
+            assert_eq!(deletes.len(), 1);
+            assert_eq!(deletes[0].path, "/api/v1/zones/claims/1");
+            assert_eq!(deletes[0].body["fence"], 1);
+        }
+    }
+}
+
+#[test]
+fn hook_check_refuses_unknown_and_incomplete_zone_answers() {
+    for paths in [
+        json!([{"path":"src", "status":"unknown"}]),
+        json!([]),
+        json!([{"path":"src", "status":"held"}]),
+        json!([{"path":"different", "status":"free"}]),
+    ] {
+        let server = Server::start();
+        server.state.lock().unwrap().check_reply = Some(json!({"paths":paths}));
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        let result = cli(
+            dir.path(),
+            runtime.path(),
+            &["hook", "check", "--path", "src"],
+        );
+        assert_eq!(
+            server.seen("POST", "/api/v1/zones/check").len(),
+            1,
+            "fixture was not reached: {result:?}"
+        );
+        assert!(
+            !result.status.success(),
+            "unchecked hook check allowed {paths}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn hook_check_refuses_unknown_from_the_agent_socket() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let folder = runtime.path().join("lockyard");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(socket(runtime.path())).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let peer_stop = stop.clone();
+    let url = server.url.clone();
+    let peer = thread::spawn(move || {
+        let mut operations = Vec::new();
+        while !peer_stop.load(Ordering::SeqCst) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => panic!("socket fixture: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let operation = request["op"].as_str().unwrap().to_string();
+            let reply = if operation == "ping" {
+                json!({"status":{
+                    "url":url, "workspace":"team", "token_id":lockyard_cloud_client::token_id("test-token"),
+                    "pid":1, "view_fresh":false, "view_age_ms":null, "claims":0, "board":0,
+                    "sessions":0, "outbox":0, "coordination_seq":0, "registry_seq":0
+                }})
+            } else {
+                assert_eq!(operation, "check");
+                json!({"source":"none", "checks":[{"path":"src", "status":"unknown"}]})
+            };
+            operations.push(operation);
+            writeln!(stream, "{reply}").unwrap();
+        }
+        operations
+    });
+    let result = cli(
+        dir.path(),
+        runtime.path(),
+        &["hook", "check", "--path", "src"],
+    );
+    stop.store(true, Ordering::SeqCst);
+    assert_eq!(peer.join().unwrap(), ["ping", "ping", "check"]);
+    assert!(
+        !result.status.success(),
+        "unknown agent check allowed an edit: {result:?}"
+    );
+    assert!(
+        server.state.lock().unwrap().seen.is_empty(),
+        "the socket answer must not fall back to HTTP"
+    );
 }
 
 #[test]

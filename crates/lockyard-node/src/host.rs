@@ -322,6 +322,18 @@ struct InvalidResponse {
 struct PendingResponse {
     tx: oneshot::Sender<std::result::Result<RpcFrame, &'static str>>,
 }
+struct PendingRegistration<'a> {
+    pending: &'a std::sync::Mutex<HashMap<String, PendingResponse>>,
+    id: String,
+}
+impl Drop for PendingRegistration<'_> {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
+    }
+}
 #[derive(Default)]
 struct CacheBudget {
     // Rebuilt once from durable files at startup. Reservations count before dispatch,
@@ -460,7 +472,9 @@ struct Host {
     workflow: Option<Arc<crate::workflow::WorkflowController>>,
     direct: Option<DirectClient>,
     relay: Option<RelaySender>,
-    pending: Mutex<HashMap<String, PendingResponse>>,
+    // Every access is an immediate map operation. A synchronous mutex lets the
+    // registration guard clean up even when its async RPC future is cancelled.
+    pending: std::sync::Mutex<HashMap<String, PendingResponse>>,
     // Stripe by request ID so independent RPCs can proceed while duplicate IDs serialize.
     request_locks: Vec<Mutex<()>>,
     cache_lock: Mutex<CacheBudget>,
@@ -1745,12 +1759,19 @@ impl Host {
         self.clock.lock().await.observe(&self.config.state_dir)?;
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = self.pending.lock().await;
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             if pending.len() >= 128 {
                 return Err("too many pending requests".into());
             }
             pending.insert(frame.id.clone(), PendingResponse { tx });
         }
+        let _registration = PendingRegistration {
+            pending: &self.pending,
+            id: frame.id.clone(),
+        };
         let saved = {
             let mut budget = self.cache_lock.lock().await;
             let dir = bucket_dir(&self.config.state_dir, "relay-requests", frame.operation);
@@ -1777,7 +1798,6 @@ impl Host {
             {
                 slot.forget();
             }
-            self.pending.lock().await.remove(&frame.id);
             return Err("cannot persist relay request".into());
         }
         if let Some(slot) = history_slot {
@@ -1788,11 +1808,9 @@ impl Host {
             .await
             .is_err()
         {
-            self.pending.lock().await.remove(&frame.id);
             return Err("relay write failed; execution outcome may be unknown".into());
         }
         let result = tokio::time::timeout(timeout, rx).await;
-        self.pending.lock().await.remove(&frame.id);
         let response = result
             .map_err(|_| "response timeout; execution outcome may be unknown")?
             .map_err(|_| "relay stopped; execution outcome may be unknown")??;
@@ -1854,7 +1872,12 @@ async fn maintain_content_cache(host: &Host) -> Result<()> {
                     serde_json::from_slice(&read_private(&path, (MAX_FRAME_BYTES * 2) as u64)?)?;
                 if frame_deadline(&cached.response).is_some_and(|deadline| now >= deadline) {
                     receive_failure(host, id, "content_expired").await?;
-                    if let Some(pending) = host.pending.lock().await.remove(id) {
+                    if let Some(pending) = host
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .remove(id)
+                    {
                         let _ = pending.tx.send(Err("content_expired"));
                     }
                 }
@@ -2772,7 +2795,11 @@ async fn replay_requests(host: &Host, sender: &RelaySender, transmit: bool) {
                 if receive_failure(host, &frame.id, "delivery_expired")
                     .await
                     .is_ok()
-                    && let Some(p) = host.pending.lock().await.remove(&frame.id)
+                    && let Some(p) = host
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .remove(&frame.id)
                 {
                     let _ = p.tx.send(Err("delivery_expired"));
                 }
@@ -2845,7 +2872,12 @@ async fn discardable_read_response(host: &Host, frame: &RpcFrame) -> bool {
     let Some(id) = frame.in_reply_to.as_ref() else {
         return false;
     };
-    if host.pending.lock().await.contains_key(id) {
+    if host
+        .pending
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains_key(id)
+    {
         return false;
     }
     if host
@@ -2896,7 +2928,11 @@ async fn reject_invalid_response(host: &Host, frame: &RpcFrame) -> Result<bool> 
     let Some(id) = frame.in_reply_to.as_ref() else {
         return Ok(false);
     };
-    let has_waiter = host.pending.lock().await.contains_key(id);
+    let has_waiter = host
+        .pending
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains_key(id);
     let _guard = host.cache_lock.lock().await;
     let pending = bucket_dir(&host.config.state_dir, "relay-requests", frame.operation).join(id);
     let expired = bucket_dir(&host.config.state_dir, "relay-expired", frame.operation).join(id);
@@ -3255,7 +3291,11 @@ async fn relay_loop(host: Arc<Host>, mut client: RelayClient) {
                 if matched || discard || reject || conflict {
                     if matched {
                         if let Some(id) = frame.in_reply_to.as_ref()
-                            && let Some(p) = host.pending.lock().await.remove(id)
+                            && let Some(p) = host
+                                .pending
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .remove(id)
                         {
                             let _ = p.tx.send(Ok(frame.clone()));
                         }
@@ -3299,7 +3339,13 @@ async fn relay_loop(host: Arc<Host>, mut client: RelayClient) {
                         .unwrap_or(false)
                 };
                 if request_recorded || response_recorded || wire::valid_ulid(&id) {
-                    if request_recorded && let Some(p) = host.pending.lock().await.remove(&id) {
+                    if request_recorded
+                        && let Some(p) = host
+                            .pending
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .remove(&id)
+                    {
                         let _ = p.tx.send(Err(reason));
                     }
                     // An authenticated broker notice acknowledges only a failed/expired
@@ -3587,7 +3633,7 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
         workflow,
         direct,
         relay: sender,
-        pending: Mutex::new(HashMap::new()),
+        pending: std::sync::Mutex::new(HashMap::new()),
         request_locks: (0..64).map(|_| Mutex::new(())).collect(),
         cache_lock: Mutex::new(cache_budget),
         permits: Arc::new(Semaphore::new(128)),
@@ -3885,7 +3931,7 @@ mod tests {
             workflow: None,
             direct: None,
             relay: None,
-            pending: Mutex::new(HashMap::new()),
+            pending: std::sync::Mutex::new(HashMap::new()),
             request_locks: (0..64).map(|_| Mutex::new(())).collect(),
             cache_lock: Mutex::new(CacheBudget::default()),
             permits: Arc::new(Semaphore::new(128)),
@@ -3921,6 +3967,187 @@ mod tests {
         };
         host.seal(&mut frame, &json!({})).unwrap();
         frame
+    }
+    #[tokio::test]
+    async fn cancelled_relay_rpc_removes_pending_waiter_while_cache_is_busy() {
+        let (_dir, mut host) = fixture();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = RelayClient::spawn(
+            RelayConfig::new(
+                &format!("http://{}", listener.local_addr().unwrap()),
+                host.config.node_id.clone(),
+                "synthetic-relay-token".into(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        host.relay = Some(client.sender());
+        let _cache = host.cache_lock.lock().await;
+        let mut request =
+            Box::pin(host.rpc_once("caller", Operation::NodePing, json!({}), None, None));
+        // Poll to the held cache mutex: the real RPC has already registered its
+        // waiter, but no durable request exists for expiry/replay to clean up.
+        assert!(futures_util::poll!(request.as_mut()).is_pending());
+        assert_eq!(
+            host.pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
+        assert_eq!(
+            fs::read_dir(host.config.state_dir.join("relay-requests-read"))
+                .unwrap()
+                .count(),
+            0
+        );
+        drop(request);
+        assert!(
+            host.pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty(),
+            "cancelled RPC must release its transient waiter without a response or expiry notice"
+        );
+    }
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn seeded_relay_rpc_cancellation_preserves_replay_and_write_history() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{
+            accept_hdr_async,
+            tungstenite::{
+                Message,
+                handshake::server::{Request, Response},
+            },
+        };
+        let _port = PORT_5221.lock().await;
+        tokio::time::timeout(Duration::from_secs(12), async {
+            let (_dir, mut host) = fixture();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let relay_url = format!("http://{}", listener.local_addr().unwrap());
+            let (observed_tx, mut observed) = tokio::sync::mpsc::channel(16);
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket =
+                    accept_hdr_async(stream, |_request: &Request, mut response: Response| {
+                        response.headers_mut().insert(
+                            "Sec-WebSocket-Protocol",
+                            "lockyard-node.v1".parse().unwrap(),
+                        );
+                        Ok(response)
+                    })
+                    .await
+                    .unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    match message {
+                        Message::Text(text) => {
+                            let RelayMessage::Frame(frame) =
+                                serde_json::from_str(&text).unwrap()
+                            else {
+                                panic!("unexpected relay control message");
+                            };
+                            observed_tx.send(frame).await.unwrap();
+                        }
+                        Message::Ping(bytes) => socket.send(Message::Pong(bytes)).await.unwrap(),
+                        _ => {}
+                    }
+                }
+            });
+            let client = RelayClient::spawn(
+                RelayConfig::new(&relay_url, "worker".into(), "test".into()).unwrap(),
+            )
+            .unwrap();
+            let mut sender = client.sender();
+            sender.wait_connected(Duration::from_secs(4)).await.unwrap();
+            host.relay = Some(sender);
+            let mut seed = 0x6f35_f83d_6072_1281_u64;
+            let mut durable_writes = 0usize;
+            let mut phases = [0usize; 4];
+            for _ in 0..256 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let phase = (seed % 4) as usize;
+                phases[phase] += 1;
+                let operation = if seed & 8 == 0 {
+                    Operation::NodePing
+                } else {
+                    Operation::JobCancel
+                };
+                let mut request = Box::pin(host.rpc_once(
+                    "caller",
+                    operation,
+                    json!({"job_id":wire::new_id().unwrap()}),
+                    None,
+                    Some(host.config.peers[0].certificate_sha256.clone()),
+                ));
+                match phase {
+                    0 => {
+                        let _clock = host.clock.lock().await;
+                        assert!(futures_util::poll!(request.as_mut()).is_pending());
+                        assert!(host.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+                        drop(request);
+                    }
+                    1 => {
+                        let _cache = host.cache_lock.lock().await;
+                        assert!(futures_util::poll!(request.as_mut()).is_pending());
+                        assert_eq!(host.pending.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+                        drop(request);
+                    }
+                    _ => {
+                        let frame = tokio::select! {
+                            frame = observed.recv() => frame.unwrap(),
+                            result = &mut request => panic!("RPC completed before response: {result:?}"),
+                        };
+                        durable_writes += usize::from(is_write(operation));
+                        let path = bucket_dir(&host.config.state_dir, "relay-requests", operation)
+                            .join(&frame.id);
+                        let saved = fs::read(&path).unwrap();
+                        if phase == 2 {
+                            drop(request);
+                            assert_eq!(fs::read(path).unwrap(), saved);
+                        } else {
+                            let mut response = RpcFrame {
+                                v: frame.v,
+                                kind: FrameKind::Response,
+                                id: wire::new_id().unwrap(),
+                                source: frame.target.clone(),
+                                target: frame.source.clone(),
+                                operation,
+                                in_reply_to: Some(frame.id.clone()),
+                                source_certificate_sha256: frame.target_certificate_sha256.clone(),
+                                target_certificate_sha256: frame.source_certificate_sha256.clone(),
+                                retention: None,
+                                payload: String::new(),
+                            };
+                            host.codec
+                                .encode(&mut response, &RpcReply::<Value>::failure("fixture", "fixture"))
+                                .unwrap();
+                            receive_response(&host, &response).await.unwrap();
+                            let pending = host.pending.lock().unwrap_or_else(|e| e.into_inner())
+                                .remove(&frame.id).unwrap();
+                            pending.tx.send(Ok(response)).unwrap();
+                            assert!(!request.await.unwrap().ok);
+                            assert!(!path.exists());
+                            assert!(bucket_dir(&host.config.state_dir, "relay-inbox", operation)
+                                .join(&frame.id).exists());
+                        }
+                    }
+                }
+                assert!(host.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+                assert_eq!(host.write_history.available_permits(), 100_000 - durable_writes);
+            }
+            assert!(phases.into_iter().all(|count| count > 0));
+            assert_eq!(count_write_history(&host.config.state_dir).unwrap(), durable_writes);
+            client.shutdown().await;
+            server.abort();
+            let _ = server.await;
+        })
+        .await
+        .unwrap();
     }
     #[tokio::test]
     async fn local_scoped_quota_rejection_settles_binding_without_a_job() {
@@ -4674,7 +4901,7 @@ mod tests {
                 workflow: None,
                 direct: None,
                 relay: None,
-                pending: Mutex::new(HashMap::new()),
+                pending: std::sync::Mutex::new(HashMap::new()),
                 request_locks: (0..64).map(|_| Mutex::new(())).collect(),
                 cache_lock: Mutex::new(cache_budget),
                 permits: Arc::new(Semaphore::new(128)),
@@ -5146,10 +5373,13 @@ mod tests {
         tampered.operation = Operation::JobSubmit;
         assert!(!discardable_read_response(&host, &tampered).await);
         let (tx, _rx) = oneshot::channel();
-        host.pending.lock().await.insert(
-            response.in_reply_to.clone().unwrap(),
-            PendingResponse { tx },
-        );
+        host.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                response.in_reply_to.clone().unwrap(),
+                PendingResponse { tx },
+            );
         assert!(!discardable_read_response(&host, &response).await);
     }
     #[tokio::test]
@@ -5185,7 +5415,7 @@ mod tests {
             let (tx, rx) = oneshot::channel();
             host.pending
                 .lock()
-                .await
+                .unwrap_or_else(|error| error.into_inner())
                 .insert(request.id.clone(), PendingResponse { tx });
             let wrong_codec =
                 PayloadCodec::new("workspace".into(), WorkspaceKey::from_entropy([8; 32])).unwrap();
@@ -5223,7 +5453,12 @@ mod tests {
                 .join(format!(".{}.tmp", request.id));
             fs::write(&blocked, b"block").unwrap();
             assert!(reject_invalid_response(&host, &poison[0]).await.is_err());
-            assert!(host.pending.lock().await.contains_key(&request.id));
+            assert!(
+                host.pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .contains_key(&request.id)
+            );
             assert!(
                 host.config
                     .state_dir
@@ -5282,7 +5517,13 @@ mod tests {
                         }
                     }
                 }
-                assert!(worker.pending.lock().await.contains_key(&server_request.id));
+                assert!(
+                    worker
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .contains_key(&server_request.id)
+                );
                 assert!(
                     worker
                         .config
@@ -5484,7 +5725,12 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(host.pending.lock().await.is_empty());
+        assert!(
+            host.pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
         assert!(
             !host
                 .config
