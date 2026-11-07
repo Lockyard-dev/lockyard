@@ -49,6 +49,9 @@ frame. The executor separately deduplicates the stable job ID and complete job
 specification. Transport delivery and job execution completion are separate events.
 
 The relay keeps 16 queued inbound events and at most one already parsed event.
+TCP connections to the relay or its configured proxy use `TCP_NODELAY` so small
+TLS/WebSocket RPC frames do not wait for Nagle buffering. Authentication,
+encryption, durable acknowledgement and queue limits remain required.
 When the consumer queue fills, socket reads pause while outbound writes, shutdown
 and reconnect remain active. This allows a consumer to finish its ACK write before
 receiving another event. The pending event has a fixed 30-second delivery deadline;

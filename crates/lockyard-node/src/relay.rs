@@ -88,7 +88,9 @@ async fn stream(url: &Url, config: Arc<rustls::ClientConfig>) -> Result<Box<dyn 
             .filter(|p| !p.is_empty())
     };
     let Some(proxy) = proxy else {
-        return Ok(Box::new(TcpStream::connect((host, port)).await?));
+        let socket = TcpStream::connect((host, port)).await?;
+        socket.set_nodelay(true)?;
+        return Ok(Box::new(socket));
     };
     let proxy = Url::parse(&proxy).map_err(|_| "invalid HTTPS proxy URL")?;
     if !matches!(proxy.scheme(), "http" | "https") {
@@ -102,6 +104,7 @@ async fn stream(url: &Url, config: Arc<rustls::ClientConfig>) -> Result<Box<dyn 
         .port_or_known_default()
         .ok_or("proxy port is missing")?;
     let socket = TcpStream::connect((proxy_host, proxy_port)).await?;
+    socket.set_nodelay(true)?;
     let mut socket: Box<dyn Io> = if proxy.scheme() == "https" {
         let name = rustls::pki_types::ServerName::try_from(proxy_host.to_string())?;
         Box::new(
