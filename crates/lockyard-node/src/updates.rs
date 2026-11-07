@@ -1380,7 +1380,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
     struct Fixture {
-        root: tempfile::TempDir,
+        _root: tempfile::TempDir,
+        root: PathBuf,
         context: Context,
         signer: SigningKey,
         baseline: SignedDocument,
@@ -1441,12 +1442,13 @@ mod tests {
     fn fixture() -> Fixture {
         // Tiny signed ELF-shaped byte fixtures prove verification/file/journal behavior.
         // No fixture is executed and this does not claim a release binary E2E rollout.
-        let root = tempfile::tempdir().unwrap();
-        private(root.path());
-        let state = root.path().join("node");
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().canonicalize().unwrap();
+        private(root.as_path());
+        let state = root.as_path().join("node");
         fs::create_dir(&state).unwrap();
         private(&state);
-        let keys = root.path().join("keys");
+        let keys = root.as_path().join("keys");
         fs::create_dir(&keys).unwrap();
         private(&keys);
         let key_path = keys.join("workspace.key");
@@ -1458,16 +1460,16 @@ mod tests {
             fs::Permissions::from_mode(0o600),
         )
         .unwrap();
-        let install = root.path().join("install");
+        let install = root.as_path().join("install");
         fs::create_dir(&install).unwrap();
         private(&install);
         let binary = install.join("lockyard");
         executable(&binary, b"baseline-never-executed");
         let config:NodeConfig=serde_json::from_value(serde_json::json!({"node_id":"worker","workspace":"workspace","state_dir":state,
-            "certificate":root.path().join("cert"),"private_key":root.path().join("tls-key"),"trust_anchors":[],"peers":[],"rpc_timeout_seconds":60})).unwrap();
-        let signer = SigningKey::generate(&root.path().join("release.pk8")).unwrap();
+            "certificate":root.as_path().join("cert"),"private_key":root.as_path().join("tls-key"),"trust_anchors":[],"peers":[],"rpc_timeout_seconds":60})).unwrap();
+        let signer = SigningKey::generate(&root.as_path().join("release.pk8")).unwrap();
         let baseline = release(&signer, &binary, env!("CARGO_PKG_VERSION"), 1);
-        let baseline_path = root.path().join("baseline.json");
+        let baseline_path = root.as_path().join("baseline.json");
         publish_json(&baseline_path, &baseline, false).unwrap();
         let context = Context {
             config,
@@ -1482,6 +1484,7 @@ mod tests {
         )
         .unwrap();
         Fixture {
+            _root: tempdir,
             root,
             context,
             signer,
@@ -1493,13 +1496,13 @@ mod tests {
         version_value: &str,
         sequence: u64,
     ) -> (PathBuf, PathBuf, SignedDocument) {
-        let binary = f.root.path().join(format!("candidate-{sequence}"));
+        let binary = f.root.as_path().join(format!("candidate-{sequence}"));
         executable(
             &binary,
             format!("candidate-{sequence}-never-executed").as_bytes(),
         );
         let document = release(&f.signer, &binary, version_value, sequence);
-        let release_path = f.root.path().join(format!("release-{sequence}.json"));
+        let release_path = f.root.as_path().join(format!("release-{sequence}.json"));
         publish_json(&release_path, &document, false).unwrap();
         (binary, release_path, document)
     }
@@ -1543,8 +1546,8 @@ mod tests {
         assert_eq!(rolled["high_water_sequence"], 2);
         assert_eq!(rolled["generation"], 3);
         assert!(rollback_inner(&recovery, digest, None).is_err()); // Reviewed generation digest is one use.
-        let new_path = f.root.path().join("release-2.json");
-        let binary = f.root.path().join("candidate-2");
+        let new_path = f.root.as_path().join("release-2.json");
+        let binary = f.root.as_path().join("candidate-2");
         assert_eq!(
             prepare_inner(&f.context, &new_path, &binary).unwrap_err().0,
             "managed_update_rollback_or_base_conflict"
@@ -1576,18 +1579,18 @@ mod tests {
         let mut statement = verify(&document, &policy.trusted).unwrap();
         statement.platform = "different-platform".into();
         let wrong = f.signer.sign_document(DOMAIN, &statement).unwrap();
-        let wrong_path = f.root.path().join("wrong-platform.json");
+        let wrong_path = f.root.as_path().join("wrong-platform.json");
         publish_json(&wrong_path, &wrong, false).unwrap();
         assert!(prepare_inner(&f.context, &wrong_path, &candidate).is_err());
         statement.platform = platform();
         statement.minimum_current_version = future_version(1);
         let wrong = f.signer.sign_document(DOMAIN, &statement).unwrap();
-        let wrong_path = f.root.path().join("wrong-minimum.json");
+        let wrong_path = f.root.as_path().join("wrong-minimum.json");
         publish_json(&wrong_path, &wrong, false).unwrap();
         assert!(prepare_inner(&f.context, &wrong_path, &candidate).is_err());
-        let attacker = SigningKey::generate(&f.root.path().join("attacker.pk8")).unwrap();
+        let attacker = SigningKey::generate(&f.root.as_path().join("attacker.pk8")).unwrap();
         let attack = attacker.sign_document(DOMAIN, &statement).unwrap();
-        let attack_path = f.root.path().join("wrong-signature.json");
+        let attack_path = f.root.as_path().join("wrong-signature.json");
         publish_json(&attack_path, &attack, false).unwrap();
         assert!(prepare_inner(&f.context, &attack_path, &candidate).is_err());
         assert!(prepare_inner(&f.context, &path, &candidate).is_ok());
@@ -1657,7 +1660,7 @@ mod tests {
         assert_eq!(fs::read(&policy.binary).unwrap(), bytes);
         assert!(f.context.root().join(PENDING).exists());
         fs::remove_file(f.context.root().join(PENDING)).unwrap();
-        symlink(f.root.path(), f.context.root().join(PENDING)).unwrap();
+        symlink(f.root.as_path(), f.context.root().join(PENDING)).unwrap();
         assert_eq!(
             startup_guard(&f.context.config).err().unwrap().0,
             "managed_update_recovery_required"
@@ -1761,7 +1764,7 @@ mod tests {
         drop(interrupted);
         assert!(prepare_inner(&f.context, &release_path, &binary).is_ok());
         assert!(!orphan.exists());
-        let alias = f.root.path().join("binary-alias");
+        let alias = f.root.as_path().join("binary-alias");
         symlink(&binary, &alias).unwrap();
         assert!(prepare_inner(&f.context, &release_path, &alias).is_err());
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o777)).unwrap();
@@ -1771,7 +1774,7 @@ mod tests {
         malformed[..4].copy_from_slice(b"nope");
         fs::write(&binary, &malformed).unwrap();
         let document = release(&f.signer, &binary, &future_version(2), 3);
-        let path = f.root.path().join("non-elf.json");
+        let path = f.root.as_path().join("non-elf.json");
         publish_json(&path, &document, false).unwrap();
         assert!(prepare_inner(&f.context, &path, &binary).is_err());
     }

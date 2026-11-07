@@ -88,7 +88,29 @@ fn entry(path: &[&str], value: Value) -> Entry {
     }
 }
 
+// Resolve only the selected base. Managed components appended below must remain visible
+// to the symlink checks, including when a selected CODEX_HOME does not exist yet.
+fn canonical_base(path: &Path) -> Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let name = path.file_name().ok_or(error)?;
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            Ok(canonical_base(parent)?.join(name))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn specs(root: &Path, client: &str, home: &Path, codex_home: Option<&Path>) -> Result<Vec<Spec>> {
+    let root = if matches!(client, "claude" | "cursor") {
+        canonical_base(root)?
+    } else {
+        root.to_path_buf()
+    };
     let server = json!({"command":"lockyard", "args":["mcp"]});
     match client {
         "claude" => {
@@ -123,9 +145,11 @@ fn specs(root: &Path, client: &str, home: &Path, codex_home: Option<&Path>) -> R
             toml: false,
         }]),
         "codex" => Ok(vec![Spec {
-            path: codex_home
-                .map_or_else(|| home.join(".codex"), Path::to_path_buf)
-                .join("config.toml"),
+            path: match codex_home {
+                Some(base) => canonical_base(base)?,
+                None => canonical_base(home)?.join(".codex"),
+            }
+            .join("config.toml"),
             entries: vec![entry(
                 &["mcp_servers", "lockyard"],
                 json!({"command":"lockyard", "args":["mcp"], "env_vars":["LOCKYARD_AGENT", "LOCKYARD_URL", "LOCKYARD_TOKEN_FILE", "LOCKYARD_TOKEN", "LOCKYARD_NODE_CONFIG", "XDG_CONFIG_HOME", "LOCKYARD_REQUIRE_E2EE", "LOCKYARD_E2EE_WORKSPACE_ID"]}),
@@ -529,30 +553,9 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn is_system_directory_alias(path: &Path) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        // macOS exposes these OS-owned directory aliases to temporary-directory callers.
-        // Only the exact built-in link is trusted; user-created symlink parents stay refused.
-        let expected = match path.to_str() {
-            Some("/var") => Path::new("/private/var"),
-            Some("/tmp") => Path::new("/private/tmp"),
-            _ => return false,
-        };
-        fs::read_link(path).is_ok_and(|target| target == expected)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = path;
-        false
-    }
-}
-
 fn execute(spec: &Spec, action: SetupAction) -> Result<Value> {
     for ancestor in spec.path.ancestors().skip(1) {
-        if fs::symlink_metadata(ancestor).is_ok_and(|metadata| metadata.file_type().is_symlink())
-            && !is_system_directory_alias(ancestor)
-        {
+        if fs::symlink_metadata(ancestor).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
             return Err(invalid(
                 "configuration parent is a symbolic link; preserving it",
             ));
@@ -1215,13 +1218,109 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn project_inside_symlink_directory_supports_setup_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("projects");
+        fs::create_dir(&base).unwrap();
+        let project = base.join("project");
+        fs::create_dir(&project).unwrap();
+        let alias = dir.path().join("projects-alias");
+        std::os::unix::fs::symlink(&base, &alias).unwrap();
+        let selected = alias.join("project");
+        let path = project.join(".cursor/mcp.json");
+        for action in [
+            SetupAction::Preview,
+            SetupAction::Apply,
+            SetupAction::Check,
+            SetupAction::Remove,
+        ] {
+            let report = setup_at(&selected, "cursor", action, dir.path()).unwrap();
+            assert_eq!(report["ok"], true, "{action:?}: {report}");
+            if action == SetupAction::Preview {
+                assert!(!path.exists());
+            }
+        }
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(value["mcpServers"].get("lockyard").is_none());
+        assert!(!sidecar(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_codex_base_alias_is_resolved_before_managed_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let selected = dir.path().join("home-alias");
+        let base = dir.path().join("home");
+        fs::create_dir(&base).unwrap();
+        std::os::unix::fs::symlink(&base, &selected).unwrap();
+        for custom in [false, true] {
+            for action in [
+                SetupAction::Preview,
+                SetupAction::Apply,
+                SetupAction::Check,
+                SetupAction::Remove,
+            ] {
+                let report = setup_selected(
+                    dir.path(),
+                    "codex",
+                    action,
+                    &selected,
+                    custom.then_some(selected.as_path()),
+                )
+                .unwrap();
+                assert_eq!(report["ok"], true, "{custom} {action:?}: {report}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_codex_directory_and_ownership_symlinks_remain_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let external = dir.path().join("external");
+        fs::create_dir(&external).unwrap();
+        let managed = dir.path().join(".codex");
+        std::os::unix::fs::symlink(&external, &managed).unwrap();
+        for action in [
+            SetupAction::Preview,
+            SetupAction::Apply,
+            SetupAction::Check,
+            SetupAction::Remove,
+        ] {
+            let report = setup_at(dir.path(), "codex", action, dir.path()).unwrap();
+            assert_eq!(report["ok"], false, "{action:?}: {report}");
+            assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
+        }
+        let path = dir.path().join(".cursor/mcp.json");
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{}").unwrap();
+        let receipt = external.join("receipt");
+        fs::write(&receipt, "{}").unwrap();
+        std::os::unix::fs::symlink(&receipt, sidecar(&path)).unwrap();
+        for action in [
+            SetupAction::Preview,
+            SetupAction::Apply,
+            SetupAction::Check,
+            SetupAction::Remove,
+        ] {
+            let report = setup_at(dir.path(), "cursor", action, dir.path()).unwrap();
+            assert_eq!(report["ok"], false, "{action:?}: {report}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), "{}");
+            assert_eq!(fs::read_to_string(&receipt).unwrap(), "{}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn user_symlink_parent_is_refused_without_writing_its_target() {
         let dir = tempfile::tempdir().unwrap();
         let external = dir.path().join("external");
         fs::create_dir(&external).unwrap();
-        let alias = dir.path().join("project-alias");
+        // EP-14 permits aliases in the selected base; managed directories inside it
+        // must still be refused rather than redirected into another directory.
+        let alias = dir.path().join(".cursor");
         std::os::unix::fs::symlink(&external, &alias).unwrap();
-        let report = setup_at(&alias, "cursor", SetupAction::Apply, dir.path()).unwrap();
+        let report = setup_at(dir.path(), "cursor", SetupAction::Apply, dir.path()).unwrap();
         assert_eq!(report["ok"], false);
         assert!(
             report["files"][0]["message"]

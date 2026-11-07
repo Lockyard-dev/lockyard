@@ -243,9 +243,28 @@ mod tests {
         // Synthetic parent journal only. This proves the actual Unix capability
         // boundary; it does not run or claim a resource-enforced container.
         let (_host_root, mut host) = super::super::tests::fixture();
-        let (_executor_root, config, executor) = retention_fixture();
+        let (_executor_root, mut config, executor) = retention_fixture();
+        drop(executor);
+        // Exercise the ordinary Unix socket here independently of TMPDIR length.
+        // The long-path directory-FD fallback has its own Linux-specific test below.
+        let socket_root = tempfile::Builder::new()
+            .prefix("ly")
+            .tempdir_in("/tmp")
+            .unwrap();
+        config.state_dir = socket_root.path().canonicalize().unwrap().join("executor");
+        let executor = crate::executor::Executor::new(config.clone()).unwrap();
         let parent =
             retained_fixture_record(&executor, JobState::Starting, wall_ms().unwrap() + 60_000);
+        assert!(
+            config
+                .state_dir
+                .join("jobs")
+                .join(&parent.spec.id)
+                .join("runtime-delegation/control.sock")
+                .as_os_str()
+                .len()
+                < 100
+        );
         host.config.executor = Some(config.clone());
         host.executor = Some(executor.clone());
         let host = Arc::new(host);

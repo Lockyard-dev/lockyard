@@ -879,6 +879,7 @@ mod tests {
     };
     struct Fixture {
         _root: tempfile::TempDir,
+        root: PathBuf,
         config: NodeConfig,
         worker: NodeConfig,
         excluded: NodeConfig,
@@ -889,10 +890,11 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let root = tempfile::tempdir().unwrap();
-            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let tempdir = tempfile::tempdir().unwrap();
+            let root = tempdir.path().canonicalize().unwrap();
+            fs::set_permissions(root.as_path(), fs::Permissions::from_mode(0o700)).unwrap();
             let make = |name: &str| {
-                let dir = root.path().join(name);
+                let dir = root.as_path().join(name);
                 fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
                 let identity = crate::quic::generate_identity(
                     &dir.join("identity"),
@@ -906,7 +908,7 @@ mod tests {
             let config = make("owner");
             let worker = make("worker");
             let excluded = make("excluded");
-            let signer_path = root.path().join("authority.pk8");
+            let signer_path = root.as_path().join("authority.pk8");
             let signer = SigningKey::generate(&signer_path).unwrap();
             for node in [&config, &worker, &excluded] {
                 write_private_json(
@@ -919,9 +921,10 @@ mod tests {
                 )
                 .unwrap();
             }
-            let draft_path = root.path().join("draft.json");
+            let draft_path = root.as_path().join("draft.json");
             Self {
-                _root: root,
+                _root: tempdir,
+                root,
                 config,
                 worker,
                 excluded,
@@ -995,7 +998,7 @@ mod tests {
     fn cloud_cannot_replace_pinned_authority_or_resign_chosen_key() {
         let f = Fixture::new();
         let mut b = f.bundle();
-        let attacker_path = f._root.path().join("attacker.pk8");
+        let attacker_path = f.root.as_path().join("attacker.pk8");
         let attacker = SigningKey::generate(&attacker_path).unwrap();
         b.draft.plan.header.authority_key_id = attacker.trusted_key().key_id().unwrap();
         b.authorization = attacker
@@ -1101,7 +1104,7 @@ mod tests {
     #[test]
     fn normal_authority_private_keys_require_exact_protected_directory() {
         let f = Fixture::new();
-        let root = f._root.path().join("rotation-authorities");
+        let root = f.root.as_path().join("rotation-authorities");
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
         validate_authority_location(&root.join("customer.pk8"), &root).unwrap();
         assert!(validate_authority_location(&f.signer_path, &root).is_err());
@@ -1142,16 +1145,16 @@ mod tests {
         use std::os::unix::fs::symlink;
         let f = Fixture::new();
         write_private_json(&f.draft_path, &f.draft()).unwrap();
-        let link = f._root.path().join("link");
+        let link = f.root.as_path().join("link");
         symlink(&f.draft_path, &link).unwrap();
         assert!(read_private_json::<RotationDraft>(&link).is_err());
-        let alias = f._root.path().join("hardlink");
+        let alias = f.root.as_path().join("hardlink");
         fs::hard_link(&f.draft_path, &alias).unwrap();
         assert!(read_private_json::<RotationDraft>(&f.draft_path).is_err());
         fs::remove_file(alias).unwrap();
         fs::set_permissions(&f.draft_path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read_private_json::<RotationDraft>(&f.draft_path).is_err());
-        let fifo = f._root.path().join("fifo");
+        let fifo = f.root.as_path().join("fifo");
         let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         assert!(read_private_json::<RotationDraft>(&fifo).is_err());

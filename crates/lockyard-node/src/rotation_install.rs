@@ -1297,12 +1297,32 @@ fn require_directory(path: &Path) -> Result<()> {
         || metadata.file_type().is_symlink()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o077 != 0
-        || fs::canonicalize(path).map_err(io)? != path
+        || !has_canonical_location(path)?
     {
         return Err(InstallError("rotation_directory_not_private"));
     }
     Ok(())
 }
+// macOS may spell its OS-owned /private directories through /var or /tmp. Resolve
+// just that exact prefix: every other directory or file symlink remains refused.
+fn has_canonical_location(path: &Path) -> Result<bool> {
+    let canonical = fs::canonicalize(path).map_err(io)?;
+    if canonical == path {
+        return Ok(true);
+    }
+    #[cfg(target_os = "macos")]
+    for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
+        if let Ok(remainder) = path.strip_prefix(alias)
+            && fs::read_link(alias).is_ok_and(|link| {
+                link == Path::new(target) || Path::new("/").join(link) == Path::new(target)
+            })
+        {
+            return Ok(canonical == Path::new(target).join(remainder));
+        }
+    }
+    Ok(false)
+}
+
 fn private_options() -> OpenOptions {
     use std::os::unix::fs::OpenOptionsExt;
     let mut options = OpenOptions::new();
@@ -1331,7 +1351,7 @@ fn read_public(path: &Path, max: u64) -> Result<Vec<u8>> {
     read_file(path, max, false, false)
 }
 fn read_file(path: &Path, max: u64, private: bool, allow_links: bool) -> Result<Vec<u8>> {
-    if !path.is_absolute() || fs::canonicalize(path).map_err(io)? != path {
+    if !path.is_absolute() || !has_canonical_location(path)? {
         return Err(InstallError("rotation_unsafe_file_path"));
     }
     let file = private_options().read(true).open(path).map_err(io)?;
@@ -1376,7 +1396,7 @@ mod tests {
     fn fixture(history_policy: HistoryPolicy) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let root = dir.path();
+        let root = dir.path().canonicalize().unwrap();
         for name in ["state", "keys"] {
             create_directory(&root.join(name)).unwrap();
         }
@@ -1520,6 +1540,60 @@ mod tests {
             &serde_json::to_vec(&global).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn private_directory_check_accepts_standard_macos_tempdir_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        require_directory(dir.path()).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn private_file_check_accepts_only_system_aliases_in_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        private_write(&path, &[7; 32]);
+        assert_eq!(read_file(&path, 32, true, false).unwrap(), [7; 32]);
+        let alias = dir.path().join("alias");
+        symlink(dir.path(), &alias).unwrap();
+        assert!(require_directory(&alias).is_err());
+        assert!(read_file(&alias.join("key"), 32, true, false).is_err());
+        let file_alias = dir.path().join("key-alias");
+        symlink(&path, &file_alias).unwrap();
+        assert!(read_file(&file_alias, 32, true, false).is_err());
+    }
+
+    #[test]
+    fn fixture_has_canonical_private_directory_and_readable_key_paths() {
+        let f = fixture(HistoryPolicy::Discard);
+        let state = config(&f).state_dir;
+        assert_eq!(state.canonicalize().unwrap(), state);
+        require_directory(&state).unwrap();
+        assert_eq!(read_file(&f.key_path, 32, true, false).unwrap(), [7; 32]);
+    }
+
+    #[test]
+    fn private_path_checks_refuse_managed_directory_and_file_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = root.join("state");
+        create_directory(&state).unwrap();
+        let file = state.join("key");
+        private_write(&file, &[7; 32]);
+        let directory_alias = root.join("state-alias");
+        symlink(&state, &directory_alias).unwrap();
+        assert!(require_directory(&directory_alias).is_err());
+        assert!(read_file(&directory_alias.join("key"), 32, true, false).is_err());
+        let file_alias = state.join("key-alias");
+        symlink(&file, &file_alias).unwrap();
+        assert!(read_file(&file_alias, 32, true, false).is_err());
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(require_directory(&state).is_err());
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_file(&file, 32, true, false).is_err());
     }
 
     #[test]
@@ -1795,12 +1869,12 @@ mod tests {
         assert!(!config_stage(&journal).unwrap().exists());
         let mut other = config(&f);
         other.node_id = "allowed".into();
-        other.state_dir = f._dir.path().join("other-state");
+        other.state_dir = f.config_path.parent().unwrap().join("other-state");
         create_directory(&other.state_dir).unwrap();
-        other.certificate = f._dir.path().join("allowed.der");
+        other.certificate = f.config_path.parent().unwrap().join("allowed.der");
         other.peers.retain(|peer| peer.node_id != "allowed");
         private_write(&other.state_dir.join("operator-drain"), b"1");
-        let other_path = f._dir.path().join("other.toml");
+        let other_path = f.config_path.parent().unwrap().join("other.toml");
         private_write(&other_path, toml::to_string(&other).unwrap().as_bytes());
         let mut second = f.metadata.clone();
         second.node_id = "allowed".into();
@@ -1835,12 +1909,12 @@ mod tests {
         assert_eq!(*read_current_key(&f.key_path).unwrap(), f.new_entropy);
         let mut other = config(&f);
         other.node_id = "allowed".into();
-        other.state_dir = f._dir.path().join("closing-other-state");
+        other.state_dir = f.config_path.parent().unwrap().join("closing-other-state");
         create_directory(&other.state_dir).unwrap();
-        other.certificate = f._dir.path().join("allowed.der");
+        other.certificate = f.config_path.parent().unwrap().join("allowed.der");
         other.peers.clear();
         private_write(&other.state_dir.join("operator-drain"), b"1");
-        let path = f._dir.path().join("closing-other.toml");
+        let path = f.config_path.parent().unwrap().join("closing-other.toml");
         private_write(&path, toml::to_string(&other).unwrap().as_bytes());
         let mut next = f.metadata.clone();
         next.node_id = "allowed".into();

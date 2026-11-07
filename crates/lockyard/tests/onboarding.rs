@@ -225,7 +225,12 @@ fn codex_custom_home_is_shared_by_preview_apply_check_doctor_and_remove() {
         serde_json::from_slice::<Value>(&result.stdout).unwrap()
     };
     let preview = selected(&["setup", "codex", "--preview", "--json"]);
-    assert_eq!(preview["files"][0]["path"], custom_path.to_str().unwrap());
+    // Setup resolves the selected base before appending managed configuration files.
+    let canonical_custom_path = custom.path().canonicalize().unwrap().join("config.toml");
+    assert_eq!(
+        preview["files"][0]["path"],
+        canonical_custom_path.to_str().unwrap()
+    );
     assert!(!custom_path.exists());
     selected(&["setup", "codex", "--apply", "--json"]);
     assert!(custom_path.exists());
