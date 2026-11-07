@@ -48,12 +48,23 @@ same application content again produces a new nonce and therefore a different
 frame. The executor separately deduplicates the stable job ID and complete job
 specification. Transport delivery and job execution completion are separate events.
 
+The relay keeps 16 queued inbound events and at most one already parsed event.
+When the consumer queue fills, socket reads pause while outbound writes, shutdown
+and reconnect remain active. This allows a consumer to finish its ACK write before
+receiving another event. The pending event has a fixed 30-second delivery deadline;
+outbound traffic does not extend it. Reconnect closes the old socket and fails its
+queued writes before publishing the parsed event and disconnect notice in order,
+within that original deadline. Shutdown and a stalled consumer can leave a frame
+unhandled; durable, unacknowledged broker delivery still requires authorized,
+unexpired identities and intact application journals to reconcile it safely.
+
 ## Validation
 
 Transport tests cover certificate trust and pins, anonymous client rejection,
 authenticated source and operation enforcement, a stalled handshake alongside a
 valid peer, oversized frames, mandatory encryption, routing metadata tampering,
 private persistent identities, WebSocket authentication, TLS trust configuration,
-and explicit replay after reconnect. Performance measurements must distinguish cold
+explicit replay after reconnect, bidirectional progress under a full event queue,
+and bounded shutdown/reconnect ordering. Performance measurements must distinguish cold
 connection establishment from warm encrypted RPCs and report their actual network
 topology. Loopback measurements do not establish Internet or NAT performance.

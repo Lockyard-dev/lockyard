@@ -492,11 +492,33 @@ fn validate_message(message: &RelayMessage, local_node_id: &str, outgoing: bool)
     Ok(())
 }
 
-async fn event(tx: &mpsc::Sender<RelayEvent>, event: RelayEvent) -> bool {
-    matches!(
-        tokio::time::timeout(Duration::from_secs(30), tx.send(event)).await,
-        Ok(Ok(()))
+async fn event(
+    tx: &mpsc::Sender<RelayEvent>,
+    event: RelayEvent,
+    stop: &mut watch::Receiver<bool>,
+) -> bool {
+    event_until(
+        tx,
+        event,
+        stop,
+        tokio::time::Instant::now() + Duration::from_secs(30),
     )
+    .await
+}
+
+async fn event_until(
+    tx: &mpsc::Sender<RelayEvent>,
+    event: RelayEvent,
+    stop: &mut watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    if *stop.borrow() {
+        return false;
+    }
+    tokio::select! {
+        _ = stop.changed() => false,
+        result = tokio::time::timeout_at(deadline, tx.send(event)) => matches!(result, Ok(Ok(()))),
+    }
 }
 
 fn reconnect_delay(base_ms: u64) -> Duration {
@@ -537,6 +559,7 @@ async fn run(
                     RelayEvent::Disconnected {
                         code: "relay_enrollment_failed",
                     },
+                    &mut stop,
                 )
                 .await
                 {
@@ -559,6 +582,7 @@ async fn run(
                     RelayEvent::Disconnected {
                         code: "relay_connect_failed",
                     },
+                    &mut stop,
                 )
                 .await
                 {
@@ -572,9 +596,11 @@ async fn run(
         delay_ms = 250;
         generation = generation.wrapping_add(1).max(1);
         let _ = state.send(generation);
-        if !event(&events, RelayEvent::Connected).await {
-            break;
-        }
+        // Keep at most one event outside the bounded consumer queue. Waiting for
+        // consumer capacity must not stop socket writes: the consumer may itself
+        // be waiting for an ACK to reach this socket before receiving its next event.
+        let mut pending_event = Some(RelayEvent::Connected);
+        let mut event_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let mut ping = tokio::time::interval(Duration::from_secs(15));
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_received = tokio::time::Instant::now();
@@ -585,6 +611,13 @@ async fn run(
                     if changed.is_err() { break "relay_shutdown"; }
                     break "relay_reconnect_requested";
                 },
+                permit = events.reserve(), if pending_event.is_some() => {
+                    let Ok(permit) = permit else { break "relay_shutdown"; };
+                    if let Some(event) = pending_event.take() { permit.send(event); }
+                }
+                _ = tokio::time::sleep_until(event_deadline), if pending_event.is_some() => {
+                    break "relay_consumer_stalled";
+                }
                 pending = outbound.recv() => {
                     let Some(pending) = pending else { break "relay_shutdown"; };
                     if pending.generation != generation { let _ = pending.result.send(Err("relay connection changed before queued write")); continue; }
@@ -593,13 +626,14 @@ async fn run(
                         _ => { let _ = pending.result.send(Err("relay write failed; delivery is unknown")); break "relay_write_failed"; }
                     }
                 }
-                incoming = socket.next() => {
+                incoming = socket.next(), if pending_event.is_none() => {
                     last_received = tokio::time::Instant::now();
                     match incoming {
                         Some(Ok(Message::Text(text))) => {
                             let parsed = serde_json::from_str::<RelayMessage>(&text).ok().filter(|message| validate_message(message,&config.node_id,false).is_ok());
                             let Some(message) = parsed else { break "relay_protocol_error"; };
-                            if !event(&events,RelayEvent::Message(message)).await { break "relay_consumer_stalled"; }
+                            pending_event = Some(RelayEvent::Message(message));
+                            event_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
                         }
                         Some(Ok(Message::Ping(bytes))) => {
                             if !matches!(tokio::time::timeout(Duration::from_secs(10),socket.send(Message::Pong(bytes))).await,Ok(Ok(()))) { break "relay_write_failed"; }
@@ -615,6 +649,8 @@ async fn run(
                 }
             }
         };
+        // Release the old transport before notifying a possibly stalled consumer.
+        drop(socket);
         let _ = state.send(0);
         while let Ok(pending) = outbound.try_recv() {
             let _ = pending
@@ -624,7 +660,16 @@ async fn run(
         if code == "relay_shutdown" || *stop.borrow() {
             break;
         }
-        if !event(&events, RelayEvent::Disconnected { code }).await {
+        // Preserve an already parsed event before the disconnect notice. Closing
+        // the socket and failing queued writes above releases consumers waiting
+        // for a write; this uses the original deadline rather than extending it.
+        if code != "relay_consumer_stalled"
+            && let Some(pending) = pending_event.take()
+            && !event_until(&events, pending, &mut stop, event_deadline).await
+        {
+            break;
+        }
+        if !event(&events, RelayEvent::Disconnected { code }, &mut stop).await {
             break;
         }
         if code == "relay_reconnect_requested" {
