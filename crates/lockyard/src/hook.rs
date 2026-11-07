@@ -423,6 +423,17 @@ fn run_cloud(
     now: i64,
     out: &mut dyn Write,
 ) -> Result<()> {
+    // The legacy agent handshake cannot attest the workspace key or required encryption
+    // policy. Like open::cloud, never use it in a required-E2EE context, even if a
+    // marker is empty or invalid. Hooks remain nonblocking when coordination is absent.
+    if std::env::var_os("LOCKYARD_REQUIRE_E2EE").is_some()
+        || std::env::var_os("LOCKYARD_E2EE_WORKSPACE_ID").is_some()
+    {
+        eprintln!(
+            "lockyard hook: cloud coordination unavailable in required E2EE mode; allowing this call without edit protection or mail delivery."
+        );
+        return Ok(());
+    }
     let (url, workspace) = crate::open::endpoint(config)?;
     let Some(mut port) = cloud::connect(&url, &workspace, root, tool) else {
         eprintln!(

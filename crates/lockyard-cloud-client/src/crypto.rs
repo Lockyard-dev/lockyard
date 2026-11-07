@@ -1203,8 +1203,23 @@ pub(crate) fn validate_required_route(method: &str, route: &str) -> Result<(), S
         .filter(|(path, _)| openapi_path_matches(path, normalized))
         .find_map(|(_, operations)| operations.get(method.to_ascii_lowercase()))
         .ok_or("required node encryption does not support this API operation")?;
+    let mut namespace_probe_seen = false;
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
         let name = pair.split('=').next().unwrap_or_default();
+        if name == "namespace_probe" {
+            // RepositoryTransport uses this fixed capability marker for both HTTP and the
+            // local daemon. It carries no content and is intentionally absent from OpenAPI.
+            // Keep the daemon negotiation intact without opening arbitrary query metadata.
+            if method != "GET"
+                || normalized != "/api/v1/zones/claims"
+                || pair != "namespace_probe=1"
+                || namespace_probe_seen
+            {
+                return Err("required node request contains an invalid namespace probe".into());
+            }
+            namespace_probe_seen = true;
+            continue;
+        }
         if name == "q" {
             return Err("required node encryption forbids sending full-text searches to the cloud; filter decrypted items locally".into());
         }

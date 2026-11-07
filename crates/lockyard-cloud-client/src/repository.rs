@@ -239,10 +239,120 @@ fn decode(encoded: &str) -> Result<String, ClientError> {
 mod tests {
     use super::*;
     use crate::fake::{FakeServer, Reply};
-    use crate::{Client, CloudBackend};
+    use crate::{Client, CloudBackend, WorkspaceKey};
     use lockyard_core::Backend;
     use lockyard_core::proto::{ClaimRequest, DirtyPath};
     use serde_json::json;
+
+    const REQUIRED_WORKSPACE: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+    fn required_client(server: &FakeServer, key: WorkspaceKey) -> Client {
+        Client::new(&server.url(), "fixture-token".into())
+            .unwrap()
+            .require_e2ee_for(REQUIRED_WORKSPACE)
+            .unwrap()
+            .with_content_encryption(REQUIRED_WORKSPACE, Some(key), true)
+    }
+
+    #[test]
+    fn required_repository_claim_negotiates_before_encrypted_literal_path_write() {
+        let key = WorkspaceKey::from_entropy([53; 32]);
+        let encrypted = key
+            .encrypt(REQUIRED_WORKSPACE, "note", "private claim note")
+            .unwrap();
+        let response = |body| Reply::json(200, body).header("X-Lockyard-Repository", "api");
+        let server = FakeServer::start(vec![
+            response(json!([])),
+            response(
+                json!({"id":1,"session":"alice","paths":[".lockyard-repository/api/src"],"note":encrypted,"repository":"api"}),
+            ),
+        ]);
+        let transport =
+            RepositoryTransport::new(required_client(&server, key.clone()), Some("api")).unwrap();
+        let mut backend = CloudBackend::new(transport, "alice");
+        let claim = backend
+            .claim(
+                "alice",
+                &ClaimRequest {
+                    paths: vec!["src".into()],
+                    note: "private claim note".into(),
+                    ttl_minutes: 10,
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap();
+        assert_eq!(claim.paths, ["src"]);
+        assert_eq!(claim.note, "private claim note");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(
+            requests[0].path,
+            "/api/v1/zones/claims?path=.lockyard-repository%2Fapi&namespace_probe=1"
+        );
+        assert_eq!(requests[0].header("x-lockyard-repository"), Some("api"));
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].body["paths"][0], ".lockyard-repository/api/src");
+        let wire_note = requests[1].body["note"].as_str().unwrap();
+        assert!(wire_note.starts_with("lyenc1."));
+        assert_eq!(
+            key.decrypt(REQUIRED_WORKSPACE, "note", wire_note).unwrap(),
+            "private claim note"
+        );
+        assert!(!requests[1].body.to_string().contains("private claim note"));
+    }
+
+    #[test]
+    fn required_repository_probe_rejects_missing_namespace_header_before_write() {
+        let server = FakeServer::start(vec![Reply::json(200, json!([]))]);
+        let transport = RepositoryTransport::new(
+            required_client(&server, WorkspaceKey::from_entropy([54; 32])),
+            Some("api"),
+        )
+        .unwrap();
+        let mut backend = CloudBackend::new(transport, "alice");
+        let error = backend
+            .claim(
+                "alice",
+                &ClaimRequest {
+                    paths: vec!["src".into()],
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("namespace support"));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+    }
+
+    #[test]
+    fn required_repository_rejects_malformed_probe_queries_before_http() {
+        let server = FakeServer::start(vec![]);
+        let client = required_client(&server, WorkspaceKey::from_entropy([55; 32]));
+        for path in [
+            "/api/v1/zones/claims?path=src&namespace_probe=0",
+            "/api/v1/zones/claims?path=src&namespace_probe=1&namespace_probe=1",
+            "/api/v1/zones/claims?path=src&namespace_probe=1&unknown=private",
+            "/api/v1/zones/claims?path=src&namespace_probe=1%0Aprivate",
+            "/api/v1/bus/inbox?namespace_probe=1",
+        ] {
+            let mut call = Call::get("alice", path.into());
+            call.repository = Some("api".into());
+            assert!(client.call(&call).is_err(), "{path}");
+        }
+        let mut wrong_method = Call::write(
+            "alice",
+            "POST",
+            "/api/v1/zones/claims?namespace_probe=1".into(),
+            json!({"paths":["src"],"note":"private"}),
+        );
+        wrong_method.repository = Some("api".into());
+        assert!(client.call(&wrong_method).is_err());
+        assert!(server.requests().is_empty());
+    }
 
     #[test]
     fn an_older_server_is_rejected_by_a_read_before_a_namespace_write_can_happen() {
