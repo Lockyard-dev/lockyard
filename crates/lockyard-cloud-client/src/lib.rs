@@ -1034,6 +1034,227 @@ mod tests {
     }
 
     #[test]
+    fn node_context_rejects_unclassified_legacy_response_metadata() {
+        for meta in [
+            json!({"code":"legacy content"}),
+            json!("legacy content"),
+            json!({}),
+        ] {
+            for (path, body) in [
+                ("/api/v1/zones/claims", json!([{"meta":meta}])),
+                ("/api/v1/zones/queue", json!([{"meta":meta}])),
+                (
+                    "/api/v1/events",
+                    json!([{"type":"zone.claimed","payload":{"meta":meta}}]),
+                ),
+                (
+                    "/api/v1/events",
+                    json!([{"type":"zone.queued","payload":{"meta":meta}}]),
+                ),
+            ] {
+                let server = FakeServer::start(vec![Reply::json(200, body)]);
+                let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
+                assert!(
+                    matches!(
+                        client.call(&Call::get("node-job", path.into())),
+                        Err(ClientError::Invalid(_))
+                    ),
+                    "{path}"
+                );
+                assert_eq!(server.requests().len(), 1);
+            }
+        }
+        for (path, body) in [
+            (
+                "/api/v1/zones/claims",
+                json!([{"meta":null,"hold_until_ref":null}]),
+            ),
+            ("/api/v1/zones/queue", json!([{"meta":null}])),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(200, body)]);
+            let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
+            assert!(
+                client.call(&Call::get("node-job", path.into())).is_ok(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_context_validates_nested_response_shapes_and_metadata_events() {
+        for (path, body) in [
+            (
+                "/api/v1/registry/items",
+                json!({"items":[],"future_content":"private"}),
+            ),
+            (
+                "/api/v1/registry/items",
+                json!({"items":[{"assignment":{"session":"worker","future_content":"private"}}]}),
+            ),
+            (
+                "/api/v1/registry/items",
+                json!({"items":[{"assignment":{"session":{"code":"private"}}}]}),
+            ),
+            (
+                "/api/v1/events",
+                json!([{"type":"bus.unread","payload":{"to":"member","future_content":"private"}}]),
+            ),
+            (
+                "/api/v1/events",
+                json!([{"type":"zone.claimed","payload":{"claim_id":{"code":"private"}}}]),
+            ),
+            (
+                "/api/v1/zones/catalog",
+                json!({"zones":{},"future_content":"private"}),
+            ),
+            ("/api/v1/zones/claims", json!("private")),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(200, body)]);
+            let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
+            assert!(
+                matches!(
+                    client.call(&Call::get("node-job", path.into())),
+                    Err(ClientError::Invalid(_))
+                ),
+                "{path}"
+            );
+            assert_eq!(server.requests().len(), 1);
+        }
+        for event in [
+            json!({"type":"bus.unread","payload":{"to":"member"}}),
+            json!({"type":"bus.seen","payload":{"seen":[17,"message-id"]}}),
+            json!({"type":"presence.heartbeat","payload":{"session":"member","state":"working","last_seen":"2026-11-07T07:00:00.1234567+00:00"}}),
+            json!({"type":"zone.claimed","payload":{"claim_id":17,"session":"member","paths":["src"],"note":"","reason":"claimed","fence":1}}),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(200, json!([event]))]);
+            let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
+            assert!(
+                client
+                    .call(&Call::get("node-job", "/api/v1/events".into()))
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn node_context_preserves_safe_presence_metadata_and_authenticated_legacy_content() {
+        let safe = json!({"level":"ok","load":0.5,"cpus":4});
+        for (method, path, response) in [
+            (
+                "POST",
+                "/api/v1/presence",
+                json!({"meta":safe,"activity":{"tool_running":true,"meta":safe}}),
+            ),
+            (
+                "GET",
+                "/api/v1/presence",
+                json!([{"meta":safe,"activity":{"tool_running":true,"meta":safe}}]),
+            ),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(200, response.clone())]);
+            let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
+            let call = if method == "POST" {
+                Call::write(
+                    "node-job",
+                    method,
+                    path.into(),
+                    json!({"client":"fixture","activity":{"tool_running":true,"meta":safe}}),
+                )
+            } else {
+                Call::get("node-job", path.into())
+            };
+            assert_eq!(client.call(&call).unwrap(), response);
+        }
+        for response in [
+            json!([{"meta":{"code":"private"}}]),
+            json!([{"activity":{"meta":{"code":"private"}}}]),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(200, response)]);
+            let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
+            assert!(
+                client
+                    .call(&Call::get("node-job", "/api/v1/presence".into()))
+                    .is_err()
+            );
+        }
+        let key = WorkspaceKey::from_entropy([85; 32]);
+        let encrypted = key
+            .encrypt(NODE_WORKSPACE, "legacy_raw", "private legacy content")
+            .unwrap();
+        let server = FakeServer::start(vec![Reply::json(
+            200,
+            json!({"items":[{"legacy_raw":encrypted,"assignment":{"session":"worker","lease_active":true,"released_at":null}}]}),
+        )]);
+        let client = forced_client(&server, key);
+        assert_eq!(
+            client
+                .call(&Call::get("node-job", "/api/v1/registry/items".into()))
+                .unwrap()["items"][0]["legacy_raw"],
+            "private legacy content"
+        );
+    }
+
+    #[test]
+    fn node_context_reads_backend_identifiers_enums_and_nested_dirty_content() {
+        let key = WorkspaceKey::from_entropy([85; 32]);
+        let note = key.encrypt(NODE_WORKSPACE, "note", "private note").unwrap();
+        let reason = key
+            .encrypt(NODE_WORKSPACE, "reason", "private dirty reason")
+            .unwrap();
+        let title = key
+            .encrypt(NODE_WORKSPACE, "title", "private title")
+            .unwrap();
+        let body = key
+            .encrypt(NODE_WORKSPACE, "body", "private message")
+            .unwrap();
+        let stamp = "2026-11-07T07:00:00.1234567+00:00";
+        for (path, response, field, expected) in [
+            (
+                "/api/v1/zones/claims",
+                json!([{"id":1,"session":"worker","paths":["src"],"mode":"exclusive","purpose":"work","note":note,"fence":1,"created_at":stamp,"expires_at":stamp,"version":1,"meta":null,"hold_until_ref":null,"foreign_dirty_paths":[{"path":"src/dirty","owner_session":"other","reported_by":"other","reason":reason,"task_id":17,"foreign":true,"created_at":stamp,"updated_at":stamp,"holder_session":"worker","repository":null}]}]),
+                "note",
+                "private note",
+            ),
+            (
+                "/api/v1/zones/queue",
+                json!([{"id":2,"session":"worker","paths":["src"],"mode":"exclusive","purpose":"work","note":note,"priority_of":1,"add_path_claim_id":1,"meta":null}]),
+                "note",
+                "private note",
+            ),
+            (
+                "/api/v1/registry/items",
+                json!({"items":[{"id":"D-1","type":"code","priority":"P2","status":"ready","target":"ci_passed","verification":"auto","sealed":false,"title":title,"assignment":{"session":"worker","lease_active":true,"claimed_at":stamp,"released_at":null}}]}),
+                "title",
+                "private title",
+            ),
+            (
+                "/api/v1/bus/inbox",
+                json!({"messages":[{"id":7,"thread_id":1,"in_reply_to":null,"from_session":"other","to":"worker","kind":"info","needs":"none","body":body,"created_at":stamp,"status":"unread","version":1}]}),
+                "body",
+                "private message",
+            ),
+        ] {
+            let server = FakeServer::start(vec![Reply::json(200, response)]);
+            let client = forced_client(&server, key.clone());
+            let result = client.call(&Call::get("node-job", path.into())).unwrap();
+            let item = if result.is_array() {
+                &result[0]
+            } else if path.contains("registry") {
+                &result["items"][0]
+            } else {
+                &result["messages"][0]
+            };
+            assert_eq!(item[field], expected, "{path}");
+            if path.ends_with("claims") {
+                assert_eq!(
+                    item["foreign_dirty_paths"][0]["reason"],
+                    "private dirty reason"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn node_context_blocks_query_and_structured_content_bypasses_before_http() {
         let server = FakeServer::start(vec![]);
         let client = forced_client(&server, WorkspaceKey::from_entropy([86; 32]));

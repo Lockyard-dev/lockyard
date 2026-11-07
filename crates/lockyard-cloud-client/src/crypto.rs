@@ -115,6 +115,15 @@ pub(crate) fn transform_fields_policy(
     if require_encrypted && !matched {
         return Err("required node encryption does not support this API operation".into());
     }
+    if require_encrypted
+        && !encrypt
+        && schemas.is_empty()
+        && !value.is_null()
+        && value != &serde_json::json!({})
+        && value != &serde_json::json!([])
+    {
+        return Err("required node response has no classified schema".into());
+    }
     if require_encrypted && encrypt {
         if schemas.is_empty() && !value.is_null() && value != &serde_json::json!({}) {
             return Err("required node encryption does not support this request body".into());
@@ -138,6 +147,7 @@ pub(crate) fn transform_fields_policy(
             key,
             encrypt,
             require_encrypted,
+            false,
             &mut touched,
         )?;
     }
@@ -177,11 +187,19 @@ fn visit(
     key: Option<&WorkspaceKey>,
     enc: bool,
     require_encrypted: bool,
+    event_payload: bool,
     touched: &mut Vec<String>,
 ) -> Result<(), String> {
     let Some(def) = schemas.get(schema) else {
-        return Ok(());
+        return if require_encrypted && !enc {
+            Err("required node response schema is unavailable".into())
+        } else {
+            Ok(())
+        };
     };
+    if v.is_null() {
+        return Ok(());
+    }
     if let Some(values) = v.as_array_mut() {
         for value in values {
             visit(
@@ -193,10 +211,17 @@ fn visit(
                 key,
                 enc,
                 require_encrypted,
+                event_payload,
                 touched,
             )?;
         }
         return Ok(());
+    }
+    if require_encrypted && !enc && !def.get("properties").is_some_and(Value::is_object) {
+        return Err("required node response has an unclassified JSON schema".into());
+    }
+    if require_encrypted && !enc && !v.is_object() {
+        return Err("required node response must be a typed object".into());
     }
     if !enc && matches!(schema, "CoordinationEvent" | "RegistryEventDto") {
         visit_event(
@@ -221,8 +246,73 @@ fn visit(
         v.as_object_mut(),
         def.get("properties").and_then(Value::as_object),
     ) {
+        if !enc && require_encrypted {
+            for (property, value) in obj.iter() {
+                if !props.contains_key(property)
+                    && !(event_payload && event_payload_alias(schema, property, value))
+                {
+                    return Err("required node response contains an unsupported field".into());
+                }
+            }
+        }
         for (p, sch) in props {
             if let Some(slot) = obj.get_mut(p) {
+                if !enc
+                    && require_encrypted
+                    && schema == "CoordinationClaim"
+                    && p == "foreign_dirty_paths"
+                    && !slot.is_null()
+                {
+                    let entries = slot
+                        .as_array_mut()
+                        .ok_or("required node foreign dirty paths must be an array")?;
+                    for entry in entries {
+                        visit(
+                            entry,
+                            "CoordinationDirtyPathReply",
+                            schemas,
+                            fields,
+                            workspace,
+                            key,
+                            false,
+                            true,
+                            false,
+                            touched,
+                        )?;
+                    }
+                    continue;
+                }
+                if !enc
+                    && require_encrypted
+                    && matches!(
+                        (schema, p.as_str()),
+                        ("CoordinationDeliveryResult", "claimed")
+                            | ("CoordinationSeenResult", "seen")
+                    )
+                    && !slot.is_null()
+                {
+                    if !slot
+                        .as_array()
+                        .is_some_and(|entries| entries.iter().all(safe_response_id))
+                    {
+                        return Err(
+                            "required node response identifier list has an invalid type".into()
+                        );
+                    }
+                    continue;
+                }
+                if !enc
+                    && require_encrypted
+                    && !slot.is_null()
+                    && (p == "hold_until_ref"
+                        || (p == "meta"
+                            && !(matches!(
+                                schema,
+                                "CoordinationPresence" | "CoordinationPresenceActivity"
+                            ) && safe_activity_meta(slot))))
+                {
+                    return Err("required node response contains unclassified metadata".into());
+                }
                 if !enc
                     && ((schema == "CoordinationCheckResult" && p == "holder")
                         || (schema == "CoordinationClaim" && p == "conflicts"))
@@ -282,51 +372,213 @@ fn visit(
                     } else if require_encrypted && !slot.is_null() {
                         return Err("required node content must be text; structured content must be serialized locally".into());
                     }
+                    continue;
                 }
-                if let Some(r) = sch
-                    .get("$ref")
-                    .and_then(Value::as_str)
-                    .and_then(|r| r.strip_prefix("#/components/schemas/"))
+                if !enc
+                    && require_encrypted
+                    && (p == "meta"
+                        || (p == "payload"
+                            && matches!(schema, "CoordinationEvent" | "RegistryEventDto")))
                 {
-                    visit(
-                        slot,
-                        r,
-                        schemas,
-                        fields,
-                        workspace,
-                        key,
-                        enc,
-                        require_encrypted,
-                        touched,
-                    )?;
+                    continue; // These slots were explicitly classified above or by visit_event.
                 }
-                if let Some(items) = sch.get("items") {
-                    if let Some(r) = items
-                        .get("$ref")
-                        .and_then(Value::as_str)
-                        .and_then(|r| r.strip_prefix("#/components/schemas/"))
-                    {
-                        if let Some(a) = slot.as_array_mut() {
-                            for item in a {
-                                visit(
-                                    item,
-                                    r,
-                                    schemas,
-                                    fields,
-                                    workspace,
-                                    key,
-                                    enc,
-                                    require_encrypted,
-                                    touched,
-                                )?
-                            }
-                        }
+                if !enc
+                    && require_encrypted
+                    && !slot.is_null()
+                    && matches!(
+                        p.as_str(),
+                        "id" | "claim_id"
+                            | "thread_id"
+                            | "in_reply_to"
+                            | "task_id"
+                            | "granted_from"
+                            | "priority_of"
+                            | "add_path_claim_id"
+                            | "version"
+                    )
+                    && schema_uses_opaque_json(sch)
+                {
+                    if !safe_response_id(slot) {
+                        return Err("required node response identifier has an invalid type".into());
                     }
+                    continue;
                 }
+                if !enc && require_encrypted && p == "sealed" && !slot.is_null() {
+                    if !slot.is_boolean() {
+                        return Err("required node response sealed flag must be boolean".into());
+                    }
+                    continue;
+                }
+                visit_shape(
+                    slot,
+                    sch,
+                    schemas,
+                    fields,
+                    workspace,
+                    key,
+                    enc,
+                    require_encrypted,
+                    touched,
+                )?;
             }
         }
     }
     Ok(())
+}
+
+fn schema_uses_opaque_json(definition: &Value) -> bool {
+    definition.get("$ref").and_then(Value::as_str) == Some("#/components/schemas/JsonElement")
+        || definition
+            .get("oneOf")
+            .or_else(|| definition.get("anyOf"))
+            .and_then(Value::as_array)
+            .is_some_and(|variants| variants.iter().any(schema_uses_opaque_json))
+}
+
+fn safe_response_id(value: &Value) -> bool {
+    value.as_u64().is_some()
+        || value.as_str().is_some_and(|s| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_shape(
+    value: &mut Value,
+    definition: &Value,
+    schemas: &Value,
+    fields: &[Field],
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    enc: bool,
+    required: bool,
+    touched: &mut Vec<String>,
+) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    if definition.get("type").and_then(Value::as_str) == Some("null") {
+        return Err("non-null value does not match the nullable schema branch".into());
+    }
+    if let Some(name) = definition
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+    {
+        let definition = schemas
+            .get(name)
+            .ok_or("required node response schema is unavailable")?;
+        return if definition.get("properties").is_some_and(Value::is_object) {
+            visit(
+                value, name, schemas, fields, workspace, key, enc, required, false, touched,
+            )
+        } else {
+            visit_shape(
+                value, definition, schemas, fields, workspace, key, enc, required, touched,
+            )
+        };
+    }
+    if let Some(variants) = definition
+        .get("oneOf")
+        .or_else(|| definition.get("anyOf"))
+        .and_then(Value::as_array)
+    {
+        for variant in variants {
+            let mut candidate = value.clone();
+            let mut changed = Vec::new();
+            if visit_shape(
+                &mut candidate,
+                variant,
+                schemas,
+                fields,
+                workspace,
+                key,
+                enc,
+                required,
+                &mut changed,
+            )
+            .is_ok()
+            {
+                *value = candidate;
+                touched.extend(changed);
+                return Ok(());
+            }
+        }
+        return Err("required node response has an unsupported field type".into());
+    }
+    if let Some(items) = definition.get("items") {
+        if let Some(values) = value.as_array_mut() {
+            for item in values {
+                visit_shape(
+                    item, items, schemas, fields, workspace, key, enc, required, touched,
+                )?;
+            }
+            return Ok(());
+        }
+        return if required && !enc {
+            Err("required node response field must be an array".into())
+        } else {
+            Ok(())
+        };
+    }
+    if !required || enc {
+        return Ok(());
+    }
+    let matches_type = |kind: &str| match kind {
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        _ => false,
+    };
+    let valid = definition.get("type").is_some_and(|kind| {
+        kind.as_str().is_some_and(matches_type)
+            || kind
+                .as_array()
+                .is_some_and(|types| types.iter().filter_map(Value::as_str).any(matches_type))
+    });
+    if !valid
+        || definition
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_some_and(|values| !values.contains(value))
+    {
+        return Err(
+            "required node response contains an unclassified value or invalid field type".into(),
+        );
+    }
+    Ok(())
+}
+
+// Backend event payloads add these fixed aliases to their typed snapshots.
+// visit_event authenticates reason/note separately; IDs and fences stay metadata.
+fn event_payload_alias(schema: &str, property: &str, value: &Value) -> bool {
+    let known = match schema {
+        "CoordinationClaim" => matches!(property, "claim_id" | "reason"),
+        "CoordinationQueueEntry" => matches!(property, "claim_id" | "fence" | "reason"),
+        "CoordinationRequest" => matches!(property, "claim_id" | "fence" | "reason" | "note"),
+        _ => false,
+    };
+    known
+        && (value.is_null()
+            || match property {
+                "claim_id" => {
+                    value.as_u64().is_some()
+                        || value.as_str().is_some_and(|id| {
+                            !id.is_empty()
+                                && id.len() <= 128
+                                && id
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b"_-:.".contains(&b))
+                        })
+                }
+                "fence" => value.as_u64().is_some(),
+                "reason" | "note" => value.is_string(),
+                _ => false,
+            })
 }
 
 /// Conflict holders are compatibility JSON in the published contract, but their
@@ -507,6 +759,7 @@ fn visit_event(
                 key,
                 false,
                 required,
+                false,
                 touched,
             )?;
         }
@@ -551,6 +804,7 @@ fn visit_event(
                 key,
                 false,
                 required,
+                true,
                 touched,
             )?;
             // The server's request event copies the already-encrypted text into its note alias.
@@ -587,7 +841,148 @@ fn visit_event(
                 }
             }
         } else if required {
-            reject_unclassified_event_content(payload)?;
+            validate_metadata_event(&kind, payload)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_metadata_event(kind: &str, value: &Value) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or("required node metadata event must be an object")?;
+    let fields: &[&str] = match kind {
+        "bus.unread" => &["to"],
+        "bus.seen" => &["seen"],
+        "bus.delivery_claimed" => &["ids"],
+        "bus.imported" => &["threads", "board", "tasks"],
+        "presence.activity" => &["session", "claim_id", "last_seen"],
+        "presence.heartbeat" => &["session", "state", "last_seen"],
+        "presence.unavailable" => &["session", "state"],
+        "zone.catalog" => &["updated_at", "repository"],
+        "zone.dirty" | "zone.dirty_adopted" | "zone.dirty_disowned" => {
+            &["session", "paths", "repository"]
+        }
+        "integration.github" => &[
+            "provider",
+            "to",
+            "item_id",
+            "repository",
+            "commit_sha",
+            "event_key",
+            "occurred_at",
+            "attention_required",
+            "delivery_mode",
+            "provider_url",
+        ],
+        _ => return Err("required node metadata event kind is unsupported".into()),
+    };
+    let id = |v: &Value| {
+        v.as_u64().is_some()
+            || v.as_str().is_some_and(|s| {
+                !s.is_empty()
+                    && s.len() <= 128
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_-:.".contains(&b))
+            })
+    };
+    let session = |v: &Value| {
+        v.as_str().is_some_and(|s| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+        })
+    };
+    let positive_decimal = |s: &str, max: usize| {
+        !s.is_empty()
+            && s.len() <= max
+            && s.as_bytes()[0] != b'0'
+            && s.bytes().all(|b| b.is_ascii_digit())
+    };
+    for (name, item) in object {
+        if !fields.contains(&name.as_str()) {
+            return Err("required node metadata event contains an unsupported field".into());
+        }
+        let valid = match name.as_str() {
+            "seen" | "ids" => item.as_array().is_some_and(|a| a.iter().all(id)),
+            "claim_id" => id(item),
+            "session" | "to" => session(item),
+            "item_id" => item
+                .as_str()
+                .and_then(|s| s.strip_prefix("D-"))
+                .is_some_and(|s| positive_decimal(s, 19)),
+            "commit_sha" => item.as_str().is_some_and(|s| {
+                s.len() == 40
+                    && s.bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            }),
+            "event_key" => item.as_str().is_some_and(|s| {
+                let parts = s.split(':').collect::<Vec<_>>();
+                matches!(
+                    parts.first().copied(),
+                    Some("workflow_run" | "check_run" | "pull_request_review")
+                ) && matches!(parts.len(), 2 | 3)
+                    && positive_decimal(parts[1], 19)
+                    && (parts.len() == 2 || positive_decimal(parts[2], 10))
+            }),
+            "provider_url" => item.as_str().is_some_and(|s| {
+                s == format!(
+                    "https://github.com/{}/commit/{}/checks",
+                    object
+                        .get("repository")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    object
+                        .get("commit_sha")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                )
+            }),
+            "threads" | "board" | "tasks" => item.as_u64().is_some(),
+            "paths" => item.as_array().is_some_and(|a| {
+                a.iter().all(|v| {
+                    v.as_str()
+                        .is_some_and(|s| s.len() <= 1024 && !s.chars().any(char::is_control))
+                })
+            }),
+            "last_seen" | "updated_at" | "occurred_at" => item
+                .as_str()
+                .is_some_and(|s| s.len() <= 40 && lockyard_core::proto::parse_rfc3339(s).is_some()),
+            "state" => matches!(
+                item.as_str(),
+                Some("working" | "idle" | "ended" | "api_failure")
+            ),
+            "provider" => item.as_str() == Some("github"),
+            "attention_required" => item.as_bool() == Some(true),
+            "delivery_mode" => item.as_str() == Some("metadata"),
+            "repository" => {
+                if kind == "integration.github" {
+                    item.as_str().is_some_and(|s| {
+                        s.len() <= 200
+                            && s.split('/').count() == 2
+                            && s.split('/').all(|part| {
+                                !part.is_empty()
+                                    && !matches!(part, "." | "..")
+                                    && part
+                                        .bytes()
+                                        .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+                            })
+                    })
+                } else {
+                    item.is_null()
+                        || item.as_str().is_some_and(|s| {
+                            !s.is_empty()
+                                && s.len() <= 255
+                                && s.bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+                        })
+                }
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err("required node metadata event contains an invalid field type".into());
         }
     }
     Ok(())
@@ -624,42 +1019,6 @@ fn decrypt_event_field(
         });
     } else if required {
         return Err("required node event content contains plaintext".into());
-    }
-    Ok(())
-}
-
-fn reject_unclassified_event_content(value: &Value) -> Result<(), String> {
-    match value {
-        Value::Object(object) => {
-            for (name, value) in object {
-                if matches!(
-                    name.as_str(),
-                    "body"
-                        | "title"
-                        | "brief"
-                        | "report"
-                        | "text"
-                        | "reply"
-                        | "value"
-                        | "note"
-                        | "accept"
-                ) && !value.is_null()
-                    && value.as_str() != Some("")
-                {
-                    return Err("required node event contains unclassified content".into());
-                }
-                reject_unclassified_event_content(value)?;
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                reject_unclassified_event_content(value)?;
-            }
-        }
-        Value::String(text) if text.starts_with(PREFIX) => {
-            return Err("required node event contains an unclassified envelope".into());
-        }
-        _ => (),
     }
     Ok(())
 }
@@ -740,6 +1099,15 @@ fn validate_request_shape(
             if name == "value" {
                 if !item.is_null() && !item.is_string() {
                     return Err("required node content must be serialized to text locally".into());
+                }
+                continue;
+            }
+            if name == "ids" && child.get("items").is_none() && !item.is_null() {
+                if !item
+                    .as_array()
+                    .is_some_and(|entries| entries.iter().all(safe_response_id))
+                {
+                    return Err("required node request identifiers must be a typed list".into());
                 }
                 continue;
             }
