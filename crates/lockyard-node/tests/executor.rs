@@ -479,6 +479,89 @@ fn output_is_capped_and_timeout_and_cancel_stop_child_groups() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn native_cancellation_kills_the_cgroup_before_signalling_the_live_helper() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(mut config) = native_cases::configured_fixture(dir.path()) else {
+        return;
+    };
+    // The shim stays outside the job cgroup while its real sandbox child joins it.
+    // A process-group signal therefore leaves a durable marker even when the job
+    // itself dies before its Python signal handler could run.
+    let helper = native_cases::sandbox_program();
+    let signal_marker = dir.path().join("unexpected-helper-signal");
+    let sandbox_pid = dir.path().join("sandbox.pid");
+    let shim = dir.path().join("cancel-order-sandbox");
+    fs::write(
+        &shim,
+        format!(
+            r#"#!/usr/bin/python3
+import json,os,pathlib,signal,subprocess,sys
+helper={helper}
+marker=pathlib.Path({marker})
+pid_file=pathlib.Path({pid_file})
+args=sys.argv[1:]
+if args and args[0]=='__native-sandbox': args=args[1:]
+if '--manifest' not in args or json.loads(pathlib.Path(args[args.index('--manifest')+1]).read_text())['patch']:
+    os.execv(helper,[helper]+args)
+def signalled(number,frame):
+    marker.write_text(str(number))
+signal.signal(signal.SIGTERM,signalled)
+child=subprocess.Popen([helper]+args)
+pid_file.write_text(str(child.pid))
+status=child.wait()
+sys.exit(status if status>=0 else 128-status)
+"#,
+            helper = serde_json::to_string(&helper).unwrap(),
+            marker = serde_json::to_string(&signal_marker).unwrap(),
+            pid_file = serde_json::to_string(&sandbox_pid).unwrap(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+    config
+        .runners
+        .get_mut("python")
+        .unwrap()
+        .container
+        .runtime_program = shim;
+    let group_name = format!("lockyard-{}-00000000000000000000000032", config.node_id);
+    let executor = Executor::new(config).unwrap();
+    let request = spec(
+        32,
+        "import time; print('ready',flush=True); time.sleep(300)",
+    );
+    executor.submit(request.clone(), &caller()).unwrap();
+    let running = wait(&executor, &request.id, |record| {
+        record.state == JobState::Running
+            && executor
+                .read_log(&request.id, 0, 100)
+                .is_ok_and(|log| log.bytes.starts_with(b"ready\n"))
+    });
+    let group = live_native_cgroup(&group_name);
+    let pids = fs::read_to_string(group.join("cgroup.procs")).unwrap();
+    let actual_sandbox_pid = fs::read_to_string(&sandbox_pid).unwrap();
+    assert!(pids.lines().any(|pid| pid == actual_sandbox_pid.trim()));
+    assert!(
+        !pids
+            .lines()
+            .any(|pid| pid == running.pid.unwrap().to_string()),
+        "the signal-observing helper must remain outside the cgroup"
+    );
+    executor.cancel(&request.id, &caller()).unwrap();
+    let record = finished(&executor, &request.id);
+    assert_eq!(record.state, JobState::Cancelled);
+    assert!(
+        !group.exists(),
+        "the populated native cgroup was not stopped"
+    );
+    assert!(
+        !signal_marker.exists(),
+        "cancellation signalled the live helper despite an available cgroup.kill"
+    );
+}
+
 #[test]
 #[ignore = "requires a resource-capable Docker daemon and LOCKYARD_NODE_EXECUTOR_IMAGE"]
 fn live_container_enforces_resource_limits_and_private_mount_policy() {

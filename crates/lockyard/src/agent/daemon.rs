@@ -164,6 +164,7 @@ struct View {
     unread: HashMap<String, UnreadCount>,
     mail: HashMap<String, MailBuffer>,
     lost: HashMap<String, LostMarks>,
+    lost_refresh_generation: u64,
 }
 
 impl View {
@@ -300,6 +301,8 @@ fn covers(claim: &Claim, path: &ZonePath) -> bool {
 
 #[derive(Default)]
 struct SessionTrack {
+    /// Outstanding refreshes retain this identity across removal and re-registration.
+    incarnation: Arc<()>,
     heard: Option<Instant>,
     beat: Option<Instant>,
     tool_running: bool,
@@ -1336,28 +1339,57 @@ impl<T: Transport + 'static> Shared<T> {
 
     fn refresh_lost(&self) {
         let window = self.timing().active_window;
-        let live: HashSet<String> = {
+        let limit = self.timing().fresh / 2;
+        let (refresh_generation, wanted) = {
+            // Keep membership and its reconciliation atomic: a paused older live-set snapshot
+            // must not recreate entries after a newer refresh has removed expired sessions.
             let mut sessions = self.sessions();
             sessions.retain(|_, track| track.heard.is_some_and(|at| at.elapsed() < window));
-            sessions.keys().cloned().collect()
-        };
-        let limit = self.timing().fresh / 2;
-        let wanted: Vec<(String, u64)> = {
             let mut view = self.write_view();
-            view.lost.retain(|session, _| live.contains(session));
-            for session in &live {
+            view.lost_refresh_generation += 1;
+            view.lost
+                .retain(|session, _| sessions.contains_key(session));
+            for session in sessions.keys() {
                 view.lost.entry(session.clone()).or_default();
             }
-            view.lost
+            let wanted: Vec<(String, u64, Arc<()>)> = view
+                .lost
                 .iter()
                 .filter(|(_, marks)| !marks.fresh(limit))
-                .map(|(session, marks)| (session.clone(), marks.generation))
-                .collect()
+                .map(|(session, marks)| {
+                    (
+                        session.clone(),
+                        marks.generation,
+                        Arc::clone(&sessions[session].incarnation),
+                    )
+                })
+                .collect();
+            (view.lost_refresh_generation, wanted)
         };
-        for (session, generation) in wanted {
+        for (session, generation, incarnation) in wanted {
             if let Ok(marks) = self.backend(&session).lost(&session) {
+                // Unread/mail upkeep can also expire sessions without starting a lost refresh.
+                // Hold the same lock order as preparation until publication is complete.
+                let sessions = self.sessions();
+                if !sessions.get(&session).is_some_and(|track| {
+                    Arc::ptr_eq(&track.incarnation, &incarnation)
+                        && track.heard.is_some_and(|at| at.elapsed() < window)
+                }) {
+                    continue;
+                }
                 let mut view = self.write_view();
-                let entry = view.lost.entry(session).or_default();
+                // A newer pass owns publication, including a remove/re-register of the same
+                // session. Never let an in-flight response restore a removed entry.
+                if view.lost_refresh_generation != refresh_generation {
+                    continue;
+                }
+                let Some(entry) = view.lost.get_mut(&session) else {
+                    continue;
+                };
+                // Events arriving during this read leave the entry dirty for the next pass.
+                if entry.generation != generation {
+                    continue;
+                }
                 entry.marks = marks;
                 entry.clean = generation;
                 entry.at = Some(Instant::now());
@@ -1695,6 +1727,7 @@ mod tests {
         queue: Mutex<Vec<Value>>,
         requests: Mutex<Vec<Value>>,
         lost: Mutex<Vec<Value>>,
+        lost_read_gate: Mutex<Option<LostReadGate>>,
         unread: Mutex<i64>,
         events: Mutex<Vec<Value>>,
         writes: Mutex<Vec<Call>>,
@@ -1711,7 +1744,25 @@ mod tests {
         fail_inbox_for: Mutex<Option<String>>,
     }
 
+    struct LostReadGate {
+        started: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+
     impl FakeServer {
+        /// Pause one response after capturing its payload, without blocking later reads.
+        fn pause_next_lost_read(
+            &self,
+        ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            let (started, observed) = channel();
+            let (resume, paused) = channel();
+            *self.lost_read_gate.lock().unwrap() = Some(LostReadGate {
+                started,
+                resume: paused,
+            });
+            (observed, resume)
+        }
+
         fn writes_to(&self, tail: &str) -> Vec<Call> {
             self.writes
                 .lock()
@@ -1824,7 +1875,13 @@ mod tests {
                     Ok(json!({"requests": *self.requests.lock().unwrap()}))
                 }
                 "/api/v1/zones/lost" if call.method == "GET" => {
-                    Ok(json!({"lost": *self.lost.lock().unwrap()}))
+                    let lost = self.lost.lock().unwrap().clone();
+                    let gate = self.lost_read_gate.lock().unwrap().take();
+                    if let Some(gate) = gate {
+                        gate.started.send(()).unwrap();
+                        gate.resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                    Ok(json!({"lost": lost}))
                 }
                 "/api/v1/zones/check" => Ok(json!({"paths": [{"path": "src", "status": "free"}]})),
                 "/api/v1/bus/board" => Ok(json!([{"key": "k", "value": "v"}])),
@@ -2272,16 +2329,11 @@ mod tests {
 
     #[test]
     fn lost_marks_are_loaded_for_heard_sessions_and_expired_sessions_are_dropped() {
-        let rig = start_with(
-            Timing {
-                active_window: Duration::from_millis(100),
-                ..timing()
-            },
-            |server| {
-                *server.lost.lock().unwrap() =
-                    vec![json!({"claim_id": 9, "session": "me", "paths": ["src"]})];
-            },
-        );
+        let mut rig = start_with(timing(), |server| {
+            *server.lost.lock().unwrap() =
+                vec![json!({"claim_id": 9, "session": "me", "paths": ["src"]})];
+        });
+        rig.daemon.stop_workers();
         rig.daemon.handle(Request::ZoneSnapshot {
             session: "me".into(),
         });
@@ -2291,9 +2343,170 @@ mod tests {
         });
         assert_eq!(reply.lost.as_ref().unwrap()[0].claim_id, 9);
         rig.daemon.shared.sessions().get_mut("me").unwrap().heard =
-            Some(Instant::now() - Duration::from_millis(200));
+            Some(Instant::now() - timing().active_window * 2);
         rig.daemon.shared.refresh_lost();
         assert!(!rig.daemon.shared.read_view().lost.contains_key("me"));
+    }
+
+    #[test]
+    fn an_older_lost_refresh_cannot_restore_an_expired_session() {
+        let mut rig = start_with(timing(), |server| {
+            *server.lost.lock().unwrap() =
+                vec![json!({"claim_id": 9, "session": "me", "paths": ["src"]})];
+        });
+        rig.daemon.stop_workers();
+        rig.daemon.shared.hear("me");
+        let (started, resume) = rig.server.pause_next_lost_read();
+        let shared = Arc::clone(&rig.daemon.shared);
+        let older = thread::spawn(move || shared.refresh_lost());
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        rig.daemon.shared.sessions().get_mut("me").unwrap().heard =
+            Some(Instant::now() - timing().active_window * 2);
+        rig.daemon.shared.refresh_lost();
+        assert!(!rig.daemon.shared.read_view().lost.contains_key("me"));
+        resume.send(()).unwrap();
+        older.join().unwrap();
+
+        assert!(
+            !rig.daemon.shared.read_view().lost.contains_key("me"),
+            "an in-flight response must not recreate a session removed by a newer refresh"
+        );
+    }
+
+    #[test]
+    fn an_older_lost_refresh_cannot_overwrite_a_newer_response() {
+        let mut rig = start_with(timing(), |server| {
+            *server.lost.lock().unwrap() =
+                vec![json!({"claim_id": 9, "session": "me", "paths": ["src"]})];
+        });
+        rig.daemon.stop_workers();
+        rig.daemon.shared.hear("me");
+        let (started, resume) = rig.server.pause_next_lost_read();
+        let shared = Arc::clone(&rig.daemon.shared);
+        let older = thread::spawn(move || shared.refresh_lost());
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        *rig.server.lost.lock().unwrap() =
+            vec![json!({"claim_id": 10, "session": "me", "paths": ["new"]})];
+        rig.daemon.shared.refresh_lost();
+        assert_eq!(
+            rig.daemon.shared.read_view().lost["me"].marks[0].claim_id,
+            10
+        );
+        resume.send(()).unwrap();
+        older.join().unwrap();
+
+        assert_eq!(
+            rig.daemon.shared.read_view().lost["me"].marks[0].claim_id,
+            10,
+            "an older response must not replace the result of a newer refresh"
+        );
+    }
+
+    #[test]
+    fn an_older_lost_refresh_cannot_overwrite_a_reregistered_session() {
+        let mut rig = start_with(timing(), |server| {
+            *server.lost.lock().unwrap() =
+                vec![json!({"claim_id": 9, "session": "me", "paths": ["src"]})];
+        });
+        rig.daemon.stop_workers();
+        rig.daemon.shared.hear("me");
+        let (started, resume) = rig.server.pause_next_lost_read();
+        let shared = Arc::clone(&rig.daemon.shared);
+        let older = thread::spawn(move || shared.refresh_lost());
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        rig.daemon.shared.sessions().get_mut("me").unwrap().heard =
+            Some(Instant::now() - timing().active_window * 2);
+        rig.daemon.shared.refresh_lost();
+        assert!(!rig.daemon.shared.read_view().lost.contains_key("me"));
+        rig.daemon.shared.hear("me");
+        *rig.server.lost.lock().unwrap() =
+            vec![json!({"claim_id": 10, "session": "me", "paths": ["new"]})];
+        rig.daemon.shared.refresh_lost();
+        assert_eq!(
+            rig.daemon.shared.read_view().lost["me"].marks[0].claim_id,
+            10
+        );
+        resume.send(()).unwrap();
+        older.join().unwrap();
+
+        assert_eq!(
+            rig.daemon.shared.read_view().lost["me"].marks[0].claim_id,
+            10,
+            "an old response must not match the default generation of a re-registered session"
+        );
+    }
+
+    #[test]
+    fn a_lost_refresh_cannot_publish_after_another_upkeep_expires_the_session() {
+        for reregister in [false, true] {
+            let mut rig = start_with(timing(), |server| {
+                *server.lost.lock().unwrap() =
+                    vec![json!({"claim_id": 9, "session": "me", "paths": ["src"]})];
+            });
+            rig.daemon.stop_workers();
+            rig.daemon.shared.hear("me");
+            let (started, resume) = rig.server.pause_next_lost_read();
+            let shared = Arc::clone(&rig.daemon.shared);
+            let older = thread::spawn(move || shared.refresh_lost());
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            rig.daemon.shared.sessions().get_mut("me").unwrap().heard =
+                Some(Instant::now() - timing().active_window * 2);
+            rig.daemon.shared.refresh_unread();
+            assert!(!rig.daemon.shared.sessions().contains_key("me"));
+            if reregister {
+                rig.daemon.shared.hear("me");
+            }
+            resume.send(()).unwrap();
+            older.join().unwrap();
+
+            let view = rig.daemon.shared.read_view();
+            assert!(
+                view.lost["me"].at.is_none(),
+                "the old session response must be discarded (re-registered: {reregister})"
+            );
+            assert!(view.lost["me"].marks.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_lost_refresh_overtaken_by_an_event_keeps_its_entry_dirty() {
+        let mut rig = start_with(timing(), |server| {
+            *server.lost.lock().unwrap() =
+                vec![json!({"claim_id": 9, "session": "me", "paths": ["src"]})];
+        });
+        rig.daemon.stop_workers();
+        rig.daemon.shared.hear("me");
+        let (started, resume) = rig.server.pause_next_lost_read();
+        let shared = Arc::clone(&rig.daemon.shared);
+        let older = thread::spawn(move || shared.refresh_lost());
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let page = serde_json::from_value(json!({
+            "events": [{"seq": 1, "type": "zone.claimed"}]
+        }))
+        .unwrap();
+        rig.daemon.shared.apply_events(&page);
+        resume.send(()).unwrap();
+        older.join().unwrap();
+
+        {
+            let view = rig.daemon.shared.read_view();
+            let entry = &view.lost["me"];
+            assert!(entry.marks.is_empty(), "the pre-event payload is obsolete");
+            assert!(entry.at.is_none());
+            assert_eq!(entry.generation, 1);
+            assert_eq!(entry.clean, 0);
+        }
+        *rig.server.lost.lock().unwrap() =
+            vec![json!({"claim_id": 10, "session": "me", "paths": ["new"]})];
+        rig.daemon.shared.refresh_lost();
+        let view = rig.daemon.shared.read_view();
+        assert_eq!(view.lost["me"].marks[0].claim_id, 10);
+        assert!(view.lost["me"].fresh(timing().fresh));
     }
 
     #[test]

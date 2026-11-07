@@ -578,18 +578,23 @@ impl Executor {
                 } else {
                     JobState::TimedOut
                 };
-                terminate_group(pid);
-                let status = match child.wait() {
+                // Keep this direct child unreaped until the fallback signal is over:
+                // even an exited child still owns its PID while it is a zombie.
+                let (status, container_stopped) = stop_execution(
+                    || stop_container(&runner.container, &job_dir, &name),
+                    || terminate_group(pid),
+                    || child.wait(),
+                );
+                let status = match status {
                     Ok(status) => status,
                     Err(error) => {
-                        let _ = stop_container(&runner.container, &job_dir, &name);
                         stopped.store(true, Ordering::SeqCst);
                         let _ = out.join();
                         let _ = err.join();
                         return Err(io_error(error));
                     }
                 };
-                if !stop_container(&runner.container, &job_dir, &name) {
+                if !container_stopped {
                     final_state = JobState::InterruptedUnknown;
                 }
                 break status;
@@ -695,5 +700,64 @@ impl Executor {
             record_log_integrity(record, spool.bytes, spool.truncated, log_error);
         })?;
         Ok(())
+    }
+}
+
+fn stop_execution<T>(
+    stop_container: impl FnOnce() -> bool,
+    terminate_helper: impl FnOnce(),
+    wait_helper: impl FnOnce() -> T,
+) -> (T, bool) {
+    let stopped = stop_container();
+    if !stopped {
+        terminate_helper();
+    }
+    (wait_helper(), stopped)
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::stop_execution;
+    use std::cell::RefCell;
+
+    #[test]
+    fn cancellation_stops_the_container_before_reaping_without_a_pid_signal() {
+        let calls = RefCell::new(Vec::new());
+        let (status, stopped) = stop_execution(
+            || {
+                calls.borrow_mut().push("cgroup.kill");
+                true
+            },
+            || calls.borrow_mut().push("pid signal"),
+            || {
+                calls.borrow_mut().push("reap child");
+                137
+            },
+        );
+        assert!(stopped);
+        assert_eq!(status, 137);
+        assert_eq!(*calls.borrow(), ["cgroup.kill", "reap child"]);
+    }
+
+    #[test]
+    fn unavailable_container_falls_back_while_the_child_is_still_owned() {
+        let calls = RefCell::new(Vec::new());
+        let (status, stopped) = stop_execution(
+            || {
+                calls.borrow_mut().push("cgroup unavailable");
+                false
+            },
+            || calls.borrow_mut().push("pid signal"),
+            || {
+                calls.borrow_mut().push("reap child");
+                137
+            },
+        );
+        assert!(!stopped);
+        assert_eq!(status, 137);
+        assert_eq!(
+            *calls.borrow(),
+            ["cgroup unavailable", "pid signal", "reap child"]
+        );
     }
 }
