@@ -11,4 +11,18 @@ if [ "$listed" != "$expected" ]; then
     printf '%s\n' "$catalog" >&2
     exit 1
 fi
-cargo test --locked --release -p lockyard --test perf_budget -- --test-threads=1 --nocapture
+# Hosted runners are noisy (owner decision 2026-11-08): up to three attempts with the
+# unchanged ceilings; a real regression fails all three. Every attempt prints its p95.
+attempt=1
+while :; do
+    echo "perf gate attempt $attempt of 3"
+    if cargo test --locked --release -p lockyard --test perf_budget -- --test-threads=1 --nocapture; then
+        exit 0
+    else
+        status=$?
+    fi
+    if [ "$attempt" -ge 3 ]; then
+        exit "$status"
+    fi
+    attempt=$((attempt + 1))
+done

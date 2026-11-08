@@ -10,5 +10,13 @@ if ($listed.Count -ne $tests.Count) { throw 'Expected exactly two performance bu
 foreach ($test in $tests) {
     if (-not ($listed -contains "${test}: test")) { throw "Missing performance budget: $test" }
 }
-cargo test --locked --release -p lockyard --test perf_budget -- --test-threads=1 --nocapture
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+# Hosted runners are noisy (owner decision 2026-11-08): up to three attempts with the
+# unchanged ceilings; a real regression fails all three. Every attempt prints its p95.
+$status = 1
+for ($attempt = 1; $attempt -le 3; $attempt++) {
+    Write-Output "perf gate attempt $attempt of 3"
+    cargo test --locked --release -p lockyard --test perf_budget -- --test-threads=1 --nocapture
+    $status = $LASTEXITCODE
+    if ($status -eq 0) { exit 0 }
+}
+exit $status
