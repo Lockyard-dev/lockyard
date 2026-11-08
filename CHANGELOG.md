@@ -11,7 +11,7 @@ All notable changes to Lockyard are recorded here. The format follows
 
 - Reuse pinned Windows directory handles for SQLite preflight while preserving fresh file ACL and reparse checks.
 - Avoid the SQLite writer lock for fresh heartbeats and load local hook machine settings only for command checks.
-- Enforce one-attempt raw subprocess p95 budgets: hook decision ≤ 15 ms on every OS; message send ≤ 20 ms on macOS/Linux and ≤ 35 ms on Windows (owner decision 2026-11-08, CI run 42504694714: FULL FlushFileBuffers plus process startup).
+- Enforce raw subprocess p95 budgets: hook decision ≤ 15 ms once on every OS; message send ≤ 20 ms once on macOS/Linux and ≤ 35 ms best of three on Windows through one shared gate (owner decision 2026-11-08; hosted send outliers in CI run 42508801763). Product and build failures remain immediate.
 - Keep CLI, Windows SQLite syscall and authenticated pipe profiling opt-in for CI/tests; require the Windows hot-journal recovery regression in both Windows jobs.
 
 ## [0.3.1] - 2026-11-08
@@ -54,7 +54,7 @@ All notable changes to Lockyard are recorded here. The format follows
   (`notify` + 10 s reconcile). `status` / `doctor` surface unannounced writes.
 - Cloud zone mirror fail-closed guarantee documented in `docs/cloud-mirror.md`; a stale or
   missing mirror refuses edits.
-- CI performance budget (`perf_budget`), one attempt: hook decision p95 ≤ 15 ms everywhere; msg send p95 ≤ 20 ms on macOS/Linux, ≤ 35 ms on Windows.
+- CI performance budget (`perf_budget`): hook decision p95 ≤ 15 ms once everywhere; msg send p95 ≤ 20 ms once on macOS/Linux, ≤ 35 ms best of three on Windows.
 - Supply chain: Sigstore cosign keyless signatures, CycloneDX SBOM, `cargo deny`, npm/PyPI
   Trusted Publishing; `install.sh` verifies signatures when `cosign` is present.
 - `SECURITY.md`, `docs/threat-model.md`, `docs/privacy.md`, `docs/json-schemas.md`.

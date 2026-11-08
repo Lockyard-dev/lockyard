@@ -2,9 +2,11 @@
 # Local CLI performance budgets
 
 `crates/lockyard/tests/perf_budget.rs` measures 80 raw subprocess samples per test,
-including process startup and durable SQLite writes. Each gate makes one attempt;
-an overrun fails immediately. There are no retries, best-of-three selection or
-sample filtering. Diagnostic runs never replace a failed budget result.
+including process startup and durable SQLite writes. Hook decision gets one attempt
+on every OS; macOS/Linux message send also gets one attempt. Only Windows message
+send gets three attempts, and the best p95 must meet its budget. Each attempt prints
+its own raw p95; samples are never filtered. Product, build and fixture failures stop
+the gate immediately. Diagnostic runs never replace a budget result.
 
 | Platform | Hook decision p95 | Message send p95 |
 | --- | --- | --- |
@@ -18,7 +20,11 @@ raw send gate p95 was 22.0/29.1 ms; diagnostic send p95 was 18.8–19.6 ms with
 maximum about 40 ms. SQLite `synchronous=FULL` commits tracked `FlushFileBuffers`
 (p50 4.7 ms, p95 about 10 ms), while process startup cost 7–8 ms. The previous
 120 ms tail did not recur in the normal send profile. The 35 ms budget preserves FULL durability;
-it is a p95 ceiling, not a maximum-latency guarantee.
+it is a p95 ceiling, not a maximum-latency guarantee. Across four hosted runs the
+worst send p95s were approximately 22/29/64/134 ms, including 63.5 ms in
+[CI run 42508801763](https://github.com/lockyard-dev/lockyard/actions/runs/42508801763).
+The owner therefore approved best-of-three acceptance for Windows send only on
+2026-11-08. Hook decision stays at one attempt; FULL durability is unchanged.
 
 The send gate warms both agents before sampling. The separate diagnostic
 `send_due` case creates a new sender per sample and also commits its heartbeat;
@@ -27,9 +33,12 @@ not the warm-sender acceptance fixture, and the budget does not bound its latenc
 
 Windows and macOS CI enforce the release binary serially through
 `tools/ci/test-windows-perf.ps1` and `tools/ci/test-macos-perf.sh`; Linux runs the
-same budget tests serially. Gate mocks include a first-failure scenario that would
-pass on a second attempt and must still fail. All CI builds disable incremental
-compilation.
+same budget tests serially. Both Windows jobs invoke the same PowerShell gate,
+which runs the hook exactly once and all three send attempts. It fails the send
+budget only when all three p95s exceed 35 ms; any failure other than the explicit
+send p95 assertion fails immediately. Gate mocks cover early and late send passes,
+three overruns, strict hook failure, and non-budget failures. macOS gate mocks keep
+the first-failure scenario strict. All CI builds disable incremental compilation.
 
 Both Windows jobs also require exactly one catalog entry and a successful exact
 run of `store::tests::windows_database_releases_the_rollback_journal_pin_before_hot_recovery`

@@ -55,7 +55,7 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
         run: cargo test --locked --workspace --exclude lockyard-node -- --nocapture --skip hook_decision_p95_stays_within_budget --skip msg_send_p95_stays_within_budget
-      - name: Enforce one-attempt Windows 15/35 ms release budgets
+      - name: Enforce Windows hook once and best-of-three send release budgets
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -126,8 +126,8 @@ jobs:
           command: check
           arguments: --all-features
 
-  # One attempt, no network: hook p95 <= 15 ms everywhere; send <= 20 ms on Linux/macOS,
-  # <= 35 ms on Windows (owner decision 2026-11-08; docs/performance.md).
+  # No network: hook p95 <= 15 ms once everywhere; send <= 20 ms once on Linux/macOS.
+  # Windows send <= 35 ms best of three through the shared Windows gate (owner 2026-11-08).
   perf-budget:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -160,7 +160,7 @@ jobs:
       - run: cargo test --workspace --locked --no-fail-fast -- --nocapture --skip hook_decision_p95_stays_within_budget --skip msg_send_p95_stays_within_budget
         env:
           RUST_BACKTRACE: "1"
-      - name: Enforce one-attempt Windows 15/35 ms release budgets
+      - name: Enforce Windows hook once and best-of-three send release budgets
         shell: pwsh
         run: |
           ./tests/windows-perf-gate.test.ps1
