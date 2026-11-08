@@ -71,6 +71,8 @@ impl Server {
                     }
                     Err(error) => panic!("fixture accept failed: {error}"),
                 };
+                // Windows inherits the listener's nonblocking mode; request I/O is blocking.
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(WAIT)).unwrap();
                 stream.set_write_timeout(Some(WAIT)).unwrap();
                 let (path, body, key) = read_request(&mut stream);
