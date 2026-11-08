@@ -3,6 +3,116 @@
 use super::*;
 
 #[test]
+fn last_public_owner_joins_terminal_workers_before_immediate_restart() {
+    // Terminal visibility does not mean the worker has completed its finalization.
+    // Keep that phase parked so the old detached-owner race is deterministic.
+    let (_root, executor, ids) = synthetic_queue(1, 1);
+    let config = executor.inner.config.clone();
+    let (terminal_tx, terminal_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = Mutex::new(release_rx);
+    install_worker_hook(
+        &executor,
+        Arc::new(move |executor, id, _cancel| {
+            executor.update(id, |record| record.state = JobState::Succeeded)?;
+            terminal_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Ok(())
+        }),
+    );
+    executor.launch_ready().unwrap();
+    terminal_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(executor.status(&ids[0]).unwrap().state, JobState::Succeeded);
+    let (dropping_tx, dropping_rx) = std::sync::mpsc::sync_channel(1);
+    let (restarted_tx, restarted_rx) = std::sync::mpsc::sync_channel(1);
+    let dropping = thread::spawn(move || {
+        dropping_tx.send(()).unwrap();
+        drop(executor);
+        assert!(restarted_tx.send(Executor::new(config)).is_ok());
+    });
+    dropping_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let premature = restarted_rx.recv_timeout(Duration::from_millis(100));
+    // Always release the fixture, including when the old implementation returns early.
+    release_tx.send(()).unwrap();
+    dropping.join().unwrap();
+    assert!(
+        matches!(premature, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+        "dropping the last public owner returned before its terminal worker exited"
+    );
+    let restarted = restarted_rx.recv().unwrap();
+    assert!(
+        restarted.is_ok(),
+        "immediate restart failed: {:?}",
+        restarted.err()
+    );
+}
+
+#[test]
+fn public_clones_keep_active_work_detached_and_state_locked() {
+    let (_root, executor, ids) = synthetic_queue(1, 1);
+    let config = executor.inner.config.clone();
+    let state_dir = config.state_dir.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = Mutex::new(release_rx);
+    install_worker_hook(
+        &executor,
+        Arc::new(move |executor, id, _cancel| {
+            started_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            executor.update(id, |record| record.state = JobState::Succeeded)?;
+            Ok(())
+        }),
+    );
+    let other = executor.clone();
+    executor.launch_ready().unwrap();
+    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    drop(executor);
+    assert_eq!(other.status(&ids[0]).unwrap().state, JobState::Starting);
+    drop(other);
+    // Active execution still owns the journal after all caller handles are gone.
+    assert!(
+        matches!(Executor::new(config.clone()), Err(error) if error.0 == "executor_already_running")
+    );
+    release_tx.send(()).unwrap();
+    // This case deliberately detached active work. Observe its actual lock release,
+    // rather than an Arc strong count which reaches zero before Inner::drop runs.
+    use std::os::fd::AsRawFd;
+    let lock = File::open(config.state_dir.join("executor.lock")).unwrap();
+    while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+    }
+    drop(lock);
+    WORKER_RUN_HOOKS
+        .get()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .remove(&state_dir);
+    assert!(Executor::new(config).is_ok());
+}
+
+#[test]
+fn terminal_worker_panic_does_not_panic_in_drop_or_leave_the_state_locked() {
+    let (_root, executor, ids) = synthetic_queue(1, 1);
+    let config = executor.inner.config.clone();
+    install_worker_hook(
+        &executor,
+        Arc::new(move |executor, id, _cancel| {
+            executor.update(id, |record| record.state = JobState::Succeeded)?;
+            panic!("synthetic terminal worker panic");
+        }),
+    );
+    executor.launch_ready().unwrap();
+    wait_queue(|| executor.status(&ids[0]).unwrap().state.is_terminal());
+    drop(executor);
+    assert!(Executor::new(config).is_ok());
+}
+
+#[test]
 fn pending_maintenance_is_rechecked_after_acquiring_the_executor_lock_before_recovery() {
     use std::os::fd::AsRawFd;
     for rotation in [false, true] {

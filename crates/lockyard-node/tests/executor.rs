@@ -321,29 +321,6 @@ fn finished(executor: &Executor, id: &str) -> JobRecord {
     })
 }
 
-fn wait_for_executor_lock_release(state: &Path) {
-    use std::os::fd::AsRawFd;
-    // docs/node-queue-workers.md keeps physical workers registered through
-    // finalization and JoinHandle completion. A visible terminal result therefore
-    // precedes the coordinator dropping its last Executor/state-lock owner.
-    let lock = fs::File::open(state.join("executor.lock")).unwrap();
-    let (released, observed) = std::sync::mpsc::sync_channel(1);
-    let waiter = thread::spawn(move || {
-        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            let error = std::io::Error::last_os_error();
-            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
-        }
-        drop(lock);
-        released.send(()).unwrap();
-    });
-    // Event-driven synchronization on that exact lifecycle edge; this one-second
-    // watchdog catches a stranded lock without retrying construction or recovery.
-    observed
-        .recv_timeout(Duration::from_secs(1))
-        .expect("completed executor retained its state lock after drop");
-    waiter.join().unwrap();
-}
-
 #[test]
 #[ignore = "requires a resource-capable Docker daemon and LOCKYARD_NODE_EXECUTOR_IMAGE"]
 fn literal_arguments_deduplicate_and_preserve_dirty_checkout() {
@@ -1287,7 +1264,6 @@ fn pre_journal_crash_directory_is_quarantined_and_job_id_can_be_retried() {
     executor.submit(request.clone(), &caller()).unwrap();
     assert_eq!(finished(&executor, &request.id).state, JobState::Failed);
     drop(executor);
-    wait_for_executor_lock_release(&config.state_dir);
     assert!(Executor::new(config).is_ok());
 }
 
@@ -1882,7 +1858,6 @@ fn completed_job_recovers_missing_signature_without_reexecuting_or_changing_outc
         .join("record.json");
     fs::write(&path, serde_json::to_vec(&missing).unwrap()).unwrap();
     drop(executor);
-    wait_for_executor_lock_release(&config.state_dir);
     let recovered = Executor::new(config).unwrap();
     let result = recovered.status(&request.id).unwrap();
     assert_eq!(result.state, completed.state);

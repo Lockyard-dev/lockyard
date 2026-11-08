@@ -41,9 +41,16 @@ jobs:
       - name: Check every Windows-supported crate
         if: runner.os == 'Windows'
         run: cargo clippy --locked --workspace --exclude lockyard-node --all-targets -- -D warnings
+      - name: Diagnose concurrent pending-journal retries on Windows
+        if: runner.os == 'Windows'
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo test --locked -p lockyard-cloud-client --test pending_concurrency -- --nocapture
       - name: Test every Windows-supported crate
         if: runner.os == 'Windows'
-        run: cargo test --locked --workspace --exclude lockyard-node -- --skip hook_decision_p95_stays_within_budget --skip msg_send_p95_stays_within_budget
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo test --locked --workspace --exclude lockyard-node -- --nocapture --skip hook_decision_p95_stays_within_budget --skip msg_send_p95_stays_within_budget
       - name: Enforce unchanged performance budgets on the Windows release binary
         if: runner.os == 'Windows'
         shell: pwsh
@@ -139,7 +146,13 @@ jobs:
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - run: cargo build --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked --no-fail-fast -- --skip hook_decision_p95_stays_within_budget --skip msg_send_p95_stays_within_budget
+      - name: Diagnose concurrent pending-journal retries on Windows
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo test --locked -p lockyard-cloud-client --test pending_concurrency -- --nocapture
+      - run: cargo test --workspace --locked --no-fail-fast -- --nocapture --skip hook_decision_p95_stays_within_budget --skip msg_send_p95_stays_within_budget
+        env:
+          RUST_BACKTRACE: "1"
       - name: Enforce unchanged performance budgets on the Windows release binary
         shell: pwsh
         run: ./tools/ci/test-windows-perf.ps1

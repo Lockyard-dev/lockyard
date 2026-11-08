@@ -216,9 +216,87 @@ impl Default for ExecutionLimits {
     }
 }
 
-#[derive(Clone)]
 pub struct Executor {
     inner: Arc<Inner>,
+    public_owner: bool,
+}
+impl Clone for Executor {
+    fn clone(&self) -> Self {
+        if self.public_owner {
+            self.inner.public_owners.fetch_add(1, Ordering::Relaxed);
+        }
+        Self {
+            inner: self.inner.clone(),
+            public_owner: self.public_owner,
+        }
+    }
+}
+impl Drop for Executor {
+    fn drop(&mut self) {
+        if !self.public_owner || self.inner.public_owners.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        // A terminal record is visible before the worker finishes signing, notification
+        // capture and teardown. Drain those physical owners before returning from the
+        // last caller's drop, so an immediate restart sees the state lock released.
+        // Active executions retain their existing detached lifetime and state lock.
+        if self
+            .inner
+            .jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .any(|entry| !terminal(&entry.record.state))
+        {
+            return;
+        }
+        let coordinators = {
+            let mut registry = self
+                .inner
+                .worker_registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current = thread::current().id();
+            // A callback can itself release a caller-owned handle. It cannot join
+            // its own worker, or a coordinator which is waiting for that worker.
+            if registry
+                .workers
+                .iter()
+                .any(|worker| worker.thread.thread().id() == current)
+                || registry
+                    .coordinators
+                    .iter()
+                    .any(|thread| thread.thread().id() == current)
+            {
+                return;
+            }
+            std::mem::take(&mut registry.coordinators)
+        };
+        for coordinator in coordinators {
+            let _ = coordinator.join();
+        }
+        // A panicked coordinator may have left handles in the registry. Join them
+        // as well, recovering poisoned locks without panicking during Drop.
+        let workers = std::mem::take(
+            &mut self
+                .inner
+                .worker_registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .workers,
+        );
+        for worker in workers {
+            let _ = worker.thread.join();
+        }
+    }
+}
+impl Executor {
+    fn worker_handle(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            public_owner: false,
+        }
+    }
 }
 struct WorkspaceKeyContext {
     workspace: String,
@@ -233,6 +311,7 @@ struct Inner {
     notifications: Option<crate::job_notifications::SharedOutbox>,
     notification_capture_failures: std::sync::atomic::AtomicU64,
     jobs: Mutex<BTreeMap<String, Entry>>,
+    public_owners: std::sync::atomic::AtomicUsize,
     worker_signal: Arc<WorkerSignal>,
     worker_registry: Mutex<WorkerRegistry>,
     dispatch_failed: AtomicBool,
@@ -275,6 +354,7 @@ impl WorkerSignal {
 #[derive(Default)]
 struct WorkerRegistry {
     workers: Vec<WorkerHandle>,
+    coordinators: Vec<thread::JoinHandle<()>>,
     coordinator_running: bool,
 }
 struct WorkerHandle {

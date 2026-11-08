@@ -231,15 +231,25 @@ impl Executor {
             self.inner.dispatch_failed.store(true, Ordering::SeqCst);
             return Err(ExecutorError("job_coordinator_failed"));
         }
-        let executor = self.clone();
-        if thread::Builder::new()
+        let mut index = 0;
+        while index < registry.coordinators.len() {
+            if registry.coordinators[index].is_finished() {
+                let _ = registry.coordinators.swap_remove(index).join();
+            } else {
+                index += 1;
+            }
+        }
+        let executor = self.worker_handle();
+        match thread::Builder::new()
             .name("lockyard-job-coordinator".into())
             .spawn(move || executor.coordinate_workers())
-            .is_err()
         {
-            registry.coordinator_running = false;
-            self.inner.dispatch_failed.store(true, Ordering::SeqCst);
-            return Err(ExecutorError("job_coordinator_failed"));
+            Ok(coordinator) => registry.coordinators.push(coordinator),
+            Err(_) => {
+                registry.coordinator_running = false;
+                self.inner.dispatch_failed.store(true, Ordering::SeqCst);
+                return Err(ExecutorError("job_coordinator_failed"));
+            }
         }
         Ok(())
     }
@@ -303,7 +313,7 @@ impl Executor {
     }
     pub(super) fn coordinate_workers(&self) {
         let mut exit = CoordinatorExit {
-            executor: self.clone(),
+            executor: self.worker_handle(),
             finished: false,
         };
         loop {
@@ -354,7 +364,7 @@ impl Executor {
                 let id = claimed.id.clone();
                 let current = Arc::new(Mutex::new(Some(id.clone())));
                 let tracker = current.clone();
-                let executor = self.clone();
+                let executor = self.worker_handle();
                 #[cfg(test)]
                 let injected = FAIL_WORKER_SPAWN.get().is_some_and(|states| {
                     states.lock().unwrap().remove(&self.inner.config.state_dir)

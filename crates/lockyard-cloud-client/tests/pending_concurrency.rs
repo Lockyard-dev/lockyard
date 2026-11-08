@@ -124,13 +124,29 @@ impl Server {
                 true,
             )
     }
+
+    fn shutdown(&mut self) -> std::thread::Result<()> {
+        self.stop.store(true, Ordering::Release);
+        self.worker.take().map_or(Ok(()), |worker| worker.join())
+    }
+
+    fn finish(mut self) {
+        // Report a worker failure on the normal path, before unwinding starts.
+        if let Err(failure) = self.shutdown() {
+            std::panic::resume_unwind(failure);
+        }
+    }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            worker.join().unwrap();
+        if self.shutdown().is_err() {
+            // The worker's panic hook already printed its cause. Panicking again here can
+            // abort the process while another assertion is unwinding, hiding both failures.
+            let _ = writeln!(
+                std::io::stderr(),
+                "pending-concurrency fixture worker failed during cleanup"
+            );
         }
     }
 }
@@ -289,6 +305,7 @@ fn concurrent_retry(same_client: bool) {
         !did_overlap,
         "two retries transmitted concurrently for one pending operation"
     );
+    server.finish();
 }
 
 #[test]
@@ -299,4 +316,38 @@ fn restored_clients_cannot_overlap_or_recreate_safe_refusal() {
 #[test]
 fn deferred_retries_share_one_in_flight_send() {
     concurrent_retry(true);
+}
+
+#[test]
+fn fixture_cleanup_preserves_failure_instead_of_aborting() {
+    const CHILD: &str = "LOCKYARD_PENDING_FIXTURE_UNWIND";
+    if std::env::var_os(CHILD).is_some() {
+        let (_sender, requests) = mpsc::channel();
+        let _server = Server {
+            url: String::new(),
+            requests,
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: Some(std::thread::spawn(|| panic!("injected fixture failure"))),
+        };
+        panic!("original caller failure");
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "fixture_cleanup_preserves_failure_instead_of_aborting",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("RUST_BACKTRACE", "0")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(101),
+        "fixture cleanup must preserve the ordinary test failure: {stderr}"
+    );
+    assert!(stderr.contains("original caller failure"), "{stderr}");
+    assert!(stderr.contains("injected fixture failure"), "{stderr}");
+    assert!(!stderr.contains("panic in a destructor"), "{stderr}");
 }

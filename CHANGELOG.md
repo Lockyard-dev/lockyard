@@ -5,6 +5,13 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-11-08
+
+### Fixed
+
+- Join terminal executor workers before releasing the last caller handle, eliminating the state-lock race during immediate restart.
+- Preserve pending-journal fixture failures without destructor double panics and enable Windows CI panic backtraces.
+
 ## [0.3.0] - 2026-11-08
 
 ### Added

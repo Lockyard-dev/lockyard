@@ -542,6 +542,7 @@ impl Executor {
                 notifications,
                 notification_capture_failures: std::sync::atomic::AtomicU64::new(0),
                 jobs: Mutex::new(jobs),
+                public_owners: std::sync::atomic::AtomicUsize::new(1),
                 worker_signal: Arc::new(WorkerSignal::default()),
                 worker_registry: Mutex::new(WorkerRegistry::default()),
                 dispatch_failed: AtomicBool::new(false),
@@ -554,6 +555,7 @@ impl Executor {
                 _workspace_key_guard: workspace_key_guard,
                 _managed_binary_guard: managed_binary_guard,
             }),
+            public_owner: true,
         };
         executor.purge_expired()?;
         // Recover only a missing local signature. This never relaunches a completed execution.
