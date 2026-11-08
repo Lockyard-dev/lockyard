@@ -2028,8 +2028,11 @@ mod windows_tests {
     #[test]
     fn windows_pe_image_requires_platform_size_and_exact_signed_hash() {
         let root = tempfile::tempdir().unwrap();
-        lockyard_core::windows::secure_owned(root.path()).unwrap();
-        let path = root.path().join("candidate.exe");
+        // Hosted Windows TEMP can contain the 8.3 alias RUNNER~1. Managed
+        // updates reject aliases, so use the final path for this PE fixture.
+        let canonical = root.path().canonicalize().unwrap();
+        lockyard_core::windows::secure_owned(&canonical).unwrap();
+        let path = canonical.join("candidate.exe");
         let mut image = vec![0u8; 128];
         image[..2].copy_from_slice(b"MZ");
         image[60..64].copy_from_slice(&64u32.to_le_bytes());

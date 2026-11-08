@@ -1190,6 +1190,60 @@ mod tests {
         );
     }
 
+    fn file_dacl(file: &File) -> (LocalAllocation, *mut ACL) {
+        let mut dacl = ptr::null_mut();
+        let mut descriptor = ptr::null_mut();
+        let result = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(result, ERROR_SUCCESS, "read the real file's DACL");
+        assert!(!dacl.is_null());
+        (LocalAllocation(descriptor), dacl)
+    }
+
+    fn replace_file_dacl(file: &File, dacl: *mut ACL) -> (LocalAllocation, *mut ACL) {
+        // Use a security read/write handle for SetSecurityInfo and readback.
+        // A WRITE_DAC-only reopen failed with ERROR_ACCESS_DENIED in native CI.
+        // Reopen the same object instead of resolving its pathname again.
+        let handle = unsafe {
+            ReOpenFile(
+                file.as_raw_handle(),
+                READ_CONTROL | WRITE_DAC,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+            )
+        };
+        assert_ne!(
+            handle,
+            INVALID_HANDLE_VALUE,
+            "security reopen: {}",
+            io::Error::last_os_error()
+        );
+        let handle = unsafe { File::from_raw_handle(handle) };
+        let result = unsafe {
+            SetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                dacl,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(result, ERROR_SUCCESS, "install the test DACL");
+        file_dacl(&handle)
+    }
+
     #[test]
     fn default_owner_is_normalized_only_after_the_private_acl_is_validated() {
         let root = tempfile::tempdir().unwrap();
@@ -1507,32 +1561,21 @@ mod tests {
             checked(GetAce(dacl, 0, &mut ace)).unwrap();
             (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask = READ_CONTROL;
         }
-        let handle = unsafe {
-            ReOpenFile(
-                file.as_raw_handle(),
-                WRITE_DAC,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                0,
-            )
-        };
-        assert_ne!(handle, INVALID_HANDLE_VALUE);
-        let handle = unsafe { File::from_raw_handle(handle) };
+        let (_actual_descriptor, actual_dacl) = replace_file_dacl(&file, dacl);
+        assert_user_owner(&file);
+        assert_eq!(unsafe { (*actual_dacl).AceCount }, 1);
+        let mut ace = ptr::null_mut();
+        unsafe {
+            checked(GetAce(actual_dacl, 0, &mut ace)).unwrap();
+        }
         assert_eq!(
-            unsafe {
-                SetSecurityInfo(
-                    handle.as_raw_handle(),
-                    SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    dacl,
-                    ptr::null_mut(),
-                )
-            },
-            0
+            unsafe { (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask },
+            READ_CONTROL,
+            "the real file must retain the intentionally incomplete owner mask"
         );
-        assert!(
-            require_private_file(&file).is_err(),
+        assert_eq!(
+            require_private_file(&file).unwrap_err().to_string(),
+            denied().to_string(),
             "owner SID alone cannot make an incomplete ACL acceptable"
         );
     }
@@ -1621,22 +1664,7 @@ mod tests {
             .create_new(true)
             .open(directory.path().join("state"))
             .unwrap();
-        let mut dacl = ptr::null_mut();
-        let mut descriptor = ptr::null_mut();
-        let result = unsafe {
-            GetSecurityInfo(
-                file.as_raw_handle(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &mut dacl,
-                ptr::null_mut(),
-                &mut descriptor,
-            )
-        };
-        assert_eq!(result, 0);
-        let _descriptor = LocalAllocation(descriptor);
+        let (_descriptor, dacl) = file_dacl(&file);
         let mut guest = ptr::null_mut();
         unsafe {
             checked(ConvertStringSidToSidW(
@@ -1688,30 +1716,21 @@ mod tests {
             ))
             .unwrap();
         }
-        let handle = unsafe {
-            ReOpenFile(
-                file.as_raw_handle(),
-                WRITE_DAC,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                0,
-            )
-        };
-        assert_ne!(handle, INVALID_HANDLE_VALUE);
-        let _handle = unsafe { File::from_raw_handle(handle) };
+        let (_actual_descriptor, actual_dacl) = replace_file_dacl(&file, dacl);
+        assert_user_owner(&file);
         assert_eq!(
-            unsafe {
-                SetSecurityInfo(
-                    handle,
-                    SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    dacl,
-                    ptr::null_mut(),
-                )
-            },
-            0
+            unsafe { GetEffectiveRightsFromAclW(actual_dacl, &trustee, &mut rights) },
+            ERROR_SUCCESS
         );
-        assert!(require_private_file(&file).is_err());
+        assert_ne!(
+            rights & FILE_READ_DATA,
+            0,
+            "the real file must contain the intentionally added foreign read grant"
+        );
+        assert_eq!(
+            require_private_file(&file).unwrap_err().to_string(),
+            denied().to_string(),
+            "a foreign allow ACE must be refused by ACL validation"
+        );
     }
 }

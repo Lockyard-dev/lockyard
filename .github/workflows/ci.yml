@@ -29,7 +29,15 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
         if: runner.os != 'Windows'
       - run: cargo test --locked --workspace
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
+      - name: Test every macOS crate except the two release performance budgets
+        if: runner.os == 'macOS'
+        run: cargo test --locked --workspace -- --exact --skip hook_decision_p95_stays_within_budget --skip msg_send_p95_stays_within_budget
+      - name: Enforce unchanged performance budgets on the macOS release binary
+        if: runner.os == 'macOS'
+        run: |
+          sh tests/macos-perf-gate.test.sh
+          sh tools/ci/test-macos-perf.sh
       - name: Check every Windows-supported crate
         if: runner.os == 'Windows'
         run: cargo clippy --locked --workspace --exclude lockyard-node --all-targets -- -D warnings

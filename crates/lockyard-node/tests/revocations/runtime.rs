@@ -2,6 +2,12 @@
 use super::*;
 #[tokio::test]
 async fn direct_only_daemon_refreshes_on_sse_and_timer_without_relay() {
+    // Keep the timer outside the SSE deadline, then prove polling with SSE disabled.
+    daemon_refresh_scenario(30, true).await;
+    daemon_refresh_scenario(1, false).await;
+}
+
+async fn daemon_refresh_scenario(poll_seconds: u64, send_events: bool) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let root = tempfile::tempdir().unwrap();
@@ -34,7 +40,7 @@ async fn direct_only_daemon_refreshes_on_sse_and_timer_without_relay() {
     );
     let mut settings = config();
     settings.trust.server_origin = url.clone();
-    settings.poll_seconds = 1;
+    settings.poll_seconds = poll_seconds;
     let epoch = Arc::new(AtomicU64::new(0));
     let events = Arc::new(tokio::sync::Notify::new());
     let gets = Arc::new(AtomicU64::new(0));
@@ -88,13 +94,14 @@ async fn direct_only_daemon_refreshes_on_sse_and_timer_without_relay() {
                         return;
                     }
                     let (kind, body) = if path.starts_with("/api/v1/revocations/events") {
-                        let changed =
-                            tokio::time::timeout(Duration::from_millis(500), events.notified())
-                                .await
-                                .is_ok();
+                        // An idle SSE request remains connected until an event. Closing
+                        // every 500 ms races the client's reconnect backoff on busy runners.
+                        if send_events {
+                            events.notified().await;
+                        }
                         (
                             "text/event-stream",
-                            if changed {
+                            if send_events {
                                 format!(
                                     "event: revocations_changed\ndata: {{\"epoch\":{}}}\n\n",
                                     epoch.load(Ordering::SeqCst)
@@ -164,13 +171,15 @@ async fn direct_only_daemon_refreshes_on_sse_and_timer_without_relay() {
     let key_file = key_dir.join(format!("{}.key", config().trust.workspace_id));
     std::fs::write(&key_file, [7; 32]).unwrap();
     fixture_permissions(key_file, 0o600).unwrap();
-    let mut daemon = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "runtime::runtime_daemon_child", "--nocapture"])
-        .env("XDG_CONFIG_HOME", root_path.join("config"))
-        .env("LOCKYARD_REVOCATION_DAEMON_CONFIG", &path)
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let daemon = RuntimeDaemon(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "runtime::runtime_daemon_child", "--nocapture"])
+            .env("XDG_CONFIG_HOME", root_path.join("config"))
+            .env("LOCKYARD_REVOCATION_DAEMON_CONFIG", &path)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(status) = lockyard_node::host::status(&path).await
@@ -188,8 +197,12 @@ async fn direct_only_daemon_refreshes_on_sse_and_timer_without_relay() {
     .unwrap();
     let initial = gets.load(Ordering::SeqCst);
     epoch.store(1, Ordering::SeqCst);
-    events.notify_one();
-    tokio::time::timeout(Duration::from_millis(750), async {
+    if send_events {
+        events.notify_one();
+    }
+    // Five seconds is still below the 30-second SSE scenario's poll interval.
+    // The other scenario receives no event, so only its one-second timer can refresh.
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if lockyard_node::host::status(&path)
                 .await
@@ -207,12 +220,11 @@ async fn direct_only_daemon_refreshes_on_sse_and_timer_without_relay() {
     .await
     .unwrap();
     assert!(gets.load(Ordering::SeqCst) > initial);
-    let refreshed = gets.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    assert!(gets.load(Ordering::SeqCst) > refreshed);
     limited.store(true, Ordering::SeqCst);
-    events.notify_one();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    if send_events {
+        events.notify_one();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if lockyard_node::host::status(&path)
                 .await
@@ -239,11 +251,19 @@ async fn direct_only_daemon_refreshes_on_sse_and_timer_without_relay() {
         blocked,
         "timer or SSE wake bypassed Retry-After"
     );
-    daemon.kill().unwrap();
-    daemon.wait().unwrap();
+    drop(daemon);
     http.abort();
     let _ = http.await;
 }
+// A failed assertion must not leave a subprocess using the temporary state directory.
+struct RuntimeDaemon(std::process::Child);
+impl Drop for RuntimeDaemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn runtime_daemon_child() {
     if let Some(path) = std::env::var_os("LOCKYARD_REVOCATION_DAEMON_CONFIG") {
