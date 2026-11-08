@@ -2,17 +2,24 @@
 # Local CLI performance budgets
 
 `crates/lockyard/tests/perf_budget.rs` measures 80 raw subprocess samples per test,
-including process startup and durable SQLite writes. Hook decision gets one attempt
-on every OS; macOS/Linux message send also gets one attempt. Only Windows message
-send gets three attempts, and the best p95 must meet its budget. Each attempt prints
-its own raw p95; samples are never filtered. Product, build and fixture failures stop
-the gate immediately. Diagnostic runs never replace a budget result.
+including process startup and durable SQLite writes. GitHub-hosted macOS uses the
+best of three attempts independently for hook decision and message send. Windows
+uses one hook attempt and the best of three send attempts; Linux uses one attempt
+per test. All three configured attempts run even after an early pass, and each
+measured attempt prints its own raw p95; samples are never filtered. Product,
+build and fixture failures stop the gate immediately. Diagnostic runs never replace
+a budget result.
 
-| Platform | Hook decision p95 | Message send p95 |
+| CI platform | Hook decision p95 | Message send p95 |
 | --- | --- | --- |
-| macOS | ≤ 15 ms | ≤ 20 ms |
-| Linux | ≤ 15 ms | ≤ 20 ms |
-| Windows | ≤ 15 ms | ≤ 35 ms |
+| GitHub-hosted macOS | ≤ 15 ms, best of three | ≤ 20 ms, best of three |
+| Linux | ≤ 15 ms, one attempt | ≤ 20 ms, one attempt |
+| Windows | ≤ 15 ms, one attempt | ≤ 35 ms, best of three |
+
+The macOS attempt policy follows the owner's 2026-11-09 decision. In
+[CI run 42517683446](https://github.com/lockyard-dev/lockyard/actions/runs/42517683446),
+the hosted macOS hook p95 was 18.5 ms in its single attempt, versus 5.8 ms in earlier
+hosted runs. The hook/send ceilings remain 15/20 ms.
 
 The Windows send threshold follows the owner's 2026-11-08 decision. In
 [CI run 42504694714](https://github.com/lockyard-dev/lockyard/actions/runs/42504694714),
@@ -23,8 +30,8 @@ maximum about 40 ms. SQLite `synchronous=FULL` commits tracked `FlushFileBuffers
 it is a p95 ceiling, not a maximum-latency guarantee. Across four hosted runs the
 worst send p95s were approximately 22/29/64/134 ms, including 63.5 ms in
 [CI run 42508801763](https://github.com/lockyard-dev/lockyard/actions/runs/42508801763).
-The owner therefore approved best-of-three acceptance for Windows send only on
-2026-11-08. Hook decision stays at one attempt; FULL durability is unchanged.
+The owner therefore approved best-of-three acceptance for Windows send on
+2026-11-08. Windows hook decision stays at one attempt; FULL durability is unchanged.
 
 The send gate warms both agents before sampling. The separate diagnostic
 `send_due` case creates a new sender per sample and also commits its heartbeat;
@@ -33,12 +40,14 @@ not the warm-sender acceptance fixture, and the budget does not bound its latenc
 
 Windows and macOS CI enforce the release binary serially through
 `tools/ci/test-windows-perf.ps1` and `tools/ci/test-macos-perf.sh`; Linux runs the
-same budget tests serially. Both Windows jobs invoke the same PowerShell gate,
-which runs the hook exactly once and all three send attempts. It fails the send
-budget only when all three p95s exceed 35 ms; any failure other than the explicit
-send p95 assertion fails immediately. Gate mocks cover early and late send passes,
-three overruns, strict hook failure, and non-budget failures. macOS gate mocks keep
-the first-failure scenario strict. All CI builds disable incremental compilation.
+same budget tests serially. Both wrappers use `tools/ci/perf-budget-gate.py` for
+the attempt policy, including the macOS gate invoked by `rust (macos-15)`.
+A three-attempt test fails its budget only when all three p95s exceed its ceiling.
+Only that test's explicit p95 assertion permits another attempt; every other
+failure stops immediately, even after an earlier passing attempt. Acceptance uses
+the Rust assertion result, not the microsecond-truncated diagnostic p95.
+Gate mocks cover early and late passes, three overruns, strict Windows hook failure,
+and immediate product/build failures. All CI builds disable incremental compilation.
 
 Both Windows jobs also require exactly one catalog entry and a successful exact
 run of `store::tests::windows_database_releases_the_rollback_journal_pin_before_hot_recovery`

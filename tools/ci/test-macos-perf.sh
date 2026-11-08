@@ -6,13 +6,7 @@ export CARGO_INCREMENTAL=0
 # Measure the shipped profile: raw subprocess p95 hook <= 15 ms, send <= 20 ms.
 # Emit hot-path spans before the strict gate, even when that gate exceeds its budget.
 cargo test --locked --release -p lockyard --test perf_profile -- --ignored --test-threads=1 --nocapture
-catalog=$(cargo test --locked --release -p lockyard --test perf_budget -- --list)
-listed=$(printf '%s\n' "$catalog" | sed -n 's/: test$//p' | LC_ALL=C sort)
-expected=$(printf '%s\n' hook_decision_p95_stays_within_budget msg_send_p95_stays_within_budget)
-if [ "$listed" != "$expected" ]; then
-    printf '%s\n' 'Expected exactly the hook decision and msg send performance budget tests' >&2
-    printf '%s\n' "$catalog" >&2
-    exit 1
-fi
-# Keep the first run's result: a later successful run must not hide an overrun.
-exec cargo test --locked --release -p lockyard --test perf_budget -- --test-threads=1 --nocapture
+# Owner decision 2026-11-09: best of all three attempts for each hosted macOS budget.
+# Share Windows' classifier: only an explicit p95 overrun may be retried.
+script_dir=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
+exec python3 "$script_dir/perf-budget-gate.py" macos

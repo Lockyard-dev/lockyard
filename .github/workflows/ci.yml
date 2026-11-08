@@ -37,7 +37,7 @@ jobs:
       - name: Test every macOS crate except the two release performance budgets
         if: runner.os == 'macOS'
         run: cargo test --locked --workspace -- --exact --skip hook_decision_p95_stays_within_budget --skip msg_send_p95_stays_within_budget
-      - name: Enforce one-attempt macOS 15/20 ms release budgets
+      - name: Enforce best-of-three macOS 15/20 ms release budgets
         if: runner.os == 'macOS'
         run: |
           sh tests/macos-perf-gate.test.sh
@@ -126,8 +126,8 @@ jobs:
           command: check
           arguments: --all-features
 
-  # No network: hook p95 <= 15 ms once everywhere; send <= 20 ms once on Linux/macOS.
-  # Windows send <= 35 ms best of three through the shared Windows gate (owner 2026-11-08).
+  # No network: Linux hook/send <= 15/20 ms once. Hosted macOS uses best of three for both.
+  # Windows keeps hook <= 15 ms once and send <= 35 ms best of three via the same classifier.
   perf-budget:
     runs-on: ubuntu-latest
     timeout-minutes: 15
