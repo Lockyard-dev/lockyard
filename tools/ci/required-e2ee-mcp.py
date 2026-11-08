@@ -23,7 +23,8 @@ WORKSPACE = "123e4567-e89b-12d3-a456-426614174000"
 results = []
 
 
-def run_case(name, has_key=True, server_workspace=WORKSPACE, force_workspace=WORKSPACE):
+def run_case(name, has_key=True, server_workspace=WORKSPACE, force_workspace=WORKSPACE,
+             malformed_discovery=False):
     root = ROOT / name
     root.mkdir(mode=0o700, exist_ok=True)
     project = root / "project"
@@ -38,6 +39,7 @@ def run_case(name, has_key=True, server_workspace=WORKSPACE, force_workspace=WOR
         key_file.chmod(0o600)
     token = secrets.token_urlsafe(32)
     requests = []
+    unexpected_routes = []
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -46,7 +48,8 @@ def run_case(name, has_key=True, server_workspace=WORKSPACE, force_workspace=WOR
         def answer(self, status, value):
             encoded = json.dumps(value).encode()
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/problem+json"
+                             if status >= 400 and "type" in value else "application/json")
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)
@@ -54,16 +57,35 @@ def run_case(name, has_key=True, server_workspace=WORKSPACE, force_workspace=WOR
         def do_GET(self):
             requests.append({"method": "GET", "path": self.path})
             assert self.headers.get("Authorization") == "Bearer " + token
-            if self.path == "/api/v1/workspace/encryption":
+            if self.path == "/api/v1/protocol":
+                # EP-10: only a well-formed 404/405 followed by the typed encryption
+                # probe establishes legacy protocol 1. Pre-negotiation errors use
+                # Problem Details with a matching legacy extension (ERRORS.md).
+                if malformed_discovery:
+                    self.answer(404, {"error": "unexpected fixture route"})
+                else:
+                    self.answer(404, {"type": "urn:lockyard:problem:not_found",
+                                      "title": "Not Found", "status": 404,
+                                      "detail": "Legacy server has no discovery endpoint",
+                                      "instance": "urn:lockyard:fixture:discovery",
+                                      "code": "not_found", "details": None,
+                                      "error": {"code": "not_found", "message": "Not Found",
+                                                "details": None}})
+            elif self.path == "/api/v1/workspace/encryption":
                 self.answer(200, {"workspace_id": server_workspace, "encryption": "off", "key_id": None})
             elif self.path.split("?", 1)[0] == "/api/v1/presence":
                 # The production MCP registers its session before the first coordination call.
                 # This session is already present, so no unrelated heartbeat write is needed.
                 self.answer(200, [{"session": "node-fixture"}])
             else:
-                self.answer(404, {"error": "unexpected fixture route"})
+                unexpected_routes.append(self.path)
+                self.answer(404, {"error": {"code": "not_found", "message": "Unexpected route"}})
 
         def do_POST(self):
+            if self.path != "/api/v1/bus/messages":
+                unexpected_routes.append(self.path)
+                self.answer(404, {"error": {"code": "not_found", "message": "Unexpected route"}})
+                return
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             assert self.headers.get("Authorization") == "Bearer " + token
             private = body.get("body", "")
@@ -118,10 +140,17 @@ def run_case(name, has_key=True, server_workspace=WORKSPACE, force_workspace=WOR
     response = json.loads(result.stdout.splitlines()[-1])
     is_error = response.get("result", {}).get("isError", False) or "error" in response
     posts = [request for request in requests if request["method"] == "POST"]
-    expected_success = has_key and server_workspace == force_workspace == WORKSPACE
+    expected_success = (has_key and server_workspace == force_workspace == WORKSPACE
+                        and not malformed_discovery)
     assert bool(is_error) != expected_success, (name, response)
+    assert not unexpected_routes, (name, unexpected_routes)
+    if malformed_discovery:
+        assert response["result"]["structuredContent"]["code"] == "protocol_response_invalid", response
+        assert requests == [{"method": "GET", "path": "/api/v1/protocol"}], requests
     assert not legacy_connections, "forced node context contacted an unverified legacy agent"
     if expected_success:
+        assert requests[:2] == [{"method": "GET", "path": "/api/v1/protocol"},
+                               {"method": "GET", "path": "/api/v1/workspace/encryption"}], requests
         assert len(posts) == 1 and posts[0]["encrypted"] and posts[0]["plaintext_absent"]
         assert "MCP-PRIVATE-SENTINEL" in json.dumps(response), "local reply was not decrypted"
     else:
@@ -132,7 +161,8 @@ def run_case(name, has_key=True, server_workspace=WORKSPACE, force_workspace=WOR
 
 for name, case_options in [("legacy-off-forced-encrypted", {}), ("missing-key", {"has_key": False}),
                       ("wrong-workspace", {"server_workspace": "different-workspace"}),
-                      ("missing-workspace-policy", {"force_workspace": ""})]:
+                      ("missing-workspace-policy", {"force_workspace": ""}),
+                      ("malformed-discovery-refused", {"malformed_discovery": True})]:
     results.append(run_case(name, **case_options))
 report = {"binary_sha256": hashlib.sha256(BINARY.read_bytes()).hexdigest(),
           "scope": "actual MCP child + synthetic HTTP fixture; no resource-enforced container or model call", "cases": results}

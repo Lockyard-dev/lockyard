@@ -2,6 +2,8 @@
 
     /// A fake backend that logs what happens, in order.
     struct Recording {
+        root: std::path::PathBuf,
+        _directory: tempfile::TempDir,
         log: Rc<RefCell<Vec<String>>>,
         unread: Option<i64>,
         mail: Option<Vec<Message>>,
@@ -10,7 +12,7 @@
 
     impl Port for Recording {
         fn root(&self) -> &Path {
-            Path::new("/")
+            &self.root
         }
         fn check(&mut self, _: &str, path: &str, _: i64) -> Result<Verdict> {
             self.log.borrow_mut().push(format!("check {path}"));
@@ -58,8 +60,11 @@
         mail: Option<Vec<Message>>,
     ) -> (Recording, Rc<RefCell<Vec<String>>>) {
         let log = Rc::new(RefCell::new(Vec::new()));
+        let directory = tempfile::tempdir().unwrap();
         (
             Recording {
+                root: directory.path().canonicalize().unwrap(),
+                _directory: directory,
                 log: Rc::clone(&log),
                 unread,
                 mail,
@@ -126,14 +131,15 @@
     fn an_unknown_zone_state_is_refused() {
         let (mut port, log) = recording(None, None);
         port.verdict = Some(Verdict::Unknown);
-        let event = json!({"hook_event_name": "PreToolUse", "tool_name": "Edit", "tool_input": {"file_path": "/src/a.rs"}});
+        let root = port.root().to_path_buf();
+        let event = json!({"hook_event_name": "PreToolUse", "tool_name": "Edit", "tool_input": {"file_path": root.join("src/a.rs")}});
         let mut out = Vec::new();
         handle(
             Tool::Claude,
             &mut port,
             &event,
             "me",
-            Path::new("/"),
+            &root,
             1,
             &lockyard_core::machine::MachineConfig::default(),
             &mut out,
@@ -154,10 +160,11 @@
     fn failed_hook_zone_checks_deny_without_reporting_a_running_tool() {
         for tool in [Tool::Claude, Tool::Codex, Tool::Cursor] {
             let (mut port, log) = recording(None, None);
+            let root = port.root().to_path_buf();
             let event = json!({
                 "hook_event_name": "PreToolUse",
                 "tool_name": "Edit",
-                "tool_input": {"file_path": "/src/a.rs"},
+                "tool_input": {"file_path": root.join("src/a.rs")},
             });
             let mut out = Vec::new();
             handle(
@@ -165,7 +172,7 @@
                 &mut port,
                 &event,
                 "me",
-                Path::new("/"),
+                &root,
                 1,
                 &lockyard_core::machine::MachineConfig::default(),
                 &mut out,
@@ -224,14 +231,15 @@
         port.verdict = Some(Verdict::Held(Box::new(
             serde_json::from_value(json!({"path":"src/a.rs","agent":"holder","claim":1})).unwrap(),
         )));
-        let event = json!({"hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":"/src/a.rs"}});
+        let root = port.root().to_path_buf();
+        let event = json!({"hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":root.join("src/a.rs")}});
         let mut out = Vec::new();
         handle(
             Tool::Claude,
             &mut port,
             &event,
             "me",
-            Path::new("/"),
+            &root,
             1,
             &lockyard_core::machine::MachineConfig::default(),
             &mut out,

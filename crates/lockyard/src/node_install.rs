@@ -27,8 +27,9 @@ fn render(lockyard: &Path, sandbox: &Path) -> Result<String> {
         let value = path
             .to_str()
             .ok_or_else(|| Error::Invalid("invalid_apparmor_binary_path".into()))?;
-        // AppArmor attachment paths are globs even inside quotes. Restrict them to literals.
-        if !path.is_absolute()
+        // AppArmor uses Linux paths, including when its renderer is tested on Windows.
+        // Attachment paths are globs even inside quotes. Restrict them to literals.
+        if !value.starts_with('/')
             || value == "/"
             || !value
                 .bytes()
@@ -241,7 +242,10 @@ mod tests {
         assert!(!single.contains("profile lockyard-sandbox"));
         assert!(!profile.contains("@LOCKYARD_BINARY@"));
         for invalid in [
+            "",
             "relative",
+            "C:/opt/lockyard",
+            r"C:\opt\lockyard",
             "/opt/*",
             "/opt/a\"b",
             "/opt/a b",
@@ -249,6 +253,7 @@ mod tests {
             "/",
         ] {
             assert!(render(Path::new(invalid), Path::new("/opt/lockyard-sandbox")).is_err());
+            assert!(render(Path::new("/opt/lockyard"), Path::new(invalid)).is_err());
         }
     }
 }

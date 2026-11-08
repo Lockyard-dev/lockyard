@@ -387,6 +387,24 @@ fn credential_job_export_is_signed_results_only_and_restores_without_a_runnable_
         "export-metadata.json" | "output.log" | "result.patch"
     )));
     let restored = root.path().join("offline");
+    if !cfg!(any(target_os = "linux", windows)) {
+        let archived = fs::read(&archive).unwrap();
+        let rejected = crate::archive::restore_offline(
+            &archive,
+            &restored,
+            "workspace",
+            &key,
+            "worker",
+            &trusted,
+        );
+        assert_eq!(
+            rejected.unwrap_err().0,
+            "archive_restore_platform_unsupported"
+        );
+        assert!(!restored.exists());
+        assert_eq!(fs::read(&archive).unwrap(), archived);
+        return;
+    }
     crate::archive::restore_offline(&archive, &restored, "workspace", &key, "worker", &trusted)
         .unwrap();
     assert!(!restored.join("files/record.json").exists());

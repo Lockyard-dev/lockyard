@@ -49,6 +49,9 @@ impl Drop for LocalAllocation {
     }
 }
 fn token_user() -> io::Result<Vec<usize>> {
+    token_information(TokenUser)
+}
+fn token_information(class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<usize>> {
     let mut token = ptr::null_mut();
     unsafe {
         checked(OpenProcessToken(
@@ -60,25 +63,59 @@ fn token_user() -> io::Result<Vec<usize>> {
     let token = unsafe { OwnedHandle::from_raw_handle(token) };
     let mut size = 0;
     unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            TokenUser,
-            ptr::null_mut(),
-            0,
-            &mut size,
-        );
+        GetTokenInformation(token.as_raw_handle(), class, ptr::null_mut(), 0, &mut size);
     }
     let mut bytes = vec![0usize; (size as usize).div_ceil(size_of::<usize>())];
     unsafe {
         checked(GetTokenInformation(
             token.as_raw_handle(),
-            TokenUser,
+            class,
             bytes.as_mut_ptr().cast(),
             size,
             &mut size,
         ))?;
     }
     Ok(bytes)
+}
+
+fn is_default_owner(owner: PSID) -> io::Result<bool> {
+    let token = token_information(TokenOwner)?;
+    let expected = unsafe { (*token.as_ptr().cast::<TOKEN_OWNER>()).Owner };
+    Ok(!owner.is_null() && unsafe { EqualSid(owner, expected) } != 0)
+}
+
+// Elevated Windows tokens can default to Administrators as an object's owner,
+// even when the creating library inherited our user-only DACL. Normalize only
+// that token's own default owner to TokenUser, through the same opened object.
+// No privileges are enabled and no arbitrary user/group ownership is accepted.
+fn set_file_user_owner(handle: HANDLE, sid: PSID) -> io::Result<()> {
+    let handle = unsafe {
+        ReOpenFile(
+            handle,
+            WRITE_OWNER | READ_CONTROL | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_handle(handle) };
+    let result = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            sid,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result as i32));
+    }
+    Ok(())
 }
 pub fn user_id() -> io::Result<String> {
     let bytes = token_user()?;
@@ -310,7 +347,11 @@ fn require_private_handle(handle: HANDLE, kind: SE_OBJECT_TYPE) -> io::Result<()
     let _allocation = LocalAllocation(descriptor);
     let user = token_user()?;
     let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-    if owner.is_null() || dacl.is_null() || unsafe { EqualSid(owner, sid) } == 0 {
+    if owner.is_null() || dacl.is_null() {
+        return Err(denied());
+    }
+    let user_owned = unsafe { EqualSid(owner, sid) } != 0;
+    if !user_owned && (kind != SE_FILE_OBJECT || !is_default_owner(owner)?) {
         return Err(denied());
     }
     let acl = unsafe { &*dacl };
@@ -340,6 +381,12 @@ fn require_private_handle(handle: HANDLE, kind: SE_OBJECT_TYPE) -> io::Result<()
     }
     if !allowed {
         return Err(denied());
+    }
+    if !user_owned {
+        // Existing private files from SQLite or another native library may
+        // carry TokenOwner. Validate every ACE before changing ownership: an
+        // exposed file must still be rejected without repairing its ACL.
+        set_file_user_owner(handle, sid)?;
     }
     Ok(())
 }
@@ -587,7 +634,10 @@ fn secure_file_owned(file: &File) -> io::Result<()> {
     let user = token_user()?;
     let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
     if unsafe { EqualSid(owner, sid) } == 0 {
-        return Err(denied());
+        if !is_default_owner(owner)? {
+            return Err(denied());
+        }
+        set_file_user_owner(handle, sid)?;
     }
     let security = Security::new()?;
     let mut present = 0;
@@ -972,9 +1022,11 @@ fn rename_opened_handle(
     if name.contains(&0) || name.len() > 255 {
         return Err(denied());
     }
-    let bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2;
+    // Follow the native contract's conservative header-plus-name size; the
+    // trailing placeholder/padding is not part of FileNameLength.
+    let bytes = size_of::<nt::FILE_RENAME_INFORMATION>() + name.len() * 2;
     let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
-    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let info = storage.as_mut_ptr().cast::<nt::FILE_RENAME_INFORMATION>();
     let handle = unsafe {
         ReOpenFile(
             file.as_raw_handle(),
@@ -997,12 +1049,23 @@ fn rename_opened_handle(
         (*info).RootDirectory = parent.as_raw_handle();
         (*info).FileNameLength = (name.len() * 2) as u32;
         ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
-        checked(SetFileInformationByHandle(
+        // The Win32 FileRenameInfo wrapper rewrites relative names and can
+        // reject a non-null RootDirectory with ERROR_INVALID_PARAMETER. Use
+        // the native contract matching our NtCreateFile handles and retain
+        // the destination directory anchor instead of resolving a full path.
+        let mut status = std::mem::zeroed();
+        let result = nt::NtSetInformationFile(
             renamed.as_raw_handle(),
-            FileRenameInfo,
+            &mut status,
             info.cast(),
             bytes as u32,
-        ))?;
+            nt::FileRenameInformation,
+        );
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(
+                RtlNtStatusToDosError(result) as i32
+            ));
+        }
     }
     if let Some(flush) = flush {
         flush.sync_all()?;
@@ -1017,6 +1080,121 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn assert_user_owner(file: &File) {
+        let mut owner = ptr::null_mut();
+        let mut descriptor = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    &mut owner,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut descriptor,
+                )
+            },
+            0
+        );
+        let _descriptor = LocalAllocation(descriptor);
+        let user = token_user().unwrap();
+        let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        assert_ne!(
+            unsafe { EqualSid(owner, sid) },
+            0,
+            "owner must be TokenUser"
+        );
+    }
+
+    #[test]
+    fn default_owner_is_normalized_only_after_the_private_acl_is_validated() {
+        let root = tempfile::tempdir().unwrap();
+        // tempfile and SQLite use the process token's default owner, which
+        // can be Administrators on an elevated CI runner.
+        private_dir(root.path()).unwrap();
+        let directory = open_directory(root.path()).unwrap();
+        assert_user_owner(&directory);
+        let path = root.path().join("native-library-sidecar");
+        fs::write(&path, b"native library bytes").unwrap();
+        let file = open_metadata(&path).unwrap();
+        require_private_file(&file).unwrap();
+        assert_user_owner(&file);
+        assert_eq!(fs::read(&path).unwrap(), b"native library bytes");
+
+        // The same default owner is insufficient if another user has access.
+        let public = root.path().join("exposed");
+        fs::write(&public, b"leave exposed bytes alone").unwrap();
+        assert!(
+            std::process::Command::new("icacls.exe")
+                .arg(&public)
+                .args(["/grant", "*S-1-1-0:R"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(require_private(&public).is_err());
+        assert_eq!(fs::read(&public).unwrap(), b"leave exposed bytes alone");
+
+        let mut world = vec![0usize; 16];
+        let mut size = std::mem::size_of_val(world.as_slice()) as u32;
+        checked(unsafe {
+            CreateWellKnownSid(
+                WinWorldSid,
+                ptr::null_mut(),
+                world.as_mut_ptr().cast(),
+                &mut size,
+            )
+        })
+        .unwrap();
+        assert!(!is_default_owner(world.as_mut_ptr().cast()).unwrap());
+    }
+
+    #[test]
+    fn relative_publication_preserves_create_only_and_replace_with_short_unicode_names() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join("staging");
+        let output = root.path().join("output");
+        private_dir(&staging).unwrap();
+        private_dir(&output).unwrap();
+        let temporary = staging.join("payload");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .unwrap();
+        file.write_all(b"first").unwrap();
+        file.sync_all().unwrap();
+        let parent = open_directory(&output).unwrap();
+        let name = std::ffi::OsStr::new("я");
+        publish_handle(&file, &parent, name, false).unwrap();
+        assert!(!temporary.exists());
+        assert_eq!(fs::read(output.join(name)).unwrap(), b"first");
+        assert_user_owner(&file);
+        drop(file);
+        let mut next = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .unwrap();
+        next.write_all(b"second").unwrap();
+        next.sync_all().unwrap();
+        assert_eq!(
+            publish_handle(&next, &parent, name, false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(output.join(name)).unwrap(), b"first");
+        publish_handle(&next, &parent, name, true).unwrap();
+        assert_eq!(fs::read(output.join(name)).unwrap(), b"second");
+        assert!(!temporary.exists());
+        require_private(&output.join(name)).unwrap();
+    }
+
     #[test]
     fn private_open_pins_ancestors_before_opening_the_leaf() {
         use std::io::{Read, Write};

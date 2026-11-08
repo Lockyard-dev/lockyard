@@ -118,23 +118,29 @@ impl Drop for AsyncStream {
 }
 impl AsyncStream {
     pub async fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
-        let path = endpoint(path.as_ref())?;
-        loop {
-            match ClientOptions::new().open(&path) {
-                Ok(pipe) => {
-                    // Tokio requests SECURITY_IDENTIFICATION; the server cannot act as this caller.
-                    require_private_handle(pipe.as_raw_handle(), SE_KERNEL_OBJECT)?;
-                    return Ok(Self {
-                        pipe: Pipe::Client(pipe),
-                        pending_operation: false,
-                    });
+        Self::connect_timeout(path.as_ref(), Duration::from_secs(1)).await
+    }
+    pub async fn connect_timeout(path: &Path, timeout: Duration) -> io::Result<Self> {
+        let path = endpoint(path)?;
+        tokio::time::timeout(timeout, async {
+            loop {
+                match ClientOptions::new().open(&path) {
+                    Ok(pipe) => {
+                        // Tokio requests SECURITY_IDENTIFICATION; the server cannot act as this caller.
+                        require_private_handle(pipe.as_raw_handle(), SE_KERNEL_OBJECT)?;
+                        return Ok(Self {
+                            pipe: Pipe::Client(pipe),
+                            pending_operation: false,
+                        });
+                    }
+                    Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                        tokio::time::sleep(Duration::from_millis(2)).await
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
-                    tokio::time::sleep(Duration::from_millis(2)).await
-                }
-                Err(error) => return Err(error),
             }
-        }
+        })
+        .await?
     }
 }
 impl AsyncRead for AsyncStream {
@@ -198,22 +204,28 @@ impl AsyncListener {
     pub async fn accept(&self) -> io::Result<(AsyncStream, ())> {
         let mut pending = self.pending.lock().await;
         pending.connect().await?;
-        let next = (|| {
-            require_private_handle(pending.as_raw_handle(), SE_KERNEL_OBJECT)?;
-            require_client_user(pending.as_raw_handle(), &self.owner)?;
-            server(&self.path, false)
-        })();
-        let next = match next {
+        // A disconnected pipe is not a fresh listening instance: clients get
+        // ERROR_PIPE_BUSY until ConnectNamedPipe is issued again. Rotate even
+        // rejected connections, keeping the namespace occupied throughout.
+        // This also avoids reusing Mio's buffered I/O state after disconnect.
+        let next = match server(&self.path, false) {
             Ok(next) => next,
             Err(error) => {
-                // Fail closed and make this instance available for the next connection.
                 let _ = pending.disconnect();
                 return Err(error);
             }
         };
+        let connected = std::mem::replace(&mut *pending, next);
+        if let Err(error) = (|| {
+            require_private_handle(connected.as_raw_handle(), SE_KERNEL_OBJECT)?;
+            require_client_user(connected.as_raw_handle(), &self.owner)
+        })() {
+            let _ = connected.disconnect();
+            return Err(error);
+        }
         Ok((
             AsyncStream {
-                pipe: Pipe::Server(std::mem::replace(&mut *pending, next)),
+                pipe: Pipe::Server(connected),
                 pending_operation: false,
             },
             (),
@@ -302,9 +314,7 @@ impl LocalStream {
     }
     pub fn connect_timeout(path: &Path, timeout: Duration) -> io::Result<Self> {
         let runtime = runtime()?;
-        let pipe = runtime.block_on(async {
-            tokio::time::timeout(timeout, AsyncStream::connect(path)).await
-        })??;
+        let pipe = runtime.block_on(AsyncStream::connect_timeout(path, timeout))?;
         Ok(Self::new(runtime, pipe))
     }
     fn new(runtime: Arc<Runtime>, pipe: AsyncStream) -> Self {
@@ -473,7 +483,48 @@ mod tests {
     use windows_sys::Win32::Security::{CreateWellKnownSid, TOKEN_USER, WinWorldSid};
 
     #[tokio::test]
+    async fn a_busy_pipe_connect_expires_without_waiting_for_the_current_client() {
+        let unique = tempfile::tempdir().unwrap();
+        let path = pipe_path(&unique.path().to_string_lossy()).unwrap();
+        let security = Security::new().unwrap();
+        let mut attributes = security.attributes();
+        let _server = unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .max_instances(1)
+                .reject_remote_clients(true)
+                .create_with_security_attributes_raw(
+                    &path,
+                    (&mut attributes as *mut windows_sys::Win32::Security::SECURITY_ATTRIBUTES)
+                        .cast(),
+                )
+        }
+        .unwrap();
+        let _client = AsyncStream::connect(&path).await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            AsyncStream::connect_timeout(&path, Duration::from_millis(20)),
+        )
+        .await
+        .expect("a busy named pipe must honor its connect deadline");
+        let error = match result {
+            Ok(_) => panic!("a second client occupied the single busy pipe instance"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
     async fn an_accepted_pipe_checks_the_client_token_sid_and_disconnects_a_mismatch() {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            rejected_client_does_not_block_the_next(),
+        )
+        .await
+        .expect("rejecting a pipe client or accepting its successor stalled");
+    }
+
+    async fn rejected_client_does_not_block_the_next() {
         let unique = tempfile::tempdir().unwrap();
         let path = pipe_path(&unique.path().to_string_lossy()).unwrap();
         let mut listener = AsyncListener::bind(&path).unwrap();
@@ -494,14 +545,16 @@ mod tests {
             (*listener.owner.as_mut_ptr().cast::<TOKEN_USER>()).User.Sid =
                 foreign_sid.as_mut_ptr().cast();
         }
-        let client = AsyncStream::connect(&path).await.unwrap();
+        let mut client = AsyncStream::connect(&path).await.unwrap();
         let error = match listener.accept().await {
             Ok(_) => panic!("a client with a different SID was accepted"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        // A refused connection must not poison the pending server instance.
-        drop(client);
+        let mut byte = [0];
+        assert!(matches!(client.read(&mut byte).await, Ok(0) | Err(_)));
+        // Reconnect before polling accept and while the rejected client is
+        // still alive. A disconnected-but-reused instance stays busy here.
         listener.owner = super::super::token_user().unwrap();
         let _client = AsyncStream::connect(&path).await.unwrap();
         let _accepted = listener.accept().await.unwrap();

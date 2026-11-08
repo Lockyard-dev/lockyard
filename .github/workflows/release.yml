@@ -10,10 +10,12 @@ permissions:
 
 jobs:
   verify:
+    # A reusable-workflow caller cannot set timeout-minutes; every job in ci.yml does.
     uses: ./.github/workflows/ci.yml
 
   npm-test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -25,6 +27,7 @@ jobs:
   # A tag that does not match the manifests would publish a version nobody can reproduce.
   versions:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - shell: bash
@@ -35,6 +38,7 @@ jobs:
 
   build:
     needs: [versions, verify]
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -42,12 +46,12 @@ jobs:
           - target: aarch64-apple-darwin
             platform: darwin
             arch: arm64
-            runner: macos-14
+            runner: macos-15
             wheel: macosx_11_0_arm64
           - target: x86_64-apple-darwin
             platform: darwin
             arch: x64
-            runner: macos-14
+            runner: macos-15-intel
             wheel: macosx_10_12_x86_64
           # Linux binaries link musl statically, so they run on any distribution.
           - target: x86_64-unknown-linux-musl
@@ -121,6 +125,7 @@ jobs:
   publish-release:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
       id-token: write
@@ -192,6 +197,7 @@ jobs:
   publish-crates:
     needs: [publish-release, verify]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action
@@ -213,6 +219,7 @@ jobs:
   publish-npm:
     needs: [publish-crates, npm-test]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
@@ -239,6 +246,7 @@ jobs:
   publish-pypi:
     needs: publish-npm
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Trusted Publishing (OIDC). Configure the GitHub environment on PyPI; no long-lived token.
     permissions:
       contents: read

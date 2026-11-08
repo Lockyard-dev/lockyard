@@ -138,7 +138,11 @@ mkdir -p "$dest"
 printf 'keep me\n' > "$work/victim"
 ln -s "$work/victim" "$dest/lockyard.new"
 if output="$(run_install "$dest")" && [ -x "$dest/lockyard" ]; then
-    [ "$(cat "$work/victim")" = "keep me" ] && ok || fail "installer wrote through a symlink in its destination"
+    if [ "$(cat "$work/victim")" = "keep me" ]; then
+        ok
+    else
+        fail "installer wrote through a symlink in its destination"
+    fi
 else
     fail "installer could not replace a symlink safely: $output"
 fi
@@ -179,7 +183,11 @@ else
         *) fail "missing signature failed for the wrong reason: $output" ;;
     esac
 fi
-[ ! -e "$dest/lockyard" ] && ok || fail "unsigned release left an executable behind"
+if [ ! -e "$dest/lockyard" ]; then
+    ok
+else
+    fail "unsigned release left an executable behind"
+fi
 
 # With both signature files present, cosign must run before the archive is installed.
 : > "$work/release/lockyard-darwin-arm64.tar.gz.sig"

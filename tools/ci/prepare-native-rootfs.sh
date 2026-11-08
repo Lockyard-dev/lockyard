@@ -7,7 +7,8 @@ test "$(id -u)" = 0 || { echo 'root is required to provision an image' >&2; exit
 case "$rootfs" in /*) ;; *) echo 'rootfs must be absolute' >&2; exit 1 ;; esac
 test ! -e "$rootfs" && test ! -L "$rootfs" || { echo 'destination already exists; refusing to change it' >&2; exit 1; }
 command -v debootstrap >/dev/null
-debootstrap --variant=minbase --include=python3,git,ca-certificates bookworm "$rootfs" https://deb.debian.org/debian
+# Refuse debootstrap's HTTPS-only fallback when the host's archive keyring is missing.
+debootstrap --force-check-gpg --variant=minbase --include=python3,git,ca-certificates bookworm "$rootfs" https://deb.debian.org/debian
 # Only immutable regular files/directories/symlinks belong in the measured image.
 # These are freshly provisioned image paths, never directories on the running host.
 for name in dev proc sys run tmp; do

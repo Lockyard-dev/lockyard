@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, macos-14, windows-latest]
+        runner: [ubuntu-latest, macos-15, windows-latest]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -45,6 +45,7 @@ jobs:
 
   ep12-compatibility:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -53,6 +54,10 @@ jobs:
       - run: python3 -m pip install -r scripts/requirements-ep12.txt
       - run: python3 -m unittest discover -s scripts/tests -v
       - run: python3 scripts/ep12-architecture.py --repo .
+      - name: Install the production duplicate scanner dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
       - name: Reject EP-12 production duplicates
         shell: bash
         run: |
@@ -63,6 +68,7 @@ jobs:
 
   crate-versions:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -84,6 +90,7 @@ jobs:
   # Licenses, advisories and banned crates. A new dependency that fails this is refused.
   supply-chain:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action
@@ -97,6 +104,7 @@ jobs:
   # Hook decision p95 ≤ 15 ms and msg send p95 ≤ 20 ms, no network.
   perf-budget:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action
@@ -143,20 +151,25 @@ jobs:
       - name: Provision an immutable rootfs and precise AppArmor attachments
         run: |
           sudo apt-get update
-          sudo apt-get install -y debootstrap apparmor-utils slirp4netns
+          sudo apt-get install -y debootstrap debian-archive-keyring apparmor-utils slirp4netns
           sudo sh tools/ci/prepare-native-rootfs.sh /var/lib/lockyard-ci-rootfs
-          sudo install -m 755 target/debug/lockyard /usr/local/bin/lockyard
-          sudo install -D -m 755 target/debug/lockyard-sandbox /usr/local/libexec/lockyard-sandbox
-          sudo /usr/local/bin/lockyard node install --apparmor --sandbox-binary /usr/local/bin/lockyard
+          # Hosted /usr/local and /opt paths can be writable by the runner.
+          # Preserve the installer's root-owned ancestor requirement with a private system path.
+          sudo install -d -o root -g root -m 755 /usr/lib/lockyard-ci /usr/lib/lockyard-ci/bin
+          sudo install -o root -g root -m 755 target/debug/lockyard /usr/lib/lockyard-ci/bin/lockyard
+          sudo install -o root -g root -m 755 target/debug/lockyard-sandbox /usr/lib/lockyard-ci/bin/lockyard-sandbox
+          sudo /usr/lib/lockyard-ci/bin/lockyard node install --apparmor \
+            --sandbox-binary /usr/lib/lockyard-ci/bin/lockyard-sandbox
       - name: Require real unprivileged cgroup and namespace enforcement
         shell: bash
         env:
           LOCKYARD_NATIVE_ROOTFS: /var/lib/lockyard-ci-rootfs
-          LOCKYARD_NATIVE_SANDBOX_BINARY: /usr/local/bin/lockyard
+          LOCKYARD_NATIVE_SANDBOX_BINARY: /usr/lib/lockyard-ci/bin/lockyard-sandbox
         run: |
           sudo loginctl enable-linger "$(id -un)"
           sudo systemctl start "user@$(id -u).service"
-          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export XDG_RUNTIME_DIR
           export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
           sh tools/ci/test-native-executor.sh
 
@@ -194,7 +207,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, macos-14, windows-latest]
+        runner: [ubuntu-latest, macos-15, windows-latest]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -213,10 +226,11 @@ jobs:
 
   # install.sh is POSIX sh for macOS and Linux; Windows is told to use npm or cargo instead.
   installer:
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, macos-14]
+        runner: [ubuntu-latest, macos-15]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -233,6 +247,7 @@ jobs:
   # The two-agent example is the README's claim that Lockyard refuses a second claim; run it.
   example:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action

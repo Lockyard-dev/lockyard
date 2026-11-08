@@ -1135,6 +1135,35 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
+    #[cfg(unix)]
+    fn authenticated_records(
+        archive: &Path,
+        workspace: &str,
+        key: &WorkspaceKey,
+    ) -> Result<Vec<String>> {
+        let mut input = private_options().read(true).open(archive).map_err(io)?;
+        let mut prefix = vec![0; MAGIC.len() + 26];
+        input.read_exact(&mut prefix).map_err(io)?;
+        let id = std::str::from_utf8(&prefix[MAGIC.len()..])
+            .map_err(|_| ArchiveError("invalid_archive_header"))?;
+        let mut records = Vec::new();
+        let mut index = 0;
+        while input.stream_position().map_err(io)? < input.metadata().map_err(io)?.len() {
+            records.push(read_record(&mut input, key, workspace, id, &mut index)?);
+        }
+        Ok(records)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn assert_unsupported_restore(result: Result<ArchiveReport>, destination: &Path) {
+        assert_eq!(
+            result.unwrap_err().0,
+            "archive_restore_platform_unsupported"
+        );
+        assert!(
+            !destination.exists(),
+            "unsupported restore created a destination"
+        );
+    }
     #[test]
     #[cfg(unix)]
     fn encrypted_roundtrip_restores_only_offline_regular_nonexecutable_files() {
@@ -1172,6 +1201,35 @@ mod tests {
         let wrong_signer =
             crate::provenance::SigningKey::generate(&dir.path().join("wrong.pk8")).unwrap();
         assert!(
+            inspect(
+                &archive,
+                "workspace",
+                &key,
+                "worker",
+                &wrong_signer.trusted_key()
+            )
+            .is_err()
+        );
+        assert!(
+            inspect(
+                &archive,
+                "workspace",
+                &key,
+                "replacement",
+                &signer.trusted_key()
+            )
+            .is_err()
+        );
+        let inspected =
+            inspect(&archive, "workspace", &key, "worker", &signer.trusted_key()).unwrap();
+        assert_eq!(inspected.entries.len(), report.files);
+        assert_eq!(
+            authenticated_records(&archive, "workspace", &key)
+                .unwrap()
+                .len(),
+            5
+        );
+        assert!(
             restore_offline(
                 &archive,
                 &dir.path().join("wrong-signer"),
@@ -1198,6 +1256,23 @@ mod tests {
         assert!(!String::from_utf8_lossy(&encrypted).contains("private-code-sentinel"));
         assert!(!String::from_utf8_lossy(&encrypted).contains("worktree/code.rs"));
         let target = dir.path().join("offline");
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_unsupported_restore(
+                restore_offline(
+                    &archive,
+                    &target,
+                    "workspace",
+                    &key,
+                    "worker",
+                    &signer.trusted_key(),
+                ),
+                &target,
+            );
+        }
+        if !cfg!(target_os = "linux") {
+            return;
+        }
         assert_eq!(
             restore_offline(
                 &archive,
@@ -1266,6 +1341,12 @@ mod tests {
             &signer,
         )
         .unwrap();
+        assert!(authenticated_records(&archive, "workspace", &key).is_ok());
+        assert!(
+            authenticated_records(&archive, "workspace", &WorkspaceKey::from_entropy([43; 32]))
+                .is_err()
+        );
+        assert!(authenticated_records(&archive, "different", &key).is_err());
         assert!(
             restore_offline(
                 &archive,
@@ -1301,6 +1382,7 @@ mod tests {
         ] {
             let damaged = dir.path().join(name);
             fs::write(&damaged, mutated).unwrap();
+            assert!(authenticated_records(&damaged, "workspace", &key).is_err());
             let target = dir.path().join(format!("restore-{name}"));
             assert!(
                 restore_offline(
@@ -1502,6 +1584,32 @@ mod tests {
         )
         .unwrap();
         let restored = dir.path().join("restored");
+        let manifest =
+            inspect(&archive, "workspace", &key, "worker", &signer.trusted_key()).unwrap();
+        assert_eq!(manifest.entries[0].sha256, expected["output.log"].sha256);
+        assert_eq!(
+            authenticated_records(&archive, "workspace", &key)
+                .unwrap()
+                .len(),
+            3
+        );
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_unsupported_restore(
+                restore_offline(
+                    &archive,
+                    &restored,
+                    "workspace",
+                    &key,
+                    "worker",
+                    &signer.trusted_key(),
+                ),
+                &restored,
+            );
+        }
+        if !cfg!(target_os = "linux") {
+            return;
+        }
         restore_offline(
             &archive,
             &restored,
@@ -1645,6 +1753,12 @@ mod tests {
                 "worker",
                 &signer.trusted_key(),
             );
+            #[cfg(not(target_os = "linux"))]
+            {
+                assert_unsupported_restore(outcome, &restored);
+                continue;
+            }
+            #[cfg(target_os = "linux")]
             if case.starts_with("valid") {
                 assert!(outcome.unwrap().result_provenance_verified);
                 assert_eq!(
@@ -1673,6 +1787,7 @@ mod tests {
         )
         .unwrap();
         let generic_out = dir.path().join("generic-out");
+        #[cfg(target_os = "linux")]
         assert!(
             !restore_offline(
                 &generic,
@@ -1684,6 +1799,18 @@ mod tests {
             )
             .unwrap()
             .result_provenance_verified
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_unsupported_restore(
+            restore_offline(
+                &generic,
+                &generic_out,
+                "workspace",
+                &key,
+                "worker",
+                &signer.trusted_key(),
+            ),
+            &generic_out,
         );
         assert!(
             restore_job_offline(
@@ -1718,6 +1845,7 @@ mod tests {
         )
         .unwrap();
         let large_out = dir.path().join("large-generic-out");
+        #[cfg(target_os = "linux")]
         assert!(
             !restore_offline(
                 &large_generic,
@@ -1729,6 +1857,18 @@ mod tests {
             )
             .unwrap()
             .result_provenance_verified
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_unsupported_restore(
+            restore_offline(
+                &large_generic,
+                &large_out,
+                "workspace",
+                &key,
+                "worker",
+                &signer.trusted_key(),
+            ),
+            &large_out,
         );
         assert!(
             restore_job_offline(
@@ -1787,6 +1927,66 @@ mod tests {
                 result.unwrap_err().0,
                 "archive_restore_platform_unsupported"
             );
+        }
+        #[cfg(unix)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            private(root.path());
+            let source = root.path().join("source");
+            fs::create_dir(&source).unwrap();
+            private(&source);
+            fs::write(source.join("data"), b"private bytes").unwrap();
+            let signing =
+                crate::provenance::SigningKey::generate(&root.path().join("signing.pk8")).unwrap();
+            let archive = root.path().join("valid.lyarchive");
+            export_files(
+                &source,
+                &["data".into()],
+                &archive,
+                "workspace",
+                "worker",
+                JOB,
+                ArchiveScope::FullProject,
+                1000,
+                &key,
+                &signing,
+            )
+            .unwrap();
+            let archive_before = fs::read(&archive).unwrap();
+            let destination = root.path().join("existing");
+            fs::create_dir(&destination).unwrap();
+            private(&destination);
+            fs::write(destination.join("keep"), b"existing destination").unwrap();
+            for outcome in [
+                restore_offline(
+                    &archive,
+                    &destination,
+                    "workspace",
+                    &key,
+                    "worker",
+                    &signing.trusted_key(),
+                ),
+                restore_job_offline(
+                    &archive,
+                    &destination,
+                    "workspace",
+                    &key,
+                    "worker",
+                    &signing.trusted_key(),
+                ),
+            ] {
+                assert_eq!(
+                    outcome.unwrap_err().0,
+                    "archive_restore_platform_unsupported"
+                );
+                assert_eq!(
+                    fs::read(destination.join("keep")).unwrap(),
+                    b"existing destination"
+                );
+                assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+                assert_eq!(fs::read(&archive).unwrap(), archive_before);
+                assert_eq!(fs::read(source.join("data")).unwrap(), b"private bytes");
+            }
         }
     }
     #[test]

@@ -1570,6 +1570,7 @@ mod tests {
         private_write(&path, &serde_json::to_vec(&record).unwrap());
         path
     }
+    #[cfg(target_os = "linux")]
     fn pending(f: &Fixture) -> (NodeConfig, Journal) {
         let (mut config, original) = load_config(&f.config_path).unwrap();
         let old = read_key(&f.key_path).unwrap();
@@ -1595,6 +1596,7 @@ mod tests {
         .unwrap();
         (config, journal)
     }
+    #[cfg(target_os = "linux")]
     fn global_pending(config: &NodeConfig, journal: &Journal) {
         let global = GlobalPending {
             version: 1,
@@ -1666,6 +1668,44 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn unsupported_atomic_publication_preserves_rotation_inputs_and_never_publishes_intent() {
+        for policy in [HistoryPolicy::Discard, HistoryPolicy::RetainPrivateHistory] {
+            let f = fixture(policy);
+            let original_config = fs::read(&f.config_path).unwrap();
+            let original_key = fs::read(&f.key_path).unwrap();
+            let state_dir = config(&f).state_dir;
+            for _ in 0..2 {
+                assert_eq!(
+                    install(&f).unwrap_err().0,
+                    "rotation_atomic_create_publish_requires_linux"
+                );
+                assert_eq!(fs::read(&f.key_path).unwrap(), original_key);
+                assert_eq!(fs::read(&f.config_path).unwrap(), original_config);
+                require_no_pending(&state_dir).unwrap();
+                require_no_global_pending(&f.key_path).unwrap();
+                assert_eq!(read_installed(&state_dir).unwrap(), None);
+                assert!(missing(&global_state_path(&f.key_path)).unwrap());
+                assert!(missing(&history_path(&f.key_path, &f.metadata).unwrap()).unwrap());
+                assert_no_publication_orphans(f._dir.path());
+            }
+            let source = state_dir.join("publish-source");
+            let destination = state_dir.join("publish-destination");
+            private_write(&source, b"new bytes");
+            private_write(&destination, b"existing bytes");
+            assert_eq!(
+                rename_create_only(&source, &destination).unwrap_err().0,
+                "rotation_atomic_create_publish_requires_linux"
+            );
+            assert_eq!(fs::read(source).unwrap(), b"new bytes");
+            assert_eq!(fs::read(destination).unwrap(), b"existing bytes");
+        }
+    }
+
+    // Successful create-only publication/recovery is a Linux acceptance contract.
+    // Other Unix platforms exercise the explicit refusal and no-mutation path above.
+    #[test]
+    #[cfg(target_os = "linux")]
     fn install_is_durable_idempotent_and_removes_excluded_direct_certificates() {
         let f = fixture(HistoryPolicy::RetainPrivateHistory);
         job(&f, JobState::Succeeded);
@@ -1695,12 +1735,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn discard_does_not_create_a_history_copy() {
         let f = fixture(HistoryPolicy::Discard);
         install(&f).unwrap();
         assert!(missing(&history_path(&f.key_path, &f.metadata).unwrap()).unwrap());
     }
     #[test]
+    #[cfg(target_os = "linux")]
     fn retained_uppercase_certificate_pins_are_normalized_before_trust_reconciliation() {
         let f = fixture(HistoryPolicy::Discard);
         let mut before = config(&f);
@@ -1763,6 +1805,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg(target_os = "linux")]
     fn partial_private_publication_of_key_config_history_or_markers_is_retryable_without_partial_final_files()
      {
         for target in [
@@ -1821,6 +1864,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg(target_os = "linux")]
     fn publication_after_rename_before_directory_sync_recovers_durable_fences_and_complete_files() {
         for target in [
             "key",
@@ -1869,6 +1913,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_second_plan_cannot_abandon_secret_staging_owned_by_a_durable_first_plan_intent() {
         for fault in [
             PublicationFault::PartialWrite,
@@ -1910,6 +1955,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg(target_os = "linux")]
     fn global_only_preparation_fence_recovers_owner_and_blocks_another_local_node_plan() {
         let f = fixture(HistoryPolicy::Discard);
         let (_, journal) = pending(&f);
@@ -1965,6 +2011,7 @@ mod tests {
         require_global_binding(&NodeConfig::load(&other_path).unwrap(), &f.key_path).unwrap();
     }
     #[test]
+    #[cfg(target_os = "linux")]
     fn completion_keeps_global_fence_until_local_intent_is_durably_gone_and_recovery_is_idempotent()
     {
         let f = fixture(HistoryPolicy::Discard);
@@ -2009,6 +2056,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn rotation_requires_explicit_local_drain_and_stopped_host_executor_and_key_readers() {
         let f = fixture(HistoryPolicy::Discard);
         let c = config(&f);
@@ -2064,6 +2112,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn forward_recovery_covers_crashes_before_key_after_key_and_after_config_replace() {
         for policy in [HistoryPolicy::Discard, HistoryPolicy::RetainPrivateHistory] {
             for phase in 0..=4 {
@@ -2124,6 +2173,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn corrupt_staged_inputs_or_wrong_verified_plan_leave_pending_and_preserve_old_key() {
         let f = fixture(HistoryPolicy::Discard);
         let (c, journal) = pending(&f);
@@ -2147,6 +2197,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn current_key_copy_orphan_hardlinks_survive_while_symlinks_permissions_and_pending_are_rejected()
      {
         let orphan = fixture(HistoryPolicy::Discard);
@@ -2173,6 +2224,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn shared_key_rotation_blocks_other_local_state_until_its_approved_plan_is_installed() {
         for policy in [HistoryPolicy::Discard, HistoryPolicy::RetainPrivateHistory] {
             let f = fixture(policy);
@@ -2211,6 +2263,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn stale_epochs_new_key_mismatches_and_post_install_direct_pin_drift_are_denied() {
         let mut f = fixture(HistoryPolicy::Discard);
         f.metadata.epoch = 2;
@@ -2238,6 +2291,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn standalone_executor_binds_current_epoch_key_context_and_retains_shared_lock() {
         let f = fixture(HistoryPolicy::Discard);
         install(&f).unwrap();
@@ -2279,6 +2333,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn standalone_workflow_lock_blocks_rotation_even_when_executor_has_no_active_jobs() {
         let f = fixture(HistoryPolicy::Discard);
         let c = config(&f);

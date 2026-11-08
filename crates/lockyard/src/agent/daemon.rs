@@ -1267,16 +1267,19 @@ impl<T: Transport + 'static> Shared<T> {
 
     fn refresh_unread(&self) {
         let window = self.timing().active_window;
-        let live: HashSet<String> = {
-            let mut sessions = self.sessions();
-            sessions.retain(|_, track| track.heard.is_some_and(|at| at.elapsed() < window));
-            sessions.keys().cloned().collect()
-        };
         let limit = self.timing().fresh / 2;
         let wanted: Vec<(String, u64)> = {
+            // Reconcile against membership under the same lock: an older snapshot must
+            // not erase a count that an Unread request registered after TakeMail.
+            let mut sessions = self.sessions();
+            sessions.retain(|_, track| track.heard.is_some_and(|at| at.elapsed() < window));
+            #[cfg(test)]
+            tests::pause_unread_reconciliation();
             let mut view = self.write_view();
-            view.unread.retain(|session, _| live.contains(session));
-            view.mail.retain(|session, _| live.contains(session));
+            view.unread
+                .retain(|session, _| sessions.contains_key(session));
+            view.mail
+                .retain(|session, _| sessions.contains_key(session));
             let stale = view.unread.iter().filter(|(_, entry)| !entry.fresh(limit));
             stale
                 .map(|(session, entry)| (session.clone(), entry.generation))
@@ -1293,18 +1296,18 @@ impl<T: Transport + 'static> Shared<T> {
         let mut journal_busy = false;
         let now = Instant::now();
         let window = self.timing().active_window;
-        let live: HashSet<String> = {
+        let wanted: Vec<String> = {
+            // Use the same sessions -> view lock order as unread/lost reconciliation.
             let mut sessions = self.sessions();
             sessions.retain(|_, track| track.heard.is_some_and(|at| at.elapsed() < window));
-            sessions.keys().cloned().collect()
-        };
-        let wanted: Vec<String> = {
             let mut view = self.write_view();
             view.mail.retain(|_, buffer| buffer.lease_expires_at > now);
             view.unread
                 .iter()
                 .filter(|(session, entry)| {
-                    entry.count > 0 && live.contains(*session) && !view.mail.contains_key(*session)
+                    entry.count > 0
+                        && sessions.contains_key(*session)
+                        && !view.mail.contains_key(*session)
                 })
                 .map(|(session, _)| session.clone())
                 .collect()
@@ -1856,6 +1859,21 @@ mod tests {
     struct LostReadGate {
         started: std::sync::mpsc::Sender<()>,
         resume: std::sync::mpsc::Receiver<()>,
+    }
+
+    thread_local! {
+        // Only the refresh thread of the targeted test pauses; parallel daemons stay independent.
+        static UNREAD_RECONCILE_GATE: std::cell::RefCell<Option<LostReadGate>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    pub(super) fn pause_unread_reconciliation() {
+        let gate = UNREAD_RECONCILE_GATE.with(|gate| gate.borrow_mut().take());
+        if let Some(gate) = gate {
+            gate.started.send(()).unwrap();
+            gate.resume.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
     }
 
     impl FakeServer {
@@ -3077,6 +3095,60 @@ mod tests {
         rig.server.down.store(false, Ordering::SeqCst);
         wait_for("the queue to drain", || rig.daemon.shared.outbox.len() == 0);
         assert_eq!(bodies(&rig.server.writes_to("/bus/messages")), ["good"]);
+    }
+
+    #[test]
+    fn registering_unread_during_reconciliation_keeps_mail_deliverable() {
+        let mut rig = start_with(timing(), |server| *server.unread.lock().unwrap() = 1);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        // TakeMail registers an unknown count before Unread supplies the active session.
+        assert_eq!(shared.take_mail("me", 1, 60).source, Some(Source::None));
+        assert!(!shared.sessions().contains_key("me"));
+
+        let (started, observed) = channel();
+        let (resume, paused) = channel();
+        let refresh = Arc::clone(shared);
+        let worker = thread::spawn(move || {
+            UNREAD_RECONCILE_GATE.with(|gate| {
+                *gate.borrow_mut() = Some(LostReadGate {
+                    started,
+                    resume: paused,
+                });
+            });
+            refresh.refresh_unread();
+        });
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        // A deterministic scheduler: if membership is unlocked, complete the real Unread
+        // request before the older reconciliation. Otherwise it must legally follow it.
+        let register_before_reconciliation = match shared.sessions.try_lock() {
+            Ok(sessions) => {
+                drop(sessions);
+                true
+            }
+            Err(std::sync::TryLockError::WouldBlock) => false,
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("session membership was poisoned"),
+        };
+        if register_before_reconciliation {
+            assert_eq!(shared.unread("me").source, Some(Source::None));
+        }
+        resume.send(()).unwrap();
+        worker.join().unwrap();
+        if !register_before_reconciliation {
+            assert_eq!(shared.unread("me").source, Some(Source::None));
+        }
+
+        // The next upkeep must fetch this active session's count and reserve its mail.
+        shared.refresh_unread();
+        shared.refresh_mail();
+        let delivered = shared.take_mail("me", 1, 60);
+        assert_eq!(
+            delivered.messages.as_ref().map(Vec::len),
+            Some(1),
+            "an older membership snapshot discarded a newly registered unread count"
+        );
+        assert_eq!(rig.server.writes_to("/bus/inbox/claim").len(), 1);
+        assert!(rig.server.writes_to("/bus/inbox/seen").is_empty());
     }
 
     #[test]

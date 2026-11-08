@@ -356,6 +356,7 @@ mod tests {
         assert!(UnixStream::connect(socket).await.is_err());
     }
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn long_state_paths_bind_with_directory_fd_and_are_reachable_by_their_mount_inode() {
         let root = tempfile::tempdir().unwrap();
         let directory=root.path().join("long-directory-component-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -377,5 +378,23 @@ mod tests {
         let stream = UnixStream::connect(short).await.unwrap();
         listener.accept().await.unwrap();
         drop(stream);
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "linux"))]
+    async fn long_state_paths_without_linux_fd_paths_refuse_without_publishing_a_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("long-directory-component-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        private_dir(&directory).unwrap();
+        let socket = directory.join("control.sock");
+        assert!(socket.as_os_str().len() >= 100);
+        let error = bind_socket(&directory, &socket, &tokio::runtime::Handle::current())
+            .expect_err("a Linux /proc/self/fd socket alias must not bind on this platform");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!socket.exists());
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
     }
 }

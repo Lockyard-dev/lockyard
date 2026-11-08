@@ -31,7 +31,13 @@ allow = [
     "CC0-1.0",
     "OpenSSL",
 ]
-exceptions = []
+# 2026-11-08: Mozilla/CCADB trust-anchor data, not the Rust tooling license.
+# https://github.com/rustls/webpki-roots#license
+# Scope approval to the locked data crates; other crates/versions still fail closed.
+exceptions = [
+    { crate = "webpki-roots@0.26.11", allow = ["CDLA-Permissive-2.0"] },
+    { crate = "webpki-roots@1.0.11", allow = ["CDLA-Permissive-2.0"] },
+]
 
 [bans]
 multiple-versions = "warn"

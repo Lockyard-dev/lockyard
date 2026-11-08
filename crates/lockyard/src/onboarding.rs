@@ -956,10 +956,8 @@ mod tests {
             true
         );
         assert!(!sidecar(&path).exists());
-        assert_eq!(
-            setup_at(dir.path(), "claude", SetupAction::Apply, dir.path()).unwrap()["ok"],
-            true
-        );
+        let applied = setup_at(dir.path(), "claude", SetupAction::Apply, dir.path()).unwrap();
+        assert_eq!(applied["ok"], true, "{applied}");
         let first = fs::read(&path).unwrap();
         assert_eq!(
             setup_at(dir.path(), "claude", SetupAction::Apply, dir.path()).unwrap()["ok"],
@@ -983,7 +981,8 @@ mod tests {
     #[test]
     fn modified_owned_entries_are_never_overwritten_or_removed() {
         let dir = tempfile::tempdir().unwrap();
-        setup_at(dir.path(), "cursor", SetupAction::Apply, dir.path()).unwrap();
+        let applied = setup_at(dir.path(), "cursor", SetupAction::Apply, dir.path()).unwrap();
+        assert_eq!(applied["ok"], true, "{applied}");
         let path = dir.path().join(".cursor/mcp.json");
         fs::write(
             &path,
@@ -1008,10 +1007,8 @@ mod tests {
         let user =
             "# Keep this comment\nmodel = 'my-model'\n[mcp_servers.other]\ncommand = 'other'\n";
         fs::write(&path, user).unwrap();
-        assert_eq!(
-            setup_at(dir.path(), "codex", SetupAction::Apply, dir.path()).unwrap()["ok"],
-            true
-        );
+        let applied = setup_at(dir.path(), "codex", SetupAction::Apply, dir.path()).unwrap();
+        assert_eq!(applied["ok"], true, "{applied}");
         assert!(fs::read_to_string(&path).unwrap().starts_with(user));
         assert_eq!(
             setup_at(dir.path(), "codex", SetupAction::Apply, dir.path()).unwrap()["ok"],
@@ -1054,10 +1051,8 @@ mod tests {
             assert_eq!(fs::read_to_string(&path).unwrap(), original);
             assert_eq!(fs::read(sidecar(&path)).unwrap(), original_receipt);
 
-            assert_eq!(
-                setup_at(dir.path(), "codex", SetupAction::Apply, dir.path()).unwrap()["ok"],
-                true
-            );
+            let applied = setup_at(dir.path(), "codex", SetupAction::Apply, dir.path()).unwrap();
+            assert_eq!(applied["ok"], true, "{applied}");
             assert_eq!(
                 fs::read_to_string(&path).unwrap(),
                 format!("{user}{TOML_BLOCK}")
@@ -1106,7 +1101,7 @@ mod tests {
             fs::write(sidecar(&spec.path), serde_json::to_vec(&receipt).unwrap()).unwrap();
 
             let report = setup_at(dir.path(), "codex", SetupAction::Apply, dir.path()).unwrap();
-            assert_eq!(report["ok"], true);
+            assert_eq!(report["ok"], true, "{report}");
             assert_eq!(fs::read_to_string(spec.path).unwrap(), TOML_BLOCK);
         }
     }
@@ -1206,7 +1201,7 @@ mod tests {
         receipt.toml_block = Some(TOML_BLOCK.into());
         fs::write(sidecar(&spec.path), serde_json::to_vec(&receipt).unwrap()).unwrap();
         let report = setup_at(dir.path(), "codex", SetupAction::Apply, dir.path()).unwrap();
-        assert_eq!(report["ok"], true);
+        assert_eq!(report["ok"], true, "{report}");
         assert_eq!(
             setup_at(dir.path(), "codex", SetupAction::Check, dir.path()).unwrap()["ok"],
             true
