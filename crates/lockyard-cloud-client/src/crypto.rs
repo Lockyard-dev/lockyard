@@ -5,20 +5,148 @@ use ring::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::{BTreeMap, HashSet};
 const LABEL: &[u8] = b"lockyard-cloud-key-id-v1";
 const WORDS: &str = include_str!("english.txt");
 const PREFIX: &str = "lyenc1.";
 const FIELDS: &str = include_str!("../content-fields.json");
 const OPENAPI: &str = include_str!("../tests/fixtures/openapi.json");
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 struct Field {
     schema: String,
     property: String,
     name: String,
+    when: BTreeMap<String, Vec<String>>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct FieldMap {
     fields: Vec<Field>,
+}
+impl<'de> Deserialize<'de> for FieldMap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Entry {
+            schema: String,
+            property: String,
+            name: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Selector {
+            schema: String,
+            property: String,
+            name: String,
+            #[serde(deserialize_with = "deserialize_conditions")]
+            when: BTreeMap<String, Vec<String>>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Manifest {
+            version: Option<u8>,
+            protocol_min: Option<u8>,
+            fields: Vec<Entry>,
+            #[serde(default)]
+            clear: Vec<Value>,
+            #[serde(default)]
+            selectors: Vec<Selector>,
+        }
+        let manifest = Manifest::deserialize(deserializer)?;
+        let versioned = manifest.version.is_some() || manifest.protocol_min.is_some();
+        if (versioned || !manifest.selectors.is_empty())
+            && (manifest.version != Some(2) || manifest.protocol_min != Some(2))
+        {
+            return Err(serde::de::Error::custom(
+                "unsupported content selector manifest version",
+            ));
+        }
+        let mut seen = HashSet::new();
+        let mut fields = Vec::new();
+        for selector in manifest.selectors {
+            // Version 2 admits only the two owner-close contexts defined by EP-12.
+            // A future selector must be introduced deliberately with its protocol contract.
+            let approved = selector.name == "owner_word"
+                && match (selector.schema.as_str(), selector.property.as_str()) {
+                    ("RegistryEvidenceDto", "value") => {
+                        selector.when.len() == 2
+                            && selector
+                                .when
+                                .get("kind")
+                                .is_some_and(|values| values == &["decision"])
+                            && selector.when.get("source").is_some_and(|values| {
+                                values.iter().all(|value| {
+                                    matches!(value.as_str(), "direct_owner" | "relayed_owner")
+                                })
+                            })
+                    }
+                    ("RegistryEventDto", "reason") => {
+                        selector.when.len() == 1
+                            && selector
+                                .when
+                                .get("op")
+                                .is_some_and(|values| values == &["owner_closed"])
+                    }
+                    _ => false,
+                };
+            if selector.schema.is_empty()
+                || selector.property.is_empty()
+                || selector.name.is_empty()
+                || selector.when.is_empty()
+                || selector.when.iter().any(|(property, values)| {
+                    property.is_empty()
+                        || values.is_empty()
+                        || values.iter().any(String::is_empty)
+                        || values.iter().collect::<HashSet<_>>().len() != values.len()
+                })
+                || !seen.insert((selector.schema.clone(), selector.property.clone()))
+                || !approved
+            {
+                return Err(serde::de::Error::custom(
+                    "invalid or ambiguous content selector",
+                ));
+            }
+            fields.push(Field {
+                schema: selector.schema,
+                property: selector.property,
+                name: selector.name,
+                when: selector.when,
+            });
+        }
+        let _ = manifest.clear;
+        fields.extend(manifest.fields.into_iter().map(|entry| Field {
+            schema: entry.schema,
+            property: entry.property,
+            name: entry.name,
+            when: BTreeMap::new(),
+        }));
+        Ok(Self { fields })
+    }
+}
+fn deserialize_conditions<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Vec<String>>, D::Error> {
+    struct Conditions;
+    impl<'de> serde::de::Visitor<'de> for Conditions {
+        type Value = BTreeMap<String, Vec<String>>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("unique context properties with string-array choices")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut conditions = BTreeMap::new();
+            while let Some((property, values)) = map.next_entry::<String, Vec<String>>()? {
+                if conditions.insert(property, values).is_some() {
+                    return Err(serde::de::Error::custom(
+                        "duplicate content selector context property",
+                    ));
+                }
+            }
+            Ok(conditions)
+        }
+    }
+    deserializer.deserialize_map(Conditions)
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldRule {
@@ -47,6 +175,19 @@ fn parsed() -> Result<&'static (FieldMap, Value), String> {
         .get_or_init(|| {
             let map: FieldMap = serde_json::from_str(FIELDS).map_err(|e| e.to_string())?;
             let api: Value = serde_json::from_str(OPENAPI).map_err(|e| e.to_string())?;
+            for field in map.fields.iter().filter(|field| !field.when.is_empty()) {
+                let properties = api["components"]["schemas"][&field.schema]["properties"]
+                    .as_object()
+                    .ok_or("content selector schema is unavailable")?;
+                if !properties.contains_key(&field.property)
+                    || field
+                        .when
+                        .keys()
+                        .any(|property| !properties.contains_key(property))
+                {
+                    return Err("content selector property is unavailable".into());
+                }
+            }
             Ok((map, api))
         })
         .as_ref()
@@ -124,6 +265,7 @@ pub(crate) fn transform_fields_policy(
     let (map, api) = parsed()?;
     let normalized = route.split('?').next().unwrap_or(route);
     let mut schemas = Vec::new();
+    let mut inline_schemas = Vec::new();
     let mut matched = false;
     for (path, ops) in api["paths"].as_object().ok_or("bad OpenAPI paths")? {
         if !openapi_path_matches(path, normalized) {
@@ -140,7 +282,11 @@ pub(crate) fn transform_fields_policy(
                 .and_then(|x| x.get("application/json"))
                 .and_then(|x| x.get("schema"));
             if let Some(n) = node {
-                collect_refs(n, &mut schemas)
+                if n.get("properties").is_some() {
+                    inline_schemas.push(n);
+                } else {
+                    collect_refs(n, &mut schemas)
+                }
             }
         } else {
             let node = op
@@ -172,7 +318,11 @@ pub(crate) fn transform_fields_policy(
         return Err("required node response has no classified schema".into());
     }
     if require_encrypted && encrypt {
-        if schemas.is_empty() && !value.is_null() && value != &serde_json::json!({}) {
+        if schemas.is_empty()
+            && inline_schemas.is_empty()
+            && !value.is_null()
+            && value != &serde_json::json!({})
+        {
             return Err("required node encryption does not support this request body".into());
         }
         for schema in &schemas {
@@ -182,6 +332,9 @@ pub(crate) fn transform_fields_policy(
                 &api["components"]["schemas"],
                 Some(schema),
             )?;
+        }
+        for definition in inline_schemas {
+            validate_inline_metadata_request(value, definition, &api["components"]["schemas"])?;
         }
     }
     let mut touched = Vec::new();
@@ -198,6 +351,93 @@ pub(crate) fn transform_fields_policy(
             false,
             &mut touched,
         )?;
+    }
+    Ok(())
+}
+fn validate_inline_metadata_request(
+    value: &Value,
+    definition: &Value,
+    schemas: &Value,
+) -> Result<(), String> {
+    if value.is_null() {
+        return if definition["type"] == "null"
+            || definition["type"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|kind| kind == "null"))
+        {
+            Ok(())
+        } else {
+            Err("required node inline metadata cannot be null".into())
+        };
+    }
+    validate_request_shape(value, definition, schemas, None)?;
+    if definition["format"] == "uuid"
+        && !value.as_str().is_some_and(|text| {
+            text.len() == 36
+                && text.bytes().enumerate().all(|(index, byte)| {
+                    if matches!(index, 8 | 13 | 18 | 23) {
+                        byte == b'-'
+                    } else {
+                        byte.is_ascii_hexdigit()
+                    }
+                })
+        })
+    {
+        return Err("required node inline metadata must be a UUID".into());
+    }
+    if let Some(properties) = definition.get("properties").and_then(Value::as_object) {
+        if definition.get("additionalProperties") != Some(&Value::Bool(false)) {
+            return Err("required node inline request schema must be closed".into());
+        }
+        if definition
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| {
+                required
+                    .iter()
+                    .any(|name| name.as_str().is_none_or(|name| value.get(name).is_none()))
+            })
+        {
+            return Err("required node request is missing a required field".into());
+        }
+        for (name, child) in properties {
+            if let Some(value) = value.get(name) {
+                // Inline metadata has no schema identity for a content-field manifest entry.
+                if matches!(
+                    name.as_str(),
+                    "body"
+                        | "text"
+                        | "reply"
+                        | "brief"
+                        | "report"
+                        | "reason"
+                        | "accept"
+                        | "acceptance"
+                        | "title"
+                        | "value"
+                        | "resolution"
+                        | "purpose"
+                        | "comment"
+                        | "owner_word"
+                        | "content"
+                ) {
+                    return Err("required node inline request contains unclassified content".into());
+                }
+                validate_inline_metadata_request(value, child, schemas)?;
+            }
+        }
+    }
+    if let Some(number) = value.as_f64()
+        && (definition
+            .get("minimum")
+            .and_then(Value::as_f64)
+            .is_some_and(|min| number < min)
+            || definition
+                .get("maximum")
+                .and_then(Value::as_f64)
+                .is_some_and(|max| number > max))
+    {
+        return Err("required node inline metadata is outside its declared range".into());
     }
     Ok(())
 }
@@ -224,6 +464,26 @@ fn collect_refs(v: &Value, out: &mut Vec<String>) {
             collect_refs(x, out)
         }
     }
+}
+fn selected_field<'a>(
+    fields: &'a [Field],
+    schema: &str,
+    property: &str,
+    value: &Value,
+) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|field| {
+            field.schema == schema
+                && field.property == property
+                && field.when.iter().all(|(property, choices)| {
+                    value
+                        .get(property)
+                        .and_then(Value::as_str)
+                        .is_some_and(|actual| choices.iter().any(|choice| choice == actual))
+                })
+        })
+        .map(|field| field.name.as_str())
 }
 #[allow(clippy::collapsible_if, clippy::too_many_arguments)]
 fn visit(
@@ -300,6 +560,19 @@ fn visit(
     let owner_decision = schema == "RegistryEvidenceDto"
         && v["kind"] == "decision"
         && matches!(v["source"].as_str(), Some("direct_owner" | "relayed_owner"));
+    // Resolve every conditional against the original object, before decrypting a sibling.
+    let content_names = def["properties"]
+        .as_object()
+        .map(|properties| {
+            properties
+                .keys()
+                .filter_map(|property| {
+                    selected_field(fields, schema, property, v)
+                        .map(|name| (property.as_str(), name))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     if let (Some(obj), Some(props)) = (
         v.as_object_mut(),
         def.get("properties").and_then(Value::as_object),
@@ -315,6 +588,9 @@ fn visit(
         }
         for (p, sch) in props {
             if let Some(slot) = obj.get_mut(p) {
+                if !enc && schema == "RegistryEventDto" && p == "reason" {
+                    continue; // visit_event has already authenticated this contextual field.
+                }
                 if !enc
                     && require_encrypted
                     && schema == "CoordinationClaim"
@@ -383,21 +659,14 @@ fn visit(
                     }
                     continue;
                 }
-                let canonical_owner = (owner_decision && p == "value")
-                    || (schema == "RegistryOwnerCloseRequest" && p == "owner_word");
-                let content_name = if canonical_owner {
-                    Some("owner_word")
-                } else {
-                    fields
-                        .iter()
-                        .find(|f| f.schema == schema && f.property == *p)
-                        .map(|f| f.name.as_str())
-                        .or_else(|| {
-                            require_encrypted
-                                .then(|| additional_node_content(schema, p))
-                                .flatten()
-                        })
-                };
+                let content_name = content_names.get(p.as_str()).copied().or_else(|| {
+                    require_encrypted
+                        .then(|| additional_node_content(schema, p))
+                        .flatten()
+                });
+                let canonical_owner = content_name == Some("owner_word")
+                    && ((owner_decision && p == "value")
+                        || (schema == "RegistryOwnerCloseRequest" && p == "owner_word"));
                 if let Some(content_name) = content_name {
                     let alternate = canonical_owner.then_some("value");
                     if let Some(s) = slot.as_str() {
@@ -825,6 +1094,7 @@ fn visit_event(
     .unwrap_or_default()
     .to_string();
     if schema == "RegistryEventDto" {
+        let reason_name = selected_field(fields, schema, "reason", value).unwrap_or("reason");
         if let Some(reason) = value.get_mut("reason") {
             let system_reason = match kind.as_str() {
                 "lease_expired" => Some("assignment lease expired"),
@@ -837,12 +1107,8 @@ fn visit_event(
             {
                 decrypt_event_field_alias(
                     reason,
-                    if kind == "owner_closed" {
-                        "owner_word"
-                    } else {
-                        "reason"
-                    },
-                    (kind == "owner_closed").then_some("value"),
+                    reason_name,
+                    (kind == "owner_closed" && reason_name == "owner_word").then_some("value"),
                     workspace,
                     key,
                     required,
@@ -1136,14 +1402,28 @@ fn decrypt_compatible(
     text: &str,
 ) -> Result<String, String> {
     if name == "owner_word" && alternate == Some("value") {
-        lockyard_compat::OwnerDecisionV1Reader::read(lockyard_compat::Source::Sdk, |field| {
-            key.decrypt(workspace, field, text)
-                .map_err(|_| "content_authentication_failed".into())
-        })
+        decrypt_owner_compatible(|field| key.decrypt(workspace, field, text))
     } else {
         key.decrypt(workspace, name, text)
             .map_err(|_| "content_authentication_failed".into())
     }
+}
+
+fn decrypt_owner_compatible(
+    mut decrypt: impl FnMut(&str) -> Result<String, String>,
+) -> Result<String, String> {
+    lockyard_compat::OwnerDecisionV1Reader::read(lockyard_compat::Source::Sdk, |field| {
+        decrypt(field).map_err(|error| {
+            // Only AES-GCM authentication failure admits the historical AAD retry.
+            // Envelope/key/encoding failures must remain terminal to the reader.
+            if error == "cannot decrypt" {
+                "content_authentication_failed".into()
+            } else {
+                error
+            }
+        })
+    })
+    .map_err(|_| "content_authentication_failed".into())
 }
 
 fn decrypt_event_field_alias(
@@ -1165,14 +1445,17 @@ fn decrypt_event_field_alias(
         };
     };
     if text.starts_with(PREFIX) {
+        let owner_context = name == "owner_word" && alternate == Some("value");
         *value = Value::String(match key {
             Some(key) => match decrypt_compatible(key, workspace, name, alternate, text) {
                 Ok(plain) => plain,
+                Err(_) if owner_context => return Err("content_authentication_failed".into()),
                 Err(_) if required => {
                     return Err("required node event content failed authentication".into());
                 }
                 Err(_) => "[cannot decrypt]".into(),
             },
+            None if owner_context => return Err("content_authentication_failed".into()),
             None if required => return Err("required node event key is unavailable".into()),
             None => "[locked]".into(),
         });
@@ -1882,6 +2165,275 @@ mod w4_owner_contract_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owner_legacy_fallback_only_retries_aead_authentication_failures() {
+        let key = WorkspaceKey::from_entropy([96; 32]);
+        let wrong_key = WorkspaceKey::from_entropy([97; 32]);
+        for envelope in [
+            "lyenc1.bad.bad".into(),
+            format!("lyenc1.{}.!", key.key_id()),
+            format!("lyenc1.{}.{}", key.key_id(), base64url(&[0; 27])),
+            wrong_key.encrypt("w", "value", "approval").unwrap(),
+        ] {
+            let mut attempts = Vec::new();
+            let result = decrypt_owner_compatible(|field| {
+                attempts.push(field.to_string());
+                key.decrypt("w", field, &envelope)
+            });
+            assert_eq!(result.unwrap_err(), "content_authentication_failed");
+            assert_eq!(attempts, ["owner_word"], "invalid envelope was retried");
+        }
+        for (aad, expected) in [
+            ("owner_word", vec!["owner_word"]),
+            ("value", vec!["owner_word", "value"]),
+        ] {
+            let envelope = key.encrypt("w", aad, "approval").unwrap();
+            let mut attempts = Vec::new();
+            let result = decrypt_owner_compatible(|field| {
+                attempts.push(field.to_string());
+                key.decrypt("w", field, &envelope)
+            });
+            assert_eq!(result.unwrap(), "approval");
+            assert_eq!(attempts, expected);
+        }
+        let mut attempts = Vec::new();
+        assert_eq!(
+            decrypt_owner_compatible(|field| {
+                attempts.push(field.to_string());
+                Err("invalid utf8".into())
+            })
+            .unwrap_err(),
+            "content_authentication_failed"
+        );
+        assert_eq!(attempts, ["owner_word"]);
+    }
+
+    #[test]
+    fn selector_manifest_rejects_unsupported_versions_and_ambiguous_conditions() {
+        let selector = serde_json::json!({"schema":"RegistryEvidenceDto","property":"value","name":"owner_word","when":{"kind":["decision"],"source":["direct_owner","relayed_owner"]}});
+        let valid = serde_json::json!({"version":2,"protocol_min":2,"fields":[],"clear":[],"selectors":[selector]});
+        assert!(serde_json::from_value::<FieldMap>(valid.clone()).is_ok());
+        let mut invalid = Vec::new();
+        for (property, value) in [
+            ("version", serde_json::json!(1)),
+            ("version", serde_json::json!(3)),
+            ("protocol_min", serde_json::json!(1)),
+        ] {
+            let mut manifest = valid.clone();
+            manifest[property] = value;
+            invalid.push(manifest);
+        }
+        for when in [
+            serde_json::json!({}),
+            serde_json::json!({"kind":[]}),
+            serde_json::json!({"kind":"decision"}),
+            serde_json::json!({"kind":["decision","decision"]}),
+            serde_json::json!({"kind":[1]}),
+        ] {
+            let mut manifest = valid.clone();
+            manifest["selectors"][0]["when"] = when;
+            invalid.push(manifest);
+        }
+        let mut unknown = valid.clone();
+        unknown["selectors"][0]["unless"] = serde_json::json!({"kind":["commit"]});
+        invalid.push(unknown);
+        for (property, value) in [
+            ("schema", "UnknownDto"),
+            ("property", "body"),
+            ("name", "body"),
+        ] {
+            let mut manifest = valid.clone();
+            manifest["selectors"][0][property] = serde_json::json!(value);
+            invalid.push(manifest);
+        }
+        let mut unknown_condition = valid.clone();
+        unknown_condition["selectors"][0]["when"]["unknown"] = serde_json::json!(["decision"]);
+        invalid.push(unknown_condition);
+        let mut duplicate = valid.clone();
+        duplicate["selectors"]
+            .as_array_mut()
+            .unwrap()
+            .push(selector);
+        invalid.push(duplicate);
+        for manifest in invalid {
+            assert!(
+                serde_json::from_value::<FieldMap>(manifest.clone()).is_err(),
+                "accepted invalid selector manifest: {manifest}"
+            );
+        }
+        assert!(serde_json::from_str::<FieldMap>(r#"{"version":2,"protocol_min":2,"fields":[],"selectors":[{"schema":"RegistryEvidenceDto","property":"value","name":"owner_word","when":{"kind":["commit"],"kind":["decision"],"source":["direct_owner","relayed_owner"]}}]}"#).is_err(), "duplicate context predicates must not silently replace one another");
+    }
+
+    #[test]
+    fn selector_manifest_is_the_source_of_owner_context() {
+        let key = WorkspaceKey::from_entropy([90; 32]);
+        let map: FieldMap = serde_json::from_value(serde_json::json!({"fields":[{"schema":"RegistryEvidenceDto","property":"value","name":"value"}]})).unwrap();
+        let (_, api) = parsed().unwrap();
+        let envelope = key.encrypt("w", "owner_word", "approval").unwrap();
+        let mut evidence =
+            serde_json::json!({"kind":"decision","source":"direct_owner","value":envelope});
+        assert!(
+            visit(
+                &mut evidence,
+                "RegistryEvidenceDto",
+                &api["components"]["schemas"],
+                &map.fields,
+                "w",
+                Some(&key),
+                false,
+                true,
+                false,
+                &mut Vec::new()
+            )
+            .is_err(),
+            "without the selector, generic evidence.value must not accept owner_word AAD"
+        );
+        let contextual_map: FieldMap = serde_json::from_value(serde_json::json!({
+            "version":2,"protocol_min":2,
+            "fields":[{"schema":"RegistryEvidenceDto","property":"value","name":"value"}],
+            "selectors":[{"schema":"RegistryEvidenceDto","property":"value","name":"owner_word","when":{"kind":["decision"],"source":["direct_owner","relayed_owner"]}}]
+        })).unwrap();
+        for source in ["direct_owner", "relayed_owner"] {
+            for aad in ["owner_word", "value"] {
+                let mut evidence = serde_json::json!({"kind":"decision","source":source,"value":key.encrypt("w", aad, "approval").unwrap()});
+                visit(
+                    &mut evidence,
+                    "RegistryEvidenceDto",
+                    &api["components"]["schemas"],
+                    &contextual_map.fields,
+                    "w",
+                    Some(&key),
+                    false,
+                    true,
+                    false,
+                    &mut Vec::new(),
+                )
+                .unwrap();
+                assert_eq!(evidence["value"], "approval");
+            }
+        }
+        for (kind, source) in [
+            ("commit", "direct_owner"),
+            ("decision", "agent"),
+            ("decision", "direct_owner_extra"),
+        ] {
+            let mut evidence = serde_json::json!({"kind":kind,"source":source,"value":key.encrypt("w", "owner_word", "approval").unwrap()});
+            assert!(
+                visit(
+                    &mut evidence,
+                    "RegistryEvidenceDto",
+                    &api["components"]["schemas"],
+                    &contextual_map.fields,
+                    "w",
+                    Some(&key),
+                    false,
+                    true,
+                    false,
+                    &mut Vec::new()
+                )
+                .is_err()
+            );
+        }
+        let event_map: FieldMap = serde_json::from_value(serde_json::json!({
+            "version":2,"protocol_min":2,"fields":[],"selectors":[
+                {"schema":"RegistryEventDto","property":"reason","name":"owner_word","when":{"op":["owner_closed"]}}
+            ]
+        })).unwrap();
+        let mut event = serde_json::json!({"op":"owner_closed","reason":key.encrypt("other-workspace", "owner_word", "approval").unwrap()});
+        assert!(
+            visit_event(
+                &mut event,
+                "RegistryEventDto",
+                &api["components"]["schemas"],
+                &event_map.fields,
+                "w",
+                Some(&key),
+                false,
+                &mut Vec::new()
+            )
+            .is_err(),
+            "confirmed owner-close content must fail authentication even outside required encryption mode"
+        );
+    }
+
+    #[test]
+    fn complete_openapi_protocol_and_drain_metadata_work_in_required_mode() {
+        let key = WorkspaceKey::from_entropy([91; 32]);
+        let mut protocol = serde_json::json!({"selected_protocol":2,"min_protocol":1,"max_protocol":2,"capabilities":["zone_catalog_v1","content_selectors_v1","drain_v1"]});
+        transform_fields_policy(
+            &mut protocol,
+            "GET",
+            "/api/v1/protocol",
+            "w",
+            Some(&key),
+            false,
+            true,
+        )
+        .unwrap();
+        let request = serde_json::json!({"scope":"workspace","instance_id":"11111111-1111-1111-1111-111111111111","timeout_seconds":30});
+        let mut outbound = request.clone();
+        transform_fields_policy(
+            &mut outbound,
+            "POST",
+            "/api/v1/admin/drain",
+            "w",
+            Some(&key),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(outbound, request);
+        for invalid in [
+            serde_json::json!({"scope":"workspace","workspace_id":"foreign"}),
+            serde_json::json!({"scope":"global"}),
+            serde_json::json!({"scope":"workspace","timeout_seconds":"private text"}),
+            serde_json::json!({"scope":"workspace"}),
+            serde_json::json!({"scope":"workspace","instance_id":"11111111-1111-1111-1111-111111111111","timeout_seconds":121}),
+        ] {
+            let mut invalid = invalid;
+            assert!(
+                transform_fields_policy(
+                    &mut invalid,
+                    "POST",
+                    "/api/v1/admin/drain",
+                    "w",
+                    Some(&key),
+                    true,
+                    true
+                )
+                .is_err()
+            );
+        }
+        let mut status = serde_json::json!({"id":"22222222-2222-2222-2222-222222222222","instance_id":"11111111-1111-1111-1111-111111111111","scope":"workspace","state":"draining","started_at":"2026-11-08T00:00:00Z","deadline_at":"2026-11-08T00:00:30Z","active_http":1,"active_workers":0,"active_transports":0,"timed_out":false});
+        for (method, route) in [
+            ("POST", "/api/v1/admin/drain"),
+            (
+                "GET",
+                "/api/v1/admin/drain/22222222-2222-2222-2222-222222222222",
+            ),
+        ] {
+            validate_required_route(method, route).unwrap();
+            transform_fields_policy(&mut status, method, route, "w", Some(&key), false, true)
+                .unwrap();
+        }
+    }
+    #[test]
+    fn inline_drain_metadata_rejects_null_and_non_uuid_instance_ids() {
+        let definition = serde_json::json!({
+            "type":"object","additionalProperties":false,"required":["scope","instance_id"],
+            "properties":{"scope":{"type":"string","enum":["workspace","instance"]},"instance_id":{"type":"string","format":"uuid"}}
+        });
+        for invalid in [
+            serde_json::json!({"scope":null,"instance_id":null}),
+            serde_json::json!({"scope":"workspace","instance_id":"private free text"}),
+        ] {
+            assert!(
+                validate_inline_metadata_request(&invalid, &definition, &serde_json::json!({}))
+                    .is_err(),
+                "invalid instance metadata was accepted: {invalid}"
+            );
+        }
+    }
     #[cfg(unix)]
     #[test]
     fn current_key_read_is_bounded_private_and_uses_opened_descriptor() {

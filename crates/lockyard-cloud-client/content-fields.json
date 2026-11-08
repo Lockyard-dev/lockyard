@@ -1,128 +1,565 @@
 {
   "fields": [
-    {"schema":"CoordinationMessageWrite","property":"body","name":"body"},
-    {"schema":"CoordinationClaimWrite","property":"note","name":"note"},
-    {"schema":"CoordinationReplyWrite","property":"text","name":"text"},
-    {"schema":"CoordinationBoardWrite","property":"value","name":"value"},
-    {"schema":"CoordinationTaskOfferWrite","property":"brief","name":"brief"},
-    {"schema":"CoordinationTaskOfferWrite","property":"title","name":"title"},
-    {"schema":"CoordinationTaskActionWrite","property":"report","name":"report"},
-    {"schema":"CoordinationTaskActionWrite","property":"reason","name":"reason"},
-    {"schema":"CoordinationTaskOfferWrite","property":"accept","name":"accept"},
-    {"schema":"CoordinationRequestWrite","property":"text","name":"text"},
-    {"schema":"CoordinationAnswerWrite","property":"reply","name":"reply"},
-    {"schema":"CreateRegistryItemRequest","property":"title","name":"title"},
-    {"schema":"CreateRegistryItemRequest","property":"body","name":"body"},
-    {"schema":"CreateRegistryItemRequest","property":"acceptance","name":"acceptance"},
-    {"schema":"RegistryImportItemRequest","property":"title","name":"title"},
-    {"schema":"RegistryImportItemRequest","property":"body","name":"body"},
-    {"schema":"RegistryImportItemRequest","property":"acceptance","name":"acceptance"},
-    {"schema":"RegistryImportItemRequest","property":"legacy_raw","name":"legacy_raw"},
-    {"schema":"RegistryEvidenceRequest","property":"value","name":"value"},
-    {"schema":"RegistryTransitionRequest","property":"reason","name":"reason"},
-    {"schema":"RegistryBatchTransitionRequest","property":"reason","name":"reason"},
-    {"schema":"RegistryReviewRequest","property":"reason","name":"reason"},
-    {"schema":"RegistryOwnerCloseRequest","property":"owner_word","name":"owner_word"},
-    {"schema":"CoordinationMessage","property":"body","name":"body"},
-    {"schema":"CoordinationClaim","property":"note","name":"note"},
-    {"schema":"CoordinationBoardValue","property":"value","name":"value"},
-    {"schema":"CoordinationRequest","property":"text","name":"text"},
-    {"schema":"CoordinationRequest","property":"reply","name":"reply"},
-    {"schema":"CoordinationTask","property":"brief","name":"brief"},
-    {"schema":"CoordinationTask","property":"title","name":"title"},
-    {"schema":"CoordinationTask","property":"report","name":"report"},
-    {"schema":"CoordinationTask","property":"reason","name":"reason"},
-    {"schema":"CoordinationTask","property":"accept","name":"accept"},
-    {"schema":"RegistryItemDto","property":"title","name":"title"},
-    {"schema":"RegistryItemDto","property":"body","name":"body"},
-    {"schema":"RegistryItemDto","property":"acceptance","name":"acceptance"},
-    {"schema":"RegistryEvidenceDto","property":"value","name":"value"},
-    {"schema":"CoordinationReplyWrite","property":"body","name":"body"},
-    {"schema":"CoordinationQueueWrite","property":"note","name":"note"},
-    {"schema":"CoordinationQueueEntry","property":"note","name":"note"},
-    {"schema":"CoordinationReleaseWrite","property":"note","name":"note"},
-    {"schema":"RegistryGitHubEvidenceRequest","property":"value","name":"value"},
-    {"schema":"CoordinationZoneCatalog","property":"content","name":"zone_catalog_content"}
+    {
+      "schema": "CoordinationMessageWrite",
+      "property": "body",
+      "name": "body"
+    },
+    {
+      "schema": "CoordinationClaimWrite",
+      "property": "note",
+      "name": "note"
+    },
+    {
+      "schema": "CoordinationReplyWrite",
+      "property": "text",
+      "name": "text"
+    },
+    {
+      "schema": "CoordinationBoardWrite",
+      "property": "value",
+      "name": "value"
+    },
+    {
+      "schema": "CoordinationTaskOfferWrite",
+      "property": "brief",
+      "name": "brief"
+    },
+    {
+      "schema": "CoordinationTaskOfferWrite",
+      "property": "title",
+      "name": "title"
+    },
+    {
+      "schema": "CoordinationTaskActionWrite",
+      "property": "report",
+      "name": "report"
+    },
+    {
+      "schema": "CoordinationTaskActionWrite",
+      "property": "reason",
+      "name": "reason"
+    },
+    {
+      "schema": "CoordinationTaskOfferWrite",
+      "property": "accept",
+      "name": "accept"
+    },
+    {
+      "schema": "CoordinationRequestWrite",
+      "property": "text",
+      "name": "text"
+    },
+    {
+      "schema": "CoordinationAnswerWrite",
+      "property": "reply",
+      "name": "reply"
+    },
+    {
+      "schema": "CreateRegistryItemRequest",
+      "property": "title",
+      "name": "title"
+    },
+    {
+      "schema": "CreateRegistryItemRequest",
+      "property": "body",
+      "name": "body"
+    },
+    {
+      "schema": "CreateRegistryItemRequest",
+      "property": "acceptance",
+      "name": "acceptance"
+    },
+    {
+      "schema": "RegistryImportItemRequest",
+      "property": "title",
+      "name": "title"
+    },
+    {
+      "schema": "RegistryImportItemRequest",
+      "property": "body",
+      "name": "body"
+    },
+    {
+      "schema": "RegistryImportItemRequest",
+      "property": "acceptance",
+      "name": "acceptance"
+    },
+    {
+      "schema": "RegistryImportItemRequest",
+      "property": "legacy_raw",
+      "name": "legacy_raw"
+    },
+    {
+      "schema": "RegistryEvidenceRequest",
+      "property": "value",
+      "name": "value"
+    },
+    {
+      "schema": "RegistryTransitionRequest",
+      "property": "reason",
+      "name": "reason"
+    },
+    {
+      "schema": "RegistryBatchTransitionRequest",
+      "property": "reason",
+      "name": "reason"
+    },
+    {
+      "schema": "RegistryReviewRequest",
+      "property": "reason",
+      "name": "reason"
+    },
+    {
+      "schema": "RegistryOwnerCloseRequest",
+      "property": "owner_word",
+      "name": "owner_word"
+    },
+    {
+      "schema": "CoordinationMessage",
+      "property": "body",
+      "name": "body"
+    },
+    {
+      "schema": "CoordinationClaim",
+      "property": "note",
+      "name": "note"
+    },
+    {
+      "schema": "CoordinationBoardValue",
+      "property": "value",
+      "name": "value"
+    },
+    {
+      "schema": "CoordinationRequest",
+      "property": "text",
+      "name": "text"
+    },
+    {
+      "schema": "CoordinationRequest",
+      "property": "reply",
+      "name": "reply"
+    },
+    {
+      "schema": "CoordinationTask",
+      "property": "brief",
+      "name": "brief"
+    },
+    {
+      "schema": "CoordinationTask",
+      "property": "title",
+      "name": "title"
+    },
+    {
+      "schema": "CoordinationTask",
+      "property": "report",
+      "name": "report"
+    },
+    {
+      "schema": "CoordinationTask",
+      "property": "reason",
+      "name": "reason"
+    },
+    {
+      "schema": "CoordinationTask",
+      "property": "accept",
+      "name": "accept"
+    },
+    {
+      "schema": "RegistryItemDto",
+      "property": "title",
+      "name": "title"
+    },
+    {
+      "schema": "RegistryItemDto",
+      "property": "body",
+      "name": "body"
+    },
+    {
+      "schema": "RegistryItemDto",
+      "property": "acceptance",
+      "name": "acceptance"
+    },
+    {
+      "schema": "RegistryEvidenceDto",
+      "property": "value",
+      "name": "value"
+    },
+    {
+      "schema": "CoordinationReplyWrite",
+      "property": "body",
+      "name": "body"
+    },
+    {
+      "schema": "CoordinationQueueWrite",
+      "property": "note",
+      "name": "note"
+    },
+    {
+      "schema": "CoordinationQueueEntry",
+      "property": "note",
+      "name": "note"
+    },
+    {
+      "schema": "CoordinationReleaseWrite",
+      "property": "note",
+      "name": "note"
+    },
+    {
+      "schema": "RegistryGitHubEvidenceRequest",
+      "property": "value",
+      "name": "value"
+    },
+    {
+      "schema": "CoordinationZoneCatalog",
+      "property": "content",
+      "name": "zone_catalog_content"
+    }
   ],
   "clear": [
-    {"schema":"CoordinationMessageWrite","property":"to"},
-    {"schema":"CoordinationMessageWrite","property":"kind"},
-    {"schema":"CoordinationMessageWrite","property":"needs"},
-    {"schema":"CoordinationTaskOfferWrite","property":"to"},
-    {"schema":"RegistryEvidenceRequest","property":"kind"},
-    {"schema":"RegistryEvidenceRequest","property":"environment"},
-    {"schema":"RegistryEvidenceRequest","property":"observed_at"},
-    {"schema":"RegistryEvidenceRequest","property":"verifier"},
-    {"schema":"RegistryEvidenceRequest","property":"expected_version"},
-    {"schema":"RegistryTransitionRequest","property":"to"},
-    {"schema":"RegistryTransitionRequest","property":"resolution"},
-    {"schema":"RegistryTransitionRequest","property":"expected_version"},
-    {"schema":"CoordinationClaimReleaseResult","property":"reason"},
-    {"schema":"CoordinationDirtyPath","property":"reason"},
-    {"schema":"CoordinationDirtyPathReply","property":"reason"},
-    {"schema":"CoordinationFreezeResult","property":"reason"},
-    {"schema":"CoordinationFreezeWrite","property":"reason"},
-    {"schema":"CoordinationLostEvent","property":"note"},
-    {"schema":"CoordinationLostEvent","property":"reason"},
-    {"schema":"CoordinationTakeoverWrite","property":"reason"},
-    {"schema":"CoordinationDirtyPathsWrite","property":"reason"},
-    {"schema":"RegistryEventDto","property":"reason"},
-    {"schema":"CoordinationClaimWrite","property":"purpose"},
-    {"schema":"CoordinationClaim","property":"purpose"},
-    {"schema":"CoordinationQueueWrite","property":"purpose"},
-    {"schema":"CoordinationQueueEntry","property":"purpose"},
-    {"schema":"RegistryAssignmentDto","property":"lease_active"},
-    {"schema":"RegistryOwnerCloseRequest","property":"expected_version"},
-    {"schema":"RegistryOwnerCloseRequest","property":"direct"},
-    {"schema":"RegistryEvidenceRequest","property":"repository"},
-    {"schema":"RegistryEvidenceRequest","property":"commit_sha"},
-    {"schema":"RegistryEvidenceRequest","property":"run_id"},
-    {"schema":"RegistryEvidenceRequest","property":"pull_request"},
-    {"schema":"RegistryEvidenceDto","property":"assurance"},
-    {"schema":"RegistryEvidenceDto","property":"source"},
-    {"schema":"RegistryEvidenceDto","property":"repository"},
-    {"schema":"RegistryEvidenceDto","property":"commit_sha"},
-    {"schema":"RegistryEvidenceDto","property":"run_id"},
-    {"schema":"RegistryEvidenceDto","property":"pull_request"},
-    {"schema":"RegistryEvidenceDto","property":"checked_at"},
-    {"schema":"RegistryEvidenceDto","property":"source_actor"},
-    {"schema":"RegistryGitHubEvidenceRequest","property":"repository"},
-    {"schema":"RegistryGitHubEvidenceRequest","property":"commit_sha"},
-    {"schema":"RegistryGitHubEvidenceRequest","property":"run_id"},
-    {"schema":"RegistryGitHubEvidenceRequest","property":"pull_request"},
-    {"schema":"RegistryGitHubEvidenceRequest","property":"expected_version"},
-    {"schema":"RegistryActorDto","property":"identity"},
-    {"schema":"RegistryActorDto","property":"role"},
-    {"schema":"RegistryActorDto","property":"is_owner"},
-    {"schema":"RegistryActorDto","property":"can_accept_review"},
-    {"schema":"RegistryActorDto","property":"can_relay_owner"},
-    {"schema":"RegistryBlockersDto","property":"item_id"},
-    {"schema":"RegistryBlockersDto","property":"status"},
-    {"schema":"RegistryBlockersDto","property":"ready"},
-    {"schema":"RegistryBlockersDto","property":"reasons"},
-    {"schema":"RegistryBlockersDto","property":"unavailable_blockers"},
-    {"schema":"RegistryActorDto","property":"workspace_id"},
-    {"schema":"CoordinationClaim","property":"repository"},
-    {"schema":"CoordinationQueueEntry","property":"repository"},
-    {"schema":"CoordinationRequest","property":"repository"},
-    {"schema":"CoordinationDirtyPathReply","property":"repository"},
-    {"schema":"CoordinationLostEvent","property":"repository"},
-    {"schema":"RegistryGitHubReceiptDto","property":"delivery_id"},
-    {"schema":"RegistryGitHubReceiptDto","property":"item_id"},
-    {"schema":"RegistryGitHubReceiptDto","property":"event_key"},
-    {"schema":"RegistryGitHubReceiptDto","property":"state"},
-    {"schema":"RegistryGitHubReceiptDto","property":"occurred_at"},
-    {"schema":"RegistryGitHubReceiptDto","property":"sent_at"},
-    {"schema":"RegistryGitHubReceiptDto","property":"repository"},
-    {"schema":"RegistryGitHubReceiptDto","property":"commit_sha"},
-    {"schema":"CoordinationZoneCatalog","property":"format"},
-    {"schema":"CoordinationZoneCatalog","property":"workspace_id"},
-    {"schema":"CoordinationZoneCatalog","property":"repository"},
-    {"schema":"CoordinationZoneCatalog","property":"revision"},
-    {"schema":"CoordinationZoneCatalog","property":"key_id"},
-    {"schema":"CoordinationZoneCatalog","property":"case_insensitive_paths"},
-    {"schema":"CoordinationZoneCatalog","property":"content_sha256"},
-    {"schema":"CoordinationZoneCatalog","property":"metadata_hmac"},
-    {"schema":"CoordinationZoneCatalogWrite","property":"expected_revision"}
+    {
+      "schema": "CoordinationMessageWrite",
+      "property": "to"
+    },
+    {
+      "schema": "CoordinationMessageWrite",
+      "property": "kind"
+    },
+    {
+      "schema": "CoordinationMessageWrite",
+      "property": "needs"
+    },
+    {
+      "schema": "CoordinationTaskOfferWrite",
+      "property": "to"
+    },
+    {
+      "schema": "RegistryEvidenceRequest",
+      "property": "kind"
+    },
+    {
+      "schema": "RegistryEvidenceRequest",
+      "property": "environment"
+    },
+    {
+      "schema": "RegistryEvidenceRequest",
+      "property": "observed_at"
+    },
+    {
+      "schema": "RegistryEvidenceRequest",
+      "property": "verifier"
+    },
+    {
+      "schema": "RegistryEvidenceRequest",
+      "property": "expected_version"
+    },
+    {
+      "schema": "RegistryTransitionRequest",
+      "property": "to"
+    },
+    {
+      "schema": "RegistryTransitionRequest",
+      "property": "resolution"
+    },
+    {
+      "schema": "RegistryTransitionRequest",
+      "property": "expected_version"
+    },
+    {
+      "schema": "CoordinationClaimReleaseResult",
+      "property": "reason"
+    },
+    {
+      "schema": "CoordinationDirtyPath",
+      "property": "reason"
+    },
+    {
+      "schema": "CoordinationDirtyPathReply",
+      "property": "reason"
+    },
+    {
+      "schema": "CoordinationFreezeResult",
+      "property": "reason"
+    },
+    {
+      "schema": "CoordinationFreezeWrite",
+      "property": "reason"
+    },
+    {
+      "schema": "CoordinationLostEvent",
+      "property": "note"
+    },
+    {
+      "schema": "CoordinationLostEvent",
+      "property": "reason"
+    },
+    {
+      "schema": "CoordinationTakeoverWrite",
+      "property": "reason"
+    },
+    {
+      "schema": "CoordinationDirtyPathsWrite",
+      "property": "reason"
+    },
+    {
+      "schema": "RegistryEventDto",
+      "property": "reason"
+    },
+    {
+      "schema": "CoordinationClaimWrite",
+      "property": "purpose"
+    },
+    {
+      "schema": "CoordinationClaim",
+      "property": "purpose"
+    },
+    {
+      "schema": "CoordinationQueueWrite",
+      "property": "purpose"
+    },
+    {
+      "schema": "CoordinationQueueEntry",
+      "property": "purpose"
+    },
+    {
+      "schema": "RegistryAssignmentDto",
+      "property": "lease_active"
+    },
+    {
+      "schema": "RegistryOwnerCloseRequest",
+      "property": "expected_version"
+    },
+    {
+      "schema": "RegistryOwnerCloseRequest",
+      "property": "direct"
+    },
+    {
+      "schema": "RegistryEvidenceRequest",
+      "property": "repository"
+    },
+    {
+      "schema": "RegistryEvidenceRequest",
+      "property": "commit_sha"
+    },
+    {
+      "schema": "RegistryEvidenceRequest",
+      "property": "run_id"
+    },
+    {
+      "schema": "RegistryEvidenceRequest",
+      "property": "pull_request"
+    },
+    {
+      "schema": "RegistryEvidenceDto",
+      "property": "assurance"
+    },
+    {
+      "schema": "RegistryEvidenceDto",
+      "property": "source"
+    },
+    {
+      "schema": "RegistryEvidenceDto",
+      "property": "repository"
+    },
+    {
+      "schema": "RegistryEvidenceDto",
+      "property": "commit_sha"
+    },
+    {
+      "schema": "RegistryEvidenceDto",
+      "property": "run_id"
+    },
+    {
+      "schema": "RegistryEvidenceDto",
+      "property": "pull_request"
+    },
+    {
+      "schema": "RegistryEvidenceDto",
+      "property": "checked_at"
+    },
+    {
+      "schema": "RegistryEvidenceDto",
+      "property": "source_actor"
+    },
+    {
+      "schema": "RegistryGitHubEvidenceRequest",
+      "property": "repository"
+    },
+    {
+      "schema": "RegistryGitHubEvidenceRequest",
+      "property": "commit_sha"
+    },
+    {
+      "schema": "RegistryGitHubEvidenceRequest",
+      "property": "run_id"
+    },
+    {
+      "schema": "RegistryGitHubEvidenceRequest",
+      "property": "pull_request"
+    },
+    {
+      "schema": "RegistryGitHubEvidenceRequest",
+      "property": "expected_version"
+    },
+    {
+      "schema": "RegistryActorDto",
+      "property": "identity"
+    },
+    {
+      "schema": "RegistryActorDto",
+      "property": "role"
+    },
+    {
+      "schema": "RegistryActorDto",
+      "property": "is_owner"
+    },
+    {
+      "schema": "RegistryActorDto",
+      "property": "can_accept_review"
+    },
+    {
+      "schema": "RegistryActorDto",
+      "property": "can_relay_owner"
+    },
+    {
+      "schema": "RegistryBlockersDto",
+      "property": "item_id"
+    },
+    {
+      "schema": "RegistryBlockersDto",
+      "property": "status"
+    },
+    {
+      "schema": "RegistryBlockersDto",
+      "property": "ready"
+    },
+    {
+      "schema": "RegistryBlockersDto",
+      "property": "reasons"
+    },
+    {
+      "schema": "RegistryBlockersDto",
+      "property": "unavailable_blockers"
+    },
+    {
+      "schema": "RegistryActorDto",
+      "property": "workspace_id"
+    },
+    {
+      "schema": "CoordinationClaim",
+      "property": "repository"
+    },
+    {
+      "schema": "CoordinationQueueEntry",
+      "property": "repository"
+    },
+    {
+      "schema": "CoordinationRequest",
+      "property": "repository"
+    },
+    {
+      "schema": "CoordinationDirtyPathReply",
+      "property": "repository"
+    },
+    {
+      "schema": "CoordinationLostEvent",
+      "property": "repository"
+    },
+    {
+      "schema": "RegistryGitHubReceiptDto",
+      "property": "delivery_id"
+    },
+    {
+      "schema": "RegistryGitHubReceiptDto",
+      "property": "item_id"
+    },
+    {
+      "schema": "RegistryGitHubReceiptDto",
+      "property": "event_key"
+    },
+    {
+      "schema": "RegistryGitHubReceiptDto",
+      "property": "state"
+    },
+    {
+      "schema": "RegistryGitHubReceiptDto",
+      "property": "occurred_at"
+    },
+    {
+      "schema": "RegistryGitHubReceiptDto",
+      "property": "sent_at"
+    },
+    {
+      "schema": "RegistryGitHubReceiptDto",
+      "property": "repository"
+    },
+    {
+      "schema": "RegistryGitHubReceiptDto",
+      "property": "commit_sha"
+    },
+    {
+      "schema": "CoordinationZoneCatalog",
+      "property": "format"
+    },
+    {
+      "schema": "CoordinationZoneCatalog",
+      "property": "workspace_id"
+    },
+    {
+      "schema": "CoordinationZoneCatalog",
+      "property": "repository"
+    },
+    {
+      "schema": "CoordinationZoneCatalog",
+      "property": "revision"
+    },
+    {
+      "schema": "CoordinationZoneCatalog",
+      "property": "key_id"
+    },
+    {
+      "schema": "CoordinationZoneCatalog",
+      "property": "case_insensitive_paths"
+    },
+    {
+      "schema": "CoordinationZoneCatalog",
+      "property": "content_sha256"
+    },
+    {
+      "schema": "CoordinationZoneCatalog",
+      "property": "metadata_hmac"
+    },
+    {
+      "schema": "CoordinationZoneCatalogWrite",
+      "property": "expected_revision"
+    }
+  ],
+  "version": 2,
+  "protocol_min": 2,
+  "selectors": [
+    {
+      "schema": "RegistryEvidenceDto",
+      "property": "value",
+      "name": "owner_word",
+      "when": {
+        "kind": [
+          "decision"
+        ],
+        "source": [
+          "direct_owner",
+          "relayed_owner"
+        ]
+      }
+    },
+    {
+      "schema": "RegistryEventDto",
+      "property": "reason",
+      "name": "owner_word",
+      "when": {
+        "op": [
+          "owner_closed"
+        ]
+      }
+    }
   ]
 }

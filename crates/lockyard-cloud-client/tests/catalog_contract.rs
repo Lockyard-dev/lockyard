@@ -109,3 +109,92 @@ fn zone_catalog_contract_has_closed_wire_and_cas_schemas_and_referenced_routes()
         "#/components/schemas/CoordinationZoneCatalogWrite"
     );
 }
+
+#[test]
+fn full_server_contract_includes_protocol_drain_and_protocol_headers() {
+    let api: Value = serde_json::from_str(OPENAPI).unwrap();
+    for (path, method, schema) in [
+        ("/api/v1/protocol", "get", "ProtocolDescription"),
+        ("/api/v1/admin/drain", "post", "DrainStatus"),
+        ("/api/v1/admin/drain/{id}", "get", "DrainStatus"),
+    ] {
+        let operation = &api["paths"][path][method];
+        assert!(operation.is_object(), "missing {method} {path}");
+        assert_eq!(
+            operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            format!("#/components/schemas/{schema}")
+        );
+    }
+    let signed_result = &api["paths"]["/api/v1/nodes/{node_id}/jobs/{job_id}/signed-result"];
+    assert_eq!(
+        signed_result["put"]["requestBody"]["content"]["application/octet-stream"]["schema"]["format"],
+        "binary"
+    );
+    assert_eq!(
+        signed_result["get"]["responses"]["200"]["content"]["application/octet-stream"]["schema"]["format"],
+        "binary"
+    );
+    assert!(signed_result["put"]["responses"]["204"].is_object());
+    assert!(
+        signed_result["put"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|parameter| {
+                parameter["in"] == "header"
+                    && parameter["name"] == "Lockyard-Result-Expires-At"
+                    && parameter["required"] == true
+            })
+    );
+    assert!(
+        signed_result["get"]["responses"]["200"]["headers"]["Lockyard-Result-Expires-At"]
+            .is_object()
+    );
+    for (path, operations) in api["paths"].as_object().unwrap() {
+        // EP-10 negotiates the versioned API; public health/auth routes are separate.
+        if !path.starts_with("/api/v1/") {
+            continue;
+        }
+        for method in ["get", "post", "put", "patch", "delete"] {
+            let Some(operation) = operations.get(method) else {
+                continue;
+            };
+            assert!(
+                operation["parameters"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|parameter| {
+                        parameter["in"] == "header" && parameter["name"] == "Lockyard-Protocol"
+                    }),
+                "missing protocol request header on {method} {path}"
+            );
+            for (status, response) in operation["responses"].as_object().unwrap() {
+                for header in [
+                    "Lockyard-Protocol",
+                    "Lockyard-Protocol-Min",
+                    "Lockyard-Protocol-Max",
+                ] {
+                    assert!(
+                        response["headers"][header].is_object(),
+                        "missing {header} on {method} {path} {status}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn owner_word_manifest_declares_versioned_contextual_selectors() {
+    let table: Value = serde_json::from_str(MANIFEST).unwrap();
+    assert_eq!(table["version"], 2);
+    assert_eq!(table["protocol_min"], 2);
+    assert_eq!(
+        table["selectors"],
+        json!([
+            {"schema":"RegistryEvidenceDto","property":"value","name":"owner_word","when":{"kind":["decision"],"source":["direct_owner","relayed_owner"]}},
+            {"schema":"RegistryEventDto","property":"reason","name":"owner_word","when":{"op":["owner_closed"]}}
+        ])
+    );
+}
