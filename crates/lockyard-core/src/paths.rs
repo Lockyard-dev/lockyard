@@ -115,6 +115,7 @@ fn overlaps_exact(a: &str, b: &str) -> bool {
 
 /// Finds the project that contains `start`.
 pub fn find_root(start: &Path) -> Option<PathBuf> {
+    let _span = crate::perf::Span::new("project.discovery");
     let start = start.canonicalize().ok()?;
     start
         .ancestors()

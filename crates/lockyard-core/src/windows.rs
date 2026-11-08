@@ -52,6 +52,7 @@ fn token_user() -> io::Result<Vec<usize>> {
     token_information(TokenUser)
 }
 fn token_information(class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<usize>> {
+    let _span = crate::perf::Span::new("windows.token_information");
     let mut token = ptr::null_mut();
     unsafe {
         checked(OpenProcessToken(
@@ -272,6 +273,7 @@ fn open_relative(
     security: Option<&Security>,
     share: u32,
 ) -> io::Result<File> {
+    let _span = crate::perf::Span::new("windows.open_relative");
     let path = Path::new(name);
     if path.components().count() != 1
         || !matches!(
@@ -482,6 +484,7 @@ pub fn require_private(path: &Path) -> io::Result<()> {
     require_private_file(&open_metadata(path)?)
 }
 pub fn require_private_file(file: &File) -> io::Result<()> {
+    let _span = crate::perf::Span::new("windows.require_private_file");
     validate_file(file, false)?;
     require_private_handle(file.as_raw_handle(), SE_FILE_OBJECT)
 }
@@ -785,7 +788,10 @@ pub fn read_private(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 pub fn file_identity(file: &File) -> io::Result<(u32, u64)> {
-    let info = handle_information(file.as_raw_handle())?;
+    handle_identity(file.as_raw_handle())
+}
+pub(crate) fn handle_identity(handle: HANDLE) -> io::Result<(u32, u64)> {
+    let info = handle_information(handle)?;
     Ok((
         info.dwVolumeSerialNumber,
         (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
@@ -807,7 +813,65 @@ impl std::ops::Deref for Directory {
     }
 }
 impl Directory {
+    /// Validate a database child relative to this already pinned directory.
+    /// Reusing the parent handles avoids a fresh pathname walk for each SQLite sidecar;
+    /// the same ancestor/type checks and a fresh leaf owner/DACL check still run.
+    #[cfg(test)]
+    pub(crate) fn open_private_file(
+        &self,
+        name: &std::ffi::OsStr,
+        create: bool,
+    ) -> io::Result<File> {
+        self.open_private_file_shared(name, create, true)
+    }
+
+    /// Hold the validated leaf name while a library opens it by pathname.
+    /// Data access plus omission of FILE_SHARE_DELETE prevents rename/unlink.
+    pub(crate) fn pin_private_file(
+        &self,
+        name: &std::ffi::OsStr,
+        create: bool,
+    ) -> io::Result<File> {
+        self.open_private_file_shared(name, create, false)
+    }
+
+    fn open_private_file_shared(
+        &self,
+        name: &std::ffi::OsStr,
+        create: bool,
+        share_delete: bool,
+    ) -> io::Result<File> {
+        let open = |disposition, security: Option<&Security>| {
+            open_relative(
+                &self.file,
+                name,
+                READ_CONTROL | FILE_READ_ATTRIBUTES | GENERIC_READ | GENERIC_WRITE,
+                disposition,
+                nt::FILE_NON_DIRECTORY_FILE,
+                security,
+                FILE_SHARE_READ
+                    | FILE_SHARE_WRITE
+                    | if share_delete { FILE_SHARE_DELETE } else { 0 },
+            )
+        };
+        self.validate_chain()?;
+        let file = match open(nt::FILE_OPEN, None) {
+            Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
+                // Existing files need no creation descriptor. A concurrent creator
+                // still goes through the same fresh type/owner/DACL checks below.
+                let security = Security::new()?;
+                self.validate_chain()?;
+                open(nt::FILE_OPEN_IF, Some(&security))?
+            }
+            opened => opened?,
+        };
+        self.validate_chain()?;
+        require_private_file(&file)?;
+        Ok(file)
+    }
+
     fn validate_chain(&self) -> io::Result<()> {
+        let _span = crate::perf::Span::new("windows.validate_chain");
         for directory in self._ancestors.iter().chain(std::iter::once(&self.file)) {
             validate_file(directory, false)?;
             if !directory.metadata()?.is_dir() {
@@ -1022,6 +1086,7 @@ fn reopen_writable(file: &File) -> io::Result<File> {
     Ok(result)
 }
 pub fn sync_file(file: &File) -> io::Result<()> {
+    let _span = crate::perf::Span::new("windows.sync_file");
     reopen_writable(file)?.sync_all()
 }
 pub fn truncate_file(file: &File, length: u64) -> io::Result<()> {
@@ -1471,6 +1536,17 @@ mod tests {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"original key");
+        let parent_pin = open_directory(&parent).unwrap();
+        assert!(
+            fs::rename(root.path().join("ancestor"), root.path().join("redirected")).is_err(),
+            "the reused directory must keep its ancestors pinned"
+        );
+        let mut pinned_file = parent_pin
+            .open_private_file(std::ffi::OsStr::new("key"), false)
+            .unwrap();
+        let mut pinned_bytes = Vec::new();
+        pinned_file.read_to_end(&mut pinned_bytes).unwrap();
+        assert_eq!(pinned_bytes, b"original key");
 
         // An existing metadata-write handle can mutate a directory in place;
         // denying rename alone is insufficient. No key may be created there.
@@ -1478,6 +1554,7 @@ mod tests {
         let target = root.path().join("target");
         private_dir(&staging).unwrap();
         private_dir(&target).unwrap();
+        let staging_pin = open_directory(&staging).unwrap();
         let attacker = open_path(
             &staging,
             FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES,
@@ -1532,6 +1609,14 @@ mod tests {
             !staging.join("key").exists(),
             "the junction target must remain untouched"
         );
+        assert!(
+            staging_pin
+                .open_private_file(std::ffi::OsStr::new("key"), true)
+                .is_err(),
+            "reusing a pinned parent must still refuse an in-place reparse mutation"
+        );
+        assert_eq!(fs::read_dir(root.path().join("target")).unwrap().count(), 0);
+        drop(staging_pin);
         drop(attacker);
         fs::remove_dir(staging).unwrap();
     }
@@ -1577,6 +1662,125 @@ mod tests {
             require_private_file(&file).unwrap_err().to_string(),
             denied().to_string(),
             "owner SID alone cannot make an incomplete ACL acceptable"
+        );
+    }
+
+    #[test]
+    fn pinned_directory_children_keep_private_acl_and_single_component_rules() {
+        use std::ffi::OsStr;
+        let root = tempfile::tempdir().unwrap();
+        private_dir(root.path()).unwrap();
+        let directory = open_directory(root.path()).unwrap();
+        let file = directory
+            .open_private_file(OsStr::new("key"), true)
+            .unwrap();
+        require_private_file(&file).unwrap();
+        drop(file);
+        directory
+            .open_private_file(OsStr::new("key"), false)
+            .unwrap();
+        assert_eq!(
+            directory
+                .open_private_file(OsStr::new("missing"), false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        for name in ["../escape", "nested/key", "key:stream", ".", ".."] {
+            assert!(directory.open_private_file(OsStr::new(name), true).is_err());
+        }
+        std::fs::hard_link(root.path().join("key"), root.path().join("alias")).unwrap();
+        assert!(
+            directory
+                .open_private_file(OsStr::new("alias"), false)
+                .is_err()
+        );
+        std::fs::remove_file(root.path().join("alias")).unwrap();
+        assert!(
+            std::process::Command::new("icacls.exe")
+                .arg(root.path().join("key"))
+                .args(["/grant", "*S-1-1-0:R"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            directory
+                .open_private_file(OsStr::new("key"), false)
+                .is_err()
+        );
+        assert!(
+            directory
+                .open_private_file(OsStr::new("key"), true)
+                .is_err(),
+            "create=true must never repair an exposed existing file"
+        );
+    }
+
+    #[test]
+    fn pinned_directory_children_refuse_directory_and_junction_leaves() {
+        use std::ffi::OsStr;
+        let root = tempfile::tempdir().unwrap();
+        private_dir(root.path()).unwrap();
+        let directory = open_directory(root.path()).unwrap();
+        let target = root.path().join("target");
+        private_dir(&target).unwrap();
+        let junction = root.path().join("junction");
+        assert!(
+            std::process::Command::new("cmd.exe")
+                .args(["/c", "mklink", "/J"])
+                .arg(&junction)
+                .arg(&target)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            directory
+                .open_private_file(OsStr::new("target"), false)
+                .is_err()
+        );
+        assert!(
+            directory
+                .open_private_file(OsStr::new("junction"), false)
+                .is_err()
+        );
+        std::fs::remove_dir(junction).unwrap();
+        assert_eq!(std::fs::read_dir(target).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "manual Windows profiling: 80 bounded authenticated pipe connections"]
+    async fn profile_authenticated_pipe_connect_80_samples() {
+        use std::time::{Duration, Instant};
+        const SAMPLES: usize = 80;
+        let unique = tempfile::tempdir().unwrap();
+        let path = pipe_path(&unique.path().to_string_lossy()).unwrap();
+        let started = Instant::now();
+        let listener = ipc::AsyncListener::bind(&path).unwrap();
+        let cold_bind = started.elapsed();
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let started = Instant::now();
+            let (client, accepted) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::try_join!(
+                    ipc::AsyncStream::connect_timeout(&path, Duration::from_secs(1)),
+                    listener.accept(),
+                )
+            })
+            .await
+            .expect("authenticated pipe connect/accept exceeded its deadline")
+            .unwrap();
+            samples.push(started.elapsed());
+            drop(client);
+            drop(accepted);
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "perf_probe windows_named_pipe_connect samples={SAMPLES} p50_us={} p95_us={} cold_bind_us={}",
+            samples[SAMPLES / 2].as_micros(),
+            samples[SAMPLES * 95 / 100].as_micros(),
+            cold_bind.as_micros()
         );
     }
 

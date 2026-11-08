@@ -9,7 +9,14 @@ cat > "$fixture/bin/cargo" <<'MOCK'
 #!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$MACOS_PERF_COMMANDS"
+if [ "${CARGO_INCREMENTAL:-}" != 0 ]; then
+    echo 'performance gate must disable incremental compilation' >&2
+    exit 2
+fi
 case "$*" in
+    'test --locked --release -p lockyard --test perf_profile -- --ignored --test-threads=1 --nocapture')
+        if [ "$MACOS_PERF_CASE" = profile_failed ]; then exit 101; fi
+        ;;
     'test --locked --release -p lockyard --test perf_budget -- --list')
         case "$MACOS_PERF_CASE" in
             missing) echo 'hook_decision_p95_stays_within_budget: test' ;;
@@ -22,7 +29,7 @@ case "$*" in
     'test --locked --release -p lockyard --test perf_budget -- --test-threads=1 --nocapture')
         if [ "$MACOS_PERF_CASE" = budget_failed ]; then exit 101; fi
         if [ "$MACOS_PERF_CASE" = flaky ]; then
-            runs=$(grep -c -- '--nocapture' "$MACOS_PERF_COMMANDS")
+            runs=$(grep -F -c -- '--test perf_budget -- --test-threads=1 --nocapture' "$MACOS_PERF_COMMANDS")
             if [ "$runs" -lt 2 ]; then exit 101; fi
         fi
         ;;
@@ -32,15 +39,15 @@ MOCK
 chmod +x "$fixture/bin/cargo"
 export MACOS_PERF_COMMANDS="$fixture/commands"
 export PATH="$fixture/bin:$PATH"
-for scenario in missing unknown duplicate list_failed budget_failed flaky valid; do
+for scenario in profile_failed missing unknown duplicate list_failed flaky budget_failed valid; do
     : > "$MACOS_PERF_COMMANDS"
-    if MACOS_PERF_CASE=$scenario sh "$repo/tools/ci/test-macos-perf.sh" > "$fixture/output" 2>&1; then status=0; else status=$?; fi
+    if CARGO_INCREMENTAL=1 MACOS_PERF_CASE=$scenario sh "$repo/tools/ci/test-macos-perf.sh" > "$fixture/output" 2>&1; then status=0; else status=$?; fi
     case "$scenario" in
-        valid) expected=0; calls=2 ;;
-        list_failed) expected=101; calls=1 ;;
-        budget_failed) expected=101; calls=4 ;;
-        flaky) expected=0; calls=3 ;;
-        *) expected=1; calls=1 ;;
+        valid) expected=0; calls=3 ;;
+        profile_failed) expected=101; calls=1 ;;
+        list_failed) expected=101; calls=2 ;;
+        budget_failed|flaky) expected=101; calls=3 ;;
+        *) expected=1; calls=2 ;;
     esac
     actual_calls=$(wc -l < "$MACOS_PERF_COMMANDS" | tr -d ' ')
     if [ "$status" != "$expected" ] || [ "$actual_calls" != "$calls" ]; then

@@ -78,6 +78,7 @@ pub struct Message {
 impl Store {
     /// Sends `body` to an agent seen in this project or to [`BROADCAST`].
     pub fn send(&mut self, from: &str, to: &str, body: &str, now: i64) -> Result<Message> {
+        let _span = crate::perf::Span::new("message.send");
         if to != BROADCAST {
             validate_agent(to)?;
         }
@@ -341,6 +342,7 @@ impl Store {
                 body.len()
             )));
         }
+        let transaction_span = crate::perf::Span::new("message.transaction");
         let transaction = self.write()?;
         // What the sweep removes is still worth one line to the sender: silence and "it expired
         // before anyone looked at it" are different answers to "did my message land?".
@@ -367,7 +369,10 @@ impl Store {
             params![from, to, body, reply_to, now],
         )?;
         let id = transaction.last_insert_rowid();
+        let _commit = crate::perf::Span::new("sqlite.commit_full");
         transaction.commit()?;
+        drop(_commit);
+        drop(transaction_span);
         Ok(Message {
             id,
             from: from.to_string(),

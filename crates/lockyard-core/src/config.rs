@@ -28,6 +28,7 @@ pub enum Mode {
 
 impl Config {
     pub fn load(root: &Path) -> Result<Self> {
+        let _span = crate::perf::Span::new("project.config");
         let path = root.join(DIR_NAME).join("config.toml");
         let content = match fs::read_to_string(path) {
             Ok(content) => content,

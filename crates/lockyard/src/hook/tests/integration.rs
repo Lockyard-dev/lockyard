@@ -125,6 +125,23 @@
         assert!(!command_is_heavy("codex", &heavy));
     }
 
+    #[test]
+    fn local_machine_config_is_loaded_only_for_command_checks() {
+        for event in [
+            json!({"hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":"src/a.rs"}}),
+            json!({"hook_event_name":"PostToolUse","tool_input":{"command":"custom-build"}}),
+            json!({"hook_event_name":"PreToolUse","tool_input":{"command":42}}),
+        ] {
+            local_machine_config(&event, || panic!("this event does not use machine settings"));
+        }
+        // Even an Edit carrying a command retains the existing machine guard.
+        let config = local_machine_config(
+            &json!({"hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"command":"custom-build"}}),
+            || lockyard_core::machine::MachineConfig { heavy_commands: Some(vec!["custom-build".into()]), ..Default::default() },
+        );
+        assert!(command_is_heavy("custom-build", &config.heavy_commands()));
+    }
+
     use lockyard_core::Error;
     use std::cell::RefCell;
     use std::fs;

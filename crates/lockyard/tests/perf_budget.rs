@@ -15,19 +15,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const SAMPLES: usize = 80;
-// Windows and macOS have their own ceilings (owner decisions 2026-11-08): NTFS durable
-// writes and process start are slower on Windows (hosted release p95: hook 15.3 ms, send
-// 26-31 ms); hosted macOS runners measured send 20.6 ms. Linux keeps the strict 15/20 ms.
-#[cfg(not(windows))]
+// The same first-run p95 contract applies on every OS. Diagnostic profiling runs
+// separately; no retries, sample filtering or relaxed platform-specific ceilings.
 const HOOK_P95: Duration = Duration::from_millis(15);
-#[cfg(not(any(windows, target_os = "macos")))]
 const SEND_P95: Duration = Duration::from_millis(20);
-#[cfg(target_os = "macos")]
-const SEND_P95: Duration = Duration::from_millis(30);
-#[cfg(windows)]
-const HOOK_P95: Duration = Duration::from_millis(20);
-#[cfg(windows)]
-const SEND_P95: Duration = Duration::from_millis(40);
 
 fn binary() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lockyard"));

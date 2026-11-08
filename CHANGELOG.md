@@ -5,6 +5,14 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-11-08
+
+### Changed
+
+- Reuse pinned Windows directory handles for SQLite preflight while preserving fresh file ACL and reparse checks.
+- Avoid the SQLite writer lock for fresh heartbeats and load local hook machine settings only for command checks.
+- Restore shared 15/20 ms performance budgets without retries; add opt-in CLI and authenticated pipe profiling.
+
 ## [0.3.1] - 2026-11-08
 
 ### Fixed

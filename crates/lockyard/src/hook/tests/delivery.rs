@@ -1,5 +1,46 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
+    #[test]
+    fn mail_in_the_same_hook_waits_for_a_busy_writer_after_heartbeat() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for event_name in ["PostToolUse", "UserPromptSubmit"] {
+            // Exercise both the no-op heartbeat and its failed best-effort write.
+            for now in [2, 60_001] {
+                let (_dir, mut store) = project();
+                store.touch("me", 0).unwrap();
+                store.send("other", "me", "mail after busy heartbeat", 1).unwrap();
+                let root = store.root().to_path_buf();
+                let db = root.join(lockyard_core::DIR_NAME).join("lockyard.db");
+                let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+                let writer = std::thread::spawn(move || {
+                    let conn = rusqlite::Connection::open(db).unwrap();
+                    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    ready_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(250));
+                    conn.execute_batch("ROLLBACK").unwrap();
+                });
+                let mut port = LocalPort { store, root: root.clone(), now };
+                let event = json!({"hook_event_name": event_name});
+                let mut out = Vec::new();
+                ready_rx.recv().unwrap();
+                let result = handle(
+                    Tool::Claude, &mut port, &event, "me", &root, now,
+                    &lockyard_core::machine::MachineConfig::default(), &mut out,
+                );
+                writer.join().unwrap();
+                result.unwrap();
+                let answer: Value = serde_json::from_slice(&out)
+                    .expect("this hook must deliver mail after the writer releases its lock");
+                assert_eq!(answer["hookSpecificOutput"]["hookEventName"], event_name);
+                assert!(answer["hookSpecificOutput"]["additionalContext"]
+                    .as_str().unwrap().contains("mail after busy heartbeat"));
+                assert_eq!(port.store.unread("me").unwrap(), 0);
+            }
+        }
+    }
+
     /// A fake backend that logs what happens, in order.
     struct Recording {
         root: std::path::PathBuf,

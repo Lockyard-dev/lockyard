@@ -237,8 +237,27 @@ fn run_event(
     }
     let store = Store::open(&root)?;
     let mut port = LocalPort { store, root, now };
-    let machine = lockyard_core::machine::MachineConfig::load_user();
+    let machine = local_machine_config(event, lockyard_core::machine::MachineConfig::load_user);
     handle(tool, &mut port, event, &agent, &cwd, now, &machine, out)
+}
+
+fn local_machine_config(
+    event: &Value,
+    load: impl FnOnce() -> lockyard_core::machine::MachineConfig,
+) -> lockyard_core::machine::MachineConfig {
+    // Only the shell-command branch reads this config. Path checks and mail must
+    // not open an unrelated user file on every local hook invocation.
+    if event.get("hook_event_name").and_then(Value::as_str) == Some("PreToolUse")
+        && event
+            .pointer("/tool_input/command")
+            .and_then(Value::as_str)
+            .is_some()
+    {
+        let _span = lockyard_core::perf::Span::new("hook.machine_config");
+        load()
+    } else {
+        Default::default()
+    }
 }
 
 fn is_pre_tool_edit(event: &Value) -> bool {
