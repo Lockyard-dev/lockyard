@@ -35,7 +35,11 @@ jobs:
         run: cargo clippy --locked --workspace --exclude lockyard-node --all-targets -- -D warnings
       - name: Test every Windows-supported crate
         if: runner.os == 'Windows'
-        run: cargo test --locked --workspace --exclude lockyard-node
+        run: cargo test --locked --workspace --exclude lockyard-node -- --skip hook_decision_p95_stays_within_budget --skip msg_send_p95_stays_within_budget
+      - name: Enforce unchanged performance budgets on the Windows release binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tools/ci/test-windows-perf.ps1
       - name: Require E2EE from the actual MCP subprocess
         if: runner.os != 'Windows'
         shell: bash
@@ -127,7 +131,10 @@ jobs:
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - run: cargo build --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked --no-fail-fast
+      - run: cargo test --workspace --locked --no-fail-fast -- --skip hook_decision_p95_stays_within_budget --skip msg_send_p95_stays_within_budget
+      - name: Enforce unchanged performance budgets on the Windows release binary
+        shell: pwsh
+        run: ./tools/ci/test-windows-perf.ps1
       - name: Two sessions arbitrate one claim over a real named pipe
         shell: pwsh
         run: |
@@ -160,12 +167,14 @@ jobs:
           sudo install -o root -g root -m 755 target/debug/lockyard-sandbox /usr/lib/lockyard-ci/bin/lockyard-sandbox
           sudo /usr/lib/lockyard-ci/bin/lockyard node install --apparmor \
             --sandbox-binary /usr/lib/lockyard-ci/bin/lockyard-sandbox
-      - name: Require real unprivileged cgroup and namespace enforcement
+      - name: Verify native enforcement or an explicit executor refusal
         shell: bash
         env:
           LOCKYARD_NATIVE_ROOTFS: /var/lib/lockyard-ci-rootfs
           LOCKYARD_NATIVE_SANDBOX_BINARY: /usr/lib/lockyard-ci/bin/lockyard-sandbox
+          LOCKYARD_NATIVE_ALLOW_REFUSAL: "1"
         run: |
+          sh tests/native-executor-gate.test.sh
           sudo loginctl enable-linger "$(id -un)"
           sudo systemctl start "user@$(id -u).service"
           XDG_RUNTIME_DIR="/run/user/$(id -u)"

@@ -853,13 +853,21 @@ fn durable_outbox_replay_without_trusted_age_or_identity_stays_quarantined() {
             .unwrap()
             .unwrap()
             .path();
-        let file = std::fs::read_dir(scoped)
+        let journals: Vec<_> = std::fs::read_dir(scoped)
             .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let mut record: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect();
+        assert_eq!(
+            journals.len(),
+            1,
+            "exactly one pending operation is persisted"
+        );
+        let file = &journals[0];
+        let mut record: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
         record[field] = value;
         std::fs::write(file, serde_json::to_vec(&record).unwrap()).unwrap();
         let restored = server.client().with_pending_journal(&directory).unwrap();

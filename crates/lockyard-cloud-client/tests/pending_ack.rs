@@ -102,16 +102,24 @@ fn deferred_ack_quarantines_legacy_journal_without_original_digest() {
         .unwrap()
         .unwrap()
         .path();
-    let journal = std::fs::read_dir(scope)
+    let journals: Vec<_> = std::fs::read_dir(scope)
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    assert_eq!(
+        journals.len(),
+        1,
+        "exactly one pending operation is persisted"
+    );
+    let journal = &journals[0];
     let mut legacy: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(journal).unwrap()).unwrap();
     legacy.as_object_mut().unwrap().remove("request_digest");
-    std::fs::write(&journal, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    std::fs::write(journal, serde_json::to_vec(&legacy).unwrap()).unwrap();
     let restored = Client::new(&url, "fixture-token".into())
         .unwrap()
         .with_pending_journal(&directory)

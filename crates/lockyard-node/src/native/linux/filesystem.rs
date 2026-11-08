@@ -32,7 +32,32 @@ pub(super) fn mount(
         )
     })
 }
-fn bind(source: &Path, target: &Path, readonly: bool) -> Result<()> {
+fn inherited_mount_flags(source: &Path) -> Result<libc::c_ulong> {
+    // Linux statvfs ABI; libc does not expose ST_RELATIME on musl targets.
+    const ST_RELATIME: libc::c_ulong = 4096;
+    let path = CString::new(source.as_os_str().as_bytes()).map_err(|_| unavailable())?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    syscall(unsafe { libc::statvfs(path.as_ptr(), &mut stat) })
+        .map_err(|_| ExecutorError("native_mount_flags_unavailable"))?;
+    let mut flags = 0;
+    // These flags become locked when inherited into a less privileged mount namespace.
+    // A bind remount must preserve them, even when its requested policy is less restrictive.
+    for (status, mount) in [
+        (libc::ST_RDONLY, libc::MS_RDONLY),
+        (libc::ST_NOSUID, libc::MS_NOSUID),
+        (libc::ST_NODEV, libc::MS_NODEV),
+        (libc::ST_NOEXEC, libc::MS_NOEXEC),
+        (libc::ST_NOATIME, libc::MS_NOATIME),
+        (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
+        (ST_RELATIME, libc::MS_RELATIME),
+    ] {
+        if stat.f_flag & status != 0 {
+            flags |= mount;
+        }
+    }
+    Ok(flags)
+}
+pub(super) fn bind(source: &Path, target: &Path, readonly: bool) -> Result<()> {
     if source.is_dir() {
         fs::create_dir_all(target).map_err(|_| unavailable())?;
     } else {
@@ -42,7 +67,8 @@ fn bind(source: &Path, target: &Path, readonly: bool) -> Result<()> {
         fs::File::create(target).map_err(|_| unavailable())?;
     }
     // Non-recursive bind deliberately excludes any nested host mounts.
-    mount(Some(source), target, None, libc::MS_BIND, None)?;
+    mount(Some(source), target, None, libc::MS_BIND, None)
+        .map_err(|_| ExecutorError("native_bind_mount_unavailable"))?;
     mount(
         None,
         target,
@@ -51,9 +77,28 @@ fn bind(source: &Path, target: &Path, readonly: bool) -> Result<()> {
             | libc::MS_REMOUNT
             | libc::MS_NOSUID
             | libc::MS_NODEV
+            | inherited_mount_flags(source)?
             | if readonly { libc::MS_RDONLY } else { 0 },
         None,
     )
+    .map_err(|_| ExecutorError("native_bind_remount_unavailable"))
+}
+pub(super) fn bind_device(source: &Path, target: &Path) -> Result<()> {
+    fs::File::create(target).map_err(|_| unavailable())?;
+    mount(Some(source), target, None, libc::MS_BIND, None)
+        .map_err(|_| ExecutorError("native_device_bind_unavailable"))?;
+    mount(
+        None,
+        target,
+        None,
+        libc::MS_BIND
+            | libc::MS_REMOUNT
+            | libc::MS_NOSUID
+            | libc::MS_NOEXEC
+            | inherited_mount_flags(source)?,
+        None,
+    )
+    .map_err(|_| ExecutorError("native_device_remount_unavailable"))
 }
 pub(super) fn setup_root(sandbox: &Sandbox) -> Result<()> {
     let root = sandbox
@@ -110,21 +155,7 @@ pub(super) fn setup_root(sandbox: &Sandbox) -> Result<()> {
     // A private /dev contains only the explicitly allowed devices, never the host device tree.
     for name in ["null", "zero", "random", "urandom"] {
         let target = root.join("dev").join(name);
-        fs::File::create(&target).map_err(|_| unavailable())?;
-        mount(
-            Some(&Path::new("/dev").join(name)),
-            &target,
-            None,
-            libc::MS_BIND,
-            None,
-        )?;
-        mount(
-            None,
-            &target,
-            None,
-            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID,
-            None,
-        )?;
+        bind_device(&Path::new("/dev").join(name), &target)?;
     }
     std::os::unix::fs::symlink("/proc/self/fd", root.join("dev/fd")).map_err(|_| unavailable())?;
     for (source, readonly) in [

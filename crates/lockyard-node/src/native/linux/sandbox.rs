@@ -1,5 +1,5 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
-use super::filesystem::{mount, setup_root};
+use super::filesystem::{bind, bind_device, mount, setup_root};
 use super::network::bridge_start;
 use super::seccomp::install as seccomp;
 use super::*;
@@ -288,6 +288,18 @@ fn probe_isolation() -> Result<i32> {
         Some("size=1048576,mode=0700"),
     )
     .map_err(|_| ExecutorError("native_tmpfs_unavailable"))?;
+    // Exercise the same bind/remount policy as setup_root. A tmpfs/proc-only probe
+    // misses host mount flags locked by the new user namespace (notably /dev noexec).
+    bind(Path::new("/usr"), &root.join("image"), true)?;
+    bind(
+        &std::env::current_dir().map_err(|_| unavailable())?,
+        &root.join("work"),
+        false,
+    )?;
+    fs::create_dir(root.join("dev")).map_err(|_| unavailable())?;
+    for name in ["null", "zero", "random", "urandom"] {
+        bind_device(&Path::new("/dev").join(name), &root.join("dev").join(name))?;
+    }
     fs::create_dir(root.join("proc")).map_err(|_| unavailable())?;
     mount(
         None,

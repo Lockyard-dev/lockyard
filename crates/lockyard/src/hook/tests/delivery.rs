@@ -314,7 +314,14 @@
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join(lockyard_core::DIR_NAME);
         fs::create_dir(&state).unwrap();
-        fs::write(state.join("lockyard.db"), "this is not a database at all").unwrap();
+        #[cfg(windows)]
+        lockyard_core::windows::private_dir(&state).unwrap();
+        lockyard_core::fsio::replace(
+            &state.join("lockyard.db"),
+            b"this is not a database at all",
+            0o600,
+        )
+        .unwrap();
         let input =
             json!({ "hook_event_name": "PostToolUse", "session_id": "me", "cwd": dir.path() });
         let answer = claude(&input.to_string(), None, Path::new("/"), 1);

@@ -2,6 +2,7 @@
 
 //! Performance budget (no network). CI fails when the local hook decision or a local
 //! `msg send` regresses past the documented p95 ceilings.
+//! Windows CI runs these same raw subprocess budgets serially with the release binary.
 //!
 //! Budgets are deliberately looser than a quiet laptop (owner baseline: hook ~4 ms p95,
 //! msg send ~4 ms) so a shared CI runner does not flake, and tight enough to catch a

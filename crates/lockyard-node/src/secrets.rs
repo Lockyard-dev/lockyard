@@ -922,9 +922,10 @@ mod tests {
     }
     #[test]
     fn vault_reference_and_ciphertext_are_bounded_and_structured() {
+        let directory = tempfile::tempdir().unwrap();
         let mut identity = VaultIdentity {
             url: "https://vault.example".into(),
-            token_file: "/private/vault-token".into(),
+            token_file: directory.path().canonicalize().unwrap().join("vault-token"),
             tls_roots: vec![],
             namespace: None,
         };

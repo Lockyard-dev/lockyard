@@ -84,23 +84,102 @@ fn is_default_owner(owner: PSID) -> io::Result<bool> {
     Ok(!owner.is_null() && unsafe { EqualSid(owner, expected) } != 0)
 }
 
+fn handle_information(handle: HANDLE) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+    let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    unsafe {
+        checked(GetFileInformationByHandle(handle, &mut info))?;
+    }
+    Ok(info)
+}
+
+// ReOpenFile rejects directories even with FILE_FLAG_BACKUP_SEMANTICS. An
+// empty native relative name reopens the directory object itself, without
+// resolving its pathname or any ancestor a second time.
+fn reopen_directory_handle(handle: HANDLE, access: u32, write_through: bool) -> io::Result<File> {
+    let original = handle_information(handle)?;
+    if original.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || original.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(denied());
+    }
+    let mut empty = 0u16;
+    let name = UNICODE_STRING {
+        Length: 0,
+        MaximumLength: 2,
+        Buffer: &mut empty,
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: handle,
+        ObjectName: &name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: ptr::null(),
+        SecurityQualityOfService: ptr::null(),
+    };
+    let mut reopened = ptr::null_mut();
+    let mut status = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        nt::NtCreateFile(
+            &mut reopened,
+            access | SYNCHRONIZE,
+            &attributes,
+            &mut status,
+            ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nt::FILE_OPEN,
+            nt::FILE_DIRECTORY_FILE
+                | nt::FILE_SYNCHRONOUS_IO_NONALERT
+                | nt::FILE_OPEN_REPARSE_POINT
+                | if write_through {
+                    nt::FILE_WRITE_THROUGH
+                } else {
+                    0
+                },
+            ptr::null(),
+            0,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(result) } as i32,
+        ));
+    }
+    let file = unsafe { File::from_raw_handle(reopened) };
+    validate_file(&file, false)?;
+    let actual = handle_information(reopened)?;
+    if actual.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || actual.dwVolumeSerialNumber != original.dwVolumeSerialNumber
+        || actual.nFileIndexHigh != original.nFileIndexHigh
+        || actual.nFileIndexLow != original.nFileIndexLow
+    {
+        return Err(denied());
+    }
+    Ok(file)
+}
+
 // Elevated Windows tokens can default to Administrators as an object's owner,
 // even when the creating library inherited our user-only DACL. Normalize only
 // that token's own default owner to TokenUser, through the same opened object.
 // No privileges are enabled and no arbitrary user/group ownership is accepted.
 fn set_file_user_owner(handle: HANDLE, sid: PSID) -> io::Result<()> {
-    let handle = unsafe {
-        ReOpenFile(
-            handle,
-            WRITE_OWNER | READ_CONTROL | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_FLAG_BACKUP_SEMANTICS,
-        )
+    let access = WRITE_OWNER | READ_CONTROL | FILE_READ_ATTRIBUTES;
+    let file = if handle_information(handle)?.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        reopen_directory_handle(handle, access, false)?
+    } else {
+        let reopened = unsafe {
+            ReOpenFile(
+                handle,
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+            )
+        };
+        if reopened == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe { File::from_raw_handle(reopened) }
     };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    let file = unsafe { File::from_raw_handle(handle) };
     let result = unsafe {
         SetSecurityInfo(
             file.as_raw_handle(),
@@ -407,10 +486,7 @@ pub fn require_private_file(file: &File) -> io::Result<()> {
     require_private_handle(file.as_raw_handle(), SE_FILE_OBJECT)
 }
 fn validate_file(file: &File, regular: bool) -> io::Result<()> {
-    let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
-    unsafe {
-        checked(GetFileInformationByHandle(file.as_raw_handle(), &mut info))?;
-    }
+    let info = handle_information(file.as_raw_handle())?;
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
         || regular
             && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 || info.nNumberOfLinks != 1)
@@ -633,11 +709,9 @@ fn secure_file_owned(file: &File) -> io::Result<()> {
     let _allocation = LocalAllocation(descriptor);
     let user = token_user()?;
     let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-    if unsafe { EqualSid(owner, sid) } == 0 {
-        if !is_default_owner(owner)? {
-            return Err(denied());
-        }
-        set_file_user_owner(handle, sid)?;
+    let user_owned = unsafe { EqualSid(owner, sid) } != 0;
+    if !user_owned && !is_default_owner(owner)? {
+        return Err(denied());
     }
     let security = Security::new()?;
     let mut present = 0;
@@ -664,6 +738,14 @@ fn secure_file_owned(file: &File) -> io::Result<()> {
     };
     if error != 0 {
         return Err(io::Error::from_raw_os_error(error as i32));
+    }
+    if !user_owned {
+        // Ownership gives READ_CONTROL and WRITE_DAC, but not WRITE_OWNER.
+        // Inherited ACLs on an existing directory can therefore let us tighten
+        // its DACL without allowing an owner-changing reopen yet. Install the
+        // user-only full-access DACL first, then normalize the validated token
+        // default owner through the same object. No broader rights are granted.
+        set_file_user_owner(handle, sid)?;
     }
     require_private_file(file)
 }
@@ -703,10 +785,7 @@ pub fn read_private(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 pub fn file_identity(file: &File) -> io::Result<(u32, u64)> {
-    let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
-    unsafe {
-        checked(GetFileInformationByHandle(file.as_raw_handle(), &mut info))?;
-    }
+    let info = handle_information(file.as_raw_handle())?;
     Ok((
         info.dwVolumeSerialNumber,
         (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
@@ -898,10 +977,12 @@ pub fn require_final_path(file: &File, expected: &Path) -> io::Result<()> {
 /// Prevent an already validated file name being replaced while a library reopens it.
 pub fn pin_file(file: &File) -> io::Result<File> {
     require_private_file(file)?;
+    // Windows ignores sharing restrictions on metadata-only opens. A data
+    // access right makes omission of FILE_SHARE_DELETE actually pin the name.
     let handle = unsafe {
         ReOpenFile(
             file.as_raw_handle(),
-            READ_CONTROL | FILE_READ_ATTRIBUTES,
+            READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_READ_DATA,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             0,
         )
@@ -1027,23 +1108,23 @@ fn rename_opened_handle(
     let bytes = size_of::<nt::FILE_RENAME_INFORMATION>() + name.len() * 2;
     let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
     let info = storage.as_mut_ptr().cast::<nt::FILE_RENAME_INFORMATION>();
-    let handle = unsafe {
-        ReOpenFile(
-            file.as_raw_handle(),
-            DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_FLAG_WRITE_THROUGH
-                | if is_directory {
-                    FILE_FLAG_BACKUP_SEMANTICS
-                } else {
-                    0
-                },
-        )
+    let access = DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES;
+    let renamed = if is_directory {
+        reopen_directory_handle(file.as_raw_handle(), access, true)?
+    } else {
+        let handle = unsafe {
+            ReOpenFile(
+                file.as_raw_handle(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_WRITE_THROUGH,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe { File::from_raw_handle(handle) }
     };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    let renamed = unsafe { File::from_raw_handle(handle) };
     unsafe {
         (*info).Anonymous.ReplaceIfExists = replace;
         (*info).RootDirectory = parent.as_raw_handle();
@@ -1150,6 +1231,120 @@ mod tests {
         })
         .unwrap();
         assert!(!is_default_owner(world.as_mut_ptr().cast()).unwrap());
+    }
+
+    #[test]
+    fn existing_owner_control_can_tighten_a_directory_before_normalizing_its_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = open_path(
+            root.path(),
+            READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+            nt::FILE_OPEN,
+            0,
+            None,
+        )
+        .unwrap();
+        // Reproduce an inherited ACL that allows owner control but does not
+        // grant WRITE_OWNER. Elevated Windows tokens can give this directory
+        // TokenOwner (Administrators), which must later become TokenUser.
+        let security = Security::new().unwrap();
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = ptr::null_mut();
+        unsafe {
+            checked(GetSecurityDescriptorDacl(
+                security.allocation.0,
+                &mut present,
+                &mut dacl,
+                &mut defaulted,
+            ))
+            .unwrap();
+            let mut ace = ptr::null_mut();
+            checked(GetAce(dacl, 0, &mut ace)).unwrap();
+            (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask =
+                READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+        }
+        assert_eq!(
+            unsafe {
+                SetSecurityInfo(
+                    directory.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    dacl,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let user = token_user().unwrap();
+        let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        assert_eq!(
+            set_file_user_owner(directory.as_raw_handle(), sid)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied,
+            "owner control alone must not imply WRITE_OWNER"
+        );
+        assert!(require_private_file(&directory).is_err());
+        private_dir(root.path()).unwrap();
+        require_private_file(&directory).unwrap();
+        assert_user_owner(&directory);
+        let child = root.path().join("private-child");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&child)
+            .unwrap();
+        require_private(&child).unwrap();
+    }
+
+    #[test]
+    fn directory_owner_reopen_keeps_the_original_object_after_its_name_is_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("original");
+        private_dir(&path).unwrap();
+        let directory = open_metadata(&path).unwrap();
+        let identity = file_identity(&directory).unwrap();
+        let moved = root.path().join("moved");
+        fs::rename(&path, &moved).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("replacement-marker"), b"untouched").unwrap();
+        assert!(
+            std::process::Command::new("icacls.exe")
+                .arg(&path)
+                .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(require_private(&path).is_err());
+        let replacement = open_metadata(&path).unwrap();
+        let reopened = reopen_directory_handle(
+            directory.as_raw_handle(),
+            READ_CONTROL | FILE_READ_ATTRIBUTES,
+            false,
+        )
+        .unwrap();
+        assert_eq!(file_identity(&reopened).unwrap(), identity);
+        assert_ne!(
+            file_identity(&reopened).unwrap(),
+            file_identity(&replacement).unwrap()
+        );
+        let user = token_user().unwrap();
+        let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        // ReOpenFile(directory) fails even when TokenOwner already is TokenUser.
+        // Reopening by pathname would instead act on the replacement directory.
+        set_file_user_owner(directory.as_raw_handle(), sid).unwrap();
+        assert_eq!(file_identity(&directory).unwrap(), identity);
+        assert_user_owner(&directory);
+        require_private(&moved).unwrap();
+        assert!(require_private(&path).is_err());
+        assert_eq!(
+            fs::read(path.join("replacement-marker")).unwrap(),
+            b"untouched"
+        );
     }
 
     #[test]

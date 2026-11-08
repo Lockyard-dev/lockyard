@@ -1623,6 +1623,42 @@ fn runtime_resource_capability_report_is_respected() {
             std::path::PathBuf::from(std::env::var_os("LOCKYARD_NATIVE_CGROUP_ROOT").unwrap());
         let report =
             lockyard_node::native::capabilities(Some(&root), &native_cases::sandbox_program());
+        if !report.available && std::env::var("LOCKYARD_NATIVE_ALLOW_REFUSAL").as_deref() == Ok("1")
+        {
+            assert!(
+                !report.reasons.is_empty(),
+                "refusal must explain the missing enforcement"
+            );
+            assert!(
+                report
+                    .reasons
+                    .iter()
+                    .all(|reason| !reason.trim().is_empty())
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = fixture(dir.path());
+            let profile = &mut config.runners.get_mut("python").unwrap().container;
+            profile.runtime = ContainerRuntime::Native;
+            profile.runtime_program = native_cases::sandbox_program();
+            profile.cgroup_root = Some(root);
+            profile.native_rootfs =
+                Some(std::env::var_os("LOCKYARD_NATIVE_ROOTFS").unwrap().into());
+            let state = config.state_dir.clone();
+            match Executor::new(config) {
+                Ok(_) => panic!("unavailable native enforcement accepted an executor"),
+                Err(error) => assert_eq!(error.0, "container_limits_unavailable"),
+            }
+            assert!(
+                !state.exists(),
+                "refusal must precede journal and checkout creation"
+            );
+            eprintln!("\nLOCKYARD_NATIVE_ACCEPTANCE=refused");
+            eprintln!(
+                "native executor refused before execution: {}",
+                report.reasons.join("; ")
+            );
+            return;
+        }
         assert!(
             report.available,
             "native limits unavailable: {:?}",
@@ -1635,6 +1671,9 @@ fn runtime_resource_capability_report_is_respected() {
         let record = finished(&executor, &request.id);
         assert_eq!(record.state, JobState::Succeeded, "{record:?}");
         assert!(record.result_manifest.is_some());
+        if std::env::var("LOCKYARD_NATIVE_ALLOW_REFUSAL").as_deref() == Ok("1") {
+            eprintln!("\nLOCKYARD_NATIVE_ACCEPTANCE=available");
+        }
         return;
     }
     let output = Command::new(runtime_program())

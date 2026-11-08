@@ -18,6 +18,8 @@ fn private_state_is_owner_only_and_replaces_atomically() {
     file.write_all(b"first").unwrap();
     let pinned = windows::pin_file(&file).unwrap();
     assert!(std::fs::rename(&path, state.join("substituted")).is_err());
+    assert!(std::fs::remove_file(&path).is_err());
+    assert!(windows::rename(&path, &state.join("substituted")).is_err());
     drop(pinned);
     drop(file);
     windows::require_private(&path).unwrap();
