@@ -15,8 +15,17 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const SAMPLES: usize = 80;
+// Windows has its own ceilings (owner decision 2026-11-08): NTFS durable writes and
+// process start are slower there; hosted runners measured hook 15.3 ms and send 26-31 ms
+// p95 in release. Unix ceilings are unchanged.
+#[cfg(not(windows))]
 const HOOK_P95: Duration = Duration::from_millis(15);
+#[cfg(not(windows))]
 const SEND_P95: Duration = Duration::from_millis(20);
+#[cfg(windows)]
+const HOOK_P95: Duration = Duration::from_millis(20);
+#[cfg(windows)]
+const SEND_P95: Duration = Duration::from_millis(40);
 
 fn binary() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lockyard"));
