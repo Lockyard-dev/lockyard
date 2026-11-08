@@ -98,30 +98,45 @@ impl Config {
 }
 
 fn read_token_file(path: &Path) -> Result<String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = fs::metadata(path).map_err(|error| {
+    #[cfg(windows)]
+    return crate::windows::read_private(path, 1024 * 1024)
+        .and_then(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })
+        .map_err(|error| {
             Error::Invalid(format!(
                 "cannot read token file {} (LOCKYARD_TOKEN_FILE): {error}",
                 path.display()
             ))
-        })?;
-        // The token is sent as a bearer credential. Refuse files readable by another user or
-        // owned by someone else, matching the private agent-state directory policy.
-        if metadata.mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
-            return Err(Error::Invalid(format!(
-                "token file {} must be owned by this user and private (mode 0600)",
-                path.display()
-            )));
+        });
+    #[cfg(unix)]
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(path).map_err(|error| {
+                Error::Invalid(format!(
+                    "cannot read token file {} (LOCKYARD_TOKEN_FILE): {error}",
+                    path.display()
+                ))
+            })?;
+            // The token is sent as a bearer credential. Refuse files readable by another user or
+            // owned by someone else, matching the private agent-state directory policy.
+            if metadata.mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(Error::Invalid(format!(
+                    "token file {} must be owned by this user and private (mode 0600)",
+                    path.display()
+                )));
+            }
         }
+        fs::read_to_string(path).map_err(|error| {
+            Error::Invalid(format!(
+                "cannot read token file {} (LOCKYARD_TOKEN_FILE): {error}",
+                path.display()
+            ))
+        })
     }
-    fs::read_to_string(path).map_err(|error| {
-        Error::Invalid(format!(
-            "cannot read token file {} (LOCKYARD_TOKEN_FILE): {error}",
-            path.display()
-        ))
-    })
 }
 
 #[cfg(test)]

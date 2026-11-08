@@ -269,8 +269,8 @@ pub fn generate_identity(directory: &Path, tls_names: Vec<String>) -> Result<Ide
             );
         }
     }
-    #[cfg(not(unix))]
-    std::fs::create_dir_all(directory)?;
+    #[cfg(windows)]
+    lockyard_core::windows::private_dir(directory)?;
     let generated = rcgen::generate_simple_self_signed(tls_names)?;
     let certificate = generated.cert.der().to_vec();
     let private_key = generated.signing_key.serialize_der();
@@ -279,7 +279,10 @@ pub fn generate_identity(directory: &Path, tls_names: Vec<String>) -> Result<Ide
         private_key: directory.join("node-key.der"),
         certificate_sha256: PeerPin::certificate(&certificate).to_hex(),
     };
+    #[cfg(unix)]
     let mut options = std::fs::OpenOptions::new();
+    #[cfg(windows)]
+    let mut options = lockyard_core::windows::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
@@ -298,7 +301,7 @@ pub fn generate_identity(directory: &Path, tls_names: Vec<String>) -> Result<Ide
     key_file.sync_all()?;
     certificate_file.write_all(&certificate)?;
     certificate_file.sync_all()?;
-    std::fs::File::open(directory)?.sync_all()?;
+    lockyard_core::fsio::sync_path(directory)?;
     Ok(files)
 }
 

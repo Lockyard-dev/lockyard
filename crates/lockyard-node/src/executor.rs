@@ -10,7 +10,7 @@ use lockyard_cloud_client::WorkspaceKey;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -595,9 +595,6 @@ use storage::*;
 mod streams;
 use streams::*;
 
-#[cfg(test)]
-pub(crate) mod regression_tests;
-
 #[cfg(target_os = "linux")]
 pub(crate) fn native_probe_diagnostic(command: &mut Command) -> std::result::Result<(), String> {
     match runtime_output(command, Duration::from_secs(5), 4096, None) {
@@ -606,3 +603,6 @@ pub(crate) fn native_probe_diagnostic(command: &mut Command) -> std::result::Res
         Err(error) => Err(error.to_string()),
     }
 }
+
+#[cfg(all(test, unix))]
+pub(crate) mod regression_tests;

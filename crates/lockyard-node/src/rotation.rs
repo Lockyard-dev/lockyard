@@ -27,13 +27,19 @@ pub use rotation_install::HistoryPolicy;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 use x509_parser::prelude::{FromDer, X509Certificate};
 use zeroize::{Zeroize, Zeroizing};
+
+#[cfg(unix)]
+#[cfg(windows)]
+use std::fs::File;
+
+#[cfg(unix)]
+use std::io::Read;
 
 const DOMAIN: &[u8] = b"lockyard-workspace-key-rotation-v1\0";
 const CAPSULE_DOMAIN: &[u8] = b"lockyard-workspace-key-hpke-v1\0";
@@ -199,12 +205,16 @@ fn validate_authority_location(path: &Path, root: &Path) -> Result<()> {
 }
 /// Normal authority keys live under the global keys tree excluded from every workload mount.
 pub fn authority_generate(path: &Path) -> Result<TrustedSigningKey> {
+    #[cfg(unix)]
     use std::os::unix::fs::DirBuilderExt;
     let root = authority_directory()?;
     let parent = root.parent().ok_or("invalid_rotation_authority_path")?;
     crate::retention::require_directory(parent)?;
+    #[cfg(windows)]
+    lockyard_core::windows::private_dir(&root)?;
+    #[cfg(unix)]
     match std::fs::DirBuilder::new().mode(0o700).create(&root) {
-        Ok(()) => File::open(parent)?.sync_all()?,
+        Ok(()) => lockyard_core::fsio::sync_path(parent)?,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
         Err(error) => return Err(error.into()),
     }
@@ -823,6 +833,7 @@ pub fn read_private_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
         MAX_ROTATION_FILE_BYTES,
     )?)?)
 }
+#[cfg(unix)]
 fn read_private(path: &Path, limit: usize) -> Result<Vec<u8>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut options = OpenOptions::new();
@@ -851,6 +862,7 @@ fn read_private(path: &Path, limit: usize) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+#[cfg(unix)]
 pub fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     crate::retention::require_directory(path.parent().ok_or("invalid_rotation_path")?)?;
@@ -866,11 +878,35 @@ pub fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .open(path)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
-    File::open(path.parent().ok_or("invalid_rotation_path")?)?.sync_all()?;
+    lockyard_core::fsio::sync_path(path.parent().ok_or("invalid_rotation_path")?)?;
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+fn read_private(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    Ok(lockyard_core::windows::read_private(path, limit as u64)?)
+}
+
+#[cfg(windows)]
+pub fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    crate::retention::require_directory(path.parent().ok_or("invalid_rotation_path")?)?;
+    let bytes = serde_json::to_vec_pretty(value)?;
+    if bytes.len() > MAX_ROTATION_FILE_BYTES {
+        return Err("rotation_file_too_large".into());
+    }
+    let mut file = lockyard_core::windows::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::{
@@ -1141,6 +1177,7 @@ mod tests {
         f.draft().validate(now_ms().unwrap(), true).unwrap();
     }
     #[test]
+    #[cfg(unix)]
     fn rotation_file_read_rejects_symlinks_fifos_oversize_and_public_permissions() {
         use std::os::unix::fs::symlink;
         let f = Fixture::new();

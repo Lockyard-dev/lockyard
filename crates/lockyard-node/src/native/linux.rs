@@ -249,9 +249,7 @@ pub(super) fn command(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
         Err(_) => return Err(unavailable()),
     }
-    fs::File::open(job_dir)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| unavailable())?;
+    lockyard_core::fsio::sync_path(job_dir).map_err(|_| unavailable())?;
     let mut command = Command::new(&profile.runtime_program);
     if profile
         .runtime_program
@@ -329,9 +327,7 @@ pub(super) fn stop(profile: &ContainerProfile, job_dir: &Path, name: &str) -> bo
     };
     if serde_json::to_writer(&mut file, &receipt).is_err()
         || file.sync_all().is_err()
-        || fs::File::open(job_dir)
-            .and_then(|directory| directory.sync_all())
-            .is_err()
+        || lockyard_core::fsio::sync_path(job_dir).is_err()
     {
         return false;
     }

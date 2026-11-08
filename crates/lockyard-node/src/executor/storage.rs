@@ -37,6 +37,8 @@ pub(super) fn resolve_revision(checkout: &Path, revision: &str) -> Result<String
     Ok(revision.to_string())
 }
 pub(super) fn private_dir(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    lockyard_core::windows::private_dir(path).map_err(io_error)?;
     if fs::symlink_metadata(path).is_err() {
         #[cfg(unix)]
         {
@@ -62,6 +64,8 @@ pub(super) fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 pub(super) fn private_dir_new(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    lockyard_core::windows::private_dir(path).map_err(io_error)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -85,7 +89,19 @@ pub(super) fn private_open(path: &Path, create_new: bool) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(unix)]
     let file = options.open(path).map_err(io_error)?;
+    #[cfg(windows)]
+    let file = {
+        let mut options = lockyard_core::windows::OpenOptions::new();
+        options.read(true).write(true);
+        if create_new {
+            options.create_new(true);
+        } else {
+            options.create(true);
+        }
+        options.open(path).map_err(io_error)?
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -108,7 +124,7 @@ pub(super) fn persist(state_dir: &Path, record: &JobRecord) -> Result<()> {
         serde_json::to_vec(record).map_err(|_| ExecutorError("job_record_encoding_failed"))?;
     file.write_all(&bytes).map_err(io_error)?;
     file.sync_all().map_err(io_error)?;
-    fs::rename(path, dir.join("record.json")).map_err(io_error)?;
+    lockyard_core::fsio::rename(path, dir.join("record.json")).map_err(io_error)?;
     File::open(dir)
         .map_err(io_error)?
         .sync_all()
@@ -199,6 +215,11 @@ pub(super) fn write_cloud_config(worktree: &Path, cloud: &CloudConfig) -> Result
     let mut file = private_open(&temp, true)?;
     file.write_all(content.as_bytes()).map_err(io_error)?;
     file.sync_all().map_err(io_error)?;
-    fs::rename(temp, path).map_err(io_error)?;
+    lockyard_core::fsio::rename(temp, path).map_err(io_error)?;
     Ok(Some(".lockyard/config.toml".into()))
 }
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;

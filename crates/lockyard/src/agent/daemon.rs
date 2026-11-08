@@ -26,9 +26,12 @@ use lockyard_core::{Backend, Error, ZonePath};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
+
 use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -36,6 +39,9 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(windows)]
+use lockyard_core::windows::ipc::{LocalListener as UnixListener, LocalStream as UnixStream};
 
 /// A request line longer than this is refused. Mail is limited to 8 KiB, with room for its envelope.
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
@@ -668,11 +674,16 @@ impl<T: Transport + 'static> Shared<T> {
             .entry(session.to_string())
             .or_insert_with(|| load_seq(&self.state_dir, &cursor_name));
         if through > *current {
+            #[cfg(unix)]
             let temporary = self.state_dir.join(format!("{cursor_name}.tmp"));
             let cursor = self.state_dir.join(cursor_name);
-            if let Err(error) = fs::write(&temporary, through.to_string())
-                .and_then(|()| fs::rename(&temporary, cursor))
-            {
+            #[cfg(unix)]
+            let saved = fs::write(&temporary, through.to_string())
+                .and_then(|()| lockyard_core::fsio::rename(&temporary, &cursor));
+            #[cfg(windows)]
+            let saved =
+                lockyard_core::fsio::replace(&cursor, through.to_string().as_bytes(), 0o600);
+            if let Err(error) = saved {
                 return Reply::failed(ClientError::Transport(format!(
                     "cannot save event cursor: {error}"
                 )));
@@ -1196,9 +1207,16 @@ impl<T: Transport + 'static> Shared<T> {
                     }
                     if last != query.after {
                         seq.store(last, Ordering::Relaxed);
+                        #[cfg(unix)]
                         let _ = fs::write(
                             self.state_dir.join(format!("cursor-{name}")),
                             last.to_string(),
+                        );
+                        #[cfg(windows)]
+                        let _ = lockyard_core::fsio::replace(
+                            &self.state_dir.join(format!("cursor-{name}")),
+                            last.to_string().as_bytes(),
+                            0o600,
                         );
                     }
                 }
@@ -1271,7 +1289,8 @@ impl<T: Transport + 'static> Shared<T> {
         }
     }
 
-    fn refresh_mail(&self) {
+    fn refresh_mail(&self) -> bool {
+        let mut journal_busy = false;
         let now = Instant::now();
         let window = self.timing().active_window;
         let live: HashSet<String> = {
@@ -1316,6 +1335,19 @@ impl<T: Transport + 'static> Shared<T> {
                 0,
             ) {
                 Ok(granted) => granted,
+                // The heartbeat sender and mail reservation share one pending journal. A
+                // busy journal is a local pre-send refusal, so retry it before the next
+                // normal upkeep. Other failures keep their existing polling cadence.
+                Err(Error::Unavailable(reason)) if reason == "pending journal is busy" => {
+                    journal_busy = true;
+                    continue;
+                }
+                Err(Error::Invalid(reason))
+                    if reason == "pending journal unavailable: pending journal is busy" =>
+                {
+                    journal_busy = true;
+                    continue;
+                }
                 Err(_) => continue,
             };
             let messages: VecDeque<Message> = page
@@ -1335,6 +1367,7 @@ impl<T: Transport + 'static> Shared<T> {
                 lease_expires_at: reserved_at + MAIL_DELIVERY_LEASE,
             });
         }
+        journal_busy
     }
 
     fn refresh_lost(&self) {
@@ -1417,7 +1450,7 @@ impl<T: Transport + 'static> Shared<T> {
                 self.refresh_board();
             }
             self.refresh_unread();
-            self.refresh_mail();
+            let retry_mail = self.refresh_mail();
             self.refresh_lost();
             self.refresh_session_events();
             self.flush_activity();
@@ -1425,7 +1458,14 @@ impl<T: Transport + 'static> Shared<T> {
             if !signal.nudged && !signal.stop {
                 signal = self
                     .wake
-                    .wait_timeout(signal, self.timing().upkeep)
+                    .wait_timeout(
+                        signal,
+                        if retry_mail {
+                            self.timing().upkeep.min(self.timing().retry_min)
+                        } else {
+                            self.timing().upkeep
+                        },
+                    )
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
             }
@@ -1523,18 +1563,30 @@ fn write_reply(writer: &mut UnixStream, reply: &Reply) -> io::Result<()> {
 }
 
 fn load_seq(dir: &Path, name: &str) -> i64 {
-    fs::read_to_string(dir.join(format!("cursor-{name}")))
+    #[cfg(unix)]
+    let bytes = fs::read(dir.join(format!("cursor-{name}")));
+    #[cfg(windows)]
+    let bytes = lockyard_core::windows::read_private(&dir.join(format!("cursor-{name}")), 128);
+    bytes
         .ok()
-        .and_then(|text| text.trim().parse().ok())
+        .and_then(|bytes| {
+            std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+        })
         .unwrap_or(0)
 }
 
 fn state_folder(config: &AgentConfig) -> String {
+    #[cfg(unix)]
     let identity = format!("{}\0{}", config.url, config.token_id);
+    #[cfg(windows)]
+    let identity = format!("{}\0{}\0{}", config.url, config.token_id, config.workspace);
     format!("target-{}", lockyard_cloud_client::token_id(&identity))
 }
 
-fn bind(path: &Path) -> io::Result<(File, UnixListener)> {
+#[cfg(unix)]
+fn bind(path: &Path) -> io::Result<(Option<File>, UnixListener)> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::other("the socket has no folder"))?;
@@ -1562,23 +1614,41 @@ fn bind(path: &Path) -> io::Result<(File, UnixListener)> {
     }
     let listener = UnixListener::bind(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok((lock, listener))
+    Ok((Some(lock), listener))
+}
+
+#[cfg(windows)]
+fn bind(path: &Path) -> io::Result<(Option<File>, UnixListener)> {
+    Ok((None, UnixListener::bind(path)?))
 }
 
 /// A running agent process.
 pub struct Daemon<T: Transport + 'static> {
     shared: Arc<Shared<T>>,
     threads: Vec<JoinHandle<()>>,
-    _lock: File,
+    _lock: Option<File>,
+    #[cfg(windows)]
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    #[cfg(windows)]
+    listener_stop: lockyard_core::windows::ipc::ListenerStop,
 }
 
 impl<T: Transport + 'static> Daemon<T> {
     /// Binds the socket, restores the outbox and starts every thread.
     pub fn start(config: AgentConfig, transport: T) -> io::Result<Self> {
+        #[cfg(windows)]
+        private_dir(&config.state_root)?;
         let (lock, listener) = bind(&config.socket)?;
+        #[cfg(windows)]
+        let listener_stop = listener.stop_handle();
         private_dir(&config.state_root)?;
         let state_dir = config.state_root.join(state_folder(&config));
         private_dir(&state_dir)?;
+        #[cfg(windows)]
+        for entry in fs::read_dir(&state_dir)? {
+            let path = entry?.path();
+            lockyard_core::windows::require_private(&path)?;
+        }
         let outbox = Outbox::open(&state_dir)?;
         let shared = Arc::new(Shared {
             transport: Arc::new(transport),
@@ -1643,6 +1713,10 @@ impl<T: Transport + 'static> Daemon<T> {
             Box::new(move || copy.poll_stream(Stream::Registry, "registry", &copy.registry_seq)),
         )?);
         let copy = Arc::clone(&shared);
+        #[cfg(windows)]
+        let connections = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
+        #[cfg(windows)]
+        let accepted = connections.clone();
         threads.push(spawn(
             "accept",
             Box::new(move || {
@@ -1652,10 +1726,18 @@ impl<T: Transport + 'static> Daemon<T> {
                     }
                     let Ok(stream) = stream else { continue };
                     let connection = Arc::clone(&copy);
-                    thread::spawn(move || {
+                    let worker = thread::spawn(move || {
                         // A hook that told and left closes its end first. That is not a failure.
                         let _ = answer(&connection, stream);
                     });
+                    #[cfg(windows)]
+                    {
+                        let mut workers = accepted.lock().unwrap_or_else(PoisonError::into_inner);
+                        workers.retain(|worker| !worker.is_finished());
+                        workers.push(worker);
+                    }
+                    #[cfg(unix)]
+                    let _ = worker;
                 }
             }),
         )?);
@@ -1663,6 +1745,10 @@ impl<T: Transport + 'static> Daemon<T> {
             shared,
             threads,
             _lock: lock,
+            #[cfg(windows)]
+            connections,
+            #[cfg(windows)]
+            listener_stop,
         })
     }
 
@@ -1679,13 +1765,29 @@ impl<T: Transport + 'static> Daemon<T> {
         self.shared.stop();
         // Wake the accept loop, which sits in a blocking call. If the socket file is already gone (its folder
         // was removed), nothing can wake it: leave that one thread behind rather than wait for it forever.
+        #[cfg(unix)]
         let woke = UnixStream::connect(&self.shared.config.socket).is_ok();
+        #[cfg(unix)]
         let _ = fs::remove_file(&self.shared.config.socket);
+        #[cfg(windows)]
+        let woke = {
+            self.listener_stop.stop();
+            true
+        };
         for thread in self.threads.drain(..) {
             if !woke && thread.thread().name() == Some("accept") {
                 continue;
             }
             let _ = thread.join();
+        }
+        #[cfg(windows)]
+        for connection in std::mem::take(
+            &mut *self
+                .connections
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        ) {
+            let _ = connection.join();
         }
     }
 }
@@ -1714,11 +1816,17 @@ impl<T: Transport + 'static> Drop for Daemon<T> {
     }
 }
 
+#[cfg(unix)]
+use std::fs::OpenOptions;
+
 #[cfg(test)]
 mod tests {
     use super::super::socket::AgentSocket;
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[cfg(windows)]
+    include!("windows_tests.rs");
 
     /// An in-memory server that can go down, hang or be made to refuse.
     #[derive(Default)]
@@ -1728,6 +1836,7 @@ mod tests {
         requests: Mutex<Vec<Value>>,
         lost: Mutex<Vec<Value>>,
         lost_read_gate: Mutex<Option<LostReadGate>>,
+        busy_mail_claim_gate: Mutex<Option<LostReadGate>>,
         unread: Mutex<i64>,
         events: Mutex<Vec<Value>>,
         writes: Mutex<Vec<Call>>,
@@ -1893,6 +2002,12 @@ mod tests {
                     Ok(json!({"messages": messages}))
                 }
                 "/api/v1/bus/inbox/claim" => {
+                    let gate = self.busy_mail_claim_gate.lock().unwrap().take();
+                    if let Some(gate) = gate {
+                        gate.started.send(()).unwrap();
+                        gate.resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                        return Err(ClientError::Transport("pending journal is busy".into()));
+                    }
                     self.writes.lock().unwrap().push(call.clone());
                     Ok(json!({"claimed": call.body.as_ref().unwrap()["ids"]}))
                 }
@@ -1949,6 +2064,7 @@ mod tests {
         assert_ne!(state_folder(&first), state_folder(&second));
         assert_ne!(state_folder(&first), state_folder(&third));
         first.workspace = "different-label".into();
+        #[cfg(unix)]
         assert_eq!(
             state_folder(&first),
             state_folder(&config(dir.path(), timing()))
@@ -2038,11 +2154,21 @@ mod tests {
         );
         view_ready(&rig);
         let before = rig.server.calls_to("/api/v1/zones/check");
+        #[cfg(unix)]
         let socket = AgentSocket::connect(
             &rig.dir.path().join("run/agent.sock"),
             "https://example.test",
             "team",
             Duration::from_secs(1),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        let socket = AgentSocket::connect_in_state(
+            &rig.dir.path().join("run/agent.sock"),
+            "https://example.test",
+            "team",
+            Duration::from_secs(1),
+            &rig.dir.path().join("state"),
         )
         .unwrap();
         let mut times = Vec::new();
@@ -2742,6 +2868,8 @@ mod tests {
                     }
                     Err(error) => panic!("fixture accept failed: {error}"),
                 };
+                // Accepted socket flags differ by platform. Fixture reads are blocking with a deadline.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -2809,7 +2937,10 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(windows)]
+        lockyard_core::windows::private_dir(&root).unwrap();
         let make_client = || {
             Client::new(&url, "fixture-token".into())
                 .unwrap()
@@ -2992,6 +3123,49 @@ mod tests {
             &json!({"ids": [1, 2], "lease_seconds": 60})
         );
         assert!(claims[0].key.is_some());
+        assert!(rig.server.writes_to("/bus/inbox/seen").is_empty());
+    }
+
+    #[test]
+    fn a_busy_local_journal_retries_mail_before_the_normal_upkeep() {
+        let rig = start_with(
+            Timing {
+                fresh: Duration::from_secs(30),
+                upkeep: Duration::from_secs(5),
+                retry_min: Duration::from_millis(250),
+                ..timing()
+            },
+            |server| *server.unread.lock().unwrap() = 1,
+        );
+        let (started, observed) = channel();
+        let (resume, paused) = channel();
+        *rig.server.busy_mail_claim_gate.lock().unwrap() = Some(LostReadGate {
+            started,
+            resume: paused,
+        });
+        rig.daemon.handle(Request::Unread {
+            session: "me".into(),
+        });
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Registration has completed while the first reserve is paused. Consume its pending
+        // nudge so the next pass must be scheduled by the retry, rather than by registration.
+        rig.daemon.shared.signal().nudged = false;
+        resume.send(()).unwrap();
+        let end = Instant::now() + Duration::from_secs(1);
+        while !rig.daemon.shared.read_view().mail.contains_key("me") {
+            assert!(
+                Instant::now() < end,
+                "local journal contention postponed mail until the normal 5 s upkeep"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let taken = rig.daemon.handle(Request::TakeMail {
+            session: "me".into(),
+            limit: 1,
+            lease_seconds: 60,
+        });
+        assert_eq!(taken.messages.unwrap().len(), 1);
+        assert_eq!(rig.server.writes_to("/bus/inbox/claim").len(), 1);
         assert!(rig.server.writes_to("/bus/inbox/seen").is_empty());
     }
 
@@ -3336,7 +3510,9 @@ mod tests {
         assert_eq!(reply.value.unwrap()[0]["key"], "k");
     }
 
+    #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn the_socket_is_0600_in_a_0700_folder_and_one_process_owns_it() {
         let rig = start_with(timing(), |_| {});
         let socket = rig.dir.path().join("run/agent.sock");

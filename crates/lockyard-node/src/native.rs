@@ -258,9 +258,6 @@ pub fn sandbox_main() -> i32 {
     }
 }
 
-#[cfg(test)]
-mod regression_tests;
-
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CleanupReceipt {
@@ -270,3 +267,6 @@ struct CleanupReceipt {
     stopped: bool,
     events: std::collections::BTreeMap<String, u64>,
 }
+
+#[cfg(test)]
+mod regression_tests;

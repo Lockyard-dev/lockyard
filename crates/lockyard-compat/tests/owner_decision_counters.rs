@@ -94,7 +94,10 @@ fn owner_decision_metrics_count_only_successful_legacy_reads_with_fixed_labels()
         .canonicalize()
         .unwrap()
         .join(format!("ly-owner-counters-{}-{unique}", std::process::id()));
+    #[cfg(unix)]
     let mut builder = fs::DirBuilder::new();
+    #[cfg(windows)]
+    let builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;

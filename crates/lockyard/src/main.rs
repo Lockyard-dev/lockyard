@@ -6,11 +6,9 @@ mod guard;
 mod hook;
 mod mcp;
 mod monitor;
-#[cfg(unix)]
 mod node_cli;
 mod onboarding;
 mod open;
-#[cfg(unix)]
 mod revoke_access;
 mod setup;
 mod shutdown;
@@ -239,7 +237,6 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
         Command::Cloud(CloudCommand::Key(command)) => run_cloud_key(cwd, command),
         Command::Cloud(CloudCommand::Encryption(command)) => run_cloud_encryption(cwd, command),
         Command::Cloud(command) => run_cloud(open()?, command, agent.as_ref()),
-        #[cfg(unix)]
         Command::Revoke(command) => {
             let (target, config) = command.parts();
             let result = revoke_access::execute(cwd, target, config)?;
@@ -266,7 +263,6 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             smoke,
             node_config,
         } => {
-            #[cfg(unix)]
             if let Some(path) = node_config.as_deref() {
                 let data = node_cli::native_doctor(path)?;
                 let exit = if data["healthy"].as_bool() == Some(true) {
@@ -282,8 +278,7 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
                 rendered.exit = exit;
                 return Ok(rendered);
             }
-            #[cfg(not(unix))]
-            let _ = node_config;
+
             if client.is_none() && !smoke {
                 let data = onboarding::doctor(cwd, agent.as_deref(), None, false)?;
                 // Invalid configuration is intentionally summarized without leaking tokens.
@@ -362,15 +357,12 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             }
             Ok(result)
         }
-        #[cfg(unix)]
         Command::Node(command) => node_output(node_cli::node(command)?),
-        #[cfg(unix)]
         Command::Job(command) => node_output(node_cli::job(command)?),
         Command::Mcp(_) => output(&Value::Null, ""),
     }
 }
 
-#[cfg(unix)]
 fn node_output(data: Value) -> Result<Output> {
     let failed = data.get("ok") == Some(&Value::Bool(false))
         || data.pointer("/reply/ok") == Some(&Value::Bool(false));

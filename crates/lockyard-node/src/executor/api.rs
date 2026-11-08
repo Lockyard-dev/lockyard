@@ -497,11 +497,9 @@ impl Executor {
         file.write_all(if enabled { b"1" } else { b"0" })
             .and_then(|()| file.sync_all())
             .map_err(io_error)?;
-        fs::rename(&temporary, self.inner.config.state_dir.join("drain-state"))
+        lockyard_core::fsio::rename(&temporary, self.inner.config.state_dir.join("drain-state"))
             .map_err(io_error)?;
-        File::open(&self.inner.config.state_dir)
-            .and_then(|directory| directory.sync_all())
-            .map_err(io_error)?;
+        lockyard_core::fsio::sync_path(&self.inner.config.state_dir).map_err(io_error)?;
         self.inner.draining.store(enabled, Ordering::SeqCst);
         Ok(drain_status(&jobs, enabled))
     }

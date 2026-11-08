@@ -235,6 +235,7 @@ pub fn run(command: KeyRotationCommand) -> Result<Value> {
 }
 
 fn install(config: PathBuf, bundle: PathBuf, output: PathBuf, recover: bool) -> Result<Value> {
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     // Avoid a known destination conflict before the irreversible install. An I/O failure
     // afterward is reported as a receipt failure, never as proof the key did not change.
@@ -246,7 +247,11 @@ fn install(config: PathBuf, bundle: PathBuf, output: PathBuf, recover: bool) -> 
     let parent = output
         .parent()
         .ok_or_else(|| invalid("rotation receipt needs an existing private parent directory"))?;
+    #[cfg(unix)]
     let metadata = std::fs::symlink_metadata(parent)?;
+    #[cfg(windows)]
+    lockyard_core::windows::require_private(parent)?;
+    #[cfg(unix)]
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != unsafe { libc::geteuid() }

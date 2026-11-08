@@ -14,7 +14,7 @@ use lockyard_core::{Error, Result};
 use serde::Serialize;
 use serde_json::Value;
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs::{self};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -77,7 +77,7 @@ pub struct Site {
 impl Site {
     /// Reads the folders from the environment, with each client's documented override honoured.
     pub fn discover(root: &Path) -> Result<Self> {
-        let home = std::env::var_os("HOME")
+        let home = lockyard_core::paths::home_dir()
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from)
             .ok_or_else(|| Error::Invalid("HOME is not set".into()))?;
@@ -676,6 +676,11 @@ pub fn describe(done: &[Applied], dry_run: bool) -> String {
 pub fn as_json(done: &[Applied]) -> Value {
     serde_json::to_value(done).unwrap_or(Value::Null)
 }
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 
 #[cfg(test)]
 mod tests;

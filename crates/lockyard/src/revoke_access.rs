@@ -8,8 +8,7 @@ use lockyard_core::{Error, Result, config::Config, paths::find_root};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::Read,
+    fs::File,
     path::{Path, PathBuf},
 };
 
@@ -404,7 +403,6 @@ fn post_once_with_retry(
 fn digest(bytes: &[u8]) -> String {
     hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
-#[cfg(unix)]
 fn node_context(path: Option<&Path>) -> Result<(Option<RevocationTrust>, Vec<String>)> {
     match path {
         None => Ok((None, vec![])),
@@ -418,11 +416,7 @@ fn node_context(path: Option<&Path>) -> Result<(Option<RevocationTrust>, Vec<Str
         }
     }
 }
-#[cfg(not(unix))]
-fn node_context(_path: Option<&Path>) -> Result<(Option<RevocationTrust>, Vec<String>)> {
-    Ok((None, vec![]))
-}
-#[cfg(unix)]
+
 fn apply_local(
     path: &Path,
     docs: Vec<lockyard_cloud_client::revocations::SignedDocument>,
@@ -431,13 +425,8 @@ fn apply_local(
         .block_on(lockyard_node::host::local_revocations(path, docs))
         .map_err(|_| Error::Invalid("revocation_state_unavailable".into()))
 }
-#[cfg(not(unix))]
-fn apply_local(
-    _path: &Path,
-    _docs: Vec<lockyard_cloud_client::revocations::SignedDocument>,
-) -> Result<Value> {
-    Err(Error::Invalid("revocation_state_unavailable".into()))
-}
+
+#[cfg(unix)]
 fn private_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     match fs::DirBuilder::new().mode(0o700).create(path) {
@@ -457,6 +446,7 @@ fn private_directory(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(unix)]
 fn operation_lock(path: &Path) -> Result<File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let f = OpenOptions::new()
@@ -485,6 +475,7 @@ fn operation_lock(path: &Path) -> Result<File> {
     }
     Ok(f)
 }
+#[cfg(unix)]
 fn read_private_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let f = OpenOptions::new()
@@ -528,3 +519,32 @@ pub(crate) fn mcp(cwd: &Path, args: &Value) -> Value {
         .unwrap_or_else(|_| json!({"code":"protocol_response_invalid"}));
     json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value,"isError":failed})
 }
+
+#[cfg(windows)]
+fn private_directory(path: &Path) -> Result<()> {
+    Ok(lockyard_core::windows::private_dir(path)?)
+}
+
+#[cfg(windows)]
+fn operation_lock(path: &Path) -> Result<File> {
+    let file = lockyard_core::windows::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)?;
+    file.try_lock()
+        .map_err(|_| Error::Invalid("revocation operation already running".into()))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn read_private_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+    let bytes = lockyard_core::windows::read_private(path, 1_048_576)?;
+    serde_json::from_slice(&bytes).map_err(|_| Error::Invalid("invalid revocation state".into()))
+}
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
+
+#[cfg(unix)]
+use std::{fs, io::Read};

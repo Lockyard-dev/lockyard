@@ -86,12 +86,8 @@ pub(super) fn stage_forwarded_environment(
         }
     }
     file.sync_all().map_err(io_error)?;
-    File::open(directory)
-        .and_then(|file| file.sync_all())
-        .map_err(io_error)?;
-    File::open(job_dir)
-        .and_then(|file| file.sync_all())
-        .map_err(io_error)?;
+    lockyard_core::fsio::sync_path(directory).map_err(io_error)?;
+    lockyard_core::fsio::sync_path(job_dir).map_err(io_error)?;
     Ok(())
 }
 
@@ -170,7 +166,7 @@ pub(super) fn quarantine_prejournal(state_dir: &Path, path: &Path, id: &str) -> 
     if destination.exists() {
         return Err(ExecutorError("quarantine_collision"));
     }
-    fs::rename(path, destination).map_err(io_error)?;
+    lockyard_core::fsio::rename(path, destination).map_err(io_error)?;
     for parent in [state_dir.to_path_buf(), state_dir.join("jobs"), quarantine] {
         File::open(parent)
             .map_err(io_error)?

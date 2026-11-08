@@ -83,7 +83,7 @@ pub fn unit_path(home: &Path, launchd: bool) -> PathBuf {
 }
 
 fn home() -> Result<PathBuf> {
-    std::env::var_os("HOME")
+    lockyard_core::paths::home_dir()
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| Error::Invalid("HOME is not set".into()))

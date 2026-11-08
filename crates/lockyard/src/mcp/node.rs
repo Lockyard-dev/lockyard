@@ -2,14 +2,6 @@
 
 use super::*;
 
-#[cfg(not(unix))]
-pub(super) fn node_tool(_name: &str, _args: Args<'_>) -> Result<Value> {
-    Err(Error::Invalid(
-        "remote node orchestration requires a Unix host; this platform supports the existing coordination tools".into(),
-    ))
-}
-
-#[cfg(unix)]
 pub(super) fn node_tool(name: &str, args: Args<'_>) -> Result<Value> {
     use lockyard_node::wire::{self, JobSpec, Operation};
     use std::path::PathBuf;

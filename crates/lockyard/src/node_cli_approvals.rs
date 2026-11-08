@@ -12,7 +12,7 @@ use lockyard_node::{
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self},
     io::Read,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -188,12 +188,19 @@ fn reject_checkout_key_directory(path: &Path) -> Result<()> {
                 git_metadata(&marker)
             }
             Ok(metadata) if metadata.is_file() && metadata.len() <= 4096 => {
+                #[cfg(unix)]
                 use std::os::unix::fs::OpenOptionsExt;
+                #[cfg(unix)]
                 let mut text = String::new();
+                #[cfg(windows)]
+                let text = String::from_utf8(lockyard_core::windows::read_public(&marker, 4096)?)
+                    .map_err(|_| invalid("invalid Git metadata"))?;
+                #[cfg(unix)]
                 let file = fs::OpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                     .open(&marker)?;
+                #[cfg(unix)]
                 file.take(4097).read_to_string(&mut text)?;
                 text.trim().strip_prefix("gitdir:").is_some_and(|target| {
                     let target = Path::new(target.trim());
@@ -223,7 +230,8 @@ fn owner_key_directory(create: bool) -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(path) if !path.is_empty() => PathBuf::from(path),
         _ => PathBuf::from(
-            std::env::var_os("HOME").ok_or_else(|| invalid("owner key directory unavailable"))?,
+            lockyard_core::paths::home_dir()
+                .ok_or_else(|| invalid("owner key directory unavailable"))?,
         )
         .join(".config"),
     };
@@ -259,19 +267,29 @@ fn owner_key_directory(create: bool) -> Result<PathBuf> {
             ));
         }
         if create {
-            fs::File::open(
+            lockyard_core::fsio::sync_path(
                 current
                     .parent()
                     .ok_or_else(|| invalid("invalid owner key directory"))?,
-            )?
-            .sync_all()?;
+            )?;
         }
     }
     Ok(current)
 }
 #[cfg(not(unix))]
-fn owner_key_directory(_: bool) -> Result<PathBuf> {
-    Err(invalid("owner key custody requires Unix file permissions"))
+fn owner_key_directory(create: bool) -> Result<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
+        .ok_or_else(|| invalid("private config directory unavailable"))?;
+    reject_checkout_key_directory(&base)?;
+    let path = base.join("lockyard/keys/owner-approvals");
+    if create {
+        lockyard_core::windows::private_dir(&path)?;
+    } else {
+        lockyard_core::windows::require_private(&path)?;
+    }
+    Ok(path)
 }
 
 fn load_owner_key(path: &Path) -> Result<SigningKey> {
@@ -501,3 +519,8 @@ pub fn run(command: ApprovalCommand) -> Result<Value> {
         }
     }
 }
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;

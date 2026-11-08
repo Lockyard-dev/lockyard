@@ -12,9 +12,8 @@ use std::{
 };
 
 fn private_temp() -> tempfile::TempDir {
-    use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture_permissions(root.path(), 0o700).unwrap();
     root
 }
 
@@ -685,3 +684,16 @@ fn explicit_owner_signer_reprovision_preserves_denies_and_requires_new_key_refre
 
 #[path = "revocations/runtime.rs"]
 mod runtime;
+
+fn fixture_permissions(path: impl AsRef<std::path::Path>, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(windows)]
+    {
+        let _ = mode;
+        lockyard_core::windows::secure_owned(path.as_ref())
+    }
+}

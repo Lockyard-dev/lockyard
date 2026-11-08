@@ -616,6 +616,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg(unix)]
     fn untrusted_evidence_paths_and_malformed_signed_sbom_are_rejected() {
         let mut fixture = Fixture::new();
         let _keep = &fixture.root;

@@ -239,6 +239,8 @@ pub struct Agent {
 pub struct Store {
     pub(crate) conn: Connection,
     root: PathBuf,
+    #[cfg(windows)]
+    _directory: crate::windows::Directory,
 }
 
 impl Store {
@@ -246,10 +248,23 @@ impl Store {
     pub fn init(root: &Path) -> Result<Self> {
         let root = root.canonicalize()?;
         let dir = root.join(DIR_NAME);
+        #[cfg(unix)]
         fs::create_dir_all(&dir)?;
+        #[cfg(windows)]
+        {
+            // Tightening an exposed existing SQL directory cannot revoke handles
+            // another SID already opened. Refuse it before any SQLite access.
+            if dir.try_exists()? {
+                crate::windows::require_private(&dir)?;
+            }
+            crate::windows::private_dir(&dir)?;
+        }
         restrict(&dir)?;
         // The database and its journals never belong in the repository.
+        #[cfg(unix)]
         fs::write(dir.join(".gitignore"), "*\n")?;
+        #[cfg(windows)]
+        crate::fsio::replace(&dir.join(".gitignore"), b"*\n", 0o600)?;
         Self::open(&root)
     }
 
@@ -260,6 +275,8 @@ impl Store {
         if !dir.is_dir() {
             return Err(Error::NoProject);
         }
+        #[cfg(windows)]
+        let directory = windows_database(&dir, true)?;
         let conn = Connection::open(dir.join(DB_NAME))?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         // Triggers distinguish a connection from this generation from an already-open old binary.
@@ -277,7 +294,12 @@ impl Store {
         // success: retaining a NORMAL-synchronous WAL would extend the power-loss window.
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
         conn.pragma_update(None, "synchronous", "FULL")?;
-        let mut store = Self { conn, root };
+        let mut store = Self {
+            conn,
+            root,
+            #[cfg(windows)]
+            _directory: directory,
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -296,6 +318,12 @@ impl Store {
             return Ok(());
         };
         let path = root.join(DIR_NAME).join(DB_NAME);
+        #[cfg(windows)]
+        let _directory = match windows_database(&root.join(DIR_NAME), false) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
         match fs::metadata(&path) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -343,6 +371,8 @@ impl Store {
             .unwrap_or_else(|| Path::new("."))
             .canonicalize()?;
         let destination = parent.join(name);
+        #[cfg(windows)]
+        let output_pin = crate::windows::open_output_directory(&parent)?;
         // This preflight improves the error; hard_link below provides race-free no-clobber.
         match fs::symlink_metadata(&destination) {
             Ok(_) => {
@@ -358,21 +388,38 @@ impl Store {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let mut staging_options = tempfile::Builder::new();
-        staging_options.prefix(".lockyard-backup-");
         #[cfg(unix)]
-        {
+        let staging = {
             use std::os::unix::fs::PermissionsExt;
-            staging_options.permissions(fs::Permissions::from_mode(0o700));
-        }
-        let staging = staging_options.tempdir_in(&parent)?;
+            tempfile::Builder::new()
+                .prefix(".lockyard-backup-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in(&parent)?
+        };
+        #[cfg(windows)]
+        let staging = PrivateBackupDirectory::new(&parent)?;
+        #[cfg(windows)]
+        let _staging_pin = crate::windows::open_directory(staging.path())?;
+        #[cfg(unix)]
         let file = tempfile::NamedTempFile::new_in(staging.path())?;
+        #[cfg(windows)]
+        let file = {
+            let path = staging.path().join("snapshot.db");
+            let file = crate::windows::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            tempfile::NamedTempFile::from_parts(file, tempfile::TempPath::try_from_path(path)?)
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             file.as_file()
                 .set_permissions(fs::Permissions::from_mode(0o600))?;
         }
+        #[cfg(windows)]
+        let payload_pin = crate::windows::pin_file(file.as_file())?;
         let mut target = Connection::open_with_flags(
             file.path(),
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -400,7 +447,15 @@ impl Store {
         }
         target.close().map_err(|(_, error)| Error::Db(error))?;
         file.as_file().sync_all()?;
+        #[cfg(unix)]
         fs::hard_link(file.path(), &destination)?;
+        #[cfg(windows)]
+        {
+            // SQLite has closed its pathname-based connection. Publish the original
+            // verified object by handle, even if its temporary name is changed now.
+            drop(payload_pin);
+            crate::windows::publish_output_handle(file.as_file(), &output_pin, name)?;
+        }
         #[cfg(unix)]
         fs::File::open(&parent)?.sync_all()?;
         Ok(())
@@ -579,8 +634,8 @@ fn restrict(dir: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn restrict(_dir: &Path) -> Result<()> {
-    Ok(())
+fn restrict(dir: &Path) -> Result<()> {
+    Ok(crate::windows::secure_owned(dir)?)
 }
 
 #[cfg(test)]
@@ -588,6 +643,66 @@ pub(crate) fn test_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::init(dir.path()).unwrap();
     (dir, store)
+}
+
+#[cfg(windows)]
+fn windows_database(dir: &Path, create: bool) -> std::io::Result<crate::windows::Directory> {
+    let directory = crate::windows::open_directory(dir)?;
+    let db = dir.join(DB_NAME);
+    let _file = crate::windows::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .open(&db)?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let path = dir.join(format!("{DB_NAME}{suffix}"));
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                crate::windows::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(windows)]
+struct PrivateBackupDirectory(PathBuf);
+#[cfg(windows)]
+impl PrivateBackupDirectory {
+    fn new(parent: &Path) -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..128 {
+            let path = parent.join(format!(
+                ".lockyard-backup-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match crate::windows::create_private_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "cannot allocate private backup directory",
+        ))
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+#[cfg(windows)]
+impl Drop for PrivateBackupDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 #[cfg(test)]
@@ -734,6 +849,8 @@ mod tests {
         Store::checkpoint_on_shutdown(dir.path()).unwrap();
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
         fs::create_dir(dir.path().join(DIR_NAME)).unwrap();
+        #[cfg(windows)]
+        crate::windows::private_dir(&dir.path().join(DIR_NAME)).unwrap();
         Store::checkpoint_on_shutdown(dir.path()).unwrap();
         assert_eq!(fs::read_dir(dir.path().join(DIR_NAME)).unwrap().count(), 0);
     }
@@ -831,6 +948,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join(DIR_NAME);
         fs::create_dir_all(&state).unwrap();
+        #[cfg(windows)]
+        crate::windows::private_dir(&state).unwrap();
         let connection = Connection::open(state.join(DB_NAME)).unwrap();
         connection.execute_batch(SCHEMA).unwrap();
         connection
@@ -855,6 +974,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join(DIR_NAME);
         fs::create_dir_all(&state).unwrap();
+        #[cfg(windows)]
+        crate::windows::private_dir(&state).unwrap();
         let connection = Connection::open(state.join(DB_NAME)).unwrap();
         connection
             .execute_batch(&format!("{SCHEMA}{SCHEMA_V2}{SCHEMA_V3}"))

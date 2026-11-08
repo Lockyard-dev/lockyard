@@ -176,10 +176,8 @@ fn persist_reconciliation(config: &ExecutorConfig, value: &TombstoneReconciliati
         )
         .and_then(|()| file.sync_all())
         .map_err(io_error)?;
-        fs::rename(&temporary, &path).map_err(io_error)?;
-        File::open(&directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(io_error)
+        lockyard_core::fsio::rename(&temporary, &path).map_err(io_error)?;
+        lockyard_core::fsio::sync_path(&directory).map_err(io_error)
     })();
     if result.is_err() {
         let _ = fs::remove_file(temporary);

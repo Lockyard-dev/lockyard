@@ -4,12 +4,14 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::fs;
 
 const MAX_SECRET_BYTES: usize = 16 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 128 * 1024;
@@ -212,12 +214,17 @@ impl VaultIdentity {
             .tls_roots
             .iter()
             .map(|path| {
+                #[cfg(unix)]
                 use std::os::unix::fs::OpenOptionsExt;
                 check_budget(deadline, cancelled)?;
+                #[cfg(unix)]
                 let file = fs::OpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
                     .open(path)
+                    .map_err(|_| SecretError("vault_trust_unavailable"))?;
+                #[cfg(windows)]
+                let file = lockyard_core::windows::open_public(path)
                     .map_err(|_| SecretError("vault_trust_unavailable"))?;
                 let metadata = file
                     .metadata()
@@ -552,8 +559,7 @@ fn stage_resolved(
             .mode(0o700)
             .create(&directory)
             .map_err(|_| SecretError("secret_staging_failed"))?;
-        fs::File::open(job_dir)
-            .and_then(|parent| parent.sync_all())
+        lockyard_core::fsio::sync_path(job_dir)
             .map_err(|_| SecretError("secret_staging_failed"))?;
         for secret in &resolved {
             check_budget(deadline, cancelled)?;
@@ -590,13 +596,48 @@ fn stage_resolved(
             file.sync_all()
                 .map_err(|_| SecretError("secret_staging_failed"))?;
         }
-        fs::File::open(&directory)
-            .and_then(|parent| parent.sync_all())
+        lockyard_core::fsio::sync_path(&directory)
             .map_err(|_| SecretError("secret_staging_failed"))?;
         Ok(resolved)
     }
-    #[cfg(not(unix))]
-    Err(SecretError("secrets_require_unix"))
+    #[cfg(windows)]
+    {
+        let _ = job_dir;
+        lockyard_core::windows::private_dir(&directory)
+            .map_err(|_| SecretError("secret_staging_failed"))?;
+        for secret in &resolved {
+            check_budget(deadline, cancelled)?;
+            let mut file = lockyard_core::windows::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(directory.join(&secret.name))
+                .map_err(|_| SecretError("secret_staging_failed"))?;
+            file.write_all(secret.bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|_| SecretError("secret_staging_failed"))?;
+        }
+        let environment: Vec<_> = resolved
+            .iter()
+            .filter_map(|secret| secret.environment.as_ref().map(|name| (name, secret)))
+            .collect();
+        if !environment.is_empty() {
+            let mut file = lockyard_core::windows::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(directory.join(".environment"))
+                .map_err(|_| SecretError("secret_staging_failed"))?;
+            for (name, secret) in environment {
+                file.write_all(name.as_bytes())
+                    .and_then(|()| file.write_all(b"="))
+                    .and_then(|()| file.write_all(secret.bytes()))
+                    .and_then(|()| file.write_all(b"\n"))
+                    .map_err(|_| SecretError("secret_staging_failed"))?;
+            }
+            file.sync_all()
+                .map_err(|_| SecretError("secret_staging_failed"))?;
+        }
+        Ok(resolved)
+    }
 }
 
 #[cfg(unix)]
@@ -632,8 +673,12 @@ fn read_private(path: &Path, max: usize) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(unix))]
-fn read_private(_: &Path, _: usize) -> Result<Vec<u8>> {
-    Err(SecretError("secrets_require_unix"))
+fn read_private(path: &Path, max: usize) -> Result<Vec<u8>> {
+    if !path.is_absolute() {
+        return Err(SecretError("secret_path_must_be_absolute"));
+    }
+    lockyard_core::windows::read_private(path, max as u64)
+        .map_err(|_| SecretError("secret_file_not_private"))
 }
 
 #[cfg(test)]
@@ -779,6 +824,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn nonexistent_control_reservations_do_not_disable_other_secret_profiles() {
         use std::os::unix::fs::OpenOptionsExt;
         let root = tempfile::tempdir().unwrap();
@@ -804,6 +850,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn vault_kv_and_transit_use_verified_tls_and_node_local_credentials() {
         let (identity, requests, server, _directory) = tls_fixture(
             200,

@@ -243,7 +243,7 @@ fn run(dir: &Path, url: &str) -> Value {
     run_with_umask(dir, url, None)
 }
 
-fn run_with_umask(dir: &Path, url: &str, mask: Option<libc::mode_t>) -> Value {
+fn run_with_umask(dir: &Path, url: &str, mask: Option<TestMode>) -> Value {
     // Ignore caller TMPDIR: shared CI ancestors may be group-writable and are deliberately
     // rejected by private journals. The OS sticky temp root plus tempfile's 0700 child is private.
     #[cfg(unix)]
@@ -506,3 +506,8 @@ fn old_readback_receipt_with_same_session_requires_reconciliation() {
     );
     assert_eq!(state.lock().unwrap().zone_writes, 1);
 }
+
+#[cfg(unix)]
+type TestMode = libc::mode_t;
+#[cfg(windows)]
+type TestMode = u32;

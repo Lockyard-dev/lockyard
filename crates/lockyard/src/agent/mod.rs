@@ -6,15 +6,14 @@
 //! network, and it holds an outbox so mail and heartbeats survive an outage. It uses plain threads:
 //! a hook only opens the socket, with no HTTP and no async runtime on that path.
 
-#[cfg(unix)]
 pub mod daemon;
-#[cfg(unix)]
 pub mod outbox;
 #[cfg(unix)]
 pub mod service;
-#[cfg(unix)]
+#[cfg(windows)]
+#[path = "service_windows.rs"]
+pub mod service;
 pub mod socket;
-#[cfg(unix)]
 pub mod wire;
 
 #[cfg(unix)]
@@ -49,7 +48,7 @@ mod unix {
         if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|dir| !dir.is_empty()) {
             return Ok(PathBuf::from(dir).join("lockyard"));
         }
-        let home = std::env::var_os("HOME")
+        let home = lockyard_core::paths::home_dir()
             .filter(|dir| !dir.is_empty())
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
         Ok(PathBuf::from(home).join(".local/state/lockyard"))
@@ -87,6 +86,7 @@ mod unix {
         use super::*;
 
         #[test]
+        #[cfg(unix)]
         fn a_private_folder_is_0700_and_a_link_is_refused() {
             let dir = tempfile::tempdir().unwrap();
             let folder = dir.path().join("a/b");
@@ -100,4 +100,29 @@ mod unix {
             assert!(private_dir(&link).is_err());
         }
     }
+}
+
+#[cfg(windows)]
+pub fn uid() -> String {
+    lockyard_core::windows::user_id().expect("Windows user SID is unavailable")
+}
+
+#[cfg(windows)]
+pub fn state_root() -> std::io::Result<std::path::PathBuf> {
+    std::env::var_os("XDG_STATE_HOME")
+        .or_else(|| std::env::var_os("LOCALAPPDATA"))
+        .map(|path| std::path::PathBuf::from(path).join("lockyard"))
+        .ok_or_else(|| std::io::Error::other("LOCALAPPDATA is not set"))
+}
+#[cfg(windows)]
+pub use lockyard_core::windows::private_dir;
+
+#[cfg(unix)]
+pub fn socket_path_for(_url: &str, _workspace: &str) -> std::path::PathBuf {
+    socket_path()
+}
+#[cfg(windows)]
+pub fn socket_path_for(url: &str, workspace: &str) -> std::path::PathBuf {
+    lockyard_core::windows::pipe_path(&format!("{}\0{}", url.trim_end_matches('/'), workspace))
+        .expect("Windows pipe identity is unavailable")
 }

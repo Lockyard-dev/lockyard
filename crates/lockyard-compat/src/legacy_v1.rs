@@ -56,7 +56,9 @@ fn diagnostics_dir() -> Option<PathBuf> {
     }
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .or_else(|| {
+            lockyard_core::paths::home_dir().map(|home| PathBuf::from(home).join(".local/state"))
+        })
         .map(|path| path.join("lockyard/diagnostics"))
 }
 

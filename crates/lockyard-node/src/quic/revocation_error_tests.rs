@@ -51,9 +51,8 @@ async fn connected() -> (
     DirectConnection,
     DirectConnection,
 ) {
-    use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture_permissions(root.path(), 0o700).unwrap();
     let signer = SigningKey::generate(&root.path().join("signer.pk8")).unwrap();
     let key = signer.trusted_key();
     let settings = RevocationConfig {
@@ -210,4 +209,17 @@ async fn unrelated_remote_close_and_stream_errors_preserve_original_sdk_error() 
     })
     .await
     .unwrap();
+}
+
+fn fixture_permissions(path: impl AsRef<std::path::Path>, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(windows)]
+    {
+        let _ = mode;
+        lockyard_core::windows::secure_owned(path.as_ref())
+    }
 }

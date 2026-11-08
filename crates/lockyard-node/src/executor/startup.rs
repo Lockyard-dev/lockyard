@@ -65,6 +65,10 @@ impl Executor {
         delegation: Option<Arc<dyn crate::delegation::DelegationProvider>>,
         notifications: Option<crate::job_notifications::SharedOutbox>,
     ) -> Result<Self> {
+        if cfg!(windows) {
+            return Err(ExecutorError("container_limits_unavailable"));
+        }
+
         if config
             .state_dir
             .file_name()
@@ -92,8 +96,6 @@ impl Executor {
             })
             .transpose()?
             .flatten();
-        #[cfg(not(unix))]
-        return Err(ExecutorError("execution_requires_unix"));
         if config.node_id.is_empty()
             || config.node_id.len() > 64
             || !config

@@ -24,8 +24,12 @@ pub struct AgentPort {
 
 /// Connects to the agent. `None` when none is running for this workspace.
 pub fn connect(url: &str, workspace: &str, root: PathBuf, tool: Tool) -> Option<AgentPort> {
-    let socket =
-        AgentSocket::connect(&crate::agent::socket_path(), url, workspace, SOCKET_TIMEOUT)?;
+    let socket = AgentSocket::connect(
+        &crate::agent::socket_path_for(url, workspace),
+        url,
+        workspace,
+        SOCKET_TIMEOUT,
+    )?;
     let repository = lockyard_core::config::Config::load(&root).ok()?.repository;
     Some(AgentPort {
         socket,

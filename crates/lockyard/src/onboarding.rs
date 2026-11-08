@@ -7,7 +7,7 @@ use lockyard_core::config::{Config, Mode};
 use lockyard_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::fs::{self, OpenOptions};
+use std::fs::{self};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -74,7 +74,7 @@ fn invalid(message: impl Into<String>) -> Error {
 }
 
 fn home() -> Result<PathBuf> {
-    std::env::var_os("HOME")
+    lockyard_core::paths::home_dir()
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| invalid("HOME is not set"))
@@ -546,7 +546,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::create_dir_all(parent)?;
     let temporary = parent.join(format!(".lockyard-{}.tmp", nonce()));
     write_private(&temporary, bytes)?;
-    if let Err(error) = fs::rename(&temporary, path) {
+    if let Err(error) = lockyard_core::fsio::rename(&temporary, path) {
         let _ = fs::remove_file(&temporary);
         return Err(error.into());
     }
@@ -795,10 +795,9 @@ fn cloud_checks(checks: &mut Vec<Value>, config: &Config) {
         if token.is_some() { "ok" } else { "failed" },
         "A non-empty credential binding or private token file is required. Values are never printed; remote authorization is not tested by doctor.",
     );
-    #[cfg(unix)]
     {
         match crate::agent::socket::AgentSocket::status(
-            &crate::agent::socket_path(),
+            &crate::agent::socket_path_for(url, workspace),
             std::time::Duration::from_millis(800),
         ) {
             Err(_) => check(
@@ -837,16 +836,6 @@ fn cloud_checks(checks: &mut Vec<Value>, config: &Config) {
                 );
             }
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = workspace;
-        check(
-            checks,
-            "daemon",
-            "warning",
-            "The background agent and its edit hooks require Unix; direct CLI calls are available.",
-        );
     }
 }
 
@@ -943,6 +932,11 @@ pub fn text(report: &Value) -> String {
     }
     lines.join("\n")
 }
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 
 #[cfg(test)]
 mod tests {

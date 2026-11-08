@@ -19,12 +19,13 @@ mod revocation_adapter;
 #[path = "host_workflow.rs"]
 mod workflow_adapter;
 use lockyard_cloud_client::WorkspaceKey;
+#[cfg(windows)]
+use lockyard_core::windows::ipc::{AsyncListener as UnixListener, AsyncStream as UnixStream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, File},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -33,9 +34,10 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
     sync::{Mutex, Semaphore, oneshot},
 };
 
@@ -305,6 +307,12 @@ struct Expired {
     request: RpcFrame,
     code: String,
 }
+#[cfg(unix)]
+use std::io::Read;
+
+#[cfg(unix)]
+use std::io::Write;
+
 const OUTBOX_SLOTS: usize = 128;
 const OUTBOX_RECORD_MAX: u64 = (MAX_FRAME_BYTES + 4096) as u64;
 #[derive(Serialize, Deserialize)]
@@ -515,6 +523,7 @@ struct Host {
     write_history: Arc<Semaphore>,
     clock: Mutex<ClockState>,
 }
+#[cfg(unix)]
 fn read_private(path: &Path, max: u64) -> Result<Vec<u8>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = OpenOptions::new()
@@ -540,11 +549,12 @@ fn read_private(path: &Path, max: u64) -> Result<Vec<u8>> {
 fn workspace_key_directory() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(path) if !path.is_empty() => PathBuf::from(path),
-        _ => PathBuf::from(std::env::var_os("HOME").ok_or("workspace key unavailable")?)
+        _ => PathBuf::from(lockyard_core::paths::home_dir().ok_or("workspace key unavailable")?)
             .join(".config"),
     };
     Ok(base.join("lockyard/keys"))
 }
+#[cfg(unix)]
 fn validate_workspace_key(workspace: &str) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let keys = workspace_key_directory()?;
@@ -568,6 +578,7 @@ fn validate_workspace_key(workspace: &str) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(unix)]
 fn private_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if !path.exists() {
@@ -586,6 +597,7 @@ fn private_dir(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(unix)]
 fn lock_state(path: &Path) -> Result<File> {
     use std::os::{
         fd::AsRawFd,
@@ -607,6 +619,7 @@ fn lock_state(path: &Path) -> Result<File> {
     }
     Ok(file)
 }
+#[cfg(unix)]
 fn make_socket(path: &Path) -> Result<UnixListener> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     if let Ok(m) = fs::symlink_metadata(path) {
@@ -819,7 +832,7 @@ fn ensure_capacity_limit(dir: &Path, op: Operation, may_expire: bool, limit: usi
                 fs::remove_file(entry.path())?;
             }
         }
-        File::open(dir)?.sync_all()?;
+        lockyard_core::fsio::sync_path(dir)?;
     }
     if fs::read_dir(dir)?.take(limit).count() >= limit {
         return Err("node durable storage capacity reached".into());
@@ -856,7 +869,7 @@ fn evict_read_responses(dir: &Path, now: u64) -> Result<(usize, Vec<String>)> {
                 let _ = fs::remove_file(entry.path());
             }
         }
-        File::open(&tombstones)?.sync_all()?;
+        lockyard_core::fsio::sync_path(&tombstones)?;
         if fs::read_dir(&tombstones)?
             .take(TOMBSTONE_LIMIT - take + 1)
             .count()
@@ -892,7 +905,7 @@ fn evict_read_responses(dir: &Path, now: u64) -> Result<(usize, Vec<String>)> {
         fs::remove_file(entry.path())?;
         removed.push(id);
     }
-    File::open(dir)?.sync_all()?;
+    lockyard_core::fsio::sync_path(dir)?;
     Ok((remaining, removed))
 }
 fn erase_cached_content(
@@ -946,7 +959,7 @@ fn erase_cached_content(
         {
             // The original outcome's ID/hash and the non-replay binding are now durable.
             fs::remove_file(path)?;
-            File::open(outbox_dir)?.sync_all()?;
+            lockyard_core::fsio::sync_path(outbox_dir)?;
             budget.forget("relay-outbox", id);
             host.relay_slots.add_permits(1);
         }
@@ -954,9 +967,11 @@ fn erase_cached_content(
     Ok(())
 }
 #[cfg(test)]
+#[cfg(unix)]
 fn store_cache(dir: &Path, id: &str, cache: &Cached) -> Result<()> {
     store_data(dir, id, &serde_json::to_vec(cache)?)
 }
+#[cfg(unix)]
 fn store_data(dir: &Path, id: &str, bytes: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let path = dir.join(id);
@@ -970,8 +985,8 @@ fn store_data(dir: &Path, id: &str, bytes: &[u8]) -> Result<()> {
     let result = (|| -> Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&tmp, path)?;
-        File::open(dir)?.sync_all()?;
+        lockyard_core::fsio::rename(&tmp, path)?;
+        lockyard_core::fsio::sync_path(dir)?;
         Ok(())
     })();
     if result.is_err() {
@@ -980,7 +995,7 @@ fn store_data(dir: &Path, id: &str, bytes: &[u8]) -> Result<()> {
         // record as uncertain durable evidence, but do not retain a failed private copy.
         match fs::remove_file(&tmp) {
             Ok(()) => {
-                File::open(dir)?.sync_all()?;
+                lockyard_core::fsio::sync_path(dir)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
             Err(error) => return Err(error.into()),
@@ -1987,14 +2002,14 @@ async fn maintain_content_cache(host: &Host) -> Result<()> {
                         archive_write_receipt(&dir, &path, &mut budget.completed_writes)?;
                     }
                     fs::remove_file(&path)?;
-                    File::open(&dir)?.sync_all()?;
+                    lockyard_core::fsio::sync_path(&dir)?;
                     let pending_dir = bucket_dir(
                         &host.config.state_dir,
                         "relay-requests",
                         receipt.request.operation,
                     );
                     if fs::remove_file(pending_dir.join(id)).is_ok() {
-                        File::open(&pending_dir)?.sync_all()?;
+                        lockyard_core::fsio::sync_path(&pending_dir)?;
                         budget.forget(
                             pending_dir
                                 .file_name()
@@ -2028,7 +2043,7 @@ async fn maintain_content_cache(host: &Host) -> Result<()> {
                         );
                     } else {
                         fs::remove_file(&path)?;
-                        File::open(&dir)?.sync_all()?;
+                        lockyard_core::fsio::sync_path(&dir)?;
                         budget.forget("relay-outbox", id);
                         host.relay_slots.add_permits(1);
                     }
@@ -2065,7 +2080,10 @@ async fn write_packet(stream: &mut UnixStream, bytes: &[u8]) -> Result<()> {
         stream
             .write_all(&(bytes.len() as u32).to_be_bytes())
             .await?;
-        stream.write_all(bytes).await
+        stream.write_all(bytes).await?;
+        #[cfg(windows)]
+        stream.flush().await?;
+        Ok::<(), std::io::Error>(())
     })
     .await??;
     Ok(())
@@ -2101,8 +2119,8 @@ fn local_dispatch_stopped(
         .state_dir;
     if executor.tombstone(id)?.is_some() {
         let tombstones = state_dir.join("job-tombstones");
-        File::open(tombstones.join(id))?.sync_all()?;
-        File::open(tombstones)?.sync_all()?;
+        lockyard_core::fsio::sync_path(tombstones.join(id))?;
+        lockyard_core::fsio::sync_path(tombstones)?;
         return Ok(());
     }
     let jobs = state_dir.join("jobs");
@@ -2110,7 +2128,7 @@ fn local_dispatch_stopped(
     match state {
         Err(error) if error.0 == "job_not_found" => match fs::symlink_metadata(&directory) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                File::open(jobs)?.sync_all()?;
+                lockyard_core::fsio::sync_path(jobs)?;
                 Ok(())
             }
             _ => Err("local job directory requires durable reconciliation".into()),
@@ -2125,14 +2143,15 @@ fn local_dispatch_stopped(
             if record.spec.id != id || !record.state.is_terminal() {
                 return Err("durable local job remains queued, active or unknown".into());
             }
-            File::open(directory.join("record.json"))?.sync_all()?;
-            File::open(directory)?.sync_all()?;
+            lockyard_core::fsio::sync_path(directory.join("record.json"))?;
+            lockyard_core::fsio::sync_path(directory)?;
             Ok(())
         }
     }
 }
 
 async fn control_connection(host: Arc<Host>, mut stream: UnixStream) -> Result<()> {
+    #[cfg(unix)]
     if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
         return Err("control peer denied".into());
     }
@@ -2283,6 +2302,7 @@ async fn call_control(path: &Path, request: Control, timeout: Duration) -> Resul
         let mut stream = UnixStream::connect(path)
             .await
             .map_err(|_| "node control socket unavailable")?;
+        #[cfg(unix)]
         if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
             return Err("control host denied".into());
         }
@@ -2573,7 +2593,7 @@ fn tombstone_reservation(state: &Path, record: &OutboxEntry, now: Option<u64>) -
                         let _ = fs::remove_file(entry.path());
                     }
                 }
-                File::open(&dir)?.sync_all()?;
+                lockyard_core::fsio::sync_path(&dir)?;
             }
             if fs::read_dir(&dir)?.take(limit).count() >= limit {
                 return Err("request tombstone capacity reached".into());
@@ -2634,7 +2654,7 @@ async fn release_empty_reservation(host: &Host, id: &str) -> Result<()> {
     }
     preserve_orphan_binding(&host.config.state_dir, &record, now)?;
     fs::remove_file(path)?;
-    File::open(dir)?.sync_all()?;
+    lockyard_core::fsio::sync_path(dir)?;
     budget.forget("relay-outbox", id);
     host.relay_slots.add_permits(1);
     Ok(())
@@ -2665,7 +2685,7 @@ fn recover_empty_reservations(state: &Path, now: u64) -> Result<()> {
             fs::remove_file(entry.path())?;
         }
     }
-    File::open(dir)?.sync_all()?;
+    lockyard_core::fsio::sync_path(dir)?;
     Ok(())
 }
 // Only a broker ACK for the exact response transitions its reservation to accepted.
@@ -2709,7 +2729,7 @@ async fn acknowledge_accepted(host: &Host, sender: &RelaySender, request_id: &st
         let entry: OutboxEntry = serde_json::from_slice(&read_private(&path, OUTBOX_RECORD_MAX)?)?;
         if entry.accepted && entry.request_id == request_id {
             fs::remove_file(path)?;
-            File::open(dir)?.sync_all()?;
+            lockyard_core::fsio::sync_path(dir)?;
             budget.forget("relay-outbox", request_id);
             host.relay_slots.add_permits(1);
         }
@@ -2777,7 +2797,7 @@ async fn retire_outbox_response(
                             let _ = fs::remove_file(entry.path());
                         }
                     }
-                    File::open(&outcomes)?.sync_all()?;
+                    lockyard_core::fsio::sync_path(&outcomes)?;
                 }
                 if fs::read_dir(&outcomes)?.take(100_000).count() >= 100_000 {
                     return Err("relay outcome capacity reached".into());
@@ -2796,7 +2816,7 @@ async fn retire_outbox_response(
             )?;
         }
         fs::remove_file(entry.path())?;
-        File::open(dir)?.sync_all()?;
+        lockyard_core::fsio::sync_path(dir)?;
         budget.forget("relay-outbox", &id);
         host.relay_slots.add_permits(1);
         return Ok(true);
@@ -2931,7 +2951,7 @@ async fn receive_response(host: &Host, frame: &RpcFrame) -> Result<()> {
             return Err("response correlation mismatch".into());
         }
         if fs::remove_file(request_dir.join(id)).is_ok() {
-            File::open(&request_dir)?.sync_all()?;
+            lockyard_core::fsio::sync_path(&request_dir)?;
         }
         return Ok(());
     }
@@ -2962,7 +2982,7 @@ async fn receive_response(host: &Host, frame: &RpcFrame) -> Result<()> {
                 .ok_or("invalid request directory")?,
             id,
         );
-        File::open(request_dir)?.sync_all()?;
+        lockyard_core::fsio::sync_path(request_dir)?;
     }
     Ok(())
 }
@@ -3156,7 +3176,7 @@ fn store_response_evidence(host: &Host, frame: &RpcFrame, prefix: &str) -> Resul
                         let _ = fs::remove_file(entry.path());
                     }
                 }
-                File::open(&dir)?.sync_all()?;
+                lockyard_core::fsio::sync_path(&dir)?;
             }
             if fs::read_dir(&dir)?.take(100_000).count() >= 100_000 {
                 return Err("invalid response evidence capacity reached".into());
@@ -3251,7 +3271,7 @@ async fn receive_failure(host: &Host, id: &str, code: &'static str) -> Result<()
                             .ok_or("invalid request directory")?,
                         id,
                     );
-                    File::open(dir)?.sync_all()?;
+                    lockyard_core::fsio::sync_path(dir)?;
                 }
             }
             return Ok(());
@@ -3292,7 +3312,7 @@ async fn receive_failure(host: &Host, id: &str, code: &'static str) -> Result<()
                         let _ = fs::remove_file(entry.path());
                     }
                 }
-                File::open(&expired)?.sync_all()?;
+                lockyard_core::fsio::sync_path(&expired)?;
             }
             if fs::read_dir(&expired)?.take(100_000).count() >= 100_000 {
                 return Err("relay expiry storage capacity reached".into());
@@ -3315,7 +3335,7 @@ async fn receive_failure(host: &Host, id: &str, code: &'static str) -> Result<()
                 .ok_or("invalid request directory")?,
             id,
         );
-        File::open(dir)?.sync_all()?;
+        lockyard_core::fsio::sync_path(dir)?;
         return Ok(());
     }
     Err("unknown expired request".into())
@@ -3598,7 +3618,7 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
             fs::remove_file(entry.path())?;
         }
     }
-    File::open(read_inbox)?.sync_all()?;
+    lockyard_core::fsio::sync_path(read_inbox)?;
     let clock = ClockState::load(&config.state_dir)?;
     recover_empty_reservations(&config.state_dir, clock.effective_ms)?;
     let occupied = count_outbox(&config.state_dir)?;
@@ -3924,7 +3944,51 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+fn read_private(path: &Path, max: u64) -> Result<Vec<u8>> {
+    Ok(lockyard_core::windows::read_private(path, max)?)
+}
+
+#[cfg(windows)]
+fn private_dir(path: &Path) -> Result<()> {
+    Ok(lockyard_core::windows::private_dir(path)?)
+}
+
+#[cfg(windows)]
+fn lock_state(path: &Path) -> Result<File> {
+    let file = lockyard_core::windows::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path.join("host.lock"))?;
+    file.try_lock().map_err(|_| "node host already running")?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn make_socket(path: &Path) -> Result<UnixListener> {
+    Ok(UnixListener::bind(path)?)
+}
+
+#[cfg(windows)]
+fn validate_workspace_key(workspace: &str) -> Result<()> {
+    let keys = workspace_key_directory()?;
+    lockyard_core::windows::require_private(&keys)?;
+    if read_private(&keys.join(format!("{workspace}.key")), 32)?.len() != 32 {
+        return Err("invalid workspace key".into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn store_data(dir: &Path, id: &str, bytes: &[u8]) -> Result<()> {
+    Ok(lockyard_core::fsio::replace(&dir.join(id), bytes, 0o600)?)
+}
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
+
+#[cfg(all(test, unix))]
 mod tests {
     #[test]
     fn node_diagnostics_exposes_shared_build_identity() {
@@ -3979,6 +4043,7 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
+    #[cfg(unix)]
     fn private_config_and_state_fifos_fail_without_blocking() {
         use std::os::unix::ffi::OsStrExt;
         let root = tempfile::tempdir().unwrap();
@@ -5426,6 +5491,7 @@ mod tests {
         .unwrap();
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn read_cache_churn_reclaims_space_and_keeps_operation_tombstones() {
         use std::os::unix::fs::PermissionsExt;
         let (_dir, mut host) = fixture();
@@ -6019,10 +6085,10 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "host_revocations_tests.rs"]
 mod revocation_negotiation_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "host_revocations_race_tests.rs"]
 mod revocation_connect_race_tests;

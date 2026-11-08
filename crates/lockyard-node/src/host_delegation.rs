@@ -78,7 +78,7 @@ impl DelegationProvider for Provider {
         )?;
         let socket = directory.join("control.sock");
         let listener = bind_socket(&directory, &socket, &self.runtime)?;
-        File::open(&directory)?.sync_all()?;
+        lockyard_core::fsio::sync_path(&directory)?;
         let active = Arc::new(AtomicBool::new(true));
         let active_task = active.clone();
         let weak = self.host.clone();
@@ -114,6 +114,7 @@ impl DelegationProvider for Provider {
     }
 }
 
+#[cfg(unix)]
 fn bind_socket(
     directory: &Path,
     socket: &Path,
@@ -156,6 +157,7 @@ async fn connection(
     submissions: &std::sync::Mutex<BTreeSet<String>>,
     discovery: &super::workflow_adapter::Driver,
 ) -> Result<()> {
+    #[cfg(unix)]
     if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
         return Err("delegation peer denied".into());
     }
@@ -235,7 +237,18 @@ async fn connection(
     write_packet(&mut stream, &serde_json::to_vec(&response)?).await
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+fn bind_socket(
+    directory: &Path,
+    socket: &Path,
+    runtime: &tokio::runtime::Handle,
+) -> Result<UnixListener> {
+    let _entered = runtime.enter();
+    let _ = directory;
+    Ok(UnixListener::bind(socket)?)
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::executor::regression_tests::{retained_fixture_record, retention_fixture};

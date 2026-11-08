@@ -10,7 +10,7 @@ use lockyard_cloud_client::WorkspaceKey;
 use ring::digest;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
@@ -173,9 +173,7 @@ pub(crate) fn clear_executor_cache(directory: &Path) -> Result<()> {
         }
         fs::remove_file(entry.path()).map_err(io)?;
     }
-    File::open(directory)
-        .and_then(|file| file.sync_all())
-        .map_err(io)
+    lockyard_core::fsio::sync_path(directory).map_err(io)
 }
 
 /// Export only explicitly selected relative regular files. The caller chooses a confirmed
@@ -410,14 +408,14 @@ fn export_files_inner(
         output.sync_all().map_err(io)?;
         // The destination is create-only, so concurrent exports and existing
         // user files cannot be replaced. The link refers to the synced inode.
+        #[cfg(unix)]
         fs::hard_link(&temporary, destination).map_err(io)?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(io)?;
+        #[cfg(windows)]
+        lockyard_core::windows::rename_create_only(&temporary, destination).map_err(io)?;
+        lockyard_core::fsio::sync_path(parent).map_err(io)?;
+        #[cfg(unix)]
         fs::remove_file(&temporary).map_err(io)?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(io)?;
+        lockyard_core::fsio::sync_path(parent).map_err(io)?;
         Ok(ArchiveReport {
             scope,
             manifest_sha256,
@@ -429,7 +427,7 @@ fn export_files_inner(
     if result.is_err() {
         drop(output);
         let _ = fs::remove_file(&temporary);
-        let _ = File::open(parent).and_then(|directory| directory.sync_all());
+        let _ = lockyard_core::fsio::sync_path(parent);
     }
     result
 }
@@ -488,7 +486,7 @@ fn restore_offline_inner(
 ) -> Result<ArchiveReport> {
     // The path-based fallback cannot prevent an ancestor from being swapped
     // during extraction. Only the descriptor-anchored implementation is safe.
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", windows)) {
         return Err(ArchiveError("archive_restore_platform_unsupported"));
     }
     if !destination.is_absolute() || !crate::wire::valid_name(workspace) {
@@ -634,9 +632,7 @@ fn restore_offline_inner(
                 )?;
             }
             file.sync_all().map_err(io)?;
-            File::open(&directory)
-                .and_then(|directory| directory.sync_all())
-                .map_err(io)?;
+            lockyard_core::fsio::sync_path(&directory).map_err(io)?;
             total += entry.bytes;
         }
         let encoded_footer = read_record(&mut input, key, workspace, archive_id, &mut index)?;
@@ -678,16 +674,20 @@ fn restore_offline_inner(
             .open(destination.join("RESTORE.txt"))
             .map_err(io)?;
         notice.write_all(b"Offline review copy only. No job was imported, scheduled, executed or applied.\nAll archived paths and hashes were verified with the independently pinned node signing key. This authenticates an offline copy; it does not authorize execution or publication.\n").and_then(|()| notice.sync_all()).map_err(io)?;
-        File::open(destination)
-            .and_then(|directory| directory.sync_all())
-            .map_err(io)?;
+        lockyard_core::fsio::sync_path(destination).map_err(io)?;
+        #[cfg(unix)]
         parent_file.sync_all().map_err(io)?;
+        #[cfg(windows)]
+        lockyard_core::fsio::sync_dir(parent).map_err(io)?;
         verify_restore_parent_identity(parent, &parent_file)?;
         Ok(report)
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(destination);
+        #[cfg(unix)]
         let _ = parent_file.sync_all();
+        #[cfg(windows)]
+        let _ = lockyard_core::fsio::sync_dir(parent);
     }
     result
 }
@@ -951,7 +951,11 @@ fn require_directory(path: &Path) -> Result<()> {
     crate::retention::require_directory(path)
         .map_err(|_| ArchiveError("archive_directory_not_private"))
 }
-fn open_restore_parent(path: &Path) -> Result<File> {
+#[cfg(unix)]
+type RestoreParent = File;
+#[cfg(windows)]
+type RestoreParent = lockyard_core::windows::Directory;
+fn open_restore_parent(path: &Path) -> Result<RestoreParent> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -968,8 +972,8 @@ fn open_restore_parent(path: &Path) -> Result<File> {
         }
         Ok(file)
     }
-    #[cfg(not(unix))]
-    options.open(path).map_err(io)
+    #[cfg(windows)]
+    lockyard_core::windows::open_directory(path).map_err(io)
 }
 fn verify_restore_parent_identity(path: &Path, pinned: &File) -> Result<()> {
     let current = open_restore_parent(path)?;
@@ -982,8 +986,12 @@ fn verify_restore_parent_identity(path: &Path, pinned: &File) -> Result<()> {
             return Err(ArchiveError("archive_restore_parent_changed"));
         }
     }
-    #[cfg(not(unix))]
-    let _ = (current, pinned);
+    #[cfg(windows)]
+    if lockyard_core::windows::file_identity(&current).map_err(io)?
+        != lockyard_core::windows::file_identity(pinned).map_err(io)?
+    {
+        return Err(ArchiveError("archive_restore_parent_changed"));
+    }
     Ok(())
 }
 
@@ -1065,10 +1073,9 @@ fn create_private_directory(path: &Path) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        fs::create_dir(path).map_err(io)?;
+        lockyard_core::windows::create_private_dir(path).map_err(io)?;
     }
-    File::open(path.parent().ok_or(ArchiveError("invalid_archive_path"))?)
-        .and_then(|parent| parent.sync_all())
+    lockyard_core::fsio::sync_path(path.parent().ok_or(ArchiveError("invalid_archive_path"))?)
         .map_err(io)
 }
 fn open_source(root: &Path, relative: &str) -> Result<File> {
@@ -1099,6 +1106,9 @@ fn open_source(root: &Path, relative: &str) -> Result<File> {
     Ok(file)
 }
 fn private_options() -> OpenOptions {
+    #[cfg(windows)]
+    let options = OpenOptions::new();
+    #[cfg(unix)]
     let mut options = OpenOptions::new();
     #[cfg(unix)]
     {
@@ -1110,9 +1120,15 @@ fn private_options() -> OpenOptions {
     options
 }
 
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     const JOB: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
     #[cfg(unix)]
     fn private(path: &Path) {
@@ -1744,7 +1760,7 @@ mod tests {
         fs::create_dir(&victim).unwrap();
         private(&victim);
         let fd = open_restore_parent(&parent).unwrap();
-        fs::rename(&parent, &moved).unwrap();
+        lockyard_core::fsio::rename(&parent, &moved).unwrap();
         symlink(&victim, &parent).unwrap();
         let anchored = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())).join("restored");
         create_private_directory(&anchored).unwrap();
@@ -1756,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     fn restore_apis_fail_closed_without_descriptor_anchored_traversal() {
         let key = WorkspaceKey::from_entropy([9; 32]);
         let signer = crate::provenance::TrustedSigningKey {
@@ -1772,5 +1788,65 @@ mod tests {
                 "archive_restore_platform_unsupported"
             );
         }
+    }
+    #[test]
+    #[cfg(windows)]
+    fn windows_signed_archive_roundtrip_and_pinned_parent() {
+        let root = tempfile::tempdir().unwrap();
+        lockyard_core::windows::secure_owned(root.path()).unwrap();
+        let source = root.path().join("source");
+        lockyard_core::windows::private_dir(&source).unwrap();
+        lockyard_core::fsio::replace(&source.join("data.txt"), b"private archive bytes", 0o600)
+            .unwrap();
+        let signer =
+            crate::provenance::SigningKey::generate(&root.path().join("signing.pk8")).unwrap();
+        let key = WorkspaceKey::from_entropy([42; 32]);
+        let archive = root.path().join("result.lyarchive");
+        let report = export_files(
+            &source,
+            &["data.txt".into()],
+            &archive,
+            "workspace",
+            "worker",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            ArchiveScope::FullProject,
+            1000,
+            &key,
+            &signer,
+        )
+        .unwrap();
+        let destination = root.path().join("restored");
+        assert_eq!(
+            restore_offline(
+                &archive,
+                &destination,
+                "workspace",
+                &key,
+                "worker",
+                &signer.trusted_key()
+            )
+            .unwrap(),
+            report
+        );
+        let restored = destination.join("files/data.txt");
+        assert_eq!(
+            lockyard_core::windows::read_private(&restored, 1024).unwrap(),
+            b"private archive bytes"
+        );
+        assert!(destination.join("RESTORE.txt").exists());
+        assert!(
+            restore_offline(
+                &archive,
+                &destination,
+                "workspace",
+                &key,
+                "worker",
+                &signer.trusted_key()
+            )
+            .is_err()
+        );
+        let pinned = open_restore_parent(root.path()).unwrap();
+        assert!(fs::rename(root.path(), root.path().with_extension("moved")).is_err());
+        drop(pinned);
     }
 }

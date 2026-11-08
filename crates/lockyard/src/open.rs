@@ -56,7 +56,8 @@ fn trusted_file() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(path) if !path.is_empty() => PathBuf::from(path),
         _ => PathBuf::from(
-            std::env::var_os("HOME").ok_or_else(|| Error::Invalid("HOME is not set".into()))?,
+            lockyard_core::paths::home_dir()
+                .ok_or_else(|| Error::Invalid("HOME is not set".into()))?,
         )
         .join(".config"),
     };
@@ -141,7 +142,9 @@ fn direct(url: &str, session: &str, repository: Option<&str>) -> Result<Box<dyn 
 pub(crate) fn journal_client(client: Client) -> Result<Client> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .or_else(|| {
+            lockyard_core::paths::home_dir().map(|home| PathBuf::from(home).join(".local/state"))
+        })
         .ok_or_else(|| Error::Invalid("private state directory is unavailable".into()))?;
     let mut directories = fs::DirBuilder::new();
     directories.recursive(true);
@@ -161,7 +164,6 @@ pub(crate) fn direct_client(url: &str) -> Result<Client> {
     journal_client(Client::new(url, Config::token_for(url)?)?)
 }
 
-#[cfg(unix)]
 fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
     use crate::agent::socket::AgentSocket;
     use std::time::Duration;
@@ -175,7 +177,12 @@ fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
     {
         return direct(&url, session, config.repository.as_deref());
     }
-    let socket = AgentSocket::connect(&crate::agent::socket_path(), &url, &workspace, CLI_TIMEOUT);
+    let socket = AgentSocket::connect(
+        &crate::agent::socket_path_for(&url, &workspace),
+        &url,
+        &workspace,
+        CLI_TIMEOUT,
+    );
     let token = Config::token_for(&url).ok();
     match socket {
         // An agent running under another token would act with that token's role.
@@ -203,10 +210,4 @@ mod tests {
         assert!(!url_matches("", "https://one.test"));
         assert!(!url_matches("https://one.test", "https://two.test"));
     }
-}
-
-#[cfg(not(unix))]
-fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
-    let (url, _) = endpoint(config)?;
-    direct(&url, session, config.repository.as_deref())
 }

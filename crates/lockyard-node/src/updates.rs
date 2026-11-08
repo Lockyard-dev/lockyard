@@ -7,7 +7,7 @@ use crate::{
 use ring::digest;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -51,6 +51,8 @@ pub fn platform() -> String {
             "gnu"
         } else if cfg!(target_env = "musl") {
             "musl"
+        } else if cfg!(target_env = "msvc") {
+            "msvc"
         } else {
             "unsupported"
         }
@@ -247,12 +249,19 @@ pub struct BinaryReadGuard {
 }
 impl Drop for BinaryReadGuard {
     fn drop(&mut self) {
+        #[cfg(unix)]
         use std::os::fd::AsRawFd;
+        #[cfg(unix)]
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
+        #[cfg(windows)]
+        {
+            let _ = self.file.unlock();
+        }
     }
 }
+#[cfg(unix)]
 fn binary_lock(policy: &Policy, exclusive: bool) -> Result<BinaryReadGuard> {
     use std::os::{
         fd::AsRawFd,
@@ -289,13 +298,12 @@ fn binary_lock(policy: &Policy, exclusive: bool) -> Result<BinaryReadGuard> {
     {
         return Err(UpdateError("managed_update_binary_in_use"));
     }
-    File::open(
+    lockyard_core::fsio::sync_path(
         policy
             .binary
             .parent()
             .ok_or(UpdateError("managed_update_path_invalid"))?,
     )
-    .and_then(|directory| directory.sync_all())
     .map_err(io)?;
     Ok(BinaryReadGuard { file })
 }
@@ -356,6 +364,7 @@ fn pending_absent(root: &Path) -> Result<()> {
 fn require_running_image(context: &Context, policy: &Policy, state: &Installed) -> Result<()> {
     require_exact_image(policy, state, &context.executable)
 }
+#[cfg(unix)]
 fn require_exact_image(policy: &Policy, state: &Installed, executable: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let release = verify(&state.current, &policy.trusted)?;
@@ -438,20 +447,27 @@ fn parent(path: &Path) -> Result<()> {
         .ok_or(UpdateError("managed_update_path_invalid"))?;
     crate::retention::require_directory(parent)
         .map_err(|_| UpdateError("managed_update_directory_must_be_private"))?;
+    #[cfg(windows)]
+    {
+        let directory = lockyard_core::windows::open_directory(parent).map_err(io)?;
+        lockyard_core::windows::require_final_path(&directory, parent)
+            .map_err(|_| UpdateError("managed_update_path_alias_forbidden"))?;
+    }
+    #[cfg(unix)]
     if fs::canonicalize(parent).map_err(io)? != parent {
         return Err(UpdateError("managed_update_path_alias_forbidden"));
     }
     Ok(())
 }
+#[cfg(unix)]
 fn directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     parent(path)?;
     match fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => File::open(
+        Ok(()) => lockyard_core::fsio::sync_path(
             path.parent()
                 .ok_or(UpdateError("managed_update_path_invalid"))?,
         )
-        .and_then(|file| file.sync_all())
         .map_err(io)?,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
         Err(error) => return Err(io(error)),
@@ -459,6 +475,7 @@ fn directory(path: &Path) -> Result<()> {
     crate::retention::require_directory(path)
         .map_err(|_| UpdateError("managed_update_directory_must_be_private"))
 }
+#[cfg(unix)]
 fn open_regular(path: &Path, private: bool) -> Result<File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     parent(path)?;
@@ -477,6 +494,7 @@ fn open_regular(path: &Path, private: bool) -> Result<File> {
     }
     Ok(file)
 }
+#[cfg(unix)]
 fn open_binary(path: &Path, installed: bool) -> Result<File> {
     use std::os::unix::fs::MetadataExt;
     let file = open_regular(path, false)?;
@@ -504,6 +522,7 @@ fn load_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     }
     serde_json::from_slice(&bytes).map_err(|_| UpdateError("managed_update_metadata_invalid"))
 }
+#[cfg(unix)]
 fn private_new(path: &Path, executable: bool) -> Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     parent(path)?;
@@ -560,16 +579,19 @@ fn publish_json<T: Serialize>(path: &Path, value: &T, replace: bool) -> Result<(
             .and_then(|()| file.sync_all())
             .map_err(io)?;
         if replace {
-            fs::rename(&tmp, path).map_err(io)?;
+            lockyard_core::fsio::rename(&tmp, path).map_err(io)?;
         } else {
+            #[cfg(unix)]
             fs::hard_link(&tmp, path).map_err(io)?;
+            #[cfg(windows)]
+            lockyard_core::windows::rename_create_only(&tmp, path).map_err(io)?;
+            #[cfg(unix)]
             fs::remove_file(&tmp).map_err(io)?;
         }
-        File::open(
+        lockyard_core::fsio::sync_path(
             path.parent()
                 .ok_or(UpdateError("managed_update_path_invalid"))?,
         )
-        .and_then(|file| file.sync_all())
         .map_err(io)
     })();
     if result.is_err() {
@@ -604,6 +626,7 @@ fn hash_reader(mut file: File, expected: u64) -> Result<String> {
         .map(|byte| format!("{byte:02x}"))
         .collect())
 }
+#[cfg(unix)]
 fn check_binary(path: &Path, release: &Release, installed: bool) -> Result<()> {
     let mut file = open_binary(path, installed)?;
     if file.metadata().map_err(io)?.len() != release.binary_bytes {
@@ -679,14 +702,17 @@ fn copy_verified_in_namespace(
             return Err(UpdateError("managed_update_binary_changed"));
         }
         output.sync_all().map_err(io)?;
+        #[cfg(unix)]
         fs::hard_link(&tmp, destination).map_err(io)?;
+        #[cfg(windows)]
+        lockyard_core::windows::rename_create_only(&tmp, destination).map_err(io)?;
+        #[cfg(unix)]
         fs::remove_file(&tmp).map_err(io)?;
-        File::open(
+        lockyard_core::fsio::sync_path(
             destination
                 .parent()
                 .ok_or(UpdateError("managed_update_path_invalid"))?,
         )
-        .and_then(|directory| directory.sync_all())
         .map_err(io)
     })();
     if result.is_err() {
@@ -799,6 +825,7 @@ fn initialize_inner(
         serde_json::json!({"initialized":true,"binary":binary,"version":release.version,"sequence":release.sequence,"platform":platform(),"automatic_execution":false}),
     )
 }
+#[cfg(unix)]
 fn cleanup_temporaries(directory: &Path, allowed: Option<&[&Path]>) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     crate::retention::require_directory(directory)
@@ -830,18 +857,14 @@ fn cleanup_temporaries(directory: &Path, allowed: Option<&[&Path]>) -> Result<()
         fs::remove_file(entry.path()).map_err(io)?;
         removed += 1;
         if removed >= 64 {
-            File::open(directory)
-                .and_then(|file| file.sync_all())
-                .map_err(io)?;
+            lockyard_core::fsio::sync_path(directory).map_err(io)?;
             return Err(UpdateError(
                 "managed_update_temporary_cleanup_retry_required",
             ));
         }
     }
     if removed > 0 {
-        File::open(directory)
-            .and_then(|file| file.sync_all())
-            .map_err(io)?;
+        lockyard_core::fsio::sync_path(directory).map_err(io)?;
     }
     Ok(())
 }
@@ -1240,14 +1263,13 @@ fn finish_transaction(
             .with_extension(format!("replacement-{}", journal.approval_sha256));
         copy_verified_in_namespace(&source, &replacement, &to, &policy.binary)?;
         check_binary(&replacement, &to, true)?;
-        fs::rename(&replacement, &policy.binary).map_err(io)?;
-        File::open(
+        lockyard_core::fsio::rename(&replacement, &policy.binary).map_err(io)?;
+        lockyard_core::fsio::sync_path(
             policy
                 .binary
                 .parent()
                 .ok_or(UpdateError("managed_update_path_invalid"))?,
         )
-        .and_then(|directory| directory.sync_all())
         .map_err(io)?;
     }
     if interrupt == Some(Phase::Binary) {
@@ -1258,9 +1280,7 @@ fn finish_transaction(
         return Err(UpdateError("managed_update_injected_crash"));
     }
     fs::remove_file(root.join(PENDING)).map_err(io)?;
-    File::open(&root)
-        .and_then(|directory| directory.sync_all())
-        .map_err(io)?;
+    lockyard_core::fsio::sync_path(&root).map_err(io)?;
     cleanup_artifacts(context, policy, &journal.to)?;
     Ok(())
 }
@@ -1314,9 +1334,7 @@ fn cleanup_artifacts(context: &Context, policy: &Policy, state: &Installed) -> R
             fs::remove_file(entry.path()).map_err(io)?;
         }
     }
-    File::open(dir)
-        .and_then(|directory| directory.sync_all())
-        .map_err(io)?;
+    lockyard_core::fsio::sync_path(dir).map_err(io)?;
     let staged = context.root().join("staged");
     let mut count = 0usize;
     for entry in fs::read_dir(&staged).map_err(io)? {
@@ -1336,9 +1354,7 @@ fn cleanup_artifacts(context: &Context, policy: &Policy, state: &Installed) -> R
             .map_err(|_| UpdateError("managed_update_staging_invalid"))?;
         fs::remove_dir_all(entry.path()).map_err(io)?;
     }
-    File::open(staged)
-        .and_then(|directory| directory.sync_all())
-        .map_err(io)
+    lockyard_core::fsio::sync_path(staged).map_err(io)
 }
 pub fn status(config_path: &Path) -> Result<serde_json::Value> {
     status_inner(&Context::load(config_path)?)
@@ -1376,7 +1392,168 @@ fn status_inner(context: &Context) -> Result<serde_json::Value> {
     )
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+fn binary_lock(policy: &Policy, exclusive: bool) -> Result<BinaryReadGuard> {
+    parent(&policy.binary)?;
+    let file = lockyard_core::windows::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(policy.binary.with_extension("managed-update.lock"))
+        .map_err(io)?;
+    if exclusive {
+        file.try_lock()
+            .map_err(|_| UpdateError("managed_update_binary_in_use"))?;
+    } else {
+        file.try_lock_shared()
+            .map_err(|_| UpdateError("managed_update_binary_in_use"))?;
+    }
+    Ok(BinaryReadGuard { file })
+}
+
+#[cfg(windows)]
+fn require_exact_image(policy: &Policy, state: &Installed, executable: &Path) -> Result<()> {
+    let release = verify(&state.current, &policy.trusted)?;
+    let target = open_binary(&policy.binary, true)?;
+    let running = File::open(executable).map_err(io)?;
+    if lockyard_core::windows::file_identity(&target).map_err(io)?
+        != lockyard_core::windows::file_identity(&running).map_err(io)?
+        || release.version != env!("CARGO_PKG_VERSION")
+    {
+        return Err(UpdateError("managed_update_invoke_current_managed_binary"));
+    }
+    check_binary(&policy.binary, &release, true)
+}
+
+#[cfg(windows)]
+fn directory(path: &Path) -> Result<()> {
+    parent(path)?;
+    lockyard_core::windows::private_dir(path).map_err(io)
+}
+
+#[cfg(windows)]
+fn open_regular(path: &Path, private: bool) -> Result<File> {
+    parent(path)?;
+    let _ = private;
+    let file = lockyard_core::windows::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(io)?;
+    lockyard_core::windows::require_final_path(&file, path)
+        .map_err(|_| UpdateError("managed_update_path_alias_forbidden"))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_binary(path: &Path, installed: bool) -> Result<File> {
+    let file = open_regular(path, false)?;
+    let meta = file.metadata().map_err(io)?;
+    let _ = installed;
+    if meta.len() < 64 || meta.len() > MAX_BINARY {
+        return Err(UpdateError("managed_update_binary_unsafe"));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn private_new(path: &Path, executable: bool) -> Result<File> {
+    parent(path)?;
+    let _ = executable;
+    let file = lockyard_core::windows::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(io)?;
+    lockyard_core::windows::require_final_path(&file, path)
+        .map_err(|_| UpdateError("managed_update_path_alias_forbidden"))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn cleanup_temporaries(directory: &Path, allowed: Option<&[&Path]>) -> Result<()> {
+    crate::retention::require_directory(directory)
+        .map_err(|_| UpdateError("managed_update_directory_must_be_private"))?;
+    let mut removed = 0usize;
+    for entry in fs::read_dir(directory).map_err(io)? {
+        let entry = entry.map_err(io)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_managed_temporary(name)
+            || allowed.is_some_and(|paths| {
+                !paths
+                    .iter()
+                    .any(|path| name.starts_with(&temporary_prefix(path)))
+            })
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(io)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(UpdateError("managed_update_temporary_file_unsafe"));
+        }
+        lockyard_core::windows::require_private(&entry.path()).map_err(io)?;
+        fs::remove_file(entry.path()).map_err(io)?;
+        removed += 1;
+        if removed >= 64 {
+            lockyard_core::fsio::sync_path(directory).map_err(io)?;
+            return Err(UpdateError(
+                "managed_update_temporary_cleanup_retry_required",
+            ));
+        }
+    }
+    if removed > 0 {
+        lockyard_core::fsio::sync_path(directory).map_err(io)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
+
+#[cfg(windows)]
+fn check_binary(path: &Path, release: &Release, installed: bool) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = open_binary(path, installed)?;
+    if file.metadata().map_err(io)?.len() != release.binary_bytes {
+        return Err(UpdateError("managed_update_binary_size_mismatch"));
+    }
+    let mut dos = [0u8; 64];
+    file.read_exact(&mut dos).map_err(io)?;
+    let offset = u32::from_le_bytes(dos[60..64].try_into().expect("DOS offset")) as u64;
+    if &dos[..2] != b"MZ"
+        || !(64..=1024 * 1024).contains(&offset)
+        || offset
+            .checked_add(26)
+            .is_none_or(|end| end > release.binary_bytes)
+    {
+        return Err(UpdateError("managed_update_pe_platform_mismatch"));
+    }
+    file.seek(SeekFrom::Start(offset)).map_err(io)?;
+    let mut pe = [0u8; 26];
+    file.read_exact(&mut pe).map_err(io)?;
+    let machine = if cfg!(target_arch = "x86_64") {
+        0x8664
+    } else if cfg!(target_arch = "aarch64") {
+        0xaa64
+    } else {
+        return Err(UpdateError("managed_update_platform_unsupported"));
+    };
+    if &pe[..4] != b"PE\0\0"
+        || u16::from_le_bytes([pe[4], pe[5]]) != machine
+        || u16::from_le_bytes([pe[20], pe[21]]) < 2
+        || u16::from_le_bytes([pe[24], pe[25]]) != 0x20b
+    {
+        return Err(UpdateError("managed_update_pe_platform_mismatch"));
+    }
+    if hash_reader(open_binary(path, installed)?, release.binary_bytes)? != release.binary_sha256 {
+        return Err(UpdateError("managed_update_binary_hash_mismatch"));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -1802,5 +1979,100 @@ mod tests {
         let path = f.root.as_path().join("non-elf.json");
         publish_json(&path, &document, false).unwrap();
         assert!(prepare_inner(&f.context, &path, &binary).is_err());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    #[test]
+    fn windows_managed_update_parent_refuses_subst_alias() {
+        struct Subst(String);
+        impl Drop for Subst {
+            fn drop(&mut self) {
+                assert!(
+                    std::process::Command::new("subst.exe")
+                        .args([&self.0, "/d"])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        lockyard_core::windows::private_dir(&canonical).unwrap();
+        parent(&canonical.join("node.exe")).unwrap();
+        let drive = (b'D'..=b'Z')
+            .rev()
+            .map(|letter| format!("{}:", char::from(letter)))
+            .find(|drive| {
+                std::process::Command::new("subst.exe")
+                    .arg(drive)
+                    .arg(&canonical)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            })
+            .expect("no unused drive letter for subst regression fixture");
+        let _mapping = Subst(drive.clone());
+        assert_eq!(
+            parent(&PathBuf::from(format!(r"{drive}\node.exe")))
+                .unwrap_err()
+                .0,
+            "managed_update_path_alias_forbidden"
+        );
+    }
+
+    #[test]
+    fn windows_pe_image_requires_platform_size_and_exact_signed_hash() {
+        let root = tempfile::tempdir().unwrap();
+        lockyard_core::windows::secure_owned(root.path()).unwrap();
+        let path = root.path().join("candidate.exe");
+        let mut image = vec![0u8; 128];
+        image[..2].copy_from_slice(b"MZ");
+        image[60..64].copy_from_slice(&64u32.to_le_bytes());
+        image[64..68].copy_from_slice(b"PE\0\0");
+        let machine = if cfg!(target_arch = "x86_64") {
+            0x8664u16
+        } else {
+            0xaa64u16
+        };
+        image[68..70].copy_from_slice(&machine.to_le_bytes());
+        image[84..86].copy_from_slice(&2u16.to_le_bytes());
+        image[88..90].copy_from_slice(&0x20bu16.to_le_bytes());
+        lockyard_core::fsio::replace(&path, &image, 0o600).unwrap();
+        let mut release = Release {
+            format: FORMAT,
+            release_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            sequence: 1,
+            platform: platform(),
+            minimum_current_version: "0.0.0".into(),
+            state_schema_version: 1,
+            binary_sha256: provenance::sha256(&image),
+            binary_bytes: image.len() as u64,
+            issued_at_ms: 1,
+            expires_at_ms: 1000,
+        };
+        check_binary(&path, &release, false).unwrap();
+        release.binary_sha256 = "0".repeat(64);
+        assert_eq!(
+            check_binary(&path, &release, false).unwrap_err().0,
+            "managed_update_binary_hash_mismatch"
+        );
+        image[68..70].copy_from_slice(&0x14cu16.to_le_bytes());
+        lockyard_core::fsio::replace(&path, &image, 0o600).unwrap();
+        release.binary_sha256 = provenance::sha256(&image);
+        assert_eq!(
+            check_binary(&path, &release, false).unwrap_err().0,
+            "managed_update_pe_platform_mismatch"
+        );
+        release.binary_bytes += 1;
+        assert_eq!(
+            check_binary(&path, &release, false).unwrap_err().0,
+            "managed_update_binary_size_mismatch"
+        );
     }
 }

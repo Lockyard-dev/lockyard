@@ -369,17 +369,7 @@ fn call_tool(
     let args = params.get("arguments").unwrap_or(&empty);
     let mut after = None;
     if name == "revoke_access" {
-        #[cfg(unix)]
-        {
-            return (crate::revoke_access::mcp(cwd, args), None);
-        }
-        #[cfg(not(unix))]
-        {
-            return (
-                tool_result("revocation_state_unavailable".into(), true),
-                None,
-            );
-        }
+        return (crate::revoke_access::mcp(cwd, args), None);
     }
     // Node orchestration uses its own verified transport and can run outside a project.
     let answer = if uses_node_transport(name) {

@@ -102,12 +102,28 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action
-      - run: cargo build --locked -p lockyard
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+      - run: cargo build --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked --no-fail-fast
+      - name: Two sessions arbitrate one claim over a real named pipe
+        shell: pwsh
+        run: |
+          $test = 'agent::daemon::tests::windows_two_sessions_one_claim_named_pipe'
+          $catalog = cargo test --locked -p lockyard --bin lockyard -- --list
+          if ($LASTEXITCODE -ne 0 -or -not ($catalog -match "^${test}: test$")) { throw 'Windows named-pipe e2e is missing' }
+          cargo test --locked -p lockyard --bin lockyard $test -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - run: ./target/debug/lockyard.exe about
+
   node-native:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

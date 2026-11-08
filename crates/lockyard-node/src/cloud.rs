@@ -3,7 +3,10 @@
 //! Credential-bound enrollment and directory lookups. Application content never enters this API.
 use crate::{Result, host::NodeConfig, quic::PeerPin, wire::valid_name};
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Read, path::Path, sync::Arc, time::Duration};
+use std::{io::Read, path::Path, sync::Arc, time::Duration};
+
+#[cfg(unix)]
+use std::fs;
 
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 
@@ -407,6 +410,7 @@ impl NodeCloudClient {
     }
 }
 
+#[cfg(unix)]
 fn private_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = fs::OpenOptions::new()
@@ -433,6 +437,11 @@ fn private_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(windows)]
+fn private_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    Ok(lockyard_core::windows::read_private(path, limit)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +462,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg(unix)]
     fn enrollment_credentials_reject_hardlinks_and_fifos_without_blocking() {
         use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
         let root = tempfile::tempdir().unwrap();

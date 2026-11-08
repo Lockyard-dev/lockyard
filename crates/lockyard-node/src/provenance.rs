@@ -11,7 +11,7 @@ use ring::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::BTreeMap,
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
 };
@@ -91,11 +91,10 @@ impl SigningKey {
         file.write_all(document.as_ref())
             .and_then(|()| file.sync_all())
             .map_err(|_| ProvenanceError("signing_key_write_failed"))?;
-        File::open(
+        lockyard_core::fsio::sync_path(
             path.parent()
                 .ok_or(ProvenanceError("invalid_signing_key_path"))?,
         )
-        .and_then(|file| file.sync_all())
         .map_err(|_| ProvenanceError("signing_key_write_failed"))?;
         Self::from_pkcs8(document.as_ref())
     }
@@ -484,6 +483,9 @@ fn regular_file(path: &Path) -> Result<File> {
     Ok(file)
 }
 fn private_options() -> OpenOptions {
+    #[cfg(windows)]
+    let options = OpenOptions::new();
+    #[cfg(unix)]
     let mut options = OpenOptions::new();
     #[cfg(unix)]
     {
@@ -514,8 +516,11 @@ fn require_private_parent(path: &Path) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-        Err(ProvenanceError("private_signing_keys_require_unix"))
+        let parent = path
+            .parent()
+            .ok_or(ProvenanceError("invalid_signing_key_path"))?;
+        lockyard_core::windows::require_private(parent)
+            .map_err(|_| ProvenanceError("signing_key_parent_not_private"))
     }
 }
 fn require_private_file(file: &File) -> Result<()> {
@@ -536,10 +541,15 @@ fn require_private_file(file: &File) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = file;
-        Err(ProvenanceError("private_signing_keys_require_unix"))
+        lockyard_core::windows::require_private_file(file)
+            .map_err(|_| ProvenanceError("signing_key_not_private"))
     }
 }
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -701,6 +711,7 @@ mod tests {
         assert!(key.sign_result(&invalid).is_err());
     }
     #[test]
+    #[cfg(unix)]
     fn signing_key_requires_private_owned_parent_regular_file_and_create_only() {
         let (root, key, _) = fixture();
         let path = root.path().join("signing.pk8");

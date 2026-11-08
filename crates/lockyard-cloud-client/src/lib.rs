@@ -10,8 +10,7 @@ pub mod catalog;
 mod catalog_client;
 mod crypto;
 pub mod device;
-#[cfg(test)]
-mod fake;
+
 pub mod protocol;
 mod registry;
 mod repository;
@@ -906,6 +905,9 @@ pub fn encode(text: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod fake;
 
 #[cfg(test)]
 mod tests {

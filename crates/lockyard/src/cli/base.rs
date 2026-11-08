@@ -88,15 +88,12 @@ pub(super) enum Command {
     #[command(subcommand)]
     Workflow(WorkflowCommand),
     /// Manage a remote orchestration node.
-    #[cfg(unix)]
     #[command(subcommand)]
     Node(node_cli::NodeCommand),
     /// Submit and inspect remote jobs.
-    #[cfg(unix)]
     #[command(subcommand)]
     Job(node_cli::JobCommand),
     /// Revoke Cloud credentials and propagate signed denies to direct peers.
-    #[cfg(unix)]
     #[command(subcommand)]
     Revoke(crate::revoke_access::RevokeCommand),
     /// Run the MCP server over standard input and output.

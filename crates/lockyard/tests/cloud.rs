@@ -689,6 +689,8 @@ fn hook_check_refuses_unknown_from_the_agent_socket() {
                 }
                 Err(error) => panic!("socket fixture: {error}"),
             };
+            // Accepted socket flags differ by platform. Fixture reads are blocking with a deadline.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
@@ -1036,10 +1038,16 @@ fn through_the_agent_a_hook_delivers_mail_in_two_phases() {
         json!({"hook_event_name": "UserPromptSubmit", "session_id": "me", "cwd": dir.path()});
     // The first hook registers the session; the agent reserves its mail in the background.
     let end = Instant::now() + Duration::from_secs(5);
-    while !String::from_utf8_lossy(&hook(dir.path(), runtime.path(), &event).stdout)
-        .contains("look at src")
-    {
-        assert!(Instant::now() < end, "the mail never reached a hook");
+    loop {
+        let result = hook(dir.path(), runtime.path(), &event);
+        if String::from_utf8_lossy(&result.stdout).contains("look at src") {
+            break;
+        }
+        assert!(
+            Instant::now() < end,
+            "the mail never reached a hook; last hook: {result:?}; server: {:?}",
+            server.state.lock().unwrap().seen
+        );
         thread::sleep(Duration::from_millis(20));
     }
     let claimed = server.seen("POST", "/api/v1/bus/inbox/claim");

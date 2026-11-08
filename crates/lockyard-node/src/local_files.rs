@@ -1,7 +1,13 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 //! Read configured identity/trust files through one checked, bounded descriptor.
 use crate::Result;
-use std::{fs, io::Read, path::Path};
+use std::path::Path;
+
+#[cfg(unix)]
+use std::fs;
+
+#[cfg(unix)]
+use std::io::Read;
 
 pub(crate) fn read_public(path: &Path, limit: usize) -> Result<Vec<u8>> {
     read(path, limit, false)
@@ -9,6 +15,7 @@ pub(crate) fn read_public(path: &Path, limit: usize) -> Result<Vec<u8>> {
 pub(crate) fn read_private(path: &Path, limit: usize) -> Result<Vec<u8>> {
     read(path, limit, true)
 }
+#[cfg(unix)]
 fn read(path: &Path, limit: usize, private: bool) -> Result<Vec<u8>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = fs::OpenOptions::new()
@@ -38,7 +45,16 @@ fn read(path: &Path, limit: usize, private: bool) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+fn read(path: &Path, limit: usize, private: bool) -> Result<Vec<u8>> {
+    Ok(if private {
+        lockyard_core::windows::read_private(path, limit as u64)?
+    } else {
+        lockyard_core::windows::read_public(path, limit as u64)?
+    })
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::{
@@ -46,6 +62,7 @@ mod tests {
         fs::{OpenOptionsExt, PermissionsExt, symlink},
     };
     #[test]
+    #[cfg(unix)]
     fn trust_and_identity_files_reject_fifos_symlinks_and_oversize_before_reading() {
         let root = tempfile::tempdir().unwrap();
         let fifo = root.path().join("fifo");

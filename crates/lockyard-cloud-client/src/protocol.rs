@@ -432,14 +432,22 @@ impl Client {
         };
         if let Some(directory) = &self.pending_journal {
             private_directory(directory)?;
-            let mut options = std::fs::OpenOptions::new();
+            let mut options = StateOpenOptions::new();
             options.read(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
             }
+            #[cfg(unix)]
             let lock = options.open(directory).map_err(journal_error)?;
+            #[cfg(windows)]
+            let lock = StateOpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(directory.join(".journal.lock"))
+                .map_err(journal_error)?;
             #[cfg(unix)]
             {
                 use std::os::fd::AsRawFd;
@@ -449,9 +457,8 @@ impl Client {
             }
             #[cfg(not(unix))]
             {
-                return Err(journal_error(
-                    "exclusive pending journals require file locking",
-                ));
+                lock.try_lock()
+                    .map_err(|_| journal_error("pending journal is busy"))?;
             }
             guard._journal = Some(lock);
             // Another client may have sent or completed this operation since we loaded it.
@@ -460,7 +467,7 @@ impl Client {
             match std::fs::symlink_metadata(&path) {
                 Ok(metadata) => {
                     private_file(&metadata)?;
-                    let mut options = std::fs::OpenOptions::new();
+                    let mut options = StateOpenOptions::new();
                     options.read(true);
                     #[cfg(unix)]
                     {
@@ -516,7 +523,7 @@ impl Client {
             if pending.len() >= MAX_PENDING || total > MAX_PENDING_BYTES {
                 return Err(journal_error("pending journal exceeds its budget"));
             }
-            let mut options = std::fs::OpenOptions::new();
+            let mut options = StateOpenOptions::new();
             options.read(true);
             #[cfg(unix)]
             {
@@ -624,7 +631,7 @@ impl Client {
         if let Some(directory) = &self.pending_journal {
             private_directory(directory)?;
             use std::io::Write;
-            let mut options = std::fs::OpenOptions::new();
+            let mut options = StateOpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
             {
@@ -1336,6 +1343,7 @@ fn journal_path(directory: &Path, key: &str) -> PathBuf {
     directory.join(format!("{}.json", crate::credential_fingerprint(key)))
 }
 
+#[cfg(unix)]
 fn private_directory(path: &Path) -> Result<(), ClientError> {
     let mut ancestor = PathBuf::new();
     for component in path.components() {
@@ -1471,4 +1479,14 @@ impl<'de> Deserialize<'de> for UniqueJson {
         }
         deserializer.deserialize_any(Visitor).map(Self)
     }
+}
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions as StateOpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions as StateOpenOptions;
+
+#[cfg(windows)]
+fn private_directory(path: &Path) -> Result<(), ClientError> {
+    lockyard_core::windows::private_dir(path).map_err(journal_error)
 }

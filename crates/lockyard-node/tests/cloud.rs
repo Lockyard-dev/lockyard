@@ -7,6 +7,7 @@ use tokio::{
     net::TcpListener,
 };
 
+#[cfg(unix)]
 #[test]
 fn key_staging_is_private_create_only_and_rejects_links_and_open_directories() {
     use std::os::unix::fs::{PermissionsExt, symlink};

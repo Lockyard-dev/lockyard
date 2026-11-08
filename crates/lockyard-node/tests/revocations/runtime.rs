@@ -2,14 +2,13 @@
 use super::*;
 #[tokio::test]
 async fn direct_only_daemon_refreshes_on_sse_and_timer_without_relay() {
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let root = tempfile::tempdir().unwrap();
     let root_path = std::fs::canonicalize(root.path()).unwrap();
     let state_dir = root_path.join("state");
     std::fs::create_dir(&state_dir).unwrap();
-    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture_permissions(&state_dir, 0o700).unwrap();
     let https_pair = {
         let p = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         (p.cert.der().to_vec(), p.signing_key.serialize_der())
@@ -149,26 +148,22 @@ async fn direct_only_daemon_refreshes_on_sse_and_timer_without_relay() {
     };
     std::fs::write(state_dir.join("broker-root-0.der"), https_pair.0).unwrap();
     std::fs::write(state_dir.join("node-token"), b"fixture").unwrap();
-    std::fs::set_permissions(
-        state_dir.join("node-token"),
-        std::fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    fixture_permissions(state_dir.join("node-token"), 0o600).unwrap();
     let identity =
         lockyard_node::quic::generate_identity(&state_dir.join("identity"), vec!["worker".into()])
             .unwrap();
     let node:lockyard_node::host::NodeConfig=serde_json::from_value(serde_json::json!({"node_id":"worker","workspace":config().trust.workspace_id,"state_dir":state_dir,"listen":null,"certificate":identity.certificate,"private_key":identity.private_key,"relay":null,"revocations":settings})).unwrap();
     let path = root_path.join("node.toml");
     std::fs::write(&path, toml::to_string(&node).unwrap()).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    fixture_permissions(&path, 0o600).unwrap();
     let key_dir = root_path.join("config/lockyard/keys");
     std::fs::create_dir_all(&key_dir).unwrap();
     for dir in [key_dir.parent().unwrap(), key_dir.as_path()] {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        fixture_permissions(dir, 0o700).unwrap();
     }
     let key_file = key_dir.join(format!("{}.key", config().trust.workspace_id));
     std::fs::write(&key_file, [7; 32]).unwrap();
-    std::fs::set_permissions(key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    fixture_permissions(key_file, 0o600).unwrap();
     let mut daemon = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "runtime::runtime_daemon_child", "--nocapture"])
         .env("XDG_CONFIG_HOME", root_path.join("config"))
@@ -257,5 +252,18 @@ fn runtime_daemon_child() {
             .unwrap()
             .block_on(lockyard_node::host::serve(config))
             .unwrap();
+    }
+}
+
+fn fixture_permissions(path: impl AsRef<std::path::Path>, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(windows)]
+    {
+        let _ = mode;
+        lockyard_core::windows::secure_owned(path.as_ref())
     }
 }

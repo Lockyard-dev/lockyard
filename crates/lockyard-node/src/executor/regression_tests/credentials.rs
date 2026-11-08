@@ -413,3 +413,8 @@ fn workload_credentials_and_context_are_readonly_main_only_and_cleaned() {
     remove_runtime_key(&job).unwrap();
     assert!(!job.join("runtime-secrets").exists());
 }
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;

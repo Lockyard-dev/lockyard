@@ -7,7 +7,11 @@
 //! the right name holding nothing. Without flushing the folder afterwards, the rename itself can be
 //! lost and the old file comes back. Both calls are here so no caller has to remember them.
 
-use std::fs::{self, File, OpenOptions};
+#[cfg(windows)]
+use crate::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,13 +82,18 @@ fn write_then_rename(
     // The bytes must be on the disk before the name points at them.
     file.sync_all()?;
     drop(file);
+    #[cfg(unix)]
     fs::rename(temporary, path)?;
+    #[cfg(windows)]
+    crate::windows::rename(temporary, path)?;
     sync_dir(parent)
 }
 
 /// Flushes a folder, so the rename inside it survives a power cut.
 ///
-/// Windows has no handle for a folder and needs none: `MoveFileEx` is already ordered there.
+/// Windows replacement flushes the staged file data before handle-based publication.
+/// This function does not flush or claim durability of arbitrary directory metadata
+/// on that platform.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -103,6 +112,8 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
 pub fn append_line(path: &Path, line: &str, mode: u32) -> io::Result<()> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
+    #[cfg(windows)]
+    options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -111,14 +122,55 @@ pub fn append_line(path: &Path, line: &str, mode: u32) -> io::Result<()> {
     #[cfg(not(unix))]
     let _ = mode;
     let mut file = options.open(path)?;
+    #[cfg(windows)]
+    {
+        use std::io::{Seek, SeekFrom};
+        file.lock()?;
+        file.seek(SeekFrom::End(0))?;
+    }
     file.write_all(line.as_bytes())?;
     if !line.ends_with('\n') {
         file.write_all(b"\n")?;
     }
     // The announcement journal is how a hook proves an edit was allowed. Losing the last line
     // after a crash would look like an outside write, so the bytes must reach the disk.
+    #[cfg(unix)]
     file.sync_all()?;
+    #[cfg(windows)]
+    crate::windows::sync_file(&file)?;
     Ok(())
+}
+
+/// Publish a synced temporary with the platform's replacement semantics.
+pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::rename(from, to)
+    }
+    #[cfg(windows)]
+    {
+        crate::windows::rename(from.as_ref(), to.as_ref())
+    }
+}
+/// Sync a regular state file or the directory containing a publication.
+pub fn sync_path(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref();
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        crate::windows::reject_reparse(path)?;
+        if path.is_dir() {
+            return sync_dir(path);
+        }
+        crate::windows::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .sync_all()
+    }
 }
 
 #[cfg(test)]

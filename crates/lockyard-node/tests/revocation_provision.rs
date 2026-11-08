@@ -107,15 +107,10 @@ async fn owner_bootstrap_rejects_legacy_wrong_workspace_key_and_algorithm() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_only_enrollment_retains_refresh_credential_and_custom_roots() {
-    use std::os::unix::fs::PermissionsExt;
     let (origin, root, server) = fixture("ok").await;
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("node-token"), "owner-fixture").unwrap();
-    fs::set_permissions(
-        dir.path().join("node-token"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    fixture_permissions(dir.path().join("node-token"), 0o600).unwrap();
     fs::write(dir.path().join("broker-root-0.der"), root).unwrap();
     let key = Ed25519KeyPair::from_seed_unchecked(&[37; 32]).unwrap();
     let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -138,4 +133,17 @@ async fn direct_only_enrollment_retains_refresh_credential_and_custom_roots() {
     .unwrap();
     assert_eq!(trust.server_origin, origin);
     server.await.unwrap();
+}
+
+fn fixture_permissions(path: impl AsRef<std::path::Path>, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(windows)]
+    {
+        let _ = mode;
+        lockyard_core::windows::secure_owned(path.as_ref())
+    }
 }

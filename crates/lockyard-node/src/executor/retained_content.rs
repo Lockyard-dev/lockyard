@@ -234,8 +234,7 @@ impl Executor {
                     fs::remove_dir_all(entry.path()).map_err(io_error)?;
                 }
             }
-            File::open(self.inner.config.state_dir.join("expired-content"))
-                .and_then(|directory| directory.sync_all())
+            lockyard_core::fsio::sync_path(self.inner.config.state_dir.join("expired-content"))
                 .map_err(io_error)?;
             Ok(purged)
         })();
@@ -291,10 +290,8 @@ impl Executor {
                     .and_then(|()| metadata_file.write_all(&metadata))
                     .and_then(|()| metadata_file.sync_all())
                     .map_err(io_error)?;
-                fs::rename(&temporary, &metadata_path).map_err(io_error)?;
-                File::open(&job)
-                    .and_then(|directory| directory.sync_all())
-                    .map_err(io_error)?;
+                lockyard_core::fsio::rename(&temporary, &metadata_path).map_err(io_error)?;
+                lockyard_core::fsio::sync_path(&job).map_err(io_error)?;
             }
             let signer = self
                 .inner

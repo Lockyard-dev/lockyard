@@ -532,10 +532,12 @@ pub(super) fn set_pipe_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> Result<(
 }
 #[cfg(not(unix))]
 pub(super) fn set_pipe_nonblocking<T>(_pipe: &T) -> Result<()> {
-    Err(ExecutorError("execution_requires_unix"))
+    Err(ExecutorError("container_limits_unavailable"))
 }
 
 pub(super) fn terminate_group(pid: u32) {
+    #[cfg(windows)]
+    let _ = pid;
     #[cfg(unix)]
     {
         unsafe {

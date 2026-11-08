@@ -3,6 +3,7 @@
 use super::*;
 
 #[cfg(test)]
+#[cfg(unix)]
 pub(super) fn drain<W: Write>(
     reader: impl Read,
     spool: Arc<Mutex<Spool<W>>>,

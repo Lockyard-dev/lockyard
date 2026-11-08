@@ -52,7 +52,7 @@ pub fn path() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(path) if !path.is_empty() => PathBuf::from(path),
         _ => PathBuf::from(
-            std::env::var_os("HOME").ok_or_else(|| Error::Invalid("HOME is not set".into()))?,
+            crate::paths::home_dir().ok_or_else(|| Error::Invalid("HOME is not set".into()))?,
         )
         .join(".config"),
     };
@@ -60,7 +60,14 @@ pub fn path() -> Result<PathBuf> {
 }
 
 fn read(path: &Path) -> Result<File> {
-    let text = match fs::read_to_string(path) {
+    #[cfg(unix)]
+    let contents = fs::read_to_string(path);
+    #[cfg(windows)]
+    let contents = crate::windows::read_private(path, 1024 * 1024).and_then(|bytes| {
+        String::from_utf8(bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    });
+    let text = match contents {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(File::default()),
         Err(error) => return Err(error.into()),
@@ -90,7 +97,10 @@ fn write(path: &Path, file: &File) -> Result<()> {
     let text = toml::to_string(file)
         .map_err(|error| Error::Invalid(format!("credentials could not be written: {error}")))?;
     if let Some(parent) = path.parent() {
+        #[cfg(unix)]
         fs::create_dir_all(parent)?;
+        #[cfg(windows)]
+        crate::windows::private_dir(parent)?;
     }
     // Atomic rename after fsync: a crash leaves the old file or the new one, never a half-written
     // token. Mode 0600 is set on the temporary before the rename.
@@ -241,6 +251,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn an_unreadable_file_says_so_instead_of_losing_the_other_logins() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials.toml");

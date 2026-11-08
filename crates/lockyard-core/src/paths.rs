@@ -154,6 +154,19 @@ fn canonical_prefix(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// User home, including native Windows profiles when HOME is not provided.
+pub fn home_dir() -> Option<std::ffi::OsString> {
+    let home = std::env::var_os("HOME");
+    #[cfg(windows)]
+    {
+        home.or_else(|| std::env::var_os("USERPROFILE"))
+    }
+    #[cfg(unix)]
+    {
+        home
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

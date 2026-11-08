@@ -17,3 +17,6 @@ ureq.workspace = true
 ring = "0.17"
 libc.workspace = true
 url = "2"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -37,31 +37,23 @@ pub(super) fn retire_job_directory(state: &Path, id: &str) -> Result<()> {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
                 Err(error) => return Err(io_error(error)),
             }
-            fs::rename(&job, &expired).map_err(io_error)?;
-            File::open(state.join("jobs"))
-                .and_then(|directory| directory.sync_all())
-                .map_err(io_error)?;
-            File::open(state.join("expired-content"))
-                .and_then(|directory| directory.sync_all())
-                .map_err(io_error)?;
+            lockyard_core::fsio::rename(&job, &expired).map_err(io_error)?;
+            lockyard_core::fsio::sync_path(state.join("jobs")).map_err(io_error)?;
+            lockyard_core::fsio::sync_path(state.join("expired-content")).map_err(io_error)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
         Err(error) => return Err(io_error(error)),
     }
     let export = state.join("exports").join(format!("{id}.lyarchive"));
     match fs::remove_file(export) {
-        Ok(()) => File::open(state.join("exports"))
-            .and_then(|directory| directory.sync_all())
-            .map_err(io_error)?,
+        Ok(()) => lockyard_core::fsio::sync_path(state.join("exports")).map_err(io_error)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
         Err(error) => return Err(io_error(error)),
     }
     match fs::symlink_metadata(&expired) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
             fs::remove_dir_all(expired).map_err(io_error)?;
-            File::open(state.join("expired-content"))
-                .and_then(|directory| directory.sync_all())
-                .map_err(io_error)?;
+            lockyard_core::fsio::sync_path(state.join("expired-content")).map_err(io_error)?;
         }
         Ok(_) => return Err(ExecutorError("unsafe_expired_job_directory")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),

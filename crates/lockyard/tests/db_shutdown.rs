@@ -92,11 +92,16 @@ fn assert_wal_has_records(root: &Path) {
 fn database_copy(root: &Path) -> (tempfile::TempDir, Store) {
     let isolated = tempfile::tempdir().unwrap();
     fs::create_dir(isolated.path().join(DIR_NAME)).unwrap();
+    #[cfg(windows)]
+    lockyard_core::windows::private_dir(&isolated.path().join(DIR_NAME)).unwrap();
     fs::copy(
         root.join(DIR_NAME).join("lockyard.db"),
         isolated.path().join(DIR_NAME).join("lockyard.db"),
     )
     .unwrap();
+    #[cfg(windows)]
+    lockyard_core::windows::secure_owned(&isolated.path().join(DIR_NAME).join("lockyard.db"))
+        .unwrap();
     let store = Store::open(isolated.path()).unwrap();
     (isolated, store)
 }

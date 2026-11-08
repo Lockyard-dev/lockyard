@@ -8,11 +8,17 @@
 //! first result.
 
 use lockyard_cloud_client::{Call, ClientError};
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
+
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -51,7 +57,11 @@ pub struct Outbox {
 }
 
 fn private_options() -> OpenOptions {
+    #[cfg(windows)]
+    let options = OpenOptions::new();
+    #[cfg(unix)]
     let mut options = OpenOptions::new();
+    #[cfg(unix)]
     options.mode(0o600);
     options
 }
@@ -66,7 +76,7 @@ impl Outbox {
             .open(dir.join(QUEUE_FILE))?;
         // sync_data on an appended entry cannot preserve a newly created directory entry.
         sync_directory(dir)?;
-        let cursor = read_cursor(dir);
+        let cursor = read_cursor(dir)?;
         let completed = read_completed(dir)?;
         let mut text = Vec::new();
         file.read_to_end(&mut text)?;
@@ -89,8 +99,8 @@ impl Outbox {
             }
         }
         if intact != text.len() {
-            file.set_len(intact as u64)?;
-            file.sync_data()?;
+            truncate_append(&file, intact as u64)?;
+            sync_file(&file)?;
         }
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -197,13 +207,13 @@ impl Outbox {
             .open(self.dir.join(DONE_FILE))?;
         let before = done.metadata()?.len();
         if let Err(error) = writeln!(done, "{n}")
-            .and_then(|()| done.sync_data())
+            .and_then(|()| sync_file(&done))
             .and_then(|()| sync_directory(&self.dir))
         {
             // A failed partial line must not fuse with the next completion number. Keep the
             // entry and its waiter until its completion has actually reached durable storage.
-            if done.set_len(before).is_ok() {
-                let _ = done.sync_data();
+            if truncate_append(&done, before).is_ok() {
+                let _ = sync_file(&done);
             }
             return Err(error);
         }
@@ -232,9 +242,20 @@ impl Outbox {
     }
 
     pub fn rejected(&self) -> usize {
-        fs::read_to_string(self.dir.join(REJECTED_FILE))
-            .map(|text| text.lines().count())
-            .unwrap_or(0)
+        #[cfg(unix)]
+        {
+            fs::read_to_string(self.dir.join(REJECTED_FILE))
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        }
+        #[cfg(windows)]
+        {
+            lockyard_core::windows::read_private(&self.dir.join(REJECTED_FILE), MAX_QUEUE_BYTES)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        }
     }
 }
 
@@ -252,10 +273,10 @@ fn store(queue: &mut Queue, call: Call) -> io::Result<u64> {
     let written = queue
         .file
         .write_all(&line)
-        .and_then(|()| queue.file.sync_data());
+        .and_then(|()| sync_file(&queue.file));
     if let Err(error) = written {
         // Undo a partial line, or the next entry would fuse with it.
-        let _ = queue.file.set_len(queue.bytes);
+        let _ = truncate_append(&queue.file, queue.bytes);
         return Err(error);
     }
     queue.bytes += size;
@@ -264,15 +285,23 @@ fn store(queue: &mut Queue, call: Call) -> io::Result<u64> {
     Ok(queue.next - 1)
 }
 
-fn read_cursor(dir: &Path) -> u64 {
-    fs::read_to_string(dir.join(CURSOR_FILE))
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
-        .unwrap_or(0)
+fn read_cursor(dir: &Path) -> io::Result<u64> {
+    #[cfg(unix)]
+    let bytes = fs::read(dir.join(CURSOR_FILE));
+    #[cfg(windows)]
+    let bytes = lockyard_core::windows::read_private(&dir.join(CURSOR_FILE), 128);
+    match bytes {
+        Ok(bytes) => Ok(std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0)),
+        Err(error) if cfg!(unix) || error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error),
+    }
 }
 
 fn sync_directory(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
+    lockyard_core::fsio::sync_path(dir)
 }
 
 fn read_completed(dir: &Path) -> io::Result<HashSet<u64>> {
@@ -306,8 +335,8 @@ fn read_completed(dir: &Path) -> io::Result<HashSet<u64>> {
     if intact != bytes.len() {
         // A crash during marker append can leave a fragment. Discard it before another
         // number is appended, or the two numbers could become an unrelated completed ID.
-        file.set_len(intact as u64)?;
-        file.sync_data()?;
+        truncate_append(&file, intact as u64)?;
+        sync_file(&file)?;
     }
     Ok(completed)
 }
@@ -323,8 +352,11 @@ fn save_cursor(dir: &Path, through: u64) -> io::Result<()> {
             .create_new(true)
             .open(&temporary)?;
         write!(file, "{through}")?;
+        #[cfg(unix)]
         file.sync_all()?;
-        fs::rename(&temporary, dir.join(CURSOR_FILE))?;
+        #[cfg(windows)]
+        sync_file(&file)?;
+        lockyard_core::fsio::rename(&temporary, dir.join(CURSOR_FILE))?;
         sync_directory(dir)
     })();
     if saved.is_err() {
@@ -337,9 +369,9 @@ fn compact(dir: &Path, queue: &mut Queue) -> io::Result<()> {
     // Commit the high-water mark before destroying either source of completion IDs.
     // Every interrupted stage then leaves a cursor, log, or marker that prevents reuse.
     save_cursor(dir, queue.next - 1)?;
-    queue.file.set_len(0)?;
+    truncate_append(&queue.file, 0)?;
     queue.bytes = 0;
-    queue.file.sync_data()?;
+    sync_file(&queue.file)?;
     fs::remove_file(dir.join(DONE_FILE))?;
     sync_directory(dir)
 }
@@ -363,6 +395,35 @@ fn log_rejection(dir: &Path, entry: &Entry, outcome: &Outcome) {
 
 fn pair_key(entry: &Entry) -> String {
     entry.call.session.clone()
+}
+
+fn truncate_append(file: &File, length: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        file.set_len(length)
+    }
+    #[cfg(windows)]
+    {
+        lockyard_core::windows::truncate_file(file, length)
+    }
+}
+fn sync_file(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        file.sync_data()
+    }
+    #[cfg(windows)]
+    {
+        lockyard_core::windows::sync_file(file)
+    }
+}
+
+#[cfg(test)]
+fn private_tempdir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    lockyard_core::windows::private_dir(dir.path()).unwrap();
+    dir
 }
 
 #[cfg(test)]
@@ -390,7 +451,7 @@ mod tests {
 
     #[test]
     fn entries_survive_a_restart_in_order_with_their_keys() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let outbox = Outbox::open(dir.path()).unwrap();
         let first = mail("one");
         let key = first.key.clone();
@@ -407,7 +468,7 @@ mod tests {
 
     #[test]
     fn a_finished_entry_is_not_sent_again_after_a_restart() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let outbox = Outbox::open(dir.path()).unwrap();
         let first = outbox.append(mail("one")).unwrap();
         outbox.append(mail("two")).unwrap();
@@ -420,7 +481,7 @@ mod tests {
 
     #[test]
     fn a_torn_last_line_is_cut_and_the_next_entry_stays_readable() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let outbox = Outbox::open(dir.path()).unwrap();
         outbox.append(mail("one")).unwrap();
         drop(outbox);
@@ -438,7 +499,7 @@ mod tests {
 
     #[test]
     fn numbers_keep_rising_after_the_queue_empties() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let outbox = Outbox::open(dir.path()).unwrap();
         let first = outbox.append(mail("one")).unwrap();
         outbox.finish(first, Ok(Value::Null)).unwrap();
@@ -457,7 +518,7 @@ mod tests {
 
     #[test]
     fn the_waiter_hears_the_outcome() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let outbox = Outbox::open(dir.path()).unwrap();
         let (n, outcome) = outbox.append_waiting(mail("one")).unwrap();
         outbox.finish(n, Ok(json!({"id": 1}))).unwrap();
@@ -466,7 +527,7 @@ mod tests {
 
     #[test]
     fn a_refusal_nobody_waits_for_keeps_the_call_and_body() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let outbox = Outbox::open(dir.path()).unwrap();
         let n = outbox.append(mail("one")).unwrap();
         outbox
@@ -481,7 +542,7 @@ mod tests {
 
     #[test]
     fn a_deferred_session_does_not_block_another_session() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let outbox = Outbox::open(dir.path()).unwrap();
         let first = outbox.append(mail("one")).unwrap();
         let mut other = mail("two");
@@ -493,7 +554,7 @@ mod tests {
 
     #[test]
     fn a_later_completion_does_not_hide_earlier_work_after_restart() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let outbox = Outbox::open(dir.path()).unwrap();
         let first = outbox.append(mail("one")).unwrap();
         let second = outbox.append(mail("two")).unwrap();
@@ -518,7 +579,7 @@ mod tests {
                 "after_marker_removal",
                 "legacy_after_truncate",
             ] {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = private_tempdir();
                 let completed = previous + 1;
                 let cursor_advanced = matches!(
                     stage,
@@ -578,7 +639,7 @@ mod tests {
 
     #[test]
     fn a_legacy_compaction_without_a_cursor_does_not_reuse_its_completed_number() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         fs::write(dir.path().join(QUEUE_FILE), "").unwrap();
         fs::write(dir.path().join(DONE_FILE), "1\n").unwrap();
         let outbox = Outbox::open(dir.path()).unwrap();
@@ -592,7 +653,7 @@ mod tests {
     #[test]
     fn an_empty_queue_without_completion_markers_retains_new_writes() {
         for cursor in [0, 9] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = private_tempdir();
             fs::write(dir.path().join(CURSOR_FILE), cursor.to_string()).unwrap();
             let outbox = Outbox::open(dir.path()).unwrap();
             let n = outbox.append(mail("new")).unwrap();
@@ -604,7 +665,7 @@ mod tests {
 
     #[test]
     fn a_failed_completion_marker_preserves_the_entry_and_its_waiter() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let outbox = Outbox::open(dir.path()).unwrap();
         let (n, waiter) = outbox.append_waiting(mail("one")).unwrap();
         outbox.defer(n, Duration::from_secs(1));
@@ -625,7 +686,7 @@ mod tests {
 
     #[test]
     fn compaction_failure_preserves_the_log_and_acknowledges_durable_completion() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let outbox = Outbox::open(dir.path()).unwrap();
         let (n, waiter) = outbox.append_waiting(mail("one")).unwrap();
         // An ordinary filesystem error prevents atomic cursor replacement.
@@ -650,7 +711,7 @@ mod tests {
 
     #[test]
     fn a_torn_completion_line_cannot_fuse_with_the_next_completed_number() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let outbox = Outbox::open(dir.path()).unwrap();
         let first = outbox.append(mail("one")).unwrap();
         let second = outbox.append(mail("two")).unwrap();
@@ -672,15 +733,16 @@ mod tests {
 
     #[test]
     fn unreadable_completion_storage_does_not_silently_replay_finished_entries() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         fs::create_dir(dir.path().join(DONE_FILE)).unwrap();
         assert!(Outbox::open(dir.path()).is_err());
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_queue_file_is_private() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         Outbox::open(dir.path()).unwrap();
         let mode = fs::metadata(dir.path().join(QUEUE_FILE))
             .unwrap()

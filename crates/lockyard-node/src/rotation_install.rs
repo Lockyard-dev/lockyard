@@ -11,7 +11,7 @@ use lockyard_cloud_client::WorkspaceKey;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
 };
@@ -213,6 +213,7 @@ pub struct KeyReadGuard {
     _file: File,
 }
 
+#[cfg(unix)]
 pub fn guard_workspace_key(key_path: &Path) -> Result<KeyReadGuard> {
     require_parent(key_path)?;
     let file = open_lock(&key_path.with_extension("rotation.lock"))?;
@@ -889,6 +890,7 @@ fn acquire_locks(config: &NodeConfig, key_path: &Path) -> Result<Locks> {
         _dispatch: dispatch,
     })
 }
+#[cfg(unix)]
 fn lock_file(path: &Path) -> Result<File> {
     use std::os::fd::AsRawFd;
     let file = open_lock(path)?;
@@ -1009,9 +1011,8 @@ fn config_stage(journal: &Journal) -> Result<PathBuf> {
     )
 }
 fn stage_path(path: &Path, plan: &str, kind: &str) -> Result<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
     let parent = path.parent().ok_or(InstallError("rotation_invalid_path"))?;
-    let destination = sha256(path.as_os_str().as_bytes());
+    let destination = sha256(path.as_os_str().as_encoded_bytes());
     Ok(parent.join(format!(
         ".workspace-rotation-{plan}-{destination}-{kind}.next"
     )))
@@ -1070,11 +1071,13 @@ fn create_private(path: &Path, bytes: &[u8]) -> Result<()> {
     publish_complete(path, bytes, false)
 }
 fn publication_prefix(path: &Path) -> Result<String> {
-    use std::os::unix::ffi::OsStrExt;
     let name = path
         .file_name()
         .ok_or(InstallError("rotation_invalid_path"))?;
-    Ok(format!(".rotation-publish-{}-", sha256(name.as_bytes())))
+    Ok(format!(
+        ".rotation-publish-{}-",
+        sha256(name.as_encoded_bytes())
+    ))
 }
 fn cleanup_unpublished(path: &Path) -> Result<()> {
     let parent = path.parent().ok_or(InstallError("rotation_invalid_path"))?;
@@ -1175,7 +1178,7 @@ fn publish_complete(path: &Path, bytes: &[u8], replace_existing: bool) -> Result
             .and_then(|()| file.sync_all())
             .map_err(io)?;
         if replace_existing {
-            fs::rename(&temp, path).map_err(io)?;
+            lockyard_core::fsio::rename(&temp, path).map_err(io)?;
         } else {
             rename_create_only(&temp, path)?;
         }
@@ -1215,7 +1218,7 @@ fn rename_create_only(source: &Path, destination: &Path) -> Result<()> {
     }
     Ok(())
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 fn rename_create_only(_source: &Path, _destination: &Path) -> Result<()> {
     Err(InstallError(
         "rotation_atomic_create_publish_requires_linux",
@@ -1238,7 +1241,7 @@ fn replace_inner(source: &Path, destination: &Path, allow_destination_links: boo
             allow_destination_links,
         )?);
     }
-    fs::rename(source, destination).map_err(io)?;
+    lockyard_core::fsio::rename(source, destination).map_err(io)?;
     sync_directory(
         destination
             .parent()
@@ -1253,6 +1256,7 @@ fn remove_stage_if_present(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(unix)]
 fn create_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     if missing(path)? {
@@ -1262,9 +1266,7 @@ fn create_directory(path: &Path) -> Result<()> {
     require_directory(path)
 }
 fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(io)
+    lockyard_core::fsio::sync_path(path).map_err(io)
 }
 fn missing(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
@@ -1283,6 +1285,7 @@ fn require_parent(path: &Path) -> Result<()> {
     }
     require_directory(path.parent().ok_or(InstallError("rotation_invalid_path"))?)
 }
+#[cfg(unix)]
 fn require_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     if !path.is_absolute()
@@ -1306,23 +1309,32 @@ fn require_directory(path: &Path) -> Result<()> {
 // macOS may spell its OS-owned /private directories through /var or /tmp. Resolve
 // just that exact prefix: every other directory or file symlink remains refused.
 fn has_canonical_location(path: &Path) -> Result<bool> {
-    let canonical = fs::canonicalize(path).map_err(io)?;
-    if canonical == path {
-        return Ok(true);
+    #[cfg(windows)]
+    {
+        lockyard_core::windows::reject_reparse(path).map_err(io)?;
+        Ok(true)
     }
-    #[cfg(target_os = "macos")]
-    for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
-        if let Ok(remainder) = path.strip_prefix(alias)
-            && fs::read_link(alias).is_ok_and(|link| {
-                link == Path::new(target) || Path::new("/").join(link) == Path::new(target)
-            })
-        {
-            return Ok(canonical == Path::new(target).join(remainder));
+    #[cfg(unix)]
+    {
+        let canonical = fs::canonicalize(path).map_err(io)?;
+        if canonical == path {
+            return Ok(true);
         }
+        #[cfg(target_os = "macos")]
+        for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
+            if let Ok(remainder) = path.strip_prefix(alias)
+                && fs::read_link(alias).is_ok_and(|link| {
+                    link == Path::new(target) || Path::new("/").join(link) == Path::new(target)
+                })
+            {
+                return Ok(canonical == Path::new(target).join(remainder));
+            }
+        }
+        Ok(false)
     }
-    Ok(false)
 }
 
+#[cfg(unix)]
 fn private_options() -> OpenOptions {
     use std::os::unix::fs::OpenOptionsExt;
     let mut options = OpenOptions::new();
@@ -1331,6 +1343,7 @@ fn private_options() -> OpenOptions {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     options
 }
+#[cfg(unix)]
 fn require_file(file: &File, private: bool, max: u64, allow_links: bool) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let metadata = file.metadata().map_err(io)?;
@@ -1376,7 +1389,62 @@ fn valid_key_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+pub fn guard_workspace_key(key_path: &Path) -> Result<KeyReadGuard> {
+    require_parent(key_path)?;
+    let file = open_lock(&key_path.with_extension("rotation.lock"))?;
+    file.try_lock_shared()
+        .map_err(|_| InstallError("workspace_rotation_installing"))?;
+    Ok(KeyReadGuard { _file: file })
+}
+
+#[cfg(windows)]
+fn lock_file(path: &Path) -> Result<File> {
+    let file = open_lock(path)?;
+    file.try_lock()
+        .map_err(|_| InstallError("rotation_requires_stopped_node"))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn create_directory(path: &Path) -> Result<()> {
+    lockyard_core::windows::private_dir(path).map_err(io)
+}
+
+#[cfg(windows)]
+fn require_directory(path: &Path) -> Result<()> {
+    if !path.is_absolute() || !path.is_dir() {
+        return Err(InstallError("rotation_invalid_path"));
+    }
+    lockyard_core::windows::require_private(path).map_err(io)
+}
+
+#[cfg(windows)]
+fn private_options() -> OpenOptions {
+    lockyard_core::windows::OpenOptions::new()
+}
+
+#[cfg(windows)]
+fn require_file(file: &File, private: bool, max: u64, allow_links: bool) -> Result<()> {
+    let metadata = file.metadata().map_err(io)?;
+    let _ = (private, allow_links);
+    if !metadata.is_file() || metadata.len() > max {
+        return Err(InstallError("rotation_file_not_private_or_bounded"));
+    }
+    lockyard_core::windows::require_private_file(file).map_err(io)
+}
+
+#[cfg(windows)]
+fn rename_create_only(source: &Path, destination: &Path) -> Result<()> {
+    lockyard_core::windows::rename_create_only(source, destination).map_err(io)
+}
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::{host::PeerConfig, wire::JobState};
@@ -2099,7 +2167,7 @@ mod tests {
         assert!(install(&f).is_err());
         fs::set_permissions(&f.key_path, fs::Permissions::from_mode(0o600)).unwrap();
         let saved = f.key_path.with_extension("saved");
-        fs::rename(&f.key_path, &saved).unwrap();
+        lockyard_core::fsio::rename(&f.key_path, &saved).unwrap();
         symlink(saved, &f.key_path).unwrap();
         assert!(install(&f).is_err());
     }

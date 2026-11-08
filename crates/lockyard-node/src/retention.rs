@@ -6,7 +6,7 @@ use crate::wire::{JobSpec, JobState};
 use ring::digest;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self},
     io::{Read, Write},
     path::Path,
 };
@@ -294,9 +294,7 @@ pub fn store_purge_completion(
     now_ms: u64,
 ) -> Result<()> {
     if load_purge_completion(directory, tombstone)?.is_some() {
-        return File::open(directory)
-            .and_then(|file| file.sync_all())
-            .map_err(io);
+        return lockyard_core::fsio::sync_path(directory).map_err(io);
     }
     let completion = PurgeCompletion {
         version: 1,
@@ -334,9 +332,7 @@ pub fn store_purge_completion(
             Err(error) => return Err(io(error)),
         }
         fs::remove_file(&tmp).map_err(io)?;
-        File::open(directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(io)
+        lockyard_core::fsio::sync_path(directory).map_err(io)
     })();
     if result.is_err() {
         let _ = fs::remove_file(tmp);
@@ -408,9 +404,7 @@ pub(crate) fn terminal_receipt(
         Ok(Some(doc))
     };
     if let Some(doc) = load()? {
-        File::open(directory)
-            .and_then(|d| d.sync_all())
-            .map_err(io)?;
+        lockyard_core::fsio::sync_path(directory).map_err(io)?;
         return Ok(doc);
     }
     let doc = signer
@@ -440,9 +434,7 @@ pub(crate) fn terminal_receipt(
             Err(e) => return Err(io(e)),
         }
         fs::remove_file(&tmp).map_err(io)?;
-        File::open(directory)
-            .and_then(|d| d.sync_all())
-            .map_err(io)?;
+        lockyard_core::fsio::sync_path(directory).map_err(io)?;
         load()?.ok_or(RetentionError("invalid_terminal_receipt"))
     })();
     if result.is_err() {
@@ -467,9 +459,7 @@ pub fn store_tombstone(directory: &Path, tombstone: &JobTombstone) -> Result<()>
     let path = directory.join(&tombstone.job_id);
     if let Some(existing) = load_tombstone(directory, &tombstone.job_id)? {
         return if existing == *tombstone {
-            File::open(directory)
-                .and_then(|dir| dir.sync_all())
-                .map_err(io)
+            lockyard_core::fsio::sync_path(directory).map_err(io)
         } else {
             Err(RetentionError("job_tombstone_conflict"))
         };
@@ -506,9 +496,7 @@ pub fn store_tombstone(directory: &Path, tombstone: &JobTombstone) -> Result<()>
             Err(error) => return Err(io(error)),
         }
         fs::remove_file(&temporary).map_err(io)?;
-        File::open(directory)
-            .and_then(|dir| dir.sync_all())
-            .map_err(io)
+        lockyard_core::fsio::sync_path(directory).map_err(io)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -552,10 +540,15 @@ pub fn load_tombstone(directory: &Path, job_id: &str) -> Result<Option<JobTombst
     Ok(Some(tombstone))
 }
 pub(crate) fn require_directory(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    lockyard_core::windows::require_private(path).map_err(io)?;
     if !path.is_absolute() {
         return Err(RetentionError("retention_path_must_be_absolute"));
     }
     let metadata = fs::symlink_metadata(path).map_err(io)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(RetentionError("retention_directory_not_private"));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -570,6 +563,9 @@ pub(crate) fn require_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 fn private_options() -> OpenOptions {
+    #[cfg(windows)]
+    let options = OpenOptions::new();
+    #[cfg(unix)]
     let mut options = OpenOptions::new();
     #[cfg(unix)]
     {
@@ -580,6 +576,11 @@ fn private_options() -> OpenOptions {
     }
     options
 }
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 
 #[cfg(test)]
 mod tests {

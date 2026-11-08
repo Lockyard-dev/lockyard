@@ -275,7 +275,7 @@ impl CatalogStore {
         Ok(verified)
     }
     fn load(&self, workspace: &str, repository: &str) -> Result<Option<CacheRecord>, CatalogError> {
-        let mut options = fs::OpenOptions::new();
+        let mut options = StateOpenOptions::new();
         options.read(true);
         #[cfg(unix)]
         {
@@ -333,7 +333,7 @@ impl CatalogStore {
             create_private_directory(parent)?;
         }
         validate_private_directory(parent)?;
-        let mut options = fs::OpenOptions::new();
+        let mut options = StateOpenOptions::new();
         options.read(true).write(true).create(create);
         #[cfg(unix)]
         {
@@ -355,13 +355,16 @@ impl CatalogStore {
         }
         #[cfg(not(unix))]
         {
-            return Err(error("catalog_offline_unavailable"));
+            lock.lock()
+                .map_err(|_| error("catalog_offline_unavailable"))?;
         }
-        #[allow(unreachable_code)]
         Ok(lock)
     }
 }
 fn validate_ancestors(path: &Path) -> Result<(), CatalogError> {
+    #[cfg(windows)]
+    lockyard_core::windows::reject_reparse(path)
+        .map_err(|_| error("catalog_offline_unavailable"))?;
     let mut ancestor = PathBuf::new();
     for component in path.components() {
         ancestor.push(component);
@@ -407,6 +410,7 @@ fn validate_ancestors(path: &Path) -> Result<(), CatalogError> {
     }
     Ok(())
 }
+#[cfg(unix)]
 fn create_private_directory(path: &Path) -> Result<(), CatalogError> {
     if fs::symlink_metadata(path).is_ok() {
         return validate_private_directory(path);
@@ -442,11 +446,9 @@ fn validate_private_directory(path: &Path) -> Result<(), CatalogError> {
             return Err(error("catalog_offline_unavailable"));
         }
     }
-    #[cfg(not(unix))]
-    {
-        return Err(error("catalog_offline_unavailable"));
-    }
-    #[allow(unreachable_code)]
+    #[cfg(windows)]
+    lockyard_core::windows::require_private(path)
+        .map_err(|_| error("catalog_offline_unavailable"))?;
     Ok(())
 }
 fn validate_private_file(file: &File) -> Result<(), CatalogError> {
@@ -466,10 +468,18 @@ fn validate_private_file(file: &File) -> Result<(), CatalogError> {
             return Err(error("catalog_offline_unavailable"));
         }
     }
-    #[cfg(not(unix))]
-    {
-        return Err(error("catalog_offline_unavailable"));
-    }
-    #[allow(unreachable_code)]
+    #[cfg(windows)]
+    lockyard_core::windows::require_private_file(file)
+        .map_err(|_| error("catalog_offline_unavailable"))?;
     Ok(())
+}
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions as StateOpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions as StateOpenOptions;
+
+#[cfg(windows)]
+fn create_private_directory(path: &Path) -> Result<(), CatalogError> {
+    lockyard_core::windows::private_dir(path).map_err(|_| error("catalog_offline_unavailable"))
 }

@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -1208,9 +1208,7 @@ impl WorkflowController {
                     .map_err(|_| WorkflowError("invalid_workflow_tombstone"))?,
             )?;
             fs::remove_file(self.directory.join(&id)).map_err(io)?;
-            File::open(&self.directory)
-                .and_then(|file| file.sync_all())
-                .map_err(io)?;
+            lockyard_core::fsio::sync_path(&self.directory).map_err(io)?;
             records.remove(&id);
         }
         Ok(())
@@ -2111,6 +2109,7 @@ pub fn offline_rotation_guard(
     Ok(lock)
 }
 
+#[cfg(unix)]
 fn lock_controller(directory: &Path) -> Result<File> {
     use std::os::{
         fd::AsRawFd,
@@ -2174,6 +2173,7 @@ struct WorkflowContext {
     inputs: Vec<WorkflowInput>,
 }
 /// Fixed read-only context file. Contains authenticated artifact references, never keys or code bytes.
+#[cfg(unix)]
 pub fn stage_context(job_dir: &Path, inputs: &[WorkflowInput]) -> Result<Option<PathBuf>> {
     use std::os::unix::fs::OpenOptionsExt;
     if inputs.is_empty() {
@@ -2195,9 +2195,7 @@ pub fn stage_context(job_dir: &Path, inputs: &[WorkflowInput]) -> Result<Option<
         if read_private(&destination, MAX_DEFINITION_BYTES as u64)? != bytes {
             return Err(WorkflowError("workflow_input_context_conflict"));
         }
-        File::open(&directory)
-            .and_then(|file| file.sync_all())
-            .map_err(io)?;
+        lockyard_core::fsio::sync_path(&directory).map_err(io)?;
         return Ok(Some(destination));
     }
     let temporary = directory.join(format!(
@@ -2216,12 +2214,10 @@ pub fn stage_context(job_dir: &Path, inputs: &[WorkflowInput]) -> Result<Option<
             .and_then(|_| file.sync_all())
             .map_err(io)?;
         fs::hard_link(&temporary, &destination).map_err(io)?;
-        File::open(&directory)
-            .and_then(|file| file.sync_all())
-            .map_err(io)
+        lockyard_core::fsio::sync_path(&directory).map_err(io)
     })();
     let _ = fs::remove_file(&temporary);
-    let _ = File::open(&directory).and_then(|file| file.sync_all());
+    let _ = lockyard_core::fsio::sync_path(&directory);
     result?;
     Ok(Some(destination))
 }
@@ -2272,6 +2268,7 @@ pub fn step_job_id(flow: &str, step: &str) -> Result<String> {
     Ok(format!("{}{suffix}", &flow[..10]))
 }
 
+#[cfg(unix)]
 fn private_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     match fs::DirBuilder::new().mode(0o700).create(path) {
@@ -2288,14 +2285,14 @@ fn private_dir(path: &Path) -> Result<()> {
         return Err(WorkflowError("workflow_directory_not_private"));
     }
     // Re-establish parent durability even if a previous creator died after mkdir.
-    File::open(
+    lockyard_core::fsio::sync_path(
         path.parent()
             .ok_or(WorkflowError("invalid_workflow_storage"))?,
     )
-    .and_then(|file| file.sync_all())
     .map_err(io)?;
     Ok(())
 }
+#[cfg(unix)]
 fn read_private(path: &Path, max: u64) -> Result<Vec<u8>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = OpenOptions::new()
@@ -2319,6 +2316,7 @@ fn read_private(path: &Path, max: u64) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+#[cfg(unix)]
 fn atomic_write(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     if !wire::valid_ulid(name) {
@@ -2339,16 +2337,97 @@ fn atomic_write(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes)
             .and_then(|_| file.sync_all())
             .map_err(io)?;
-        fs::rename(&temporary, directory.join(name)).map_err(io)?;
-        File::open(directory)
-            .and_then(|file| file.sync_all())
-            .map_err(io)
+        lockyard_core::fsio::rename(&temporary, directory.join(name)).map_err(io)?;
+        lockyard_core::fsio::sync_path(directory).map_err(io)
     })();
     if result.is_err() {
         let _ = fs::remove_file(temporary);
     }
     result
 }
+
+#[cfg(windows)]
+fn private_dir(path: &Path) -> Result<()> {
+    lockyard_core::windows::private_dir(path).map_err(io)
+}
+
+#[cfg(windows)]
+fn read_private(path: &Path, max: u64) -> Result<Vec<u8>> {
+    lockyard_core::windows::read_private(path, max).map_err(io)
+}
+
+#[cfg(windows)]
+fn lock_controller(directory: &Path) -> Result<File> {
+    let file = lockyard_core::windows::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(directory.join(".lock"))
+        .map_err(io)?;
+    file.try_lock()
+        .map_err(|_| WorkflowError("workflow_controller_already_running"))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn atomic_write(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    if !wire::valid_ulid(name) {
+        return Err(WorkflowError("invalid_workflow_id"));
+    }
+    lockyard_core::fsio::replace(&directory.join(name), bytes, 0o600).map_err(io)
+}
+
+#[cfg(windows)]
+pub fn stage_context(job_dir: &Path, inputs: &[WorkflowInput]) -> Result<Option<PathBuf>> {
+    if inputs.is_empty() {
+        return Ok(None);
+    }
+    validate_inputs(inputs)?;
+    let bytes = serde_json::to_vec(&WorkflowContext {
+        version: 1,
+        inputs: inputs.to_vec(),
+    })
+    .map_err(|_| WorkflowError("invalid_workflow_inputs"))?;
+    if bytes.len() > MAX_DEFINITION_BYTES {
+        return Err(WorkflowError("workflow_inputs_too_large"));
+    }
+    let directory = job_dir.join("runtime-context");
+    private_dir(&directory)?;
+    let destination = directory.join("workflow-inputs.json");
+    if destination.exists() {
+        if read_private(&destination, MAX_DEFINITION_BYTES as u64)? != bytes {
+            return Err(WorkflowError("workflow_input_context_conflict"));
+        }
+        lockyard_core::fsio::sync_path(&directory).map_err(io)?;
+        return Ok(Some(destination));
+    }
+    let temporary = directory.join(format!(
+        ".{}.tmp",
+        wire::new_id().map_err(|_| WorkflowError("workflow_entropy_unavailable"))?
+    ));
+    let mut file = lockyard_core::windows::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(io)?;
+    let result = (|| {
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(io)?;
+        lockyard_core::windows::rename_create_only(&temporary, &destination).map_err(io)?;
+        lockyard_core::fsio::sync_path(&directory).map_err(io)
+    })();
+    let _ = fs::remove_file(&temporary);
+    let _ = lockyard_core::fsio::sync_path(&directory);
+    result?;
+    Ok(Some(destination))
+}
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
+
+#[cfg(unix)]
+use std::io::Read;
 
 #[cfg(test)]
 mod tests {
@@ -2452,8 +2531,12 @@ mod tests {
     }
     impl FixtureDriver {
         fn new(root: &Path) -> Self {
+            #[cfg(unix)]
             use std::os::unix::fs::PermissionsExt;
+            #[cfg(unix)]
             fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+            #[cfg(windows)]
+            lockyard_core::windows::secure_owned(root).unwrap();
             Self {
                 root: root.into(),
                 key: SigningKey::generate(&root.join("signing.pk8")).unwrap(),

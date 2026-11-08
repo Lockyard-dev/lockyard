@@ -8,7 +8,7 @@ use lockyard_node::{
 };
 use serde_json::{Value, json};
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self},
     io::{Read, Write},
     path::{Path, PathBuf},
 };
@@ -18,7 +18,11 @@ mod approvals;
 #[path = "node_cli_rotation.rs"]
 mod key_rotation;
 
+#[cfg(unix)]
 #[path = "node_download.rs"]
+mod download;
+#[cfg(windows)]
+#[path = "node_download_windows.rs"]
 mod download;
 
 #[path = "node_install.rs"]
@@ -466,7 +470,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    fs::File::open(parent)?.sync_all()?;
+    lockyard_core::fsio::sync_path(parent)?;
     Ok(())
 }
 pub fn node(command: NodeCommand) -> Result<Value> {
@@ -603,7 +607,7 @@ pub fn node(command: NodeCommand) -> Result<Value> {
             }
             #[cfg(not(unix))]
             {
-                fs::create_dir(&state_dir)?;
+                lockyard_core::windows::private_dir(&state_dir)?;
             }
             let identity = quic::generate_identity(&state_dir, vec![tls_name])
                 .map_err(|_| invalid("cannot create node identity"))?;
@@ -890,6 +894,7 @@ fn read_prompt(path: &Path) -> Result<String> {
 }
 // The private receipt is durable before the control socket sees the request. Its keyed
 // fingerprint binds all fields including the prompt without storing the prompt itself.
+#[cfg(unix)]
 fn secure_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if !path.exists() {
@@ -911,6 +916,7 @@ fn secure_dir(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(unix)]
 fn read_private(path: &Path, max: u64) -> Result<Vec<u8>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let f = OpenOptions::new()
@@ -939,7 +945,7 @@ fn receipt_dir(config: Option<PathBuf>) -> Result<PathBuf> {
     secure_dir(&config.state_dir)?;
     let dir = config.state_dir.join("submissions");
     secure_dir(&dir)?;
-    fs::File::open(&config.state_dir)?.sync_all()?;
+    lockyard_core::fsio::sync_path(&config.state_dir)?;
     Ok(dir)
 }
 fn fingerprint_key(dir: &Path) -> Result<Vec<u8>> {
@@ -960,14 +966,17 @@ fn fingerprint_key(dir: &Path) -> Result<Vec<u8>> {
         wire::new_id().map_err(|_| invalid("cannot generate submission key"))?
     ));
     write_new(&tmp, &key)?;
+    #[cfg(unix)]
     let link = fs::hard_link(&tmp, &path);
+    #[cfg(windows)]
+    let link = lockyard_core::windows::rename_create_only(&tmp, &path);
     let _ = fs::remove_file(&tmp);
     if let Err(e) = link
         && e.kind() != std::io::ErrorKind::AlreadyExists
     {
         return Err(e.into());
     }
-    fs::File::open(dir)?.sync_all()?;
+    lockyard_core::fsio::sync_path(dir)?;
     let key = read_private(&path, 32)?;
     if key.len() != 32 {
         return Err(invalid("invalid submission fingerprint key"));
@@ -1006,7 +1015,10 @@ fn prepare_receipt(config: Option<PathBuf>, target: &str, spec: &JobSpec) -> Res
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
+    #[cfg(unix)]
     let linked = fs::hard_link(&tmp, &path);
+    #[cfg(windows)]
+    let linked = lockyard_core::windows::rename_create_only(&tmp, &path);
     let _ = fs::remove_file(&tmp);
     if let Err(error) = linked
         && error.kind() != std::io::ErrorKind::AlreadyExists
@@ -1022,7 +1034,7 @@ fn prepare_receipt(config: Option<PathBuf>, target: &str, spec: &JobSpec) -> Res
     {
         return Err(invalid("job ID already belongs to a different submission"));
     }
-    fs::File::open(&dir)?.sync_all()?;
+    lockyard_core::fsio::sync_path(&dir)?;
     Ok(path)
 }
 pub fn receipts(config: Option<PathBuf>, id: Option<&str>) -> Result<Value> {
@@ -1512,3 +1524,18 @@ pub fn native_doctor(path: &Path) -> Result<Value> {
         json!({"healthy": healthy, "native_executor": runners, "build": lockyard_core::build_info()}),
     )
 }
+
+#[cfg(windows)]
+fn secure_dir(path: &Path) -> Result<()> {
+    Ok(lockyard_core::windows::private_dir(path)?)
+}
+
+#[cfg(windows)]
+fn read_private(path: &Path, max: u64) -> Result<Vec<u8>> {
+    Ok(lockyard_core::windows::read_private(path, max)?)
+}
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;

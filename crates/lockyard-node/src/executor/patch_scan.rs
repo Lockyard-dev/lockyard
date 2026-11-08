@@ -268,6 +268,7 @@ pub(super) fn patch_git_scan_blob(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 pub(super) fn scan_credential_stream(
     reader: impl Read,
     secrets: &[Vec<u8>],

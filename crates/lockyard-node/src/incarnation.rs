@@ -18,14 +18,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
 };
+
+#[cfg(unix)]
+use std::io::Read;
 
 const PROOF_DOMAIN: &str = "node-identity-v1";
 const MAX_BINDINGS: usize = 100_000;
@@ -229,6 +232,7 @@ struct DispatchSummary {
     manual_review_after_ms: Option<u64>,
 }
 
+#[cfg(unix)]
 fn private(path: &Path, limit: u64) -> Result<Vec<u8>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = OpenOptions::new()
@@ -285,7 +289,7 @@ fn private(path: &Path, limit: u64) -> Result<Vec<u8>> {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
-            File::open(parent)?.sync_all()?;
+            lockyard_core::fsio::sync_path(parent)?;
         }
         metadata = file.metadata()?;
     }
@@ -304,6 +308,7 @@ fn private(path: &Path, limit: u64) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+#[cfg(unix)]
 fn directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if !path.exists() {
@@ -323,9 +328,10 @@ fn directory(path: &Path) -> Result<()> {
     }
     // A creator may have died after mkdir. Sync every parent in the short private
     // chain before any route below it is treated as durable and sent remotely.
-    File::open(path.parent().ok_or("invalid incarnation directory")?)?.sync_all()?;
+    lockyard_core::fsio::sync_path(path.parent().ok_or("invalid incarnation directory")?)?;
     Ok(())
 }
+#[cfg(unix)]
 fn publish(path: &Path, bytes: &[u8]) -> Result<bool> {
     use std::os::unix::fs::OpenOptionsExt;
     let parent = path.parent().ok_or("invalid incarnation path")?;
@@ -345,13 +351,13 @@ fn publish(path: &Path, bytes: &[u8]) -> Result<bool> {
         Err(error) => Err(error),
     };
     // Every contender establishes durability, including a creator killed after linking.
-    File::open(parent)?.sync_all()?;
+    lockyard_core::fsio::sync_path(parent)?;
     match fs::remove_file(temporary) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    File::open(parent)?.sync_all()?;
+    lockyard_core::fsio::sync_path(parent)?;
     linked.map_err(Into::into)
 }
 fn fingerprint_key(root: &Path) -> Result<Vec<u8>> {
@@ -367,7 +373,7 @@ fn fingerprint_key(root: &Path) -> Result<Vec<u8>> {
     if bytes.len() != 32 {
         return Err("invalid incarnation fingerprint key".into());
     }
-    File::open(root)?.sync_all()?;
+    lockyard_core::fsio::sync_path(root)?;
     Ok(bytes)
 }
 fn counter(routes: &Path) -> Result<Arc<AtomicUsize>> {
@@ -484,7 +490,7 @@ pub fn has_binding(config: &NodeConfig, job_id: &str) -> Result<bool> {
     {
         return Err("invalid durable job incarnation binding".into());
     }
-    File::open(routes)?.sync_all()?;
+    lockyard_core::fsio::sync_path(routes)?;
     Ok(true)
 }
 
@@ -689,9 +695,9 @@ pub(crate) async fn target_pin_bound(
                     "job ID cannot be retried with a changed specification or incarnation".into(),
                 );
             }
-            File::open(&submissions)?.sync_all()?;
+            lockyard_core::fsio::sync_path(&submissions)?;
         }
-        File::open(&routes)?.sync_all()?;
+        lockyard_core::fsio::sync_path(&routes)?;
         Ok(chosen)
     })
     .await
@@ -757,6 +763,7 @@ fn load_submission(path: &Path) -> Result<Submission> {
     }
     Ok(value)
 }
+#[cfg(unix)]
 fn replace_submission(directory: &Path, submission: &Submission) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let temporary = directory.join(format!(".incarnation-{}.partial", wire::new_id()?));
@@ -769,8 +776,8 @@ fn replace_submission(directory: &Path, submission: &Submission) -> Result<()> {
     file.write_all(&serde_json::to_vec(submission)?)?;
     file.sync_all()?;
     drop(file);
-    fs::rename(&temporary, directory.join(&submission.job_id))?;
-    File::open(directory)?.sync_all()?;
+    lockyard_core::fsio::rename(&temporary, directory.join(&submission.job_id))?;
+    lockyard_core::fsio::sync_path(directory)?;
     Ok(())
 }
 
@@ -860,8 +867,17 @@ pub(crate) fn pending_submissions(config: &NodeConfig) -> Result<Vec<PendingSubm
             .and_then(|name| name.strip_suffix(".partial"))
             .is_some_and(wire::valid_ulid)
         {
+            #[cfg(unix)]
             use std::os::unix::fs::MetadataExt;
             let metadata = fs::symlink_metadata(entry.path())?;
+            #[cfg(windows)]
+            {
+                lockyard_core::windows::require_private(&entry.path())?;
+                if !metadata.is_file() || metadata.len() > 8192 {
+                    return Err("invalid outbound temporary publication".into());
+                }
+            }
+            #[cfg(unix)]
             if !metadata.is_file()
                 || metadata.file_type().is_symlink()
                 || metadata.uid() != unsafe { libc::geteuid() }
@@ -903,6 +919,7 @@ pub fn unresolved_dispatches(config: &NodeConfig) -> Result<usize> {
 
 /// Offline installers retain this lock in addition to the exclusive Host lock.
 /// Every accepted outbound submit must have an authenticated signed terminal receipt.
+#[cfg(unix)]
 fn job_lock(root: &Path, job_id: &str) -> Result<File> {
     use std::os::{
         fd::AsRawFd,
@@ -936,6 +953,7 @@ fn job_lock(root: &Path, job_id: &str) -> Result<File> {
     Ok(file)
 }
 
+#[cfg(unix)]
 fn dispatch_lock(root: &Path, exclusive: bool) -> Result<File> {
     use std::os::{
         fd::AsRawFd,
@@ -970,7 +988,7 @@ fn dispatch_lock(root: &Path, exclusive: bool) -> Result<File> {
     {
         return Err("outbound dispatch reconciliation is active".into());
     }
-    File::open(root)?.sync_all()?;
+    lockyard_core::fsio::sync_path(root)?;
     Ok(file)
 }
 pub fn offline_dispatch_guard(config: &NodeConfig) -> Result<File> {
@@ -1452,6 +1470,83 @@ pub(crate) fn dispatch_control_with_local(
     }
 }
 
+#[cfg(windows)]
+fn private(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    Ok(lockyard_core::windows::read_private(path, limit)?)
+}
+
+#[cfg(windows)]
+fn directory(path: &Path) -> Result<()> {
+    Ok(lockyard_core::windows::private_dir(path)?)
+}
+
+#[cfg(windows)]
+fn publish(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let parent = path.parent().ok_or("invalid incarnation path")?;
+    lockyard_core::windows::require_private(parent)?;
+    let temporary = parent.join(format!(".incarnation-{}.partial", wire::new_id()?));
+    let mut file = lockyard_core::windows::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    let result = match lockyard_core::windows::rename_create_only(&temporary, path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e.into()),
+    };
+    let _ = fs::remove_file(temporary);
+    result
+}
+
+#[cfg(windows)]
+fn replace_submission(directory: &Path, submission: &Submission) -> Result<()> {
+    Ok(lockyard_core::fsio::replace(
+        &directory.join(&submission.job_id),
+        &serde_json::to_vec(submission)?,
+        0o600,
+    )?)
+}
+
+#[cfg(windows)]
+fn job_lock(root: &Path, job_id: &str) -> Result<File> {
+    if !wire::valid_ulid(job_id) {
+        return Err("invalid stable outbound job ID".into());
+    }
+    let dir = root.join("locks");
+    directory(&dir)?;
+    let stripe = ring::digest::digest(&ring::digest::SHA256, job_id.as_bytes()).as_ref()[0] % 64;
+    let file = lockyard_core::windows::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(dir.join(format!("{stripe:02}")))?;
+    file.lock()?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn dispatch_lock(root: &Path, exclusive: bool) -> Result<File> {
+    let file = lockyard_core::windows::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(root.join(".offline-lock"))?;
+    if exclusive {
+        file.try_lock()
+            .map_err(|_| "outbound dispatch reconciliation is active")?;
+    } else {
+        file.try_lock_shared()
+            .map_err(|_| "outbound dispatch reconciliation is active")?;
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1646,6 +1741,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn publication_crash_alias_is_recovered_but_arbitrary_hardlink_is_rejected() {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let root = tempfile::tempdir().unwrap();
@@ -1673,6 +1769,7 @@ mod tests {
         assert!(private(&final_path, 128).is_err());
         assert!(arbitrary.exists());
     }
+    #[cfg(unix)]
     fn signed_terminal(
         config: &mut NodeConfig,
         spec: &crate::wire::JobSpec,
@@ -1694,6 +1791,7 @@ mod tests {
         record
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn expired_receipt_settles_only_exact_signed_dispatch_and_legacy_manifest() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
@@ -1853,6 +1951,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn outbound_maintenance_fence_requires_exact_pinned_signed_terminal_result() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();

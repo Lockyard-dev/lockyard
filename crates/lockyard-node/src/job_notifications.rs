@@ -8,13 +8,16 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self},
     io::Write,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+#[cfg(windows)]
+use std::fs::File;
 
 const CAPACITY: usize = 2000;
 const DAY: u64 = 24 * 60 * 60 * 1000;
@@ -84,7 +87,7 @@ impl Outbox {
             }
         }
         if removed {
-            File::open(directory)?.sync_all()?;
+            lockyard_core::fsio::sync_path(directory)?;
         }
         let path = directory.join("job-notifications.json");
         let now = now_ms()?;
@@ -159,17 +162,15 @@ impl Outbox {
         let temporary = self
             .directory
             .join(format!(".job-notifications-{}.tmp", wire::new_id()?));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)?;
+        let mut options = OpenOptions::new();
+        #[cfg(unix)]
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.write(true).create_new(true).open(&temporary)?;
         let result = (|| -> Result<()> {
             file.write_all(&bytes)?;
             file.sync_all()?;
-            fs::rename(&temporary, self.directory.join("job-notifications.json"))?;
-            File::open(&self.directory)?.sync_all()?;
+            lockyard_core::fsio::rename(&temporary, self.directory.join("job-notifications.json"))?;
+            lockyard_core::fsio::sync_path(&self.directory)?;
             Ok(())
         })();
         if result.is_err() {
@@ -344,6 +345,14 @@ pub(crate) fn disable_if_present(directory: &Path, pin: &str) -> Result<()> {
         Err(_) => Err("cannot inspect job notification outbox".into()),
     }
 }
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 
 #[cfg(test)]
 mod tests {

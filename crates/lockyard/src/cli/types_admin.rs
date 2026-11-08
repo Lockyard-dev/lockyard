@@ -66,6 +66,10 @@ pub(super) enum PresenceCommand {
 
 #[derive(Args)]
 pub(super) struct AgentArgs {
+    /// Private credential reference used by the native Windows scheduled task.
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    pub(super) service_token_file: Option<PathBuf>,
     #[command(subcommand)]
     pub(super) command: Option<AgentCommand>,
 }

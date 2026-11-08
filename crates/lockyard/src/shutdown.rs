@@ -20,6 +20,16 @@ extern "C" fn request(_signal: libc::c_int) {
     REQUESTED.store(true, Ordering::Relaxed);
 }
 
+#[cfg(windows)]
+unsafe extern "system" fn console_request(event: u32) -> i32 {
+    if matches!(event, 0 | 1 | 2 | 5 | 6) {
+        REQUESTED.store(true, Ordering::Relaxed);
+        1
+    } else {
+        0
+    }
+}
+
 /// Declare before worker/runtime/store owners: they must stop before its final checkpoint.
 pub(crate) struct Guard {
     cwd: PathBuf,
@@ -52,15 +62,20 @@ impl Guard {
                 previous: [(libc::SIGINT, interrupt), (libc::SIGTERM, terminate)],
             })
         }
-        #[cfg(not(unix))]
-        Ok(Self {
-            cwd: cwd.to_path_buf(),
-        })
+        #[cfg(windows)]
+        {
+            lockyard_core::windows::console_handler(console_request, true)?;
+            Ok(Self {
+                cwd: cwd.to_path_buf(),
+            })
+        }
     }
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        let _ = lockyard_core::windows::console_handler(console_request, false);
         if let Err(error) = lockyard_core::Store::checkpoint_on_shutdown(&self.cwd) {
             eprintln!(
                 "lockyard shutdown: WAL checkpoint incomplete; retain database sidecars: {error}"

@@ -8,7 +8,6 @@ pub use lockyard_cloud_client::revocations::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -24,6 +23,10 @@ fn poll() -> u64 {
 fn offline() -> u64 {
     600
 }
+#[cfg(unix)]
+#[cfg(windows)]
+use std::fs::File;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevocationConfig {
@@ -97,6 +100,8 @@ pub struct RevocationManager {
 impl RevocationManager {
     pub fn open(config: RevocationConfig, state_dir: &Path) -> Result<Arc<Self>> {
         config.validate()?;
+        #[cfg(windows)]
+        lockyard_core::windows::private_dir(state_dir)?;
         if !state_dir.exists() {
             #[cfg(unix)]
             {
@@ -566,8 +571,8 @@ impl RevocationManager {
         let mut file = options.open(&temp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        std::fs::rename(&temp, &self.path)?;
-        File::open(self.path.parent().ok_or("revocation_state_unavailable")?)?.sync_all()?;
+        lockyard_core::fsio::rename(&temp, &self.path)?;
+        lockyard_core::fsio::sync_path(self.path.parent().ok_or("revocation_state_unavailable")?)?;
         Ok(())
     }
 }
@@ -583,3 +588,8 @@ fn add_pins(state: &mut State, page: &RevocationPage) {
         }
     }
 }
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;

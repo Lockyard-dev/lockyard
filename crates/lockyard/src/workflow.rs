@@ -8,7 +8,7 @@ use lockyard_core::task_id::{BusTaskId, TaskId};
 use lockyard_core::{Backend, Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -693,9 +693,9 @@ fn save(dir: &Path, path: &Path, value: &Value) -> Result<()> {
         let mut file = private_new(&temporary)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
+        lockyard_core::fsio::rename(&temporary, path)?;
         #[cfg(unix)]
-        File::open(dir)?.sync_all()?;
+        lockyard_core::fsio::sync_path(dir)?;
         Ok(())
     })();
     if result.is_err() {
@@ -754,6 +754,11 @@ fn definite_step_failure(error: &Error) -> bool {
         _ => false,
     }
 }
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 
 #[cfg(test)]
 mod tests {

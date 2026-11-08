@@ -45,7 +45,11 @@ fn assert_snapshot_contents(snapshot: &Path) {
     let restored = tempfile::tempdir().unwrap();
     let state = restored.path().join(DIR_NAME);
     fs::create_dir(&state).unwrap();
+    #[cfg(windows)]
+    lockyard_core::windows::private_dir(&state).unwrap();
     fs::copy(snapshot, state.join("lockyard.db")).unwrap();
+    #[cfg(windows)]
+    lockyard_core::windows::secure_owned(&state.join("lockyard.db")).unwrap();
     // Rollback-journal format guarantees this file can be opened without a retained source WAL.
     let bytes = fs::read(snapshot).unwrap();
     assert_eq!(&bytes[18..20], &[1, 1]);

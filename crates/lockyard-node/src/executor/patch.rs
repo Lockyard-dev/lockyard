@@ -3,6 +3,7 @@
 use super::*;
 
 #[cfg(test)]
+#[cfg(unix)]
 pub(super) fn collect_patch(
     profile: &ContainerProfile,
     job_dir: &Path,

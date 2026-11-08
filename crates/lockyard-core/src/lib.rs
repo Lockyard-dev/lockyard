@@ -23,6 +23,8 @@ mod store;
 pub mod task_id;
 pub mod tasks;
 pub mod watch;
+#[cfg(windows)]
+pub mod windows;
 pub mod zones;
 
 pub use backend::{

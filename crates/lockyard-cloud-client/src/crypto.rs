@@ -1146,66 +1146,6 @@ fn decrypt_compatible(
     }
 }
 
-#[cfg(test)]
-mod w4_owner_contract_tests {
-    use super::*;
-
-    #[test]
-    fn owner_close_canonical_aad_round_trips_across_rust_and_web() {
-        let key = WorkspaceKey::from_entropy([18; 32]);
-        let mut value =
-            serde_json::json!({"owner_word":"owner approved", "expected_version":1, "direct":true});
-        transform_fields_policy(
-            &mut value,
-            "POST",
-            "/api/v1/registry/items/FE-1/owner-close",
-            "w",
-            Some(&key),
-            true,
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            key.decrypt("w", "owner_word", value["owner_word"].as_str().unwrap())
-                .unwrap(),
-            "owner approved"
-        );
-        let wrong = WorkspaceKey::from_entropy([19; 32]);
-        let mut tampered = serde_json::json!({"id":"FE-1","evidence":[{"kind":"decision","source":"direct_owner","value":wrong.encrypt("w","owner_word","private").unwrap()}]});
-        assert!(
-            transform_fields_policy(
-                &mut tampered,
-                "GET",
-                "/api/v1/registry/items/FE-1",
-                "w",
-                Some(&key),
-                false,
-                false
-            )
-            .is_err(),
-            "owner-context auth failures must not become display placeholders"
-        );
-        decision_without_owner_source_never_reads_owner_word_aad();
-    }
-
-    fn decision_without_owner_source_never_reads_owner_word_aad() {
-        let key = WorkspaceKey::from_entropy([18; 32]);
-        let mut value = serde_json::json!({"id":"FE-1", "evidence":[{"kind":"decision", "source":"agent", "value":key.encrypt("w", "owner_word", "private").unwrap()}]});
-        assert!(
-            transform_fields_policy(
-                &mut value,
-                "GET",
-                "/api/v1/registry/items/FE-1",
-                "w",
-                Some(&key),
-                false,
-                true
-            )
-            .is_err()
-        );
-    }
-}
-
 fn decrypt_event_field_alias(
     value: &mut Value,
     name: &str,
@@ -1539,11 +1479,11 @@ impl WorkspaceKey {
         entropy_to_phrase(&self.0)
     }
     pub fn store_for_workspace(&self, workspace: &str) -> Result<(), String> {
-        use std::fs;
         let destination = Self::storage_path(workspace)?;
         let directory = destination.parent().ok_or("invalid key directory")?;
         #[cfg(unix)]
         {
+            use std::fs;
             use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
             fs::DirBuilder::new()
                 .recursive(true)
@@ -1569,20 +1509,9 @@ impl WorkspaceKey {
                     .map_err(|_| "cannot secure key directory")?;
             }
         }
-        #[cfg(not(unix))]
-        {
-            use std::io::Write;
-            fs::create_dir_all(directory).map_err(|_| "cannot create key directory")?;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(destination)
-                .map_err(|_| "cannot create workspace key")?;
-            file.write_all(&self.0)
-                .and_then(|()| file.sync_all())
-                .map_err(|_| "cannot write workspace key")
-        }
-        #[cfg(unix)]
+        #[cfg(windows)]
+        lockyard_core::windows::private_dir(directory)
+            .map_err(|_| "cannot secure key directory")?;
         self.copy_to_private(&destination)
     }
     /// Location of the current workspace key; no key bytes or recovery words are returned.
@@ -1597,7 +1526,8 @@ impl WorkspaceKey {
         }
         let base = match std::env::var_os("XDG_CONFIG_HOME") {
             Some(p) if !p.is_empty() => PathBuf::from(p),
-            _ => PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(".config"),
+            _ => PathBuf::from(lockyard_core::paths::home_dir().ok_or("HOME is not set")?)
+                .join(".config"),
         };
         if !base.is_absolute() {
             return Err("workspace key directory must be absolute".into());
@@ -1609,8 +1539,8 @@ impl WorkspaceKey {
     }
     /// Bounded file-descriptor validation prevents symlink, FIFO and metadata replacement races.
     pub fn load_private(path: &std::path::Path) -> Result<Option<Self>, String> {
-        use std::{fs, io::Read};
-        let mut options = fs::OpenOptions::new();
+        use std::io::Read;
+        let mut options = StateOpenOptions::new();
         options.read(true);
         #[cfg(unix)]
         {
@@ -1675,7 +1605,7 @@ impl WorkspaceKey {
             .fill(&mut nonce)
             .map_err(|_| "key staging random source unavailable")?;
         let staged = parent.join(format!(".lykey-stage-{}", base64url(&nonce)));
-        let mut file = fs::OpenOptions::new()
+        let mut file = StateOpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
@@ -1705,9 +1635,33 @@ impl WorkspaceKey {
         Ok(())
     }
 
-    #[cfg(not(unix))]
-    pub fn copy_to_private(&self, _: &std::path::Path) -> Result<(), String> {
-        Err("private key staging requires Unix ownership checks".into())
+    #[cfg(windows)]
+    pub fn copy_to_private(&self, destination: &std::path::Path) -> Result<(), String> {
+        use std::io::Write;
+        if !destination.is_absolute() {
+            return Err("key destination must be absolute".into());
+        }
+        let parent = destination.parent().ok_or("invalid key destination")?;
+        lockyard_core::windows::require_private(parent)
+            .map_err(|_| "key staging directory must be private and owned")?;
+        lockyard_core::windows::reject_reparse(destination)
+            .map_err(|_| "key destination contains reparse points")?;
+        let staged = parent.join(format!(".lykey-stage-{}", crate::ulid()));
+        let result = (|| {
+            let mut file = StateOpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged)
+                .map_err(|_| "cannot create private key copy")?;
+            file.write_all(&self.0)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| "cannot write private key copy")?;
+            lockyard_core::windows::rename_create_only(&staged, destination)
+                .map_err(|_| "cannot publish private key copy")?;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(staged);
+        result
     }
     pub fn key_id(&self) -> String {
         let k = hmac::Key::new(hmac::HMAC_SHA256, &self.0);
@@ -1858,6 +1812,71 @@ fn unbase64url(s: &str) -> Result<Vec<u8>, String> {
         return Err("noncanonical base64".into());
     }
     Ok(o)
+}
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions as StateOpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions as StateOpenOptions;
+
+#[cfg(test)]
+mod w4_owner_contract_tests {
+    use super::*;
+
+    #[test]
+    fn owner_close_canonical_aad_round_trips_across_rust_and_web() {
+        let key = WorkspaceKey::from_entropy([18; 32]);
+        let mut value =
+            serde_json::json!({"owner_word":"owner approved", "expected_version":1, "direct":true});
+        transform_fields_policy(
+            &mut value,
+            "POST",
+            "/api/v1/registry/items/FE-1/owner-close",
+            "w",
+            Some(&key),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            key.decrypt("w", "owner_word", value["owner_word"].as_str().unwrap())
+                .unwrap(),
+            "owner approved"
+        );
+        let wrong = WorkspaceKey::from_entropy([19; 32]);
+        let mut tampered = serde_json::json!({"id":"FE-1","evidence":[{"kind":"decision","source":"direct_owner","value":wrong.encrypt("w","owner_word","private").unwrap()}]});
+        assert!(
+            transform_fields_policy(
+                &mut tampered,
+                "GET",
+                "/api/v1/registry/items/FE-1",
+                "w",
+                Some(&key),
+                false,
+                false
+            )
+            .is_err(),
+            "owner-context auth failures must not become display placeholders"
+        );
+        decision_without_owner_source_never_reads_owner_word_aad();
+    }
+
+    fn decision_without_owner_source_never_reads_owner_word_aad() {
+        let key = WorkspaceKey::from_entropy([18; 32]);
+        let mut value = serde_json::json!({"id":"FE-1", "evidence":[{"kind":"decision", "source":"agent", "value":key.encrypt("w", "owner_word", "private").unwrap()}]});
+        assert!(
+            transform_fields_policy(
+                &mut value,
+                "GET",
+                "/api/v1/registry/items/FE-1",
+                "w",
+                Some(&key),
+                false,
+                true
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

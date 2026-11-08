@@ -15,30 +15,6 @@ use crate::proto::{
 use crate::{Error, Result, Store, ZonePath, bus, coordination, tasks, zones};
 use serde_json::Value;
 
-#[cfg(test)]
-mod w4_contract_tests {
-    use super::*;
-
-    #[test]
-    fn local_task_lookup_never_discards_area_prefix() {
-        let (_dir, mut store) = crate::store::test_store();
-        let task = store.add_task("lead", "local", "", 0).unwrap();
-        assert!(Backend::task(&store, &task.id).is_ok());
-        for foreign in ["FE-1", "D-01", "FE-0001"] {
-            assert!(
-                matches!(Backend::task(&store, foreign), Err(Error::NotFound(_))),
-                "{foreign} must not resolve to {}",
-                task.id
-            );
-            assert!(Backend::claim_task(&mut store, "worker", foreign, 10, 1).is_err());
-        }
-        assert_eq!(
-            Backend::task(&store, &task.id).unwrap().status,
-            tasks::Status::Open
-        );
-    }
-}
-
 fn cloud<T>(feature: &str) -> Result<T> {
     Err(Error::needs_cloud(feature))
 }
@@ -906,6 +882,30 @@ impl Backend for Store {
                 activity: None,
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod w4_contract_tests {
+    use super::*;
+
+    #[test]
+    fn local_task_lookup_never_discards_area_prefix() {
+        let (_dir, mut store) = crate::store::test_store();
+        let task = store.add_task("lead", "local", "", 0).unwrap();
+        assert!(Backend::task(&store, &task.id).is_ok());
+        for foreign in ["FE-1", "D-01", "FE-0001"] {
+            assert!(
+                matches!(Backend::task(&store, foreign), Err(Error::NotFound(_))),
+                "{foreign} must not resolve to {}",
+                task.id
+            );
+            assert!(Backend::claim_task(&mut store, "worker", foreign, 10, 1).is_err());
+        }
+        assert_eq!(
+            Backend::task(&store, &task.id).unwrap().status,
+            tasks::Status::Open
+        );
     }
 }
 

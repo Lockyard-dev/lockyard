@@ -7,19 +7,29 @@ use super::wire::{AgentStatus, Envelope, Reply, Request};
 use lockyard_cloud_client::{Call, ClientError, Transport};
 use lockyard_core::proto::PathCheck;
 use serde_json::Value;
+#[cfg(unix)]
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+#[cfg(windows)]
+use lockyard_core::windows::ipc::LocalStream as UnixStream;
 
 pub struct AgentSocket {
     path: PathBuf,
     workspace: String,
     timeout: Duration,
+    #[cfg(windows)]
+    state_root: PathBuf,
 }
 
 impl AgentSocket {
@@ -29,11 +39,34 @@ impl AgentSocket {
             path: path.to_path_buf(),
             workspace: workspace.to_string(),
             timeout,
+            #[cfg(windows)]
+            state_root: super::state_root().ok()?,
         };
-        let status = socket.ping().ok()?;
+        socket.match_target(url, workspace)
+    }
+
+    fn match_target(self, url: &str, workspace: &str) -> Option<Self> {
+        let status = self.ping().ok()?;
         (status.url.trim_end_matches('/') == url.trim_end_matches('/')
             && status.workspace == workspace)
-            .then_some(socket)
+            .then_some(self)
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn connect_in_state(
+        path: &Path,
+        url: &str,
+        workspace: &str,
+        timeout: Duration,
+        state_root: &Path,
+    ) -> Option<Self> {
+        Self {
+            path: path.to_path_buf(),
+            workspace: workspace.to_string(),
+            timeout,
+            state_root: state_root.to_path_buf(),
+        }
+        .match_target(url, workspace)
     }
 
     /// The token this process runs under. Calls through it carry that token's role, not the caller's.
@@ -47,6 +80,8 @@ impl AgentSocket {
             path: path.to_path_buf(),
             workspace: String::new(),
             timeout,
+            #[cfg(windows)]
+            state_root: super::state_root()?,
         }
         .ping()
     }
@@ -60,6 +95,7 @@ impl AgentSocket {
 
     /// The default folder sits in `/tmp`, where anyone could prepare it first. A process listening in a
     /// folder this user does not alone control could pose as the agent and read mail, so it is refused.
+    #[cfg(unix)]
     fn trust_folder(&self) -> io::Result<()> {
         let folder = self
             .path
@@ -75,6 +111,11 @@ impl AgentSocket {
         ))
     }
 
+    #[cfg(windows)]
+    fn trust_folder(&self) -> io::Result<()> {
+        trust_windows_endpoint(&self.path, &self.state_root)
+    }
+
     fn line(&self, request: &Request) -> io::Result<Vec<u8>> {
         let envelope = Envelope {
             workspace: self.workspace.clone(),
@@ -86,6 +127,8 @@ impl AgentSocket {
     }
 
     fn open(&self) -> io::Result<UnixStream> {
+        #[cfg(windows)]
+        self.trust_folder()?;
         let stream = connect_bounded(&self.path, self.timeout)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
@@ -123,6 +166,33 @@ impl AgentSocket {
     }
 }
 
+#[cfg(windows)]
+fn trust_windows_endpoint(path: &Path, state_root: &Path) -> io::Result<()> {
+    use lockyard_core::windows;
+    // A named pipe has no filesystem parent. Its environment is the agent's
+    // private state directory and its current-user SID namespace.
+    windows::require_private_directory(state_root)?;
+    let text = path.to_string_lossy();
+    let pipe = if text.starts_with(r"\\.\pipe\") {
+        path.to_path_buf()
+    } else {
+        // Match ipc::endpoint for callers that name a pipe with an opaque path.
+        windows::pipe_path(&text)?
+    };
+    let prefix = format!(r"\\.\pipe\lockyard-{}-", windows::user_id()?);
+    let pipe = pipe.to_string_lossy();
+    if pipe.strip_prefix(&prefix).is_some_and(|suffix| {
+        suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "agent endpoint is outside this user's pipe namespace",
+    ))
+}
+
+#[cfg(unix)]
 fn connect_bounded(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let bytes = path.as_os_str().as_bytes();
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -211,6 +281,11 @@ fn connect_bounded(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     Ok(UnixStream::from(owned))
 }
 
+#[cfg(windows)]
+fn connect_bounded(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    UnixStream::connect_timeout(path, timeout)
+}
+
 impl Transport for AgentSocket {
     fn call(&self, call: &Call) -> Result<Value, ClientError> {
         let reply = self.ask_for(&Request::Call { call: call.clone() })?;
@@ -272,7 +347,7 @@ impl Transport for AgentSocket {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -380,5 +455,36 @@ mod tests {
             }
         }
         assert!(bounded, "listener backlog never filled");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use lockyard_core::windows;
+
+    #[test]
+    fn endpoint_trust_requires_a_private_state_directory_and_our_pipe_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let endpoint = windows::pipe_path("trust-regression").unwrap();
+        assert!(trust_windows_endpoint(&endpoint, &state).is_err());
+        windows::private_dir(&state).unwrap();
+        trust_windows_endpoint(&endpoint, &state).unwrap();
+        assert!(
+            trust_windows_endpoint(
+                Path::new(r"\\.\pipe\lockyard-S-1-1-0-0123456789abcdef"),
+                &state
+            )
+            .is_err()
+        );
+        assert!(trust_windows_endpoint(Path::new(r"\\.\pipe\foreign-agent"), &state).is_err());
+        let grant = std::process::Command::new("icacls.exe")
+            .arg(&state)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
+            .status()
+            .unwrap();
+        assert!(grant.success(), "cannot expose fixture directory");
+        assert!(trust_windows_endpoint(&endpoint, &state).is_err());
     }
 }

@@ -57,7 +57,7 @@ mod linux {
     use super::*;
     use serde_json::json;
     use std::{
-        fs::{self, File, OpenOptions},
+        fs,
         io::{Read, Write},
         os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         path::PathBuf,
@@ -204,7 +204,7 @@ mod linux {
                 Err(error) => return Err(Error::Io(error)),
             }
             fs::remove_file(&temporary.0)?;
-            File::open(directory)?.sync_all()?;
+            lockyard_core::fsio::sync_path(directory)?;
         }
         parser(&parser_path, &target, false)?;
         Ok(
@@ -213,6 +213,9 @@ mod linux {
         )
     }
 }
+
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
 
 #[cfg(test)]
 mod tests {

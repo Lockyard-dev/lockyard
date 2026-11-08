@@ -98,7 +98,7 @@ impl MachineConfig {
         let xdg = std::env::var_os("XDG_CONFIG_HOME")
             .filter(|v| !v.is_empty())
             .map(std::path::PathBuf::from);
-        let home = std::env::var_os("HOME")
+        let home = crate::paths::home_dir()
             .filter(|v| !v.is_empty())
             .map(std::path::PathBuf::from);
         Self::config_path(xdg.as_deref(), home.as_deref())

@@ -13,7 +13,6 @@ pub(super) fn env_lockyard_agent() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-#[cfg(unix)]
 pub(super) fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
     use agent::daemon::{AgentConfig, Daemon};
     use agent::service;
@@ -28,20 +27,33 @@ pub(super) fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
         }
         Ok((root, config))
     };
+    #[cfg(windows)]
+    if args.service_token_file.is_some() && args.command.is_some() {
+        return Err(Error::Invalid(
+            "--service-token-file only applies to the running agent".into(),
+        ));
+    }
     match args.command {
         None => {
             let _shutdown = crate::shutdown::Guard::new(cwd)?;
             let (_, config) = project()?;
             let (url, workspace) = open::endpoint(&config)?;
             open::trusted_url(&url)?;
+            #[cfg(unix)]
             let token = Config::token_for(&url)?;
+            #[cfg(windows)]
+            let token = match args.service_token_file.as_deref() {
+                Some(path) => service::read_service_token(path)?,
+                None => Config::token_for(&url)?,
+            };
             let token_id = lockyard_cloud_client::token_id(&token);
             let client = agent_client(open::journal_client(Client::new(&url, token)?)?)?;
+            let socket = agent::socket_path_for(&url, &workspace);
             let settings = AgentConfig {
                 url,
                 workspace,
                 token_id,
-                socket: agent::socket_path(),
+                socket,
                 state_root: agent::state_root()?,
                 timing: Default::default(),
             };
@@ -61,7 +73,14 @@ pub(super) fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
         }
         Some(AgentCommand::Status) => {
             let installed = service::installed()?;
+            #[cfg(unix)]
             let socket = agent::socket_path();
+            #[cfg(windows)]
+            let socket = {
+                let (_, config) = project()?;
+                let (url, workspace) = open::endpoint(&config)?;
+                agent::socket_path_for(&url, &workspace)
+            };
             match AgentSocket::status(&socket, Duration::from_secs(1)) {
                 Ok(status) => {
                     let age = status
@@ -90,9 +109,4 @@ pub(super) fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
             }
         }
     }
-}
-
-#[cfg(not(unix))]
-pub(super) fn run_agent(_: AgentArgs, _: &Path) -> Result<Output> {
-    Err(Error::Invalid("lockyard agent needs a Unix socket".into()))
 }

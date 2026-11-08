@@ -110,7 +110,6 @@ pub(super) fn run_cloud(
 
 /// The agent must start while the server is away, so the encryption setting it last saw is kept
 /// in its state folder and used until the server answers again. A setting the server sends wins.
-#[cfg(unix)]
 pub(super) fn agent_client(
     client: lockyard_cloud_client::Client,
 ) -> Result<lockyard_cloud_client::Client> {

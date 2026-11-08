@@ -14,11 +14,18 @@ use ring::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self},
+    io::Write,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+#[cfg(windows)]
+use std::fs::File;
+
+#[cfg(unix)]
+use std::io::Read;
 
 const MAX_FILE: u64 = 256 * 1024;
 
@@ -225,11 +232,12 @@ fn absolute(path: &Path) -> Result<PathBuf> {
     })
 }
 
+#[cfg(unix)]
 fn secure_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if !path.exists() {
         fs::DirBuilder::new().mode(0o700).create(path)?;
-        File::open(path.parent().ok_or("invalid enrollment directory")?)?.sync_all()?;
+        lockyard_core::fsio::sync_path(path.parent().ok_or("invalid enrollment directory")?)?;
     }
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir()
@@ -242,6 +250,7 @@ fn secure_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn private(path: &Path, limit: u64) -> Result<Vec<u8>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = OpenOptions::new()
@@ -267,6 +276,7 @@ fn private(path: &Path, limit: u64) -> Result<Vec<u8>> {
 
 /// Durable create-only publication: a kill cannot leave a partially visible receipt. Every
 /// contender syncs the parent before it may send an irreversible claim to the broker.
+#[cfg(unix)]
 fn persist(path: &Path, bytes: &[u8]) -> Result<bool> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let parent = path.parent().ok_or("invalid enrollment output path")?;
@@ -299,7 +309,7 @@ fn persist(path: &Path, bytes: &[u8]) -> Result<bool> {
         Err(error) => Err(error),
     };
     // If the target already exists, the winning creator might not have synced yet.
-    File::open(parent)?.sync_all()?;
+    lockyard_core::fsio::sync_path(parent)?;
     fs::remove_file(&temporary)?;
     result.map_err(Into::into)
 }
@@ -322,7 +332,7 @@ fn retire(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    File::open(path.parent().ok_or("invalid enrollment receipt")?)?.sync_all()?;
+    lockyard_core::fsio::sync_path(path.parent().ok_or("invalid enrollment receipt")?)?;
     Ok(())
 }
 
@@ -613,7 +623,8 @@ pub fn resume(config_path: &Path, receipt_path: &Path) -> Result<Value> {
 fn stage_workspace_key(workspace: &str, key: &WorkspaceKey) -> Result<()> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(value) if !value.is_empty() => PathBuf::from(value),
-        _ => PathBuf::from(std::env::var_os("HOME").ok_or("HOME is unavailable")?).join(".config"),
+        _ => PathBuf::from(lockyard_core::paths::home_dir().ok_or("HOME is unavailable")?)
+            .join(".config"),
     };
     let base = absolute(&base)?;
     if !base.exists() {
@@ -639,7 +650,7 @@ fn stage_workspace_key(workspace: &str, key: &WorkspaceKey) -> Result<()> {
         }
         // The winning publisher may have linked the complete key and died before syncing
         // its parent. Recovery must establish that directory durability itself.
-        File::open(&keys)?.sync_all()?;
+        lockyard_core::fsio::sync_path(&keys)?;
         Ok(())
     };
     if destination.exists() {
@@ -768,7 +779,7 @@ pub fn join(ticket_path: &Path, state_dir: &Path, config_path: &Path) -> Result<
             "pending enrollment receipt differs from this invitation or destination".into(),
         );
     }
-    File::open(&state_dir)?.sync_all()?;
+    lockyard_core::fsio::sync_path(&state_dir)?;
     let roots = ticket
         .broker_tls_roots
         .iter()
@@ -947,7 +958,48 @@ pub fn retire_node(
     serde_json::to_value(retired).map_err(|_| "cannot encode node retirement receipt".into())
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+fn secure_dir(path: &Path) -> Result<()> {
+    Ok(lockyard_core::windows::private_dir(path)?)
+}
+
+#[cfg(windows)]
+fn private(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    Ok(lockyard_core::windows::read_private(path, limit)?)
+}
+
+#[cfg(windows)]
+fn persist(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let parent = path.parent().ok_or("invalid enrollment path")?;
+    let directory = lockyard_core::windows::open_directory(parent)?;
+    let temporary = parent.join(format!(".enrollment-{}.partial", wire::new_id()?));
+    let mut file = lockyard_core::windows::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        match lockyard_core::windows::publish_handle(
+            &file,
+            &directory,
+            path.file_name().ok_or("invalid enrollment path")?,
+            false,
+        ) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    })();
+    drop(file);
+    let _ = fs::remove_file(temporary);
+    result
+}
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::{

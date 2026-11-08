@@ -172,7 +172,6 @@ impl Port for LocalPort {
     }
 }
 
-#[cfg(unix)]
 mod cloud;
 /// Reads one event from `input` and writes the hook's answer to `out`.
 pub fn run(
@@ -285,7 +284,6 @@ fn deny_unchecked_edit(tool: Tool, event: &Value, reason: &str, out: &mut dyn Wr
     emit(out, &text)
 }
 
-#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn run_cloud(
     tool: Tool,
@@ -357,22 +355,6 @@ fn deny_cloud_unavailable(tool: Tool, event: &Value, out: &mut dyn Write) -> Res
         .to_string()
     };
     emit(out, &text)
-}
-
-#[cfg(not(unix))]
-#[allow(clippy::too_many_arguments)]
-fn run_cloud(
-    tool: Tool,
-    event: &Value,
-    _: &str,
-    _: &Path,
-    _: PathBuf,
-    _: &Config,
-    _: i64,
-    out: &mut dyn Write,
-) -> Result<()> {
-    eprintln!("lockyard hook: the agent process needs a Unix socket.");
-    deny_cloud_unavailable(tool, event, out)
 }
 
 /// Cursor events may provide the path directly; normalize that shape before using the common decision.

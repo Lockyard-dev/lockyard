@@ -4,10 +4,13 @@
 
 use lockyard_core::machine::{Level, Levels, MachineConfig, Sample, Sampler, SystemSampler};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs::{self, File};
+use std::io::{self, Write};
+#[cfg(not(windows))]
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::{Command, ExitStatus};
+#[cfg(not(windows))]
 use std::thread;
 use std::time::Duration;
 
@@ -49,7 +52,8 @@ fn shared_dir() -> std::path::PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state"))
+            lockyard_core::paths::home_dir()
+                .map(|home| std::path::PathBuf::from(home).join(".local/state"))
         })
         .unwrap_or_else(|| std::path::PathBuf::from("/dev/null"))
         .join("lockyard/machine")
@@ -59,8 +63,8 @@ fn ensure_shared_dir() -> io::Result<std::path::PathBuf> {
     let dir = shared_dir();
     #[cfg(unix)]
     crate::agent::private_dir(&dir)?;
-    #[cfg(not(unix))]
-    fs::create_dir_all(&dir)?;
+    #[cfg(windows)]
+    lockyard_core::windows::private_dir(&dir)?;
     Ok(dir)
 }
 
@@ -84,11 +88,22 @@ fn acquire_state_lock(lock: &File, hook: bool, has_stale: bool) -> io::Result<bo
     }
     #[cfg(not(unix))]
     {
-        let _ = (lock, hook, has_stale);
-        Ok(true)
+        if !hook {
+            lock.lock()?;
+            return Ok(true);
+        }
+        match lock.try_lock() {
+            Ok(()) => Ok(true),
+            Err(_) if has_stale => Ok(false),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "machine state unavailable",
+            )),
+        }
     }
 }
 
+#[cfg(any(test, not(windows)))]
 fn wait_remaining(elapsed: Duration, limit: Duration) -> Option<Duration> {
     limit
         .checked_sub(elapsed)
@@ -134,7 +149,7 @@ fn with_state_mode(config: &MachineConfig, details: bool, hook: bool) -> io::Res
             let temp = dir.join(format!("state-{}.tmp", std::process::id()));
             let mut file = File::create(&temp)?;
             file.write_all(&serde_json::to_vec(&state).map_err(io::Error::other)?)?;
-            fs::rename(temp, path)?;
+            lockyard_core::fsio::rename(temp, path)?;
         }
     }
     #[cfg(windows)]
@@ -276,8 +291,22 @@ pub fn maintain_reserve(config: &MachineConfig, report: &MachineReport) {
                 bytes as libc::off_t,
             )
         } == 0;
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let allocated = false;
+        #[cfg(windows)]
+        let allocated = {
+            use std::io::Write;
+            let result = (|| -> io::Result<()> {
+                let mut remaining = bytes;
+                let zeros = vec![0u8; 1024 * 1024];
+                let mut sink = &file;
+                while remaining > 0 {
+                    let count = remaining.min(zeros.len() as u64) as usize;
+                    sink.write_all(&zeros[..count])?;
+                    remaining -= count as u64;
+                }
+                file.sync_all()
+            })();
+            result.is_ok()
+        };
         if !allocated {
             let _ = fs::remove_file(path);
         }
@@ -550,6 +579,7 @@ struct RunnerRecord {
 }
 
 #[derive(Default, Serialize, Deserialize)]
+#[cfg(not(windows))]
 struct CoordinationState {
     last_pause_ms: i64,
 }
@@ -626,14 +656,16 @@ fn process_start_time(pid: i32) -> Option<String> {
     }
 }
 
+#[cfg(not(windows))]
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     let mut file = File::create(&temp)?;
     file.write_all(&serde_json::to_vec(value).map_err(io::Error::other)?)?;
     file.sync_all()?;
-    fs::rename(temp, path)
+    lockyard_core::fsio::rename(temp, path)
 }
 
+#[cfg(not(windows))]
 fn register_runner(pgid: i32, _config: &MachineConfig) -> io::Result<()> {
     let Some(owner_start) = process_start_time(std::process::id() as i32) else {
         return Err(io::Error::other("cannot verify runner process identity"));
@@ -653,6 +685,7 @@ fn register_runner(pgid: i32, _config: &MachineConfig) -> io::Result<()> {
     write_json_atomic(&dir.join(format!("{}.json", pgid)), &record)
 }
 
+#[cfg(not(windows))]
 fn update_runner(pgid: i32) -> io::Result<()> {
     let dir = shared_dir().join("runners");
     let path = dir.join(format!("{}.json", pgid));
@@ -662,10 +695,12 @@ fn update_runner(pgid: i32) -> io::Result<()> {
     write_json_atomic(&path, &record)
 }
 
+#[cfg(not(windows))]
 fn unregister_runner(pgid: i32) {
     let _ = fs::remove_file(shared_dir().join("runners").join(format!("{pgid}.json")));
 }
 
+#[cfg(not(windows))]
 fn process_memory(pid: i32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -754,6 +789,7 @@ fn process_memory(pid: i32) -> Option<u64> {
     }
 }
 
+#[cfg(not(windows))]
 fn coordinate_groups(own_group: i32, report: &MachineReport) -> io::Result<()> {
     update_runner(own_group)?;
     let dir = shared_dir();
@@ -768,6 +804,8 @@ fn coordinate_groups(own_group: i32, report: &MachineReport) -> io::Result<()> {
     if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX) } == -1 {
         return Err(io::Error::last_os_error());
     }
+    #[cfg(windows)]
+    lock.lock()?;
     let runner_dir = dir.join("runners");
     let paused_dir = pause_dir();
     fs::create_dir_all(&paused_dir)?;
@@ -847,6 +885,7 @@ fn coordinate_groups(own_group: i32, report: &MachineReport) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn remove_pause_record(pgid: i32) {
     let _ = fs::remove_file(pause_dir().join(format!("{pgid}.json")));
 }
@@ -895,6 +934,7 @@ pub fn run_heavy(
 }
 
 #[cfg(unix)]
+#[cfg(not(windows))]
 fn pause_group(pid: i32) -> io::Result<()> {
     signal_group(pid, libc::SIGSTOP)
 }
@@ -911,6 +951,7 @@ fn signal_group(pid: i32, signal: i32) -> io::Result<()> {
     }
 }
 #[cfg(not(unix))]
+#[cfg(not(windows))]
 fn pause_group(_: i32) -> io::Result<()> {
     Ok(())
 }
@@ -919,13 +960,16 @@ fn resume_group(_: i32) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 struct Slot {
     _file: File,
 }
+#[cfg(not(windows))]
 struct QueueTicket {
     path: std::path::PathBuf,
     id: u64,
 }
+#[cfg(not(windows))]
 impl Drop for QueueTicket {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
@@ -996,6 +1040,7 @@ fn pause_records() -> Vec<PauseRecord> {
     records
 }
 
+#[cfg(not(windows))]
 fn acquire_slot(config: &MachineConfig, max_wait: Duration) -> io::Result<Option<Slot>> {
     let limit = config.slots(with_state(config, false)?.sample);
     let base = heavy_dir();
@@ -1067,6 +1112,7 @@ fn acquire_slot(config: &MachineConfig, max_wait: Duration) -> io::Result<Option
     }
 }
 
+#[cfg(not(windows))]
 fn make_ticket(base: &Path) -> io::Result<QueueTicket> {
     let counter_path = base.join("queue-counter");
     let mut counter = OpenOptions::new()
@@ -1108,6 +1154,7 @@ fn make_ticket(base: &Path) -> io::Result<QueueTicket> {
     Ok(QueueTicket { path, id })
 }
 
+#[cfg(not(windows))]
 fn ticket_is_first(base: &Path, id: u64) -> bool {
     let Ok(entries) = fs::read_dir(base) else {
         return true;
@@ -1141,6 +1188,11 @@ pub fn project_config(cwd: &Path) -> MachineConfig {
     let _ = cwd;
     MachineConfig::load_user()
 }
+
+#[cfg(windows)]
+use lockyard_core::windows::OpenOptions;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 
 #[cfg(test)]
 mod format_tests {
