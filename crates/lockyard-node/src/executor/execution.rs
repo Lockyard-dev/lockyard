@@ -109,7 +109,29 @@ impl Executor {
         }
         let mut candidate = entry.record.clone();
         match result {
-            Ok(document) => candidate.result_manifest = Some(document),
+            Ok(document) => {
+                // This is the original document serialization used for every cloud upload.
+                let saved = serde_json::to_vec(&document)
+                    .map_err(|_| ExecutorError("result_document_invalid"))
+                    .and_then(|bytes| {
+                        lockyard_core::fsio::replace(
+                            &self
+                                .inner
+                                .config
+                                .state_dir
+                                .join("jobs")
+                                .join(id)
+                                .join("signed-result.json"),
+                            &bytes,
+                            0o600,
+                        )
+                        .map_err(io_error)
+                    });
+                if saved.is_err() {
+                    return;
+                }
+                candidate.result_manifest = Some(document);
+            }
             Err(error) => candidate.provenance_error = Some(error.0.into()),
         }
         if persist(&self.inner.config.state_dir, &candidate).is_ok() {

@@ -57,6 +57,9 @@ pub struct ExecutorConfig {
     /// Populated by the trusted node host before journal recovery; never configurable via TOML.
     #[serde(skip)]
     pub protected_identity_files: Vec<PathBuf>,
+    /// Runtime-only authenticated cloud transport, installed by NodeHost before recovery.
+    #[serde(skip)]
+    pub signed_results: Option<Arc<lockyard_cloud_client::Client>>,
     #[serde(default)]
     pub limits: ExecutionLimits,
     #[serde(default)]
@@ -235,6 +238,8 @@ struct Inner {
     dispatch_failed: AtomicBool,
     retention_lock: Mutex<()>,
     pending_erasures: Mutex<std::collections::BTreeSet<String>>,
+    signed_result_cursor: Mutex<Option<String>>,
+    legacy_result_cursor: Mutex<Option<String>>,
     retention_failed: AtomicBool,
     draining: AtomicBool,
     _lock: File,
@@ -575,6 +580,7 @@ mod api;
 mod execution;
 mod queue;
 mod retained_content;
+mod signed_results;
 mod tombstone_reconciliation;
 use tombstone_reconciliation::*;
 mod retention_files;

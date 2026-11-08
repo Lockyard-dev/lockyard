@@ -547,6 +547,8 @@ impl Executor {
                 dispatch_failed: AtomicBool::new(false),
                 retention_lock: Mutex::new(()),
                 pending_erasures: Mutex::new(pending_erasures),
+                signed_result_cursor: Mutex::new(None),
+                legacy_result_cursor: Mutex::new(None),
                 retention_failed: AtomicBool::new(false),
                 _lock: lock,
                 _workspace_key_guard: workspace_key_guard,

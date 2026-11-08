@@ -23,6 +23,7 @@ fn queued_cancellation_immediately_has_a_signed_terminal_result() {
         scheduling: Default::default(),
         node_certificate_sha256: Some("a".repeat(64)),
         protected_identity_files: Vec::new(),
+        signed_results: None,
     };
     let outbox = Arc::new(Mutex::new(
         crate::job_notifications::Outbox::open(root.path(), &"a".repeat(64), true).unwrap(),
@@ -62,6 +63,18 @@ fn queued_cancellation_immediately_has_a_signed_terminal_result() {
         .result_manifest
         .as_ref()
         .expect("signed without restart or archive request");
+    let original = fs::read(
+        config
+            .state_dir
+            .join("jobs")
+            .join(&record.spec.id)
+            .join("signed-result.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        &serde_json::from_slice::<crate::provenance::SignedDocument>(&original).unwrap(),
+        signed
+    );
     let manifest = crate::provenance::verify_result_identity(
         signed,
         &trusted,
@@ -153,6 +166,7 @@ async fn signed_negative_terminal_reaches_cloud_notification_fixture() {
         scheduling: Default::default(),
         node_certificate_sha256: Some("a".repeat(64)),
         protected_identity_files: Vec::new(),
+        signed_results: None,
     };
     let outbox = Arc::new(Mutex::new(
         crate::job_notifications::Outbox::open(root.path(), &"a".repeat(64), true).unwrap(),
@@ -230,6 +244,7 @@ fn signature_persist_failure_never_exposes_a_successful_signed_patch() {
         external_actions: Default::default(),
         node_certificate_sha256: None,
         protected_identity_files: Vec::new(),
+        signed_results: None,
         node_id: "worker".into(),
         state_dir: root.path().join("executor"),
         repositories: BTreeMap::new(),

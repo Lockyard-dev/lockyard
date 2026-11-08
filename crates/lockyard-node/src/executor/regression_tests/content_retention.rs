@@ -225,6 +225,7 @@ fn expired_unsigned_terminal_restart_preserves_recoverable_signed_outcome() {
         scheduling: Default::default(),
         node_certificate_sha256: None,
         protected_identity_files: Vec::new(),
+        signed_results: None,
     };
     let executor = Executor::new(config.clone()).unwrap();
     let record = retained_fixture_record(&executor, JobState::Succeeded, now_ms() - 1);
@@ -292,6 +293,7 @@ fn receipt_signer_failure_does_not_delay_purge_and_retries_from_tombstone() {
         scheduling: Default::default(),
         node_certificate_sha256: None,
         protected_identity_files: Vec::new(),
+        signed_results: None,
     };
     let mut executor = Executor::new(config.clone()).unwrap();
     let record = retained_fixture_record(&executor, JobState::Failed, now_ms() - 1);
@@ -344,6 +346,7 @@ fn credential_job_export_is_signed_results_only_and_restores_without_a_runnable_
         scheduling: Default::default(),
         node_certificate_sha256: None,
         protected_identity_files: Vec::new(),
+        signed_results: None,
     };
     let key = WorkspaceKey::from_entropy([37; 32]);
     let executor =

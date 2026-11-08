@@ -196,6 +196,7 @@ fn fixture(path: &Path) -> ExecutorConfig {
         external_actions: Default::default(),
         node_certificate_sha256: None,
         protected_identity_files: Vec::new(),
+        signed_results: None,
         scheduling: Default::default(),
         node_id: "fixture-node".into(),
         state_dir: path.join("state"),
@@ -318,6 +319,29 @@ fn finished(executor: &Executor, id: &str) -> JobRecord {
         record.state.is_terminal()
             && (record.result_manifest.is_some() || record.provenance_error.is_some())
     })
+}
+
+fn wait_for_executor_lock_release(state: &Path) {
+    use std::os::fd::AsRawFd;
+    // docs/node-queue-workers.md keeps physical workers registered through
+    // finalization and JoinHandle completion. A visible terminal result therefore
+    // precedes the coordinator dropping its last Executor/state-lock owner.
+    let lock = fs::File::open(state.join("executor.lock")).unwrap();
+    let (released, observed) = std::sync::mpsc::sync_channel(1);
+    let waiter = thread::spawn(move || {
+        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+        }
+        drop(lock);
+        released.send(()).unwrap();
+    });
+    // Event-driven synchronization on that exact lifecycle edge; this one-second
+    // watchdog catches a stranded lock without retrying construction or recovery.
+    observed
+        .recv_timeout(Duration::from_secs(1))
+        .expect("completed executor retained its state lock after drop");
+    waiter.join().unwrap();
 }
 
 #[test]
@@ -1263,6 +1287,7 @@ fn pre_journal_crash_directory_is_quarantined_and_job_id_can_be_retried() {
     executor.submit(request.clone(), &caller()).unwrap();
     assert_eq!(finished(&executor, &request.id).state, JobState::Failed);
     drop(executor);
+    wait_for_executor_lock_release(&config.state_dir);
     assert!(Executor::new(config).is_ok());
 }
 
@@ -1857,16 +1882,8 @@ fn completed_job_recovers_missing_signature_without_reexecuting_or_changing_outc
         .join("record.json");
     fs::write(&path, serde_json::to_vec(&missing).unwrap()).unwrap();
     drop(executor);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let recovered = loop {
-        match Executor::new(config.clone()) {
-            Ok(executor) => break executor,
-            Err(error) if error.0 == "executor_already_running" && Instant::now() < deadline => {
-                thread::yield_now()
-            }
-            Err(error) => panic!("unexpected recovery error: {error}"),
-        }
-    };
+    wait_for_executor_lock_release(&config.state_dir);
+    let recovered = Executor::new(config).unwrap();
     let result = recovered.status(&request.id).unwrap();
     assert_eq!(result.state, completed.state);
     assert_eq!(result.updated_at_ms, completed.updated_at_ms);

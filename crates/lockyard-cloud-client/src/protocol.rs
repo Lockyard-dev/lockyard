@@ -88,6 +88,11 @@ pub struct PendingWrite {
     /// Binds frozen wire bytes to the encryption policy that produced them.
     #[serde(default)]
     pub encryption_context: Option<String>,
+    /// EP-09 freezes this header together with its opaque wire body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_retry_at: Option<u64>,
 }
 
 impl std::fmt::Debug for PendingWrite {
@@ -398,7 +403,7 @@ fn pre_execution_refusal(error: &ClientError) -> bool {
 }
 
 impl Client {
-    fn encryption_context(&self) -> String {
+    pub(crate) fn encryption_context(&self) -> String {
         crate::credential_fingerprint(
             &serde_json::to_string(&(
                 &self.workspace,
@@ -464,6 +469,16 @@ impl Client {
             // Another client may have sent or completed this operation since we loaded it.
             // Never recreate a stale entry or trust a cached pre-execution refusal.
             let path = journal_path(directory, key);
+            if path
+                .with_extension("quarantine")
+                .try_exists()
+                .map_err(journal_error)?
+            {
+                return Err(local(
+                    "outcome_unknown",
+                    "signed result is quarantined; original bytes retained",
+                ));
+            }
             match std::fs::symlink_metadata(&path) {
                 Ok(metadata) => {
                     private_file(&metadata)?;
@@ -540,7 +555,10 @@ impl Client {
                 || operation.key.is_empty()
                 || operation.path.starts_with("//")
                 || !operation.path.starts_with('/')
-                || !matches!(operation.method.as_str(), "POST" | "DELETE")
+                || !(matches!(operation.method.as_str(), "POST" | "DELETE")
+                    || (operation.method == "PUT"
+                        && operation.result_expires_at.is_some()
+                        && crate::signed_results::is_result_path(&operation.path)))
                 || entry.path() != journal_path(&directory, &operation.key)
                 || pending.insert(operation.key.clone(), operation).is_some()
             {
@@ -577,6 +595,31 @@ impl Client {
             .collect()
     }
 
+    /// Retire an EP-09 operation from the active budget without erasing its bytes/key.
+    pub fn quarantine_signed_result(&self, key: &str) -> Result<(), ClientError> {
+        let _guard = self.claim_pending_send(key)?;
+        let pending = self
+            .pending_operation(key)
+            .ok_or_else(|| local("invalid_request", "pending result missing"))?;
+        if pending.method != "PUT" || !crate::signed_results::is_result_path(&pending.path) {
+            return Err(local("invalid_request", "not a signed result operation"));
+        }
+        let directory = self
+            .pending_journal
+            .as_ref()
+            .ok_or_else(|| local("outcome_unknown", "durable quarantine required"))?;
+        let path = journal_path(directory, key);
+        lockyard_core::fsio::rename(&path, path.with_extension("quarantine"))
+            .map_err(journal_error)?;
+        lockyard_core::fsio::sync_dir(directory).map_err(journal_error)?;
+        self.protocol_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .remove(key);
+        Ok(())
+    }
+
     /// Forget an operation only after its receipt or domain state has been verified.
     pub fn resolve_pending(&self, key: &str) -> Result<(), ClientError> {
         let resolved = if let Some(directory) = &self.pending_journal {
@@ -607,7 +650,7 @@ impl Client {
         Ok(())
     }
 
-    fn retain_pending(&self, operation: PendingWrite) -> Result<(), ClientError> {
+    pub(crate) fn retain_pending(&self, operation: PendingWrite) -> Result<(), ClientError> {
         let mut state = self
             .protocol_state
             .lock()
@@ -651,7 +694,7 @@ impl Client {
         Ok(())
     }
 
-    fn update_pending(
+    pub(crate) fn update_pending(
         &self,
         previous: &PendingWrite,
         operation: PendingWrite,
@@ -688,6 +731,17 @@ impl Client {
 
     /// Resolve the current generation without performing any write or changing origin.
     pub fn negotiated_protocol(&self, session: &str) -> Result<NegotiatedProtocol, ClientError> {
+        self.discover(session, None)
+    }
+
+    pub(crate) fn refresh_protocol(
+        &self,
+        session: &str,
+    ) -> Result<NegotiatedProtocol, ClientError> {
+        self.protocol_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cached = None;
         self.discover(session, None)
     }
 
@@ -967,6 +1021,8 @@ impl Client {
                 ),
                 pre_execution_rejected: false,
                 encryption_context: Some(self.encryption_context()),
+                result_expires_at: None,
+                result_retry_at: None,
             });
             if let Some(pending) = &pending {
                 if let Some(previous) = refused_pending.take() {
@@ -1214,7 +1270,12 @@ impl Client {
         Ok(value)
     }
 
-    fn unknown(&self, mut pending: PendingWrite, cause: &str, status: Option<u16>) -> ClientError {
+    pub(crate) fn unknown(
+        &self,
+        mut pending: PendingWrite,
+        cause: &str,
+        status: Option<u16>,
+    ) -> ClientError {
         pending.pre_execution_rejected = false;
         pending.cause_code = cause.into();
         pending.cause_status = status;

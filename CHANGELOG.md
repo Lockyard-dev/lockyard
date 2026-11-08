@@ -5,6 +5,17 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-08
+
+### Added
+
+- Cloud client APIs publish and retrieve signed job results with exact-byte idempotent replay and explicit quota resumption.
+- Nodes publish saved terminal result manifests and reconcile legacy tombstones against locally verified cloud results.
+
+### Changed
+
+- Advance the synchronized Rust, npm, PyPI and MCP registry versions to `0.3.0` for the new signed-result APIs.
+
 ## [0.2.2] - 2026-11-08
 
 - Support Windows agent, hook, CLI and MCP coordination over user-private named pipes.

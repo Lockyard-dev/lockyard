@@ -13,6 +13,10 @@ pub(super) struct TombstoneReconciliation {
     source: Option<ReconciliationSource>,
     pub(super) completed_at_ms: Option<u64>,
     diagnostic_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cloud_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cloud_error_status: Option<u16>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +29,7 @@ pub(super) enum ReconciliationStatus {
 enum ReconciliationSource {
     SignedResult,
     NodeJournal,
+    CloudSignedResult,
 }
 fn tombstone_hash(tombstone: &JobTombstone) -> Result<String> {
     Ok(crate::provenance::sha256(
@@ -79,6 +84,8 @@ pub(super) fn load_reconciliation(
                         .completed_at_ms
                         .is_none_or(|time| !valid_completion(tombstone, time))
                     || value.diagnostic_code.is_some()
+                    || value.cloud_error_code.is_some()
+                    || value.cloud_error_status.is_some()
             }
             ReconciliationStatus::NeedsReview => {
                 value.source.is_some()
@@ -95,6 +102,13 @@ fn signed_completion(config: &ExecutorConfig, tombstone: &JobTombstone) -> Resul
     let Some(document) = &tombstone.result_manifest else {
         return Ok(None);
     };
+    verified_completion(config, tombstone, document).map(Some)
+}
+fn verified_completion(
+    config: &ExecutorConfig,
+    tombstone: &JobTombstone,
+    document: &crate::provenance::SignedDocument,
+) -> Result<u64> {
     let signing = config
         .provenance
         .as_ref()
@@ -116,7 +130,28 @@ fn signed_completion(config: &ExecutorConfig, tombstone: &JobTombstone) -> Resul
     {
         return Err(ExecutorError("tombstone_evidence_invalid"));
     }
-    Ok(Some(manifest.completed_at_ms))
+    Ok(manifest.completed_at_ms)
+}
+fn cloud_completion(
+    config: &ExecutorConfig,
+    tombstone: &JobTombstone,
+) -> std::result::Result<Option<u64>, (String, Option<u16>)> {
+    let Some(client) = &config.signed_results else {
+        return Ok(None);
+    };
+    let bytes = client
+        .get_signed_result(&config.node_id, &config.node_id, &tombstone.job_id)
+        .map_err(|error| {
+            (
+                error.code().unwrap_or("temporarily_unavailable").to_owned(),
+                error.status(),
+            )
+        })?;
+    let document: crate::provenance::SignedDocument = serde_json::from_slice(&bytes)
+        .map_err(|_| ("content_authentication_failed".into(), None))?;
+    verified_completion(config, tombstone, &document)
+        .map(Some)
+        .map_err(|error| (error.0.into(), None))
 }
 fn journal_path_completion(
     config: &ExecutorConfig,
@@ -188,6 +223,14 @@ pub(super) fn reconcile_legacy_tombstone(
     config: &ExecutorConfig,
     tombstone: &JobTombstone,
 ) -> Result<TombstoneReconciliation> {
+    reconcile_with_cloud(config, tombstone, None)
+}
+type CloudCompletion = std::result::Result<Option<u64>, (String, Option<u16>)>;
+fn reconcile_with_cloud(
+    config: &ExecutorConfig,
+    tombstone: &JobTombstone,
+    cloud: Option<CloudCompletion>,
+) -> Result<TombstoneReconciliation> {
     tombstone
         .validate()
         .map_err(|error| ExecutorError(error.0))?;
@@ -207,6 +250,10 @@ pub(super) fn reconcile_legacy_tombstone(
             return Err(ExecutorError("tombstone_reconciliation_unavailable"));
         }
     }
+    #[cfg(not(unix))]
+    _guard
+        .lock()
+        .map_err(|_| ExecutorError("tombstone_reconciliation_unavailable"))?;
     let previous = load_reconciliation(config, tombstone)?;
     if let Some(value) = &previous
         && value.status == ReconciliationStatus::Reconciled
@@ -214,6 +261,12 @@ pub(super) fn reconcile_legacy_tombstone(
         return Ok(value.clone());
     }
     // Both sources are checked before erasing the surviving journal. Conflicts require review.
+    let mut cloud_error = previous.as_ref().and_then(|value| {
+        value
+            .cloud_error_code
+            .clone()
+            .map(|code| (code, value.cloud_error_status))
+    });
     let evidence = match (
         signed_completion(config, tombstone),
         journal_completion(config, tombstone),
@@ -223,8 +276,19 @@ pub(super) fn reconcile_legacy_tombstone(
         }
         (Ok(Some(signed)), Ok(None)) => Some((signed, ReconciliationSource::SignedResult)),
         (Ok(None), Ok(Some(journal))) => Some((journal, ReconciliationSource::NodeJournal)),
+        (Ok(None), Ok(None)) => match cloud.unwrap_or(Ok(None)) {
+            Ok(Some(time)) => Some((time, ReconciliationSource::CloudSignedResult)),
+            Ok(None) => None,
+            Err(error) => {
+                cloud_error = Some(error);
+                None
+            }
+        },
         _ => None,
     };
+    if evidence.is_some() {
+        cloud_error = None;
+    }
     let value = TombstoneReconciliation {
         version: 1,
         job_id: tombstone.job_id.clone(),
@@ -239,6 +303,8 @@ pub(super) fn reconcile_legacy_tombstone(
         diagnostic_code: evidence
             .is_none()
             .then(|| "tombstone_reconciliation_required".into()),
+        cloud_error_code: cloud_error.as_ref().map(|error| error.0.clone()),
+        cloud_error_status: cloud_error.and_then(|error| error.1),
     };
     if previous.as_ref() != Some(&value) {
         persist_reconciliation(config, &value)?;
@@ -261,6 +327,50 @@ pub(super) fn legacy_erasure_authorized(
             == ReconciliationStatus::Reconciled)
 }
 impl Executor {
+    /// Fetch one unresolved legacy result per background tick. Remote I/O happens before
+    /// taking the reconciliation lock, so metadata, startup and unrelated erasure stay local.
+    pub(crate) fn reconcile_cloud_tombstones(&self) -> Result<()> {
+        if self.inner.config.signed_results.is_none() {
+            return Ok(());
+        }
+        let Ok(mut cursor) = self.inner.legacy_result_cursor.try_lock() else {
+            return Ok(());
+        };
+        let mut candidates = BTreeMap::new();
+        for entry in
+            fs::read_dir(self.inner.config.state_dir.join("job-tombstones")).map_err(io_error)?
+        {
+            let entry = entry.map_err(io_error)?;
+            let Some(id) = entry
+                .file_name()
+                .to_str()
+                .filter(|id| valid_id(id))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let tombstone = self
+                .tombstone(&id)?
+                .ok_or(ExecutorError("job_tombstone_missing"))?;
+            if tombstone.completed_at_ms.is_none()
+                && !load_reconciliation(&self.inner.config, &tombstone)?
+                    .is_some_and(|value| value.status == ReconciliationStatus::Reconciled)
+            {
+                candidates.insert(id, tombstone);
+            }
+        }
+        let next = candidates
+            .iter()
+            .find(|(id, _)| cursor.as_ref().is_none_or(|last| *id > last))
+            .or_else(|| candidates.first_key_value());
+        if let Some((id, tombstone)) = next {
+            *cursor = Some(id.clone());
+            let evidence = cloud_completion(&self.inner.config, tombstone);
+            reconcile_with_cloud(&self.inner.config, tombstone, Some(evidence))?;
+        }
+        Ok(())
+    }
+
     pub(super) fn reconcile_legacy_tombstones(&self) -> Result<()> {
         for entry in
             fs::read_dir(self.inner.config.state_dir.join("job-tombstones")).map_err(io_error)?

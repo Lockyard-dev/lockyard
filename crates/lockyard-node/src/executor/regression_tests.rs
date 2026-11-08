@@ -17,6 +17,7 @@ pub(crate) fn retention_fixture() -> (tempfile::TempDir, ExecutorConfig, Executo
         scheduling: Default::default(),
         node_certificate_sha256: None,
         protected_identity_files: Vec::new(),
+        signed_results: None,
     };
     let executor = Executor::new(config.clone()).unwrap();
     (root, config, executor)

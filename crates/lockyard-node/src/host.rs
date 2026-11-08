@@ -3653,6 +3653,21 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
         .clone()
         .map(|mut executor| {
             executor.node_certificate_sha256 = Some(certificate_sha256.clone());
+            let cloud = if config.relay.is_some() {
+                Some(crate::cloud::NodeCloudClient::from_config(&config)?)
+            } else if config.revocations.is_some() {
+                Some(crate::cloud::NodeCloudClient::for_revocations(&config)?)
+            } else {
+                None
+            };
+            if let Some(cloud) = cloud {
+                executor.signed_results = Some(Arc::new(
+                    cloud
+                        .revocation_client()?
+                        .with_content_encryption(&config.workspace, Some(key.clone()), true)
+                        .with_pending_journal(executor.state_dir.join("signed-result-pending"))?,
+                ));
+            }
             executor
                 .protected_identity_files
                 .push(config.private_key.clone());
@@ -3907,6 +3922,29 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
                 if failed {
                     eprintln!("lockyard node: content retention cleanup is incomplete");
                 }
+            }
+        }));
+    }
+    if let Some(executor) = host.executor.clone() {
+        let reconciliation_executor = executor.clone();
+        tasks.0.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let executor = reconciliation_executor.clone();
+                let _ = tokio::task::spawn_blocking(move || executor.reconcile_cloud_tombstones())
+                    .await;
+            }
+        }));
+        tasks.0.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let executor = executor.clone();
+                let _ =
+                    tokio::task::spawn_blocking(move || executor.publish_signed_results()).await;
             }
         }));
     }

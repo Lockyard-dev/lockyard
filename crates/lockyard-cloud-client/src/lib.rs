@@ -15,6 +15,7 @@ pub mod protocol;
 mod registry;
 mod repository;
 pub mod revocations;
+mod signed_results;
 
 pub use backend::CloudBackend;
 pub use crypto::{CONTENT_FIELDS, FieldRule, WorkspaceKey, route_matches, transform_fields};

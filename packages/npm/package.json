@@ -1,6 +1,6 @@
 {
   "name": "lockyard",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Coordination for coding agents: a shared bus, work zones and tasks.",
   "license": "Apache-2.0",
   "homepage": "https://lockyard.dev",
@@ -21,10 +21,10 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "lockyard-darwin-arm64": "0.2.2",
-    "lockyard-darwin-x64": "0.2.2",
-    "lockyard-linux-x64": "0.2.2",
-    "lockyard-linux-arm64": "0.2.2",
-    "lockyard-win32-x64": "0.2.2"
+    "lockyard-darwin-arm64": "0.3.0",
+    "lockyard-darwin-x64": "0.3.0",
+    "lockyard-linux-x64": "0.3.0",
+    "lockyard-linux-arm64": "0.3.0",
+    "lockyard-win32-x64": "0.3.0"
   }
 }

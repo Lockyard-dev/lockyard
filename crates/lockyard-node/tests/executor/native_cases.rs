@@ -187,6 +187,7 @@ mod linux {
             external_actions: Default::default(),
             node_certificate_sha256: None,
             protected_identity_files: vec![],
+            signed_results: None,
             scheduling: Default::default(),
             node_id: "native-fixture".into(),
             state_dir: path.join("state"),
