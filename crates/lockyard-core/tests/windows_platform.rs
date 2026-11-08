@@ -46,27 +46,44 @@ fn named_pipe_namespace_is_per_user_and_workspace() {
 #[test]
 fn named_pipe_first_instance_and_framing_are_enforced() {
     use lockyard_core::windows::ipc::{LocalListener, LocalStream};
+    use std::{sync::mpsc, time::Duration};
+    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    let timeout = Duration::from_secs(2);
     let unique = tempfile::tempdir().unwrap();
     let path = windows::pipe_path(&unique.path().display().to_string()).unwrap();
     let listener = LocalListener::bind(&path).unwrap();
-    assert!(LocalListener::bind(&path).is_err());
+    let duplicate = LocalListener::bind(&path)
+        .err()
+        .expect("a second first-instance listener must be refused");
+    assert_eq!(duplicate.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+    let (written, write_completed) = mpsc::channel();
+    let (verified, reply_verified) = mpsc::channel();
     let peer = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(timeout)).unwrap();
+        stream.set_write_timeout(Some(timeout)).unwrap();
         let mut bytes = [0; 6];
         stream.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"frame\n");
         stream.write_all(b"reply\n").unwrap();
+        written.send(()).unwrap();
+        // Keep the server and listener alive until the client has checked the frame.
+        reply_verified.recv_timeout(timeout).unwrap();
     });
     let mut client = LocalStream::connect(&path).unwrap();
-    client
-        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-        .unwrap();
+    client.set_read_timeout(Some(timeout)).unwrap();
+    client.set_write_timeout(Some(timeout)).unwrap();
     client.write_all(b"frame\n").unwrap();
     let mut bytes = [0; 6];
     client.read_exact(&mut bytes).unwrap();
     assert_eq!(&bytes, b"reply\n");
-    drop(client);
+    // Reading the bytes can precede completion of the server's overlapped write.
+    // Closing now can make its drain fail with ERROR_NO_DATA/ERROR_PIPE_NOT_CONNECTED.
+    write_completed.recv_timeout(timeout).unwrap();
+    verified.send(()).unwrap();
     peer.join().unwrap();
+    drop(client);
 }
 
 #[test]
