@@ -15,13 +15,15 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const SAMPLES: usize = 80;
-// Windows has its own ceilings (owner decision 2026-11-08): NTFS durable writes and
-// process start are slower there; hosted runners measured hook 15.3 ms and send 26-31 ms
-// p95 in release. Unix ceilings are unchanged.
+// Windows and macOS have their own ceilings (owner decisions 2026-11-08): NTFS durable
+// writes and process start are slower on Windows (hosted release p95: hook 15.3 ms, send
+// 26-31 ms); hosted macOS runners measured send 20.6 ms. Linux keeps the strict 15/20 ms.
 #[cfg(not(windows))]
 const HOOK_P95: Duration = Duration::from_millis(15);
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 const SEND_P95: Duration = Duration::from_millis(20);
+#[cfg(target_os = "macos")]
+const SEND_P95: Duration = Duration::from_millis(30);
 #[cfg(windows)]
 const HOOK_P95: Duration = Duration::from_millis(20);
 #[cfg(windows)]
