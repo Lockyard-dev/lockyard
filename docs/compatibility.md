@@ -116,7 +116,8 @@ copy only a live `lockyard.db` or drop sidecars containing committed data.
 Cloud pending-journal syncs, ownership guards and frozen replay bytes are unchanged.
 The CLI's broken-database fixture removes retained WAL/SHM before corrupting the
 main file; otherwise SQLite legitimately recovers it from the WAL. All hook-denial
-expectations and performance thresholds remain unchanged.
+expectations remain unchanged; platform performance thresholds are documented in
+[performance budgets](performance.md).
 
 Typed catalog schema/manifest artifacts are prepared from EP-07. The concurrent
 cloud generator still needs equivalent additions; cross-repository byte parity

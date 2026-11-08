@@ -3521,7 +3521,7 @@ mod tests {
 
     #[test]
     fn session_events_repeat_until_the_hook_acknowledges_written_output() {
-        let rig = start_with(
+        let mut rig = start_with(
             Timing {
                 upkeep: Duration::from_secs(1),
                 ..timing()
@@ -3546,6 +3546,9 @@ mod tests {
                 .get("alice")
                 .is_some_and(|cache| !cache.events.is_empty())
         });
+        // Join the background polls before counting: only TakeEvents may affect
+        // the assertion below, not an unrelated stream refresh in this rig.
+        rig.daemon.stop_workers();
         let polls = rig.server.event_calls.load(Ordering::SeqCst);
         let first = rig.daemon.handle(take.clone()).events.unwrap();
         assert_eq!(

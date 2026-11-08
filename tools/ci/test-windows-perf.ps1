@@ -12,7 +12,8 @@ if (@($recoveryCatalog | Where-Object { $_ -ceq "${recovery}: test" }).Count -ne
 cargo test --locked --release -p lockyard-core --lib $recovery -- --exact --nocapture
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 # Windows debug validation overhead exceeded the production latency budgets.
-# Measure the shipped profile; keep the same raw subprocess timings and ceilings.
+# Measure the shipped profile: raw subprocess p95 hook <= 15 ms, send <= 35 ms.
+# Owner decision 2026-11-08; see docs/performance.md for the Windows FULL-sync evidence.
 # Emit hot-path and authenticated-pipe spans before the strict budget gate.
 cargo test --locked --release -p lockyard --test perf_profile -- --ignored --test-threads=1 --nocapture
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

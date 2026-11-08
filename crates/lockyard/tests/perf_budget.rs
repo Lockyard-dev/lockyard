@@ -15,14 +15,21 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const SAMPLES: usize = 80;
-// The same first-run p95 contract applies on every OS. Diagnostic profiling runs
-// separately; no retries, sample filtering or relaxed platform-specific ceilings.
+// Every OS uses one attempt and raw subprocess timings; diagnostics run separately.
 const HOOK_P95: Duration = Duration::from_millis(15);
+// Owner decision 2026-11-08: Windows send p95 <= 35 ms. SQLite synchronous=FULL
+// pays FlushFileBuffers (p50 4.7 ms / p95 ~10 ms) plus 7-8 ms process startup.
+// CI run 42504694714: raw send p95 22.0/29.1 ms; profiled p95 18.8-19.6 ms,
+// max ~40 ms. Keep durability and one attempt; no best-of-three acceptance.
+#[cfg(windows)]
+const SEND_P95: Duration = Duration::from_millis(35);
+#[cfg(not(windows))]
 const SEND_P95: Duration = Duration::from_millis(20);
 
 fn binary() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lockyard"));
     command.env_remove("LOCKYARD_AGENT");
+    command.env_remove("LOCKYARD_PERF_TRACE");
     command
 }
 

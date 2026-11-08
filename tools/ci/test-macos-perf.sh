@@ -3,7 +3,7 @@
 set -eu
 export CARGO_INCREMENTAL=0
 # Shared hosted macOS runners exceed the production budgets in the debug profile.
-# Measure the shipped profile; keep the same raw subprocess timings and ceilings.
+# Measure the shipped profile: raw subprocess p95 hook <= 15 ms, send <= 20 ms.
 # Emit hot-path spans before the strict gate, even when that gate exceeds its budget.
 cargo test --locked --release -p lockyard --test perf_profile -- --ignored --test-threads=1 --nocapture
 catalog=$(cargo test --locked --release -p lockyard --test perf_budget -- --list)

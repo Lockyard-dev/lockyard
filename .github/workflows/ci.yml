@@ -10,6 +10,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   rust:
     timeout-minutes: 30
@@ -28,12 +31,13 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
         if: runner.os != 'Windows'
-      - run: cargo test --locked --workspace
+      - name: Test every Linux crate except the two dedicated performance budgets
         if: runner.os == 'Linux'
+        run: cargo test --locked --workspace -- --exact --skip hook_decision_p95_stays_within_budget --skip msg_send_p95_stays_within_budget
       - name: Test every macOS crate except the two release performance budgets
         if: runner.os == 'macOS'
         run: cargo test --locked --workspace -- --exact --skip hook_decision_p95_stays_within_budget --skip msg_send_p95_stays_within_budget
-      - name: Enforce unchanged performance budgets on the macOS release binary
+      - name: Enforce one-attempt macOS 15/20 ms release budgets
         if: runner.os == 'macOS'
         run: |
           sh tests/macos-perf-gate.test.sh
@@ -51,7 +55,7 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
         run: cargo test --locked --workspace --exclude lockyard-node -- --nocapture --skip hook_decision_p95_stays_within_budget --skip msg_send_p95_stays_within_budget
-      - name: Enforce unchanged performance budgets on the Windows release binary
+      - name: Enforce one-attempt Windows 15/35 ms release budgets
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -122,7 +126,8 @@ jobs:
           command: check
           arguments: --all-features
 
-  # Hook decision p95 ≤ 15 ms and msg send p95 ≤ 20 ms, no network.
+  # One attempt, no network: hook p95 <= 15 ms everywhere; send <= 20 ms on Linux/macOS,
+  # <= 35 ms on Windows (owner decision 2026-11-08; docs/performance.md).
   perf-budget:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -132,7 +137,7 @@ jobs:
         with:
           toolchain: 1.99.1
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-      - run: cargo test -p lockyard --test perf_budget -- --nocapture
+      - run: cargo test --locked -p lockyard --test perf_budget -- --test-threads=1 --nocapture
 
   windows:
     runs-on: windows-latest
@@ -155,7 +160,7 @@ jobs:
       - run: cargo test --workspace --locked --no-fail-fast -- --nocapture --skip hook_decision_p95_stays_within_budget --skip msg_send_p95_stays_within_budget
         env:
           RUST_BACKTRACE: "1"
-      - name: Enforce unchanged performance budgets on the Windows release binary
+      - name: Enforce one-attempt Windows 15/35 ms release budgets
         shell: pwsh
         run: |
           ./tests/windows-perf-gate.test.ps1

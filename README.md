@@ -250,6 +250,10 @@ guarantee that a machine cannot hang.
 
 ## Testing against a real server
 
+Local CLI p95 budgets are 15 ms for hooks on every OS and 20 ms for sends on
+macOS/Linux, 35 ms on Windows, with one attempt per gate. See
+[performance budgets and opt-in diagnostics](docs/performance.md).
+
 `crates/lockyard/tests/e2e.rs` drives the real binary as several agents. It needs `LOCKYARD_E2E_URL`, `LOCKYARD_E2E_OWNER_TOKEN`
 and `LOCKYARD_E2E_SERVER`, a shell command that runs the server in the foreground on a database that survives a restart.
 The suite starts and stops that server itself. Without the URL it skips, and with `LOCKYARD_E2E_REQUIRED=1` it fails instead.
