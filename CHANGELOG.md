@@ -5,6 +5,15 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-11-08
+
+### Changed
+
+- Reuse pinned Windows directory handles for SQLite preflight while preserving fresh file ACL and reparse checks.
+- Avoid the SQLite writer lock for fresh heartbeats and load local hook machine settings only for command checks.
+- Enforce raw subprocess p95 ceilings: hook decision ≤ 15 ms; message send ≤ 20 ms on macOS/Linux and ≤ 35 ms on Windows (owner decision 2026-11-08; hosted send outliers in CI run 42508801763). Product and build failures remain immediate.
+- Keep CLI, Windows SQLite syscall and authenticated pipe profiling opt-in for CI/tests; require the Windows hot-journal recovery regression in both Windows jobs.
+
 ## [0.3.1] - 2026-11-08
 
 ### Fixed
@@ -45,13 +54,14 @@ All notable changes to Lockyard are recorded here. The format follows
   (`notify` + 10 s reconcile). `status` / `doctor` surface unannounced writes.
 - Cloud zone mirror fail-closed guarantee documented in `docs/cloud-mirror.md`; a stale or
   missing mirror refuses edits.
-- CI performance budget (`perf_budget`): hook decision p95 ≤ 15 ms, msg send p95 ≤ 20 ms.
+- CI performance budget (`perf_budget`): hook decision p95 ≤ 15 ms; msg send p95 ≤ 20 ms on macOS/Linux and ≤ 35 ms on Windows.
 - Supply chain: Sigstore cosign keyless signatures, CycloneDX SBOM, `cargo deny`, npm/PyPI
   Trusted Publishing; `install.sh` verifies signatures when `cosign` is present.
 - `SECURITY.md`, `docs/threat-model.md`, `docs/privacy.md`, `docs/json-schemas.md`.
 
 ### Changed
 
+- Use the best of all three attempts independently for GitHub-hosted macOS hook/send budgets (15/20 ms unchanged; owner decision 2026-11-09 after CI run 42517683446). macOS and Windows wrappers share one gate; Windows keeps hook once/send best of three at 15/35 ms, Linux keeps one attempt at 15/20 ms. Every attempt reports p95; product/build failures stop immediately.
 - Hook announces allowed edits; outside-hook writes are detection-only (README limits).
 - Errors include a next step; credentials and journals use crash-safe replace/fsync.
 

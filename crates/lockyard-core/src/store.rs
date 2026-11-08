@@ -270,14 +270,27 @@ impl Store {
 
     /// Opens the project at `root`, which must already exist.
     pub fn open(root: &Path) -> Result<Self> {
+        let _total = crate::perf::Span::new("store.total");
+        let path_span = crate::perf::Span::new("store.directory");
         let root = root.canonicalize()?;
         let dir = root.join(DIR_NAME);
         if !dir.is_dir() {
             return Err(Error::NoProject);
         }
         #[cfg(windows)]
-        let directory = windows_database(&dir, true)?;
+        let mut database = windows_database(&dir, true)?;
+        drop(path_span);
+        let open_span = crate::perf::Span::new("sqlite.open");
         let conn = Connection::open(dir.join(DB_NAME))?;
+        #[cfg(windows)]
+        {
+            database.verify_connection(&conn)?;
+            // SQLite may need to delete a hot rollback journal during its first read.
+            // The database/WAL/SHM names stay pinned through configuration and migration.
+            drop(database.journal.take());
+        }
+        drop(open_span);
+        let config_span = crate::perf::Span::new("sqlite.configure");
         conn.busy_timeout(BUSY_TIMEOUT)?;
         // Triggers distinguish a connection from this generation from an already-open old binary.
         conn.create_scalar_function(
@@ -294,13 +307,26 @@ impl Store {
         // success: retaining a NORMAL-synchronous WAL would extend the power-loss window.
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
         conn.pragma_update(None, "synchronous", "FULL")?;
+        drop(config_span);
+        #[cfg(windows)]
+        let WindowsDatabase {
+            directory,
+            db: db_pin,
+            sidecars: sidecar_pins,
+            journal: _,
+        } = database;
         let mut store = Self {
             conn,
             root,
             #[cfg(windows)]
             _directory: directory,
         };
+        let _schema = crate::perf::Span::new("sqlite.schema");
         store.migrate()?;
+        #[cfg(windows)]
+        // SQLite's Win32 VFS now owns the database and WAL/SHM handles, which also
+        // omit FILE_SHARE_DELETE. Release preflight pins before later SQLite cleanup.
+        drop((db_pin, sidecar_pins));
         Ok(store)
     }
 
@@ -319,7 +345,7 @@ impl Store {
         };
         let path = root.join(DIR_NAME).join(DB_NAME);
         #[cfg(windows)]
-        let _directory = match windows_database(&root.join(DIR_NAME), false) {
+        let mut database = match windows_database(&root.join(DIR_NAME), false) {
             Ok(directory) => directory,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
@@ -333,6 +359,11 @@ impl Store {
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        #[cfg(windows)]
+        {
+            database.verify_connection(&conn)?;
+            drop(database.journal.take());
+        }
         // A failed explicit checkpoint must not turn into another implicit checkpoint on close.
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
         conn.busy_timeout(Duration::from_millis(250))?;
@@ -469,7 +500,25 @@ impl Store {
     /// Records that `agent` is alive, at most once per [`TOUCH_INTERVAL_MS`]. Hooks call this on every
     /// tool use, and a call that writes nothing skips the WAL checkpoint when its connection closes.
     pub fn touch(&self, agent: &str, now: i64) -> Result<()> {
+        let _span = crate::perf::Span::new("presence.touch");
         validate_agent(agent)?;
+        // A no-op UPSERT still acquires SQLite's single writer lock. Read first so
+        // a recent heartbeat needs no write transaction; the UPSERT predicate below
+        // remains authoritative when another process updates the row concurrently.
+        let last_seen: Option<i64> = {
+            let _read = crate::perf::Span::new("presence.read");
+            self.conn
+                .query_row(
+                    "SELECT last_seen FROM agents WHERE id = ?1",
+                    [agent],
+                    |row| row.get(0),
+                )
+                .optional()?
+        };
+        if last_seen.is_some_and(|last| now < last.saturating_add(TOUCH_INTERVAL_MS)) {
+            return Ok(());
+        }
+        let _upsert = crate::perf::Span::new("presence.upsert_commit");
         self.conn.execute(
             "INSERT INTO agents (id, first_seen, last_seen) VALUES (?1, ?2, ?2)
              ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen
@@ -484,20 +533,17 @@ impl Store {
     /// keeps a busy writer from delaying the next tool call.
     pub fn touch_best_effort(&self, agent: &str, now: i64) -> Result<()> {
         validate_agent(agent)?;
+        let previous: u32 = self
+            .conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
         self.conn
             .busy_timeout(std::time::Duration::from_millis(25))?;
-        let last_seen: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT last_seen FROM agents WHERE id = ?1",
-                [agent],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if last_seen.is_none_or(|last| now >= last.saturating_add(TOUCH_INTERVAL_MS)) {
-            self.touch(agent, now)?;
-        }
-        Ok(())
+        let result = self.touch(agent, now);
+        // The same connection next reserves hook mail. Restore its own timeout
+        // even when the best-effort write fails under another writer's lock.
+        self.conn
+            .busy_timeout(Duration::from_millis(u64::from(previous)))?;
+        result
     }
 
     /// Every agent seen in this project, most recent first.
@@ -526,6 +572,7 @@ impl Store {
 
     /// Starts a write that holds the database lock from its first statement.
     pub(crate) fn write(&mut self) -> Result<Transaction<'_>> {
+        let _begin = crate::perf::Span::new("sqlite.begin_immediate");
         Ok(self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?)
@@ -646,28 +693,72 @@ pub(crate) fn test_store() -> (tempfile::TempDir, Store) {
 }
 
 #[cfg(windows)]
-fn windows_database(dir: &Path, create: bool) -> std::io::Result<crate::windows::Directory> {
+struct WindowsDatabase {
+    directory: crate::windows::Directory,
+    db: fs::File,
+    sidecars: Vec<fs::File>,
+    journal: Option<fs::File>,
+}
+
+#[cfg(any(windows, test))]
+fn require_database_identity(expected: (u32, u64), actual: (u32, u64)) -> std::io::Result<()> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "SQLite opened a different database file from the pinned private file",
+        ))
+    }
+}
+
+#[cfg(windows)]
+impl WindowsDatabase {
+    fn verify_connection(&self, conn: &Connection) -> std::io::Result<()> {
+        let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SQLite writes a borrowed native HANDLE; ownership remains with the
+        // connection. Read its identity before any schema or journal access.
+        let code = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                conn.handle(),
+                c"main".as_ptr(),
+                rusqlite::ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
+                std::ptr::from_mut(&mut handle).cast(),
+            )
+        };
+        if code != rusqlite::ffi::SQLITE_OK {
+            return Err(std::io::Error::other(format!(
+                "cannot verify SQLite native database handle: {code}"
+            )));
+        }
+        require_database_identity(
+            crate::windows::file_identity(&self.db)?,
+            crate::windows::handle_identity(handle)?,
+        )
+    }
+}
+
+#[cfg(windows)]
+fn windows_database(dir: &Path, create: bool) -> std::io::Result<WindowsDatabase> {
     let directory = crate::windows::open_directory(dir)?;
-    let db = dir.join(DB_NAME);
-    let _file = crate::windows::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(create)
-        .open(&db)?;
+    let db = directory.pin_private_file(std::ffi::OsStr::new(DB_NAME), create)?;
+    let mut sidecars = Vec::new();
+    let mut journal = None;
     for suffix in ["-wal", "-shm", "-journal"] {
-        let path = dir.join(format!("{DB_NAME}{suffix}"));
-        match fs::symlink_metadata(&path) {
-            Ok(_) => {
-                crate::windows::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&path)?;
-            }
+        let name = format!("{DB_NAME}{suffix}");
+        match directory.pin_private_file(std::ffi::OsStr::new(&name), false) {
+            Ok(file) if suffix == "-journal" => journal = Some(file),
+            Ok(file) => sidecars.push(file),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
     }
-    Ok(directory)
+    Ok(WindowsDatabase {
+        directory,
+        db,
+        sidecars,
+        journal,
+    })
 }
 
 #[cfg(windows)]
@@ -708,6 +799,124 @@ impl Drop for PrivateBackupDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_identity_requires_both_the_volume_and_complete_file_index() {
+        let identity = (7, (23_u64 << 32) | 41);
+        require_database_identity(identity, identity).unwrap();
+        for different in [
+            (8, identity.1),
+            (7, (24_u64 << 32) | 41),
+            (7, identity.1 + 1),
+        ] {
+            assert_eq!(
+                require_database_identity(identity, different)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_database_pins_validated_leaves_and_checks_sqlites_native_file() {
+        let (root, store) = test_store();
+        let dir = root.path().join(DIR_NAME);
+        drop(store);
+        // NO_CKPT_ON_CLOSE leaves real, valid WAL/SHM files for the next opener.
+        for suffix in ["-wal", "-shm"] {
+            assert!(dir.join(format!("{DB_NAME}{suffix}")).is_file());
+        }
+        crate::windows::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(format!("{DB_NAME}-journal")))
+            .unwrap();
+        let database = windows_database(&dir, false).unwrap();
+        assert_eq!(database.sidecars.len(), 2);
+        assert!(database.journal.is_some());
+        let assert_pinned = || {
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                let leaf = dir.join(format!("{DB_NAME}{suffix}"));
+                assert!(
+                    fs::rename(&leaf, leaf.with_extension("substituted")).is_err(),
+                    "validated SQLite leaf must remain pinned: {suffix}"
+                );
+            }
+        };
+        assert_pinned();
+        let conn = Connection::open(dir.join(DB_NAME)).unwrap();
+        database.verify_connection(&conn).unwrap();
+        assert_pinned();
+        let (_other_root, other) = test_store();
+        assert_eq!(
+            database.verify_connection(&other.conn).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "a valid private database at a different file ID must be rejected"
+        );
+        drop(conn);
+        drop(database);
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let leaf = dir.join(format!("{DB_NAME}{suffix}"));
+            let moved = leaf.with_extension(format!("released{suffix}"));
+            fs::rename(leaf, moved).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_database_releases_the_rollback_journal_pin_before_hot_recovery() {
+        let (source_root, store) = test_store();
+        let source_dir = source_root.path().join(DIR_NAME);
+        drop(store);
+        let source = Connection::open(source_dir.join(DB_NAME)).unwrap();
+        source
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        source
+            .execute_batch("PRAGMA cache_size=4; CREATE TABLE recovery_probe(payload BLOB);")
+            .unwrap();
+        let committed = vec![0x11_u8; 65_536];
+        source
+            .execute("INSERT INTO recovery_probe VALUES (?1)", [&committed])
+            .unwrap();
+        source.execute_batch("BEGIN IMMEDIATE").unwrap();
+        source
+            .execute(
+                "UPDATE recovery_probe SET payload=?1",
+                [vec![0x22_u8; 65_536]],
+            )
+            .unwrap();
+        let journal_name = format!("{DB_NAME}-journal");
+        assert_eq!(
+            &fs::read(source_dir.join(&journal_name)).unwrap()[..8],
+            &[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7],
+            "the fixture must contain a synced hot-journal header after cache spill"
+        );
+        // Snapshot the on-disk crash state without inheriting the writer's locks.
+        let recovered_root = tempfile::tempdir().unwrap();
+        let recovered_dir = recovered_root.path().join(DIR_NAME);
+        crate::windows::private_dir(&recovered_dir).unwrap();
+        for name in [DB_NAME, journal_name.as_str()] {
+            let mut input = fs::File::open(source_dir.join(name)).unwrap();
+            let mut output = crate::windows::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(recovered_dir.join(name))
+                .unwrap();
+            std::io::copy(&mut input, &mut output).unwrap();
+            output.sync_all().unwrap();
+        }
+        source.execute_batch("ROLLBACK").unwrap();
+        let recovered = Store::open(recovered_root.path()).unwrap();
+        let actual: Vec<u8> = recovered
+            .conn
+            .query_row("SELECT payload FROM recovery_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(actual, committed);
+        assert!(!recovered_dir.join(journal_name).exists());
+    }
 
     #[test]
     fn short_lived_writers_reuse_durable_wal_and_keep_auto_checkpointing() {
@@ -926,9 +1135,30 @@ mod tests {
     fn a_touch_inside_the_interval_writes_nothing() {
         let (_dir, store) = test_store();
         store.touch("a", 1).unwrap();
+        let before = store.conn.total_changes();
         store.touch("a", TOUCH_INTERVAL_MS).unwrap();
-        assert_eq!(store.conn.changes(), 0);
+        assert_eq!(store.conn.total_changes(), before);
         assert_eq!(store.agents().unwrap()[0].last_seen, 1);
+    }
+
+    #[test]
+    fn a_fresh_touch_does_not_acquire_the_writer_lock() {
+        let (dir, store) = test_store();
+        store.touch("a", 1).unwrap();
+        let blocker = Connection::open(dir.path().join(DIR_NAME).join(DB_NAME)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        store.conn.busy_timeout(Duration::from_millis(25)).unwrap();
+        store.touch("a", TOUCH_INTERVAL_MS).unwrap();
+        assert!(store.touch("a", TOUCH_INTERVAL_MS + 1).is_err());
+        assert!(store.touch("new", 1).is_err());
+        blocker.execute_batch("ROLLBACK").unwrap();
+        store.touch("a", TOUCH_INTERVAL_MS + 1).unwrap();
+        store.touch("a", 0).unwrap();
+        let agent = store.agents().unwrap().remove(0);
+        assert_eq!(
+            (agent.first_seen, agent.last_seen),
+            (1, TOUCH_INTERVAL_MS + 1)
+        );
     }
 
     #[test]
@@ -937,10 +1167,69 @@ mod tests {
         store.touch("a", 1).unwrap();
         let blocker = Connection::open(dir.path().join(DIR_NAME).join(DB_NAME)).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let previous = Duration::from_millis(1_375);
+        store.conn.busy_timeout(previous).unwrap();
         let started = std::time::Instant::now();
-        let _ = store.touch_best_effort("a", 1 + TOUCH_INTERVAL_MS);
+        assert!(store.touch_best_effort("a", 1 + TOUCH_INTERVAL_MS).is_err());
         assert!(started.elapsed() < Duration::from_millis(250));
+        let timeout = || {
+            store
+                .conn
+                .pragma_query_value(None, "busy_timeout", |row| row.get::<_, u32>(0))
+                .unwrap()
+        };
+        assert_eq!(timeout(), previous.as_millis() as u32);
+        store.touch_best_effort("a", 2).unwrap();
+        assert_eq!(timeout(), previous.as_millis() as u32);
         blocker.execute_batch("ROLLBACK").unwrap();
+        store.touch_best_effort("a", 1 + TOUCH_INTERVAL_MS).unwrap();
+        assert_eq!(timeout(), previous.as_millis() as u32);
+    }
+
+    #[test]
+    fn touch_recreates_an_agent_deleted_between_select_and_upsert() {
+        use std::sync::mpsc;
+
+        let (dir, mut store) = test_store();
+        store.touch("a", 1).unwrap();
+        let blocker = Store::open(dir.path()).unwrap();
+        blocker.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (blocked_tx, blocked_rx) = mpsc::sync_channel(1);
+        store
+            .conn
+            .busy_handler(Some(move |attempt| {
+                if attempt == 0 {
+                    blocked_tx.send(()).unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(1));
+                attempt < 1_000
+            }))
+            .unwrap();
+        let writer = std::thread::spawn(move || {
+            // WAL permits the SELECT; the callback proves the UPSERT is now blocked.
+            blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                blocker
+                    .conn
+                    .execute("DELETE FROM agents WHERE id = 'a'", [])
+                    .unwrap(),
+                1
+            );
+            blocker.conn.execute_batch("COMMIT").unwrap();
+        });
+        let now = 1 + TOUCH_INTERVAL_MS;
+        let result = store.touch("a", now);
+        writer.join().unwrap();
+        result.unwrap();
+        store.conn.busy_timeout(BUSY_TIMEOUT).unwrap();
+        assert_eq!(
+            store.agents().unwrap(),
+            vec![Agent {
+                id: "a".into(),
+                first_seen: now,
+                last_seen: now,
+            }]
+        );
     }
 
     #[test]

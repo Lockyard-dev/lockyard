@@ -17,6 +17,8 @@ pub mod fsio;
 pub mod machine;
 pub mod outside;
 pub mod paths;
+#[doc(hidden)]
+pub mod perf;
 pub mod proto;
 pub mod repository;
 mod store;

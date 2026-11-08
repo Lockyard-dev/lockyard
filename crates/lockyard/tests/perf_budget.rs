@@ -15,23 +15,27 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const SAMPLES: usize = 80;
-// Windows and macOS have their own ceilings (owner decisions 2026-11-08): NTFS durable
-// writes and process start are slower on Windows (hosted release p95: hook 15.3 ms, send
-// 26-31 ms); hosted macOS runners measured send 20.6 ms. Linux keeps the strict 15/20 ms.
-#[cfg(not(windows))]
+// Each invocation measures one raw subprocess p95; diagnostics run separately.
+// Owner decision 2026-11-09: hosted macOS CI takes the best of all three attempts
+// independently for hook/send (15/20 ms). Linux runs each once (15/20 ms).
+// Windows runs hook once and all three send attempts (15/35 ms). Both CI wrappers
+// share the attempt gate; only explicit budget assertions permit another attempt.
+// Acceptance uses the assertion result, not the as_micros-truncated diagnostic p95.
 const HOOK_P95: Duration = Duration::from_millis(15);
-#[cfg(not(any(windows, target_os = "macos")))]
+// Owner decision 2026-11-08: Windows send p95 <= 35 ms. SQLite synchronous=FULL
+// pays FlushFileBuffers (p50 4.7 ms / p95 ~10 ms) plus 7-8 ms process startup.
+// CI run 42504694714: raw send p95 22.0/29.1 ms; profiled p95 18.8-19.6 ms,
+// Hosted outliers reached 63.5/134 ms. The shared CI gate accepts the best of all
+// three Windows send attempts; Windows hook remains one attempt.
+#[cfg(windows)]
+const SEND_P95: Duration = Duration::from_millis(35);
+#[cfg(not(windows))]
 const SEND_P95: Duration = Duration::from_millis(20);
-#[cfg(target_os = "macos")]
-const SEND_P95: Duration = Duration::from_millis(30);
-#[cfg(windows)]
-const HOOK_P95: Duration = Duration::from_millis(20);
-#[cfg(windows)]
-const SEND_P95: Duration = Duration::from_millis(40);
 
 fn binary() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lockyard"));
     command.env_remove("LOCKYARD_AGENT");
+    command.env_remove("LOCKYARD_PERF_TRACE");
     command
 }
 

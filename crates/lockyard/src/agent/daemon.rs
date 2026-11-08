@@ -472,6 +472,25 @@ impl<T: Transport + 'static> Shared<T> {
     }
 
     fn check(&self, session: &str, paths: Vec<String>) -> Reply {
+        self.check_with_server(session, paths, |wanted| {
+            let wanted = wanted.to_vec();
+            self.within_deadline(
+                {
+                    let session = session.to_string();
+                    move |backend| backend.check(&session, &wanted, None, 0)
+                },
+                session,
+            )
+        })
+    }
+
+    /// Keeps the cache/fallback decision separate from the bounded transport execution.
+    fn check_with_server(
+        &self,
+        session: &str,
+        paths: Vec<String>,
+        server_check: impl FnOnce(&[String]) -> Option<lockyard_core::Result<Vec<PathCheck>>>,
+    ) -> Reply {
         {
             let view = self.read_view();
             if view.fresh(self.timing().fresh) {
@@ -488,15 +507,7 @@ impl<T: Transport + 'static> Shared<T> {
                 }
             }
         }
-        let wanted = paths.clone();
-        let answer = self.within_deadline(
-            {
-                let session = session.to_string();
-                move |backend| backend.check(&session, &wanted, None, 0)
-            },
-            session,
-        );
-        match answer {
+        match server_check(&paths) {
             Some(Ok(checks)) => Reply {
                 checks: Some(checks),
                 source: Some(Source::Server),
@@ -2655,15 +2666,34 @@ mod tests {
 
     #[test]
     fn a_stale_view_makes_one_server_call_and_never_answers_from_memory() {
-        let mut rig = start_with(timing(), |server| server.claim(1, "bob", "src"));
+        let mut rig = start_with(
+            Timing {
+                fresh: Duration::from_secs(30),
+                ..timing()
+            },
+            |server| server.claim(1, "bob", "src"),
+        );
         view_ready(&rig);
         rig.daemon.stop_workers();
-        // The upkeep threads are gone, so the view can only age.
-        wait_for("the view to go stale", || {
-            !rig.daemon.shared.read_view().fresh(timing().fresh)
-        });
+        let shared = &rig.daemon.shared;
+        // This test covers the cache/fallback decision, so run the fake server inline.
+        // Thread scheduling and diagnostic I/O under parallel test load can exhaust
+        // the real 150 ms deadline; the hung-server test covers that separate bound.
+        let server_check =
+            |paths: &[String]| Some(shared.backend("me").check("me", paths, None, 0));
         let before = rig.server.calls_to("/api/v1/zones/check");
-        let reply = rig.daemon.handle(check("me", "src"));
+        let cached = shared.check_with_server("me", vec!["src".into()], server_check);
+        assert_eq!(cached.source, Some(Source::View));
+        assert_eq!(cached.checks.unwrap()[0].status, CheckStatus::Held);
+        assert_eq!(rig.server.calls_to("/api/v1/zones/check"), before);
+        {
+            let mut view = shared.write_view();
+            let age = shared.timing().fresh * 2;
+            view.zones_at = Some(Instant::now() - age);
+            view.zones_wall_at = Some(SystemTime::now() - age);
+        }
+        assert!(!shared.read_view().fresh(shared.timing().fresh));
+        let reply = shared.check_with_server("me", vec!["src".into()], server_check);
         assert_eq!(reply.source, Some(Source::Server));
         assert_eq!(
             reply.checks.unwrap()[0].status,
@@ -3521,7 +3551,7 @@ mod tests {
 
     #[test]
     fn session_events_repeat_until_the_hook_acknowledges_written_output() {
-        let rig = start_with(
+        let mut rig = start_with(
             Timing {
                 upkeep: Duration::from_secs(1),
                 ..timing()
@@ -3546,6 +3576,9 @@ mod tests {
                 .get("alice")
                 .is_some_and(|cache| !cache.events.is_empty())
         });
+        // Join the background polls before counting: only TakeEvents may affect
+        // the assertion below, not an unrelated stream refresh in this rig.
+        rig.daemon.stop_workers();
         let polls = rig.server.event_calls.load(Ordering::SeqCst);
         let first = rig.daemon.handle(take.clone()).events.unwrap();
         assert_eq!(

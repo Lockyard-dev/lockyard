@@ -415,6 +415,20 @@ fn deliver(out: &Output, json: bool) -> std::io::Result<()> {
 }
 
 fn main() -> ExitCode {
+    let _total = lockyard_core::perf::Span::new("process.main");
+    #[cfg(windows)]
+    let _sqlite_io = {
+        // SAFETY: CLI startup is single-threaded here; no SQLite connection or
+        // runtime has been created. The opt-in VFS probes forward every syscall.
+        unsafe { lockyard_core::perf::windows_sqlite::install_before_threads() };
+        struct FlushSqliteIo;
+        impl Drop for FlushSqliteIo {
+            fn drop(&mut self) {
+                lockyard_core::perf::windows_sqlite::flush();
+            }
+        }
+        FlushSqliteIo
+    };
     #[cfg(unix)]
     if std::env::args_os()
         .nth(1)
@@ -422,7 +436,9 @@ fn main() -> ExitCode {
     {
         return ExitCode::from(lockyard_node::native::sandbox_main() as u8);
     }
+    let parsing = lockyard_core::perf::Span::new("process.parse");
     let cli = Cli::parse();
+    drop(parsing);
     let json = cli.json;
     if let Command::Mcp(args) = &cli.command {
         let surface = match mcp::Surface::choose(args.tools.as_deref()) {

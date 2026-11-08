@@ -78,14 +78,22 @@ pub struct Message {
 impl Store {
     /// Sends `body` to an agent seen in this project or to [`BROADCAST`].
     pub fn send(&mut self, from: &str, to: &str, body: &str, now: i64) -> Result<Message> {
+        let _span = crate::perf::Span::new("message.send");
         if to != BROADCAST {
             validate_agent(to)?;
         }
         if to == from {
             return Err(Error::Invalid("cannot send a message to yourself".into()));
         }
-        self.touch(from, now)?;
-        if to != BROADCAST && !self.agent_exists(to)? {
+        {
+            let _touch = crate::perf::Span::new("message.touch_sender");
+            self.touch(from, now)?;
+        }
+        let recipient_exists = {
+            let _recipient = crate::perf::Span::new("message.recipient_lookup");
+            to == BROADCAST || self.agent_exists(to)?
+        };
+        if !recipient_exists {
             return Err(Error::NotFound(format!(
                 "no agent named {to} has been seen here, see `lockyard who`"
             )));
@@ -341,7 +349,9 @@ impl Store {
                 body.len()
             )));
         }
+        let transaction_span = crate::perf::Span::new("message.transaction");
         let transaction = self.write()?;
+        let retention = crate::perf::Span::new("message.retention");
         // What the sweep removes is still worth one line to the sender: silence and "it expired
         // before anyone looked at it" are different answers to "did my message land?".
         transaction.execute(
@@ -361,13 +371,19 @@ impl Store {
             "DELETE FROM message_outcomes WHERE created_at <= ?1",
             [now - 2 * RETENTION_MS],
         )?;
+        drop(retention);
+        let insert = crate::perf::Span::new("message.insert");
         transaction.execute(
             "INSERT INTO messages (from_agent, to_agent, body, reply_to, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![from, to, body, reply_to, now],
         )?;
         let id = transaction.last_insert_rowid();
+        drop(insert);
+        let _commit = crate::perf::Span::new("sqlite.commit_full");
         transaction.commit()?;
+        drop(_commit);
+        drop(transaction_span);
         Ok(Message {
             id,
             from: from.to_string(),
