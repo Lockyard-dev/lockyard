@@ -1,6 +1,16 @@
 # Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 $ErrorActionPreference = 'Stop'
 $env:CARGO_INCREMENTAL = '0'
+# Require this Windows-only regression by exact name: a successful zero-test run is not proof.
+# Keep it in this step's log alongside the performance diagnostics, even when the budget fails.
+$recovery = 'store::tests::windows_database_releases_the_rollback_journal_pin_before_hot_recovery'
+$recoveryCatalog = cargo test --locked --release -p lockyard-core --lib -- --list
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if (@($recoveryCatalog | Where-Object { $_ -ceq "${recovery}: test" }).Count -ne 1) {
+    throw "Missing or duplicate Windows hot-journal regression: $recovery"
+}
+cargo test --locked --release -p lockyard-core --lib $recovery -- --exact --nocapture
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 # Windows debug validation overhead exceeded the production latency budgets.
 # Measure the shipped profile; keep the same raw subprocess timings and ceilings.
 # Emit hot-path and authenticated-pipe spans before the strict budget gate.

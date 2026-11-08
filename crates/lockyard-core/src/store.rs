@@ -505,17 +505,20 @@ impl Store {
         // A no-op UPSERT still acquires SQLite's single writer lock. Read first so
         // a recent heartbeat needs no write transaction; the UPSERT predicate below
         // remains authoritative when another process updates the row concurrently.
-        let last_seen: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT last_seen FROM agents WHERE id = ?1",
-                [agent],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let last_seen: Option<i64> = {
+            let _read = crate::perf::Span::new("presence.read");
+            self.conn
+                .query_row(
+                    "SELECT last_seen FROM agents WHERE id = ?1",
+                    [agent],
+                    |row| row.get(0),
+                )
+                .optional()?
+        };
         if last_seen.is_some_and(|last| now < last.saturating_add(TOUCH_INTERVAL_MS)) {
             return Ok(());
         }
+        let _upsert = crate::perf::Span::new("presence.upsert_commit");
         self.conn.execute(
             "INSERT INTO agents (id, first_seen, last_seen) VALUES (?1, ?2, ?2)
              ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen
@@ -569,6 +572,7 @@ impl Store {
 
     /// Starts a write that holds the database lock from its first statement.
     pub(crate) fn write(&mut self) -> Result<Transaction<'_>> {
+        let _begin = crate::perf::Span::new("sqlite.begin_immediate");
         Ok(self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?)

@@ -54,7 +54,9 @@ jobs:
       - name: Enforce unchanged performance budgets on the Windows release binary
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./tools/ci/test-windows-perf.ps1
+        run: |
+          ./tests/windows-perf-gate.test.ps1
+          ./tools/ci/test-windows-perf.ps1
       - name: Require E2EE from the actual MCP subprocess
         if: runner.os != 'Windows'
         shell: bash
@@ -155,7 +157,9 @@ jobs:
           RUST_BACKTRACE: "1"
       - name: Enforce unchanged performance budgets on the Windows release binary
         shell: pwsh
-        run: ./tools/ci/test-windows-perf.ps1
+        run: |
+          ./tests/windows-perf-gate.test.ps1
+          ./tools/ci/test-windows-perf.ps1
       - name: Two sessions arbitrate one claim over a real named pipe
         shell: pwsh
         run: |

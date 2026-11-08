@@ -3,6 +3,14 @@
 //! Opt-in, payload-free CLI profiling. Disabled unless `LOCKYARD_PERF_TRACE=1`.
 use std::{sync::OnceLock, time::Instant};
 
+#[cfg(windows)]
+pub mod windows_sqlite;
+
+pub(crate) fn enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("LOCKYARD_PERF_TRACE").as_deref() == Ok("1"))
+}
+
 /// A diagnostic wall-time span. Labels must never contain paths, identities or payloads.
 pub struct Span {
     label: &'static str,
@@ -11,12 +19,9 @@ pub struct Span {
 
 impl Span {
     pub fn new(label: &'static str) -> Self {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        let enabled =
-            *ENABLED.get_or_init(|| std::env::var("LOCKYARD_PERF_TRACE").as_deref() == Ok("1"));
         Self {
             label,
-            started: enabled.then(Instant::now),
+            started: enabled().then(Instant::now),
         }
     }
 }

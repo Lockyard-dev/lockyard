@@ -19,6 +19,18 @@ if ($env:CARGO_INCREMENTAL -ne '0') {
     exit 2
 }
 switch ($command) {
+    'test --locked --release -p lockyard-core --lib -- --list' {
+        $recovery = 'store::tests::windows_database_releases_the_rollback_journal_pin_before_hot_recovery: test'
+        switch ($env:WINDOWS_PERF_CASE) {
+            'recovery_missing' { Write-Output 'store::tests::other: test' }
+            'recovery_duplicate' { Write-Output $recovery, $recovery }
+            'recovery_list_failed' { exit 101 }
+            default { Write-Output $recovery, '', '1 test, 0 benchmarks' }
+        }
+    }
+    'test --locked --release -p lockyard-core --lib store::tests::windows_database_releases_the_rollback_journal_pin_before_hot_recovery -- --exact --nocapture' {
+        if ($env:WINDOWS_PERF_CASE -eq 'recovery_failed') { exit 101 }
+    }
     'test --locked --release -p lockyard --test perf_profile -- --ignored --test-threads=1 --nocapture' {
         if ($env:WINDOWS_PERF_CASE -eq 'profile_failed') { exit 101 }
     }
@@ -54,7 +66,7 @@ exit /b %ERRORLEVEL%
     $env:WINDOWS_PERF_MOCK = $mock
     $env:WINDOWS_PERF_COMMANDS = Join-Path $fixture 'commands'
     $env:PATH = $bin.FullName + [System.IO.Path]::PathSeparator + $env:PATH
-    foreach ($scenario in @('profile_failed', 'pipe_profile_failed', 'missing', 'unknown', 'duplicate', 'list_failed', 'flaky', 'budget_failed', 'valid')) {
+    foreach ($scenario in @('recovery_missing', 'recovery_duplicate', 'recovery_list_failed', 'recovery_failed', 'profile_failed', 'pipe_profile_failed', 'missing', 'unknown', 'duplicate', 'list_failed', 'flaky', 'budget_failed', 'valid')) {
         [System.IO.File]::WriteAllText($env:WINDOWS_PERF_COMMANDS, '')
         $env:WINDOWS_PERF_CASE = $scenario
         $env:CARGO_INCREMENTAL = '1'
@@ -64,14 +76,18 @@ exit /b %ERRORLEVEL%
         $process = Start-Process -FilePath $engine -ArgumentList @('-NoProfile', '-File', ('"' + $gate + '"')) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
         $status = $process.ExitCode
         $expected = 1
-        $calls = 3
+        $calls = 5
         switch ($scenario) {
-            'valid' { $expected = 0; $calls = 4 }
-            'profile_failed' { $expected = 101; $calls = 1 }
-            'pipe_profile_failed' { $expected = 101; $calls = 2 }
+            'valid' { $expected = 0; $calls = 6 }
+            'recovery_missing' { $calls = 1 }
+            'recovery_duplicate' { $calls = 1 }
+            'recovery_list_failed' { $expected = 101; $calls = 1 }
+            'recovery_failed' { $expected = 101; $calls = 2 }
+            'profile_failed' { $expected = 101; $calls = 3 }
+            'pipe_profile_failed' { $expected = 101; $calls = 4 }
             'list_failed' { $expected = 101 }
-            'flaky' { $expected = 101; $calls = 4 }
-            'budget_failed' { $expected = 101; $calls = 4 }
+            'flaky' { $expected = 101; $calls = 6 }
+            'budget_failed' { $expected = 101; $calls = 6 }
         }
         $actualCalls = @(Get-Content -LiteralPath $env:WINDOWS_PERF_COMMANDS).Count
         if ($status -ne $expected -or $actualCalls -ne $calls) {
