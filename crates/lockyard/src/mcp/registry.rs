@@ -20,7 +20,7 @@ pub(super) fn tool_def(
     })
 }
 
-/// One definition supplies schema, description, dispatch and surface visibility.
+/// One definition supplies dispatch and the base schema for both surfaces.
 #[derive(Clone)]
 pub(super) enum ToolHandler {
     Primitive(String),
@@ -142,7 +142,26 @@ impl ToolRegistry {
         }
         definitions
             .into_iter()
-            .map(|definition| definition.wire.clone())
+            .map(|definition| {
+                let mut wire = definition.wire.clone();
+                if surface == Surface::Compact {
+                    match wire["name"].as_str().unwrap() {
+                        "task_add" => {
+                            wire["description"] = json!("Add a task in an explicit area, using that area's task prefix.");
+                            wire["inputSchema"]["required"] = json!(["title", "area"]);
+                        }
+                        "zone_renew" => {
+                            wire["description"] = json!("Renew your live claim; ttl is optional minutes (1-240, default 30); fence is required in cloud mode.");
+                            wire["inputSchema"]["properties"]["ttl"] = json!({
+                                "type": "integer", "minimum": 1, "maximum": 240, "default": 30,
+                                "description": "Optional lease length in minutes, from 1 through 240; defaults to 30."
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                wire
+            })
             .collect()
     }
 }
@@ -163,6 +182,8 @@ fn compact_visibility(name: &str) -> Option<usize> {
         "area_create" => 11,
         "area_update" => 12,
         "cloud_protocol" => 13,
+        "task_add" => 14,
+        "zone_renew" => 15,
         _ => return None,
     })
 }

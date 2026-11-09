@@ -93,8 +93,8 @@ pub struct Task {
     pub registry_evidence: Vec<serde_json::Value>,
 }
 
-/// A new task. Everything past `body` belongs to the cloud backlog, where the agent that writes an
-/// item also sets its urgency.
+/// A new task. Local mode supports the default `general` area; the remaining registry fields belong
+/// to the cloud backlog, where the agent that writes an item also sets its urgency.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskSpec {
     pub title: String,
@@ -122,13 +122,16 @@ impl TaskSpec {
             &self.kind,
             &self.target,
             &self.verification,
-            &self.area,
             &self.prefix,
             &self.due_at,
             &self.evidence,
         ]
         .iter()
         .any(|field| field.is_some())
+            || self
+                .area
+                .as_deref()
+                .is_some_and(|area| !area.eq_ignore_ascii_case("general"))
             || self.pad.is_some()
     }
 }

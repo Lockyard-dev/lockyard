@@ -3,12 +3,35 @@
     #[test]
     fn compact_definitions_are_projection_of_full_registry() {
         let full = tools(Surface::Full);
-        for compact in tools(Surface::Compact) {
-            let name = compact["name"].as_str().unwrap();
+        for mut compact in tools(Surface::Compact) {
+            let name = compact["name"].as_str().unwrap().to_string();
             let canonical = full
                 .iter()
                 .find(|tool| tool["name"] == name)
                 .unwrap_or_else(|| panic!("compact tool {name} is absent from full registry"));
+            match name.as_str() {
+                "task_add" => {
+                    assert_eq!(canonical["inputSchema"]["required"], json!(["title"]));
+                    assert_eq!(compact["inputSchema"]["required"], json!(["title", "area"]));
+                    compact["inputSchema"]["required"] = canonical["inputSchema"]["required"].clone();
+                    compact["description"] = canonical["description"].clone();
+                }
+                "zone_renew" => {
+                    assert_eq!(canonical["inputSchema"]["required"], json!([]));
+                    assert_eq!(canonical["inputSchema"]["properties"]["ttl"], json!({"type":"integer"}));
+                    assert_eq!(compact["inputSchema"]["required"], json!([]));
+                    let ttl = &compact["inputSchema"]["properties"]["ttl"];
+                    assert_eq!(ttl["type"], "integer");
+                    assert_eq!(ttl["minimum"], 1);
+                    assert_eq!(ttl["maximum"], 240);
+                    assert_eq!(ttl["default"], 30);
+                    assert!(compact["description"].as_str().unwrap().contains("fence is required in cloud mode"));
+                    compact["inputSchema"]["required"] = canonical["inputSchema"]["required"].clone();
+                    compact["inputSchema"]["properties"]["ttl"] = canonical["inputSchema"]["properties"]["ttl"].clone();
+                    compact["description"] = canonical["description"].clone();
+                }
+                _ => {}
+            }
             assert_eq!(&compact, canonical, "{name} has a second definition");
         }
         for name in ["zone_catalog_put", "cloud_drain", "cloud_drain_status"] {

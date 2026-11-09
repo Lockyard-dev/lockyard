@@ -8,6 +8,7 @@ pub(super) fn run_tool(
     agent: Option<&str>,
     cwd: &Path,
     client: Option<&str>,
+    surface: Surface,
     after: &mut Option<After>,
 ) -> Result<Value> {
     let handler = tool_registry()
@@ -388,11 +389,19 @@ pub(super) fn run_tool(
         "zone_lost" => encode(&opened.backend.lost(me()?)?),
         "zone_catalog" => opened.backend.catalog(),
         "zone_renew" => {
+            let fence = args.some_int("fence")?;
+            if surface == Surface::Compact && is_cloud && fence.is_none() {
+                return Err(Error::Invalid("fence is required in cloud mode".into()));
+            }
             let request = RenewRequest {
                 ttl_minutes: args.ttl()?,
                 hold_reason: args.some_text("hold_reason")?,
                 hold_until: args.some_text("hold_until")?,
-                fence: args.some_int("fence")?,
+                fence: if surface == Surface::Compact && !is_cloud {
+                    None
+                } else {
+                    fence
+                },
             };
             let renewed = opened
                 .backend

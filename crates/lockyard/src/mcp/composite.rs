@@ -16,7 +16,15 @@ pub(super) fn run_composite(
     after: &mut Option<After>,
 ) -> Result<Value> {
     let step = |tool: &str, arguments: Value, after: &mut Option<After>| {
-        run_tool(tool, Args(&arguments), agent, cwd, client, after)
+        run_tool(
+            tool,
+            Args(&arguments),
+            agent,
+            cwd,
+            client,
+            Surface::Full,
+            after,
+        )
     };
     match name {
         "start_work" => {

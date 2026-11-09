@@ -20,7 +20,9 @@
                 "area_list",
                 "area_create",
                 "area_update",
-                "cloud_protocol"
+                "cloud_protocol",
+                "task_add",
+                "zone_renew"
             ]
         );
         let full = listed(Surface::Full, &dir);
@@ -36,6 +38,117 @@
         for tool in tools(Surface::Compact) {
             let description = tool["description"].as_str().unwrap();
             assert!(description.len() <= 110, "{description}");
+        }
+    }
+
+    #[test]
+    fn compact_task_creation_requires_an_explicit_nonempty_area() {
+        let dir = project();
+        for arguments in [
+            json!({"title": "ship"}),
+            json!({"title": "ship", "area": null}),
+            json!({"title": "ship", "area": ""}),
+            json!({"title": "ship", "area": "  "}),
+            json!({"title": "ship", "area": 42}),
+        ] {
+            let response = handle(
+                &json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "task_add", "arguments": arguments}
+                }),
+                Some("lead"), dir.path(), Surface::Compact,
+            ).unwrap();
+            assert_eq!(response["result"]["isError"], true);
+            assert!(text(&response["result"]).contains("requires a non-empty area"));
+        }
+        // Full integrations retain their existing optional-area behavior.
+        let added = call(&dir, "lead", "task_add", json!({"title": "legacy"}));
+        assert_eq!(added["isError"], false);
+        let listed = call(&dir, "lead", "task_list", json!({}));
+        assert_eq!(listed["structuredContent"].as_array().unwrap().len(), 1);
+    }
+
+    fn compact_call(dir: &tempfile::TempDir, agent: &str, name: &str, arguments: Value) -> Value {
+        handle(
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            }),
+            Some(agent), dir.path(), Surface::Compact,
+        ).unwrap()["result"].clone()
+    }
+
+    #[test]
+    fn compact_local_task_creation_uses_the_explicit_general_area_prefix() {
+        let dir = project();
+        let added = compact_call(
+            &dir, "lead", "task_add", json!({"title": "local task", "area": "general"}),
+        );
+        assert_eq!(added["isError"], false, "{}", text(&added));
+        assert_eq!(added["structuredContent"]["id"], "D-1");
+        let listed = call(&dir, "lead", "task_list", json!({}));
+        let tasks = listed["structuredContent"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], "D-1");
+        assert_eq!(tasks[0]["title"], "local task");
+    }
+
+    #[test]
+    fn compact_renewal_validates_optional_fence_and_bounds_ttl_in_minutes() {
+        let dir = project();
+        for (arguments, expected) in [
+            (json!({"fence": "1"}), "fence must be an integer"),
+            (json!({"fence": true}), "fence must be an integer"),
+            (json!({"ttl": 0}), "ttl must be 1 to 240 minutes"),
+            (json!({"ttl": 241}), "ttl must be 1 to 240 minutes"),
+        ] {
+            let response = compact_call(&dir, "lead", "zone_renew", arguments);
+            assert_eq!(response["isError"], true);
+            assert_eq!(text(&response), expected);
+        }
+    }
+
+    #[test]
+    fn full_local_renewal_keeps_its_existing_fence_refusal() {
+        let dir = project();
+        let started = call(&dir, "lead", "start_work", json!({"paths": ["src"]}));
+        assert_eq!(started["isError"], false);
+        let id = started["structuredContent"]["claim"]["id"].as_i64().unwrap();
+        let refused = call(&dir, "lead", "zone_renew", json!({"id": id, "fence": 0}));
+        assert_eq!(refused["isError"], true);
+        assert!(text(&refused).starts_with("a fence needs cloud mode."));
+        let renewed = call(&dir, "lead", "zone_renew", json!({"id": id}));
+        assert_eq!(renewed["isError"], false);
+        assert_eq!(renewed["structuredContent"]["renewed"], 1);
+    }
+
+    #[test]
+    fn compact_local_renewal_extends_a_live_claim_without_a_cloud_fence() {
+        for fence in [None, Some(json!(null)), Some(json!(0))] {
+            let dir = project();
+            let started = compact_call(
+                &dir, "lead", "start_work", json!({"paths": ["src"], "ttl": 1}),
+            );
+            assert_eq!(started["isError"], false, "{}", text(&started));
+            let claim = &started["structuredContent"]["claim"];
+            let id = claim["id"].as_i64().unwrap();
+            let original_expiry = claim["expires_at"].as_i64().unwrap();
+            let mut arguments = json!({"id": id});
+            if let Some(fence) = fence {
+                arguments["fence"] = fence;
+            }
+            let before = crate::now_ms();
+            let renewed = compact_call(&dir, "lead", "zone_renew", arguments);
+            let after = crate::now_ms();
+            assert_eq!(renewed["isError"], false, "{}", text(&renewed));
+            assert_eq!(renewed["structuredContent"]["renewed"], 1);
+            let claims = call(&dir, "lead", "zone_list", json!({}));
+            let stored = &claims["structuredContent"][0];
+            assert_eq!(stored["id"], id);
+            assert_eq!(stored["session"], "lead");
+            let expiry = stored["expires_at"].as_i64().unwrap();
+            assert!(expiry > original_expiry);
+            assert!((before + 30 * 60_000..=after + 30 * 60_000).contains(&expiry));
         }
     }
 

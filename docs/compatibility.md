@@ -13,10 +13,22 @@ returns strings. Protocol 1 numeric projection refuses IDs that cannot be
 reconstructed exactly, including area-prefixed and padded IDs.
 
 The full MCP `ToolRegistry` owns all definitions, handlers, aliases, and compact
-visibility. Compact filters these definitions; `check` resolves to the same
-handler, description, and schema as `zone_check`. `cloud_protocol` is compact;
-`cloud_drain`, `cloud_drain_status`, and `zone_catalog_put` are full-only.
-Visibility never supplies authorization.
+visibility. The compact catalog has 16 tools: `revoke_access`, `start_work`,
+`check`, `update`, `handover`, `finish_work`, `status`, `tasks`, `task_bulk`,
+`registry_import`, `area_list`, `area_create`, `area_update`, `cloud_protocol`,
+`task_add`, and `zone_renew`. Compact projects these definitions; `check` resolves
+to the same handler, description, and schema as `zone_check`. `cloud_drain`,
+`cloud_drain_status`, and `zone_catalog_put` are full-only.
+
+Compact `task_add` requires `area` in its schema and rejects omission before
+calling the shared handler; task numbers retain that area's prefix. Full
+`task_add` keeps its existing optional `area` and default-area behavior.
+Local `task_add` supports `general` (`D-*`); other registry areas require cloud mode.
+Compact `zone_renew` accepts an optional `ttl` of 1–240 minutes (default 30).
+The current `fence` is required only in cloud mode; local claims renew without
+a fence. It uses the existing renewal handler, including refusals for foreign
+and expired claims and, in cloud mode, stale fences. Full-catalog behavior
+remains unchanged. Visibility never supplies authorization.
 
 Claim, queue, and presence DTOs use canonical `session` in domain serialization.
 Their historical `agent` field is accepted only by the schema-specific SDK codec;

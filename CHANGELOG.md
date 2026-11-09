@@ -5,6 +5,17 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-11-09
+
+### Added
+
+- Expose `task_add` and `zone_renew` in the 16-tool compact MCP catalog: `revoke_access`, `start_work`, `check`, `update`, `handover`, `finish_work`, `status`, `tasks`, `task_bulk`, `registry_import`, `area_list`, `area_create`, `area_update`, `cloud_protocol`, `task_add`, and `zone_renew`.
+- Require an explicit `area` for compact `task_add`, preserving the area's task prefix and the full catalog's existing optional-area behavior. Local `task_add` supports `general` (`D-*`); other registry areas require cloud mode. Compact `zone_renew` accepts an optional `ttl` of 1–240 minutes (default 30); the current `fence` is required only in cloud mode. Local claims renew without a fence, using the existing ownership and expiry checks; cloud renewals also check for stale fences.
+
+### Changed
+
+- Advance the synchronized Rust, npm, PyPI and MCP registry versions to `0.3.3`.
+
 ## [0.3.2] - 2026-11-08
 
 ### Changed

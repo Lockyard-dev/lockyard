@@ -13,6 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+// Renewal fixtures use a fixed server clock so subprocess scheduling cannot age a claim.
+const RENEW_NOW_MS: i64 = 1_000_000;
+
 #[derive(Debug, Clone)]
 struct Seen {
     method: String,
@@ -38,6 +41,8 @@ struct State {
     catalog: Option<Value>,
     encryption_key_id: Option<String>,
     refuse_catalog_put: bool,
+    registry_areas: Vec<Value>,
+    registry_next_item: u64,
 }
 
 #[derive(Clone)]
@@ -116,7 +121,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
                 path: path.clone(),
                 body: body.clone(),
                 key,
-                session,
+                session: session.clone(),
             };
             state.seen.push(record);
         }
@@ -126,7 +131,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
                 json!({"error": {"code": "unauthorized", "message": "bad token"}}),
             )
         } else {
-            route_reply(&mut state, &method, &route, &body)
+            route_reply(&mut state, &method, &route, &body, session.as_deref())
         }
     };
     let text = answer.to_string();
@@ -138,7 +143,13 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
     let _ = stream.write_all(response.as_bytes());
 }
 
-fn route_reply(state: &mut State, method: &str, route: &str, body: &Value) -> (u16, Value) {
+fn route_reply(
+    state: &mut State,
+    method: &str,
+    route: &str,
+    body: &Value,
+    session: Option<&str>,
+) -> (u16, Value) {
     match (method, route) {
         ("GET", "/api/v1/protocol") => (
             200,
@@ -188,6 +199,43 @@ fn route_reply(state: &mut State, method: &str, route: &str, body: &Value) -> (u
             (200, reply)
         }
         ("GET", "/api/v1/zones/claims") => (200, json!({"claims": state.claims})),
+        ("POST", _) if route.starts_with("/api/v1/zones/claims/") && route.ends_with("/renew") => {
+            let id = route
+                .trim_end_matches("/renew")
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .parse::<i64>()
+                .unwrap();
+            let Some(claim) = state.claims.iter_mut().find(|claim| claim["id"] == id) else {
+                return (
+                    404,
+                    json!({"error":{"code":"not_found","message":"claim does not exist"}}),
+                );
+            };
+            if claim["session"].as_str() != session {
+                return (
+                    404,
+                    json!({"error":{"code":"not_found","message":"claim is not yours"}}),
+                );
+            }
+            if claim["expires_at"].as_i64().unwrap() <= RENEW_NOW_MS {
+                return (
+                    404,
+                    json!({"error":{"code":"not_found","message":"claim has expired"}}),
+                );
+            }
+            if claim["fence"] != body["fence"] {
+                return (
+                    412,
+                    json!({"error":{"code":"stale_fence","message":"stale fence"}}),
+                );
+            }
+            let ttl = body["ttl_minutes"].as_i64().unwrap();
+            assert!((1..=240).contains(&ttl));
+            claim["expires_at"] = json!(RENEW_NOW_MS + ttl * 60_000);
+            (200, claim.clone())
+        }
         ("DELETE", _) if route.starts_with("/api/v1/zones/claims/") => {
             if let Some(refusal) = state.refuse_release.clone() {
                 return refusal;
@@ -199,6 +247,23 @@ fn route_reply(state: &mut State, method: &str, route: &str, body: &Value) -> (u
             (200, json!({"released":1}))
         }
         ("GET", "/api/v1/presence") => (200, json!({"sessions":[]})),
+        ("GET", "/api/v1/registry/areas") if !state.registry_areas.is_empty() => {
+            (200, json!({"areas": state.registry_areas}))
+        }
+        ("POST", "/api/v1/registry/items") if !state.registry_areas.is_empty() => {
+            let area = state
+                .registry_areas
+                .iter()
+                .find(|area| area["id"] == body["area_id"])
+                .unwrap();
+            state.registry_next_item += 1;
+            let id = format!(
+                "{}-{}",
+                area["prefix"].as_str().unwrap(),
+                state.registry_next_item
+            );
+            (200, json!({"id":id,"title":body["title"],"status":"ready"}))
+        }
         ("GET", "/api/v1/registry/items/D-1") if state.refuse_registry_claim => (
             200,
             json!({"id":"D-1", "title":"taken", "status":"claimed", "version":1}),
@@ -344,6 +409,209 @@ fn json_of(result: &Output) -> Value {
         String::from_utf8_lossy(&result.stderr)
     );
     serde_json::from_slice(&result.stdout).unwrap()
+}
+
+fn mcp_calls(dir: &Path, runtime: &Path, surface: &str, calls: &[(&str, Value)]) -> Vec<Value> {
+    let mut child = binary(dir, runtime)
+        .args(["mcp", "--tools", surface])
+        .env("LOCKYARD_AGENT", "alice")
+        .env("LOCKYARD_TOKEN", "test-token")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    for (id, (name, arguments)) in calls.iter().enumerate() {
+        writeln!(
+            input,
+            "{}",
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}})
+        )
+        .unwrap();
+    }
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answers: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap()["result"].clone())
+        .collect();
+    assert_eq!(answers.len(), calls.len());
+    answers
+}
+
+#[test]
+fn compact_task_add_requires_area_and_uses_its_prefix_while_full_keeps_the_default() {
+    let server = Server::start();
+    server.state.lock().unwrap().registry_areas = vec![
+        json!({"id":"general-id","key":"general","prefix":"D"}),
+        json!({"id":"engine-id","key":"engine","prefix":"FE"}),
+    ];
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let invalid = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "compact",
+        &[
+            ("task_add", json!({"title":"missing area"})),
+            ("task_add", json!({"title":"null area","area":null})),
+            ("task_add", json!({"title":"empty area","area":""})),
+            ("task_add", json!({"title":"blank area","area":"  "})),
+        ],
+    );
+    for answer in invalid {
+        assert_eq!(answer["isError"], true, "{answer}");
+        assert!(
+            answer["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("area"),
+            "{answer}"
+        );
+    }
+    assert!(server.seen("GET", "/api/v1/registry/areas").is_empty());
+    assert!(server.seen("POST", "/api/v1/registry/items").is_empty());
+
+    let explicit = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "compact",
+        &[("task_add", json!({"title":"engine task","area":"engine"}))],
+    );
+    assert_eq!(explicit[0]["isError"], false, "{}", explicit[0]);
+    assert_eq!(explicit[0]["structuredContent"]["id"], "FE-1");
+    let fallback = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "full",
+        &[("task_add", json!({"title":"legacy default"}))],
+    );
+    assert_eq!(fallback[0]["isError"], false, "{}", fallback[0]);
+    assert_eq!(fallback[0]["structuredContent"]["id"], "D-2");
+    let writes = server.seen("POST", "/api/v1/registry/items");
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].body["area_id"], "engine-id");
+    assert_eq!(writes[1].body["area_id"], "general-id");
+}
+
+#[test]
+fn compact_zone_renew_checks_fence_and_ttl_before_sending_and_extends_the_claim() {
+    let server = Server::start();
+    let original_expiry = RENEW_NOW_MS + 30_000;
+    server.state.lock().unwrap().claims = vec![json!({
+        "id":1,"session":"alice","paths":["src"],"fence":7,"expires_at":original_expiry
+    })];
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let invalid = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "compact",
+        &[
+            ("zone_renew", json!({"id":1,"ttl":30})),
+            ("zone_renew", json!({"id":1,"ttl":30,"fence":null})),
+            ("zone_renew", json!({"id":1,"ttl":30,"fence":"7"})),
+            ("zone_renew", json!({"id":1,"ttl":0,"fence":7})),
+            ("zone_renew", json!({"id":1,"ttl":241,"fence":7})),
+        ],
+    );
+    for (answer, expected) in invalid.iter().zip([
+        "fence is required in cloud mode",
+        "fence is required in cloud mode",
+        "fence must be an integer",
+        "ttl must be 1 to 240 minutes",
+        "ttl must be 1 to 240 minutes",
+    ]) {
+        assert_eq!(answer["isError"], true, "{answer}");
+        assert_eq!(answer["content"][0]["text"], expected, "{answer}");
+    }
+    assert!(
+        server
+            .seen("POST", "/api/v1/zones/claims/1/renew")
+            .is_empty()
+    );
+    assert_eq!(
+        server.state.lock().unwrap().claims[0]["expires_at"],
+        original_expiry
+    );
+
+    for (arguments, ttl) in [
+        (json!({"id":1,"fence":7}), 30),
+        (json!({"id":1,"ttl":1,"fence":7}), 1),
+        (json!({"id":1,"ttl":240,"fence":7}), 240),
+    ] {
+        let renewed = mcp_calls(
+            dir.path(),
+            runtime.path(),
+            "compact",
+            &[("zone_renew", arguments)],
+        );
+        assert_eq!(renewed[0]["isError"], false, "{}", renewed[0]);
+        assert_eq!(renewed[0]["structuredContent"]["renewed"], 1);
+        let expiry = server.state.lock().unwrap().claims[0]["expires_at"]
+            .as_i64()
+            .unwrap();
+        assert!(expiry > original_expiry);
+        assert_eq!(expiry, RENEW_NOW_MS + ttl * 60_000);
+    }
+    let writes = server.seen("POST", "/api/v1/zones/claims/1/renew");
+    assert_eq!(writes.len(), 3);
+    for (write, ttl) in writes.iter().zip([30, 1, 240]) {
+        assert_eq!(write.body["ttl_minutes"], ttl);
+        assert_eq!(write.body["fence"], 7);
+        assert_eq!(write.session.as_deref(), Some("alice"));
+    }
+}
+
+#[test]
+fn compact_zone_renew_preserves_stale_fence_foreign_and_expired_refusals() {
+    let server = Server::start();
+    let expiry = RENEW_NOW_MS + 60_000;
+    server.state.lock().unwrap().claims = vec![
+        // Fence 7 belongs to an earlier generation of this claim.
+        json!({"id":1,"session":"alice","paths":["src"],"fence":8,"expires_at":expiry}),
+        json!({"id":2,"session":"bob","paths":["docs"],"fence":9,"expires_at":expiry}),
+        json!({"id":3,"session":"alice","paths":["tests"],"fence":10,"expires_at":0}),
+    ];
+    let original = server.state.lock().unwrap().claims.clone();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let refused = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "compact",
+        &[
+            ("zone_renew", json!({"id":1,"ttl":30,"fence":7})),
+            ("zone_renew", json!({"id":2,"ttl":30,"fence":9})),
+            ("zone_renew", json!({"id":3,"ttl":30,"fence":10})),
+        ],
+    );
+    for (answer, needle) in refused.iter().zip(["stale fence", "not yours", "expired"]) {
+        assert_eq!(answer["isError"], true, "{answer}");
+        assert!(
+            answer["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(needle),
+            "{answer}"
+        );
+    }
+    assert_eq!(server.state.lock().unwrap().claims, original);
+    for id in [1, 2, 3] {
+        assert_eq!(
+            server
+                .seen("POST", &format!("/api/v1/zones/claims/{id}/renew"))
+                .len(),
+            1
+        );
+    }
 }
 
 #[test]

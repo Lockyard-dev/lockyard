@@ -1004,6 +1004,51 @@ mod tests {
     }
 
     #[test]
+    fn local_general_tasks_keep_default_ids_and_refuse_registry_options_without_writes() {
+        let (_dir, mut store) = test_store();
+        let backend: &mut dyn Backend = &mut store;
+        let general = tasks::TaskSpec {
+            title: "local general task".into(),
+            area: Some("general".into()),
+            ..tasks::TaskSpec::default()
+        };
+        let task = backend.add_task("lead", &general, 0).unwrap();
+        assert_eq!(task.id, "D-1");
+        let refused = [
+            tasks::TaskSpec {
+                area: Some("engine".into()),
+                ..general.clone()
+            },
+            tasks::TaskSpec {
+                priority: Some("P1".into()),
+                ..general.clone()
+            },
+            tasks::TaskSpec {
+                prefix: Some("FE".into()),
+                ..general.clone()
+            },
+            tasks::TaskSpec {
+                pad: Some(4),
+                ..general
+            },
+        ];
+        for spec in refused {
+            assert!(matches!(
+                backend.add_task("refused", &spec, 1),
+                Err(Error::NeedsCloud(_))
+            ));
+            assert_eq!(
+                backend.tasks(None, true).unwrap().as_slice(),
+                std::slice::from_ref(&task)
+            );
+            assert_eq!(backend.task_history(&task.id).unwrap().len(), 1);
+        }
+        let agents = store.agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id, "lead");
+    }
+
+    #[test]
     fn a_numeric_workflow_claim_preserves_the_local_string_task_contract() {
         let (_dir, mut store) = test_store();
         let backend: &mut dyn Backend = &mut store;

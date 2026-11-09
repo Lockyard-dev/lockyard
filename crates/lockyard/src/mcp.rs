@@ -73,8 +73,8 @@ fn executor_evidence(evidence: &str) -> String {
 
 /// How many tools the server lists.
 ///
-/// A model pays for every tool description on every turn, so the default is six composites that
-/// cover the whole working loop. `full` stays for integrations written against the long list.
+/// A model pays for every tool description on every turn, so the default lists 16 tools for the
+/// working loop. `full` stays for integrations written against the long list.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Surface {
     Compact,
@@ -259,7 +259,7 @@ fn respond(
             }
         }
         "tools/call" => {
-            let (result, follow_up) = call_tool(params, agent, cwd, client);
+            let (result, follow_up) = call_tool(params, agent, cwd, client, surface);
             after = follow_up;
             result
         }
@@ -363,6 +363,7 @@ fn call_tool(
     agent: Option<&str>,
     cwd: &Path,
     client: Option<&str>,
+    surface: Surface,
 ) -> (Value, Option<After>) {
     let empty = json!({});
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
@@ -372,12 +373,14 @@ fn call_tool(
         return (crate::revoke_access::mcp(cwd, args), None);
     }
     // Node orchestration uses its own verified transport and can run outside a project.
-    let answer = if uses_node_transport(name) {
-        run_tool(name, Args(args), agent, cwd, client, &mut after)
-    } else {
-        ensure_first_presence(agent, cwd, client)
-            .and_then(|()| run_tool(name, Args(args), agent, cwd, client, &mut after))
-    };
+    let answer = validate_surface_args(surface, name, Args(args)).and_then(|()| {
+        if uses_node_transport(name) {
+            run_tool(name, Args(args), agent, cwd, client, surface, &mut after)
+        } else {
+            ensure_first_presence(agent, cwd, client)
+                .and_then(|()| run_tool(name, Args(args), agent, cwd, client, surface, &mut after))
+        }
+    });
     let result = match answer {
         Ok(result)
             if [
@@ -417,6 +420,32 @@ fn call_tool(
         }
     };
     (result, after)
+}
+
+fn validate_surface_args(surface: Surface, name: &str, args: Args<'_>) -> Result<()> {
+    if surface == Surface::Compact {
+        match name {
+            "task_add" => {
+                if !args
+                    .get("area")
+                    .and_then(Value::as_str)
+                    .is_some_and(|area| !area.trim().is_empty())
+                {
+                    return Err(Error::Invalid(
+                        "task_add requires a non-empty area; choose one with area_list".into(),
+                    ));
+                }
+            }
+            "zone_renew" => {
+                args.some_int("fence")?;
+                if !(1..=240).contains(&args.ttl()?) {
+                    return Err(Error::Invalid("ttl must be 1 to 240 minutes".into()));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn tool_error_message(name: &str, args: &Value, error: &Error) -> String {

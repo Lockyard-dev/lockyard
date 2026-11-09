@@ -74,14 +74,23 @@ agent does anything — which, with the Claude Code hook installed, is its next 
 ## MCP
 
 ```sh
-lockyard mcp                  # six tools: start_work, check, update, handover, finish_work, status
+lockyard mcp                  # 16 compact tools (listed below)
 lockyard mcp --tools full     # every tool, for a client that can handle a long list
 ```
 
-The six are the whole working loop: `start_work` claims paths and takes a task, `check` asks whether a path is free,
-`update` sends a message and reads the inbox, `handover` gives work to another agent, `finish_work` submits evidence
-and releases, `status` says where everything stands. Each is the same sequence of the underlying tools, so a refusal
-is a refusal in both surfaces. `LOCKYARD_MCP_TOOLS=full` does the same as the flag, and the flag wins.
+The compact catalog contains `revoke_access`, `start_work`, `check`, `update`, `handover`, `finish_work`, `status`,
+`tasks`, `task_bulk`, `registry_import`, `area_list`, `area_create`, `area_update`, `cloud_protocol`, `task_add`,
+and `zone_renew`.
+
+The working loop uses `start_work` to claim paths and take a task, `check` to ask whether a path is free,
+`update` to send a message and read the inbox, `handover` to give work to another agent, `finish_work` to submit
+evidence and release, and `status` to show where everything stands. `task_add` creates a task and requires an
+explicit `area` on the compact surface; the task number uses that area's prefix. Full mode retains its optional
+`area` and existing default. Local `task_add` supports `area: "general"` with `D-*` numbers; other registry areas
+require cloud mode. `zone_renew` extends an owned, live claim with an optional `ttl` of 1–240 minutes
+(default 30). Cloud mode requires the current `fence`; local claims renew without a fence. Foreign and expired
+claims are refused, as are stale fences in cloud mode. Underlying authorization and refusal behavior are shared
+by both surfaces. `LOCKYARD_MCP_TOOLS=full` does the same as the flag, and the flag wins.
 
 For configuration snippets, use `lockyard setup --print --client claude`, `--client codex` or `--client cursor`. Set `LOCKYARD_AGENT` to a unique name for each agent. The MCP server communicates over standard input and output. The Codex configuration forwards the agent identity and configured Cloud URL/token variables; export them before starting Codex.
 

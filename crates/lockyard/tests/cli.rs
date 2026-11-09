@@ -1042,7 +1042,9 @@ fn mcp_stdio_initializes_lists_claims_and_reports_conflicts_and_parse_errors() {
             "area_list",
             "area_create",
             "area_update",
-            "cloud_protocol"
+            "cloud_protocol",
+            "task_add",
+            "zone_renew"
         ],
         "the default surface is the short one"
     );
@@ -1092,8 +1094,8 @@ fn the_full_tool_surface_is_a_flag_or_an_environment_variable_away() {
         list,
     ));
     assert_eq!(
-        compact, 14,
-        "EP-10 adds discovery to the EP-12 compact surface, including revocation"
+        compact, 16,
+        "the compact surface includes task creation and claim renewal"
     );
     assert!(by_flag > 50, "the full surface keeps every tool: {by_flag}");
     assert_eq!(by_flag, by_env, "the flag and the variable agree");

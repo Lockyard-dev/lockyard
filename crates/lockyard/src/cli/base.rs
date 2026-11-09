@@ -145,7 +145,7 @@ pub(super) enum SetupClient {
 
 #[derive(Args)]
 pub(super) struct McpArgs {
-    /// compact (six composite tools, the default) or full (every tool).
+    /// compact (16 tools, the default) or full (every tool).
     #[arg(long = "tools")]
     pub(super) tools: Option<String>,
 }
