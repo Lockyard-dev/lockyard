@@ -1948,23 +1948,36 @@ fn mcp(w: &World) {
     );
     let child = a.ok("task_add", json!({"title":"mcp dependency child"}));
     let status = a.ok("status", json!({}));
-    let backlog = status["backlog"]
-        .as_array()
-        .expect("cloud status includes backlog");
+    assert!(status.get("backlog").is_none(), "{status}");
+    let backlog = a.ok("task_list", json!({}));
     for expected in [&parent, &child] {
         assert!(
-            backlog.iter().any(|task| task["id"] == expected["id"]),
-            "{status}"
+            backlog
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|task| task["id"] == expected["id"]),
+            "{backlog}"
+        );
+        assert!(
+            !status["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|task| task["id"] == expected["id"]),
+            "unassigned task must not appear in personal status: {status}"
         );
     }
     let raw = a.ok("task_links", json!({"id":parent["id"]}));
     let linked = a.ok("task_link", json!({"id":parent["id"],"to":child["id"],"kind":"blocks","if_version":raw["version"],"key":lockyard_cloud_client::ulid()}));
     assert!(linked.to_string().contains("blocks"));
+    a.ok("task_claim", json!({"id":parent["id"]}));
     let mcp_status = a.ok("status", json!({}));
     let cli_status = w.ly(&one, &["status"]).ok();
     assert_eq!(mcp_status["tasks"], cli_status["tasks"]);
-    assert_eq!(mcp_status["backlog"], cli_status["backlog"]);
-    let parent_status = mcp_status["backlog"]
+    assert!(mcp_status.get("backlog").is_none(), "{mcp_status}");
+    assert!(cli_status.get("backlog").is_none(), "{cli_status}");
+    let parent_status = mcp_status["tasks"]
         .as_array()
         .unwrap()
         .iter()

@@ -5,6 +5,17 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-11-10
+
+### Fixed
+
+- Cloud CLI and MCP `status` fetch assigned tasks through paginated server-side `active` and `review` filters instead of scanning the entire task registry, reusing one HTTP client across requests. Other statuses release their assignment.
+- Remove the full registry `backlog` field from cloud `status` JSON. Use `lockyard task list --json` or the MCP `task_list` tool when the full registry is needed. Local status and task listing behavior are unchanged.
+
+### Changed
+
+- Advance the synchronized Rust, npm, PyPI and MCP registry versions to `0.3.4`.
+
 ## [0.3.3] - 2026-11-09
 
 ### Added

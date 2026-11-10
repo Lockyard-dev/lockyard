@@ -225,6 +225,12 @@ rejects or cancels, and an item can be cancelled only while nobody holds it. `ta
 as a CI run for the target `ci_passed`. A target that needs a deploy probe cannot be closed from here. Task offers between
 agents stay in `lockyard work`.
 
+`lockyard status --json` and the MCP `status` tool return the current session's assigned registry tasks in
+`tasks`. Cloud status follows pages for `active` and `review`, the statuses that retain an assignee; empty
+pages require two registry requests. It does not fetch or return the full registry in a `backlog` field.
+Use `lockyard task list --json` (or MCP `task_list`) for the full task list. Local status keeps its existing
+behavior.
+
 ### The agent process
 
 Hooks in cloud mode talk only to `lockyard agent`, one background process per user. It keeps a view of claims, unread

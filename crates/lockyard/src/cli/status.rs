@@ -93,9 +93,7 @@ pub(super) fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Outp
                 "assignee": item.assignee, "to": item.to})
             })
             .collect();
-        let backlog = backend.tasks(None, false)?;
-        let mut tasks = backlog.clone();
-        tasks.retain(|task| task.assignee.as_deref() == Some(session));
+        let mut tasks = backend.assigned_tasks(session)?;
         tasks.truncate(20);
         lines.push(join(&tasks, task_line, "no tasks"));
         let data = json!({
@@ -104,7 +102,6 @@ pub(super) fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Outp
             "offers": offers,
             "work": work,
             "tasks": tasks,
-            "backlog": backlog,
             "machine_level": machine_level,
             "unannounced": unannounced,
         });

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lockyard"
-version = "0.3.3"
+version = "0.3.4"
 description = "Coordination for coding agents: a shared bus, work zones and tasks."
 readme = "README.md"
 license = "Apache-2.0"

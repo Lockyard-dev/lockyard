@@ -214,6 +214,17 @@ fn status_only_shows_the_current_agents_claims_and_tasks() {
     ok(root, "bob", &["task", "add", "bob task"]);
     ok(root, "alice", &["task", "claim", "D-1"]);
     ok(root, "bob", &["task", "claim", "D-2"]);
+    ok(root, "alice", &["task", "add", "alice review"]);
+    ok(root, "alice", &["task", "claim", "D-3"]);
+    ok(
+        root,
+        "alice",
+        &["task", "submit", "D-3", "--evidence", "review evidence"],
+    );
+    ok(root, "alice", &["task", "add", "alice open"]);
+    ok(root, "alice", &["task", "add", "alice cancelled"]);
+    ok(root, "alice", &["task", "claim", "D-5"]);
+    ok(root, "alice", &["task", "cancel", "D-5"]);
     lockyard_core::Store::open(root)
         .unwrap()
         .record_unannounced("docs/outside.rs", "bob", 99, 1_000)
@@ -222,18 +233,41 @@ fn status_only_shows_the_current_agents_claims_and_tasks() {
     let status: Value = serde_json::from_str(&status).unwrap();
     assert_eq!(status["claims"].as_array().unwrap().len(), 1);
     assert_eq!(status["claims"][0]["session"], "alice");
-    assert_eq!(status["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(status["tasks"].as_array().unwrap().len(), 2);
     assert_eq!(status["tasks"][0]["title"], "alice task");
+    assert_eq!(status["tasks"][0]["status"], "claimed");
+    assert_eq!(status["tasks"][1]["title"], "alice review");
+    assert_eq!(status["tasks"][1]["status"], "review");
+    assert!(status.get("backlog").is_none());
     assert!(status["unannounced"].as_array().unwrap().is_empty());
+    let text = ok(root, "alice", &["status"]);
+    assert!(text.contains("alice task"), "{text}");
+    assert!(text.contains("alice review"), "{text}");
+    for excluded in ["bob task", "alice open", "alice cancelled"] {
+        assert!(!text.contains(excluded), "{text}");
+    }
 }
 
 /// Exercise the cloud CLI against actual HTTP responses, without an agent or live credentials.
 fn cloud_status(claims: Value, work: Value, json_output: bool) -> String {
+    cloud_status_with_registry(claims, work, json!([]), json_output, false)
+}
+
+fn cloud_status_with_registry(
+    claims: Value,
+    work: Value,
+    items: Value,
+    json_output: bool,
+    mcp: bool,
+) -> String {
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
+    let registry_routes = Arc::new(Mutex::new(Vec::new()));
+    let seen_routes = Arc::clone(&registry_routes);
     std::thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -253,6 +287,17 @@ fn cloud_status(claims: Value, work: Value, json_output: bool) -> String {
             }
             assert_eq!(protocol.as_deref(), Some("2"));
             let path = first.split_whitespace().nth(1).unwrap();
+            if path.starts_with("/api/v1/registry/items") {
+                seen_routes.lock().unwrap().push(path.to_string());
+                assert!(
+                    matches!(
+                        path,
+                        "/api/v1/registry/items?status=active&limit=200"
+                            | "/api/v1/registry/items?status=review&limit=200"
+                    ),
+                    "status must use a bounded server-side status filter: {path}"
+                );
+            }
             let answer = match path.split('?').next().unwrap() {
                 // EP-10 requires discovery and selected-version/repository echoes before reads.
                 "/api/v1/protocol" => {
@@ -260,10 +305,29 @@ fn cloud_status(claims: Value, work: Value, json_output: bool) -> String {
                 }
                 "/api/v1/workspace/encryption" => json!({"encryption":"off", "key_id":null,
                     "workspace_id":"00000000-0000-0000-0000-000000000001"}),
+                // MCP checks first-call presence before dispatching status. Model an already-live
+                // session so this read-only fixture does not need to publish a heartbeat.
+                "/api/v1/presence" if first.starts_with("GET ") => {
+                    json!({"sessions":[{"session":"alice", "client":"mcp"}]})
+                }
                 "/api/v1/zones/claims" => claims.clone(),
                 "/api/v1/bus/inbox" => json!({"messages":[], "skipped":0}),
                 "/api/v1/bus/tasks" => work.clone(),
-                "/api/v1/registry/items" => json!({"items":[], "cursor":null}),
+                "/api/v1/registry/items" => {
+                    let status = if path.contains("status=active&") {
+                        "active"
+                    } else {
+                        "review"
+                    };
+                    let rows: Vec<_> = items
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|item| item["status"] == status)
+                        .cloned()
+                        .collect();
+                    json!({"items":rows, "cursor":null})
+                }
                 other => panic!("unexpected status route: {other}"),
             };
             let body = answer.to_string();
@@ -284,11 +348,10 @@ fn cloud_status(claims: Value, work: Value, json_output: bool) -> String {
     )
     .unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_lockyard"));
-    if json_output {
+    if json_output && !mcp {
         command.arg("--json");
     }
-    let result = command
-        .arg("status")
+    command
         .current_dir(dir.path())
         .env("LOCKYARD_AGENT", "alice")
         .env("LOCKYARD_TOKEN", "test-token")
@@ -296,15 +359,96 @@ fn cloud_status(claims: Value, work: Value, json_output: bool) -> String {
         .env("XDG_RUNTIME_DIR", runtime.path())
         .env("XDG_STATE_HOME", runtime.path().join("state"))
         .env_remove("LOCKYARD_TOKEN_FILE")
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .output()
+        .env_remove("CLAUDE_CODE_SESSION_ID");
+    let result = if mcp {
+        let mut child = command
+            .args(["mcp", "--tools", "full"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.take().unwrap(),
+            "{}",
+            json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"status", "arguments":{}}})
+        )
         .unwrap();
+        child.wait_with_output().unwrap()
+    } else {
+        command.arg("status").output().unwrap()
+    };
     assert!(
         result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    assert_eq!(
+        *registry_routes.lock().unwrap(),
+        [
+            "/api/v1/registry/items?status=active&limit=200",
+            "/api/v1/registry/items?status=review&limit=200",
+        ]
+    );
     String::from_utf8(result.stdout).unwrap()
+}
+
+#[test]
+fn cloud_cli_and_mcp_status_keep_only_owned_tasks_without_a_backlog() {
+    let item = |id, status, executor| {
+        json!({"id":id, "title":format!("registry {id}"), "status":status,
+            "assignment":{"executor":executor}, "created_by":"token:lead:lead",
+            "links":[{"to":"D-9", "kind":"blocks"}], "priority":"P1"})
+    };
+    let items = json!([
+        item("D-1", "active", "token:a:alice"),
+        item("D-2", "active", "token:b:bob"),
+        item("D-3", "review", "token:a:alice"),
+        item("D-4", "review", "token:b:bob"),
+        {"id":"D-5", "title":"unassigned backlog", "status":"ready"}
+    ]);
+    let claims = json!([{"id":42, "session":"alice", "paths":["owned/path"]}]);
+    let work = json!([
+        {"id":"BT-1", "title":"owned work", "status":"claimed", "assignee":"alice", "to":"*", "version":1}
+    ]);
+    let cli: Value = serde_json::from_str(&cloud_status_with_registry(
+        claims.clone(),
+        work.clone(),
+        items.clone(),
+        true,
+        false,
+    ))
+    .unwrap();
+    let mcp: Value = serde_json::from_str(&cloud_status_with_registry(
+        claims,
+        work,
+        items.clone(),
+        true,
+        true,
+    ))
+    .unwrap();
+    assert_ne!(mcp["result"]["isError"], true, "{mcp}");
+    let mcp = &mcp["result"]["structuredContent"];
+    for status in [&cli, mcp] {
+        assert!(status.get("backlog").is_none(), "{status}");
+        assert_eq!(status["claims"][0]["id"], 42);
+        assert_eq!(status["work"][0]["id"], "BT-1");
+        let tasks = status["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2, "{status}");
+        assert_eq!(tasks[0]["id"], "D-1");
+        assert_eq!(tasks[0]["raw_status"], "active");
+        assert_eq!(tasks[1]["id"], "D-3");
+        assert_eq!(tasks[1]["raw_status"], "review");
+        assert_eq!(tasks[0]["assignee"], "alice");
+        assert_eq!(tasks[0]["links"], items[0]["links"]);
+    }
+    assert_eq!(mcp["tasks"], cli["tasks"]);
+    let text = cloud_status_with_registry(json!([]), json!([]), items, false, false);
+    assert!(text.contains("registry D-1"), "{text}");
+    assert!(text.contains("registry D-3"), "{text}");
+    for excluded in ["registry D-2", "registry D-4", "unassigned backlog"] {
+        assert!(!text.contains(excluded), "{text}");
+    }
 }
 
 #[test]

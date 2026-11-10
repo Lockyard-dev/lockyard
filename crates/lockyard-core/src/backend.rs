@@ -206,6 +206,15 @@ pub trait Backend {
 
     fn tasks(&self, status: Option<tasks::Status>, include_final: bool)
     -> Result<Vec<tasks::Task>>;
+    /// Unfinished tasks assigned to this session. Cloud backends should filter on the server
+    /// before paging; the local default preserves the existing task selection and order.
+    fn assigned_tasks(&self, session: &str) -> Result<Vec<tasks::Task>> {
+        Ok(self
+            .tasks(None, false)?
+            .into_iter()
+            .filter(|task| task.assignee.as_deref() == Some(session))
+            .collect())
+    }
     fn ready_tasks(&self, _area: Option<&str>) -> Result<Vec<tasks::Task>> {
         self.tasks(Some(tasks::Status::Open), false)
     }

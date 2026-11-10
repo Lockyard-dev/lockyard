@@ -4,7 +4,7 @@ members = ["crates/lockyard", "crates/lockyard-core", "crates/lockyard-cloud-cli
 resolver = "3"
 
 [workspace.package]
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/lockyard-dev/lockyard"
@@ -12,10 +12,10 @@ homepage = "https://lockyard.dev"
 description = "Coordination for coding agents: a shared bus, work zones and tasks."
 
 [workspace.dependencies]
-lockyard-compat = { path = "crates/lockyard-compat", version = "0.3.3" }
-lockyard-core = { path = "crates/lockyard-core", version = "0.3.3" }
-lockyard-cloud-client = { path = "crates/lockyard-cloud-client", version = "0.3.3" }
-lockyard-node = { path = "crates/lockyard-node", version = "0.3.3" }
+lockyard-compat = { path = "crates/lockyard-compat", version = "0.3.4" }
+lockyard-core = { path = "crates/lockyard-core", version = "0.3.4" }
+lockyard-cloud-client = { path = "crates/lockyard-cloud-client", version = "0.3.4" }
+lockyard-node = { path = "crates/lockyard-node", version = "0.3.4" }
 clap = { version = "4.6", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }
 # Only the file-system backends: no debouncer, no async runtime, no serde of events.
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }

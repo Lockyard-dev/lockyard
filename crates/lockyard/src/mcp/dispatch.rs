@@ -235,12 +235,10 @@ pub(super) fn run_tool(
                     Some(name) => split_handover_offers(name, claims),
                     None => (claims, Vec::new()),
                 };
-                let backlog = backend.tasks(None, false)?;
-                let mut tasks = backlog.clone();
-                tasks.retain(|task| task.assignee.as_deref() == agent);
+                let mut tasks = backend.assigned_tasks(agent.unwrap_or("lockyard-cli"))?;
                 tasks.truncate(20);
                 return Ok(
-                    json!({"unread": unread, "claims": claims, "work": work, "offers": offers, "tasks": tasks, "backlog": backlog}),
+                    json!({"unread": unread, "claims": claims, "work": work, "offers": offers, "tasks": tasks}),
                 );
             }
             let mut tasks = backend.tasks(None, false)?;

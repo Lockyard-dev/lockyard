@@ -1130,6 +1130,36 @@ impl<T: Transport> Backend for CloudBackend<T> {
         Ok(found)
     }
 
+    fn assigned_tasks(&self, session: &str) -> Result<Vec<tasks::Task>> {
+        let mut found = Vec::new();
+        // Claiming creates an active assignment; submitting for review preserves it. The server
+        // releases the assignment on every other transition, including blocked, so those states
+        // cannot contribute to status. Keep each cursor scoped to its server-side status filter.
+        for status in ["active", "review"] {
+            let mut cursor: Option<String> = None;
+            loop {
+                let tail = query(&[
+                    ("status", Some(status.to_string())),
+                    ("limit", Some(ITEM_PAGE.to_string())),
+                    ("cursor", cursor.clone()),
+                ]);
+                let page = self.get(&self.session, format!("{ITEMS}{tail}"))?;
+                let items = page.get("items").and_then(Value::as_array);
+                for item in items.into_iter().flatten() {
+                    let task = task_from(item)?;
+                    if task.assignee.as_deref() == Some(session) {
+                        found.push(task);
+                    }
+                }
+                match page.get("cursor").and_then(Value::as_str) {
+                    Some(next) => cursor = Some(next.to_string()),
+                    None => break,
+                }
+            }
+        }
+        Ok(found)
+    }
+
     fn ready_tasks(&self, area: Option<&str>) -> Result<Vec<tasks::Task>> {
         let tail = query(&[
             ("area", area.map(str::to_string)),
@@ -2757,6 +2787,107 @@ mod tests {
             "assignment": {"executor": "token:ab:s:1", "lease_expires_at": "2026-11-02T12:00:00+00:00"},
             "evidence": [{"value": "run 5"}],
         })
+    }
+
+    #[test]
+    fn status_assigned_tasks_only_queries_assignment_statuses_when_empty() {
+        let (server, cloud) = backend(vec![
+            json!({"items": [], "cursor": null}),
+            json!({"items": [], "cursor": null}),
+        ]);
+        assert!(cloud.assigned_tasks("me").unwrap().is_empty());
+        sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/items?status=active&limit=200"),
+                ("GET", "/api/v1/registry/items?status=review&limit=200"),
+            ],
+        );
+    }
+
+    #[test]
+    fn status_assigned_tasks_filters_foreign_and_unassigned_items() {
+        let assigned = |id: &str, status: &str, session: &str| {
+            let mut value = item(status, 1);
+            value["id"] = json!(id);
+            value["assignment"]["executor"] = json!(format!("token:ab:{session}"));
+            value
+        };
+        let mut unassigned = item("active", 1);
+        unassigned["assignment"] = Value::Null;
+        let (server, cloud) = backend(vec![
+            json!({"items": [
+                assigned("D-1", "active", "me"),
+                assigned("D-2", "active", "other"),
+                unassigned,
+            ]}),
+            json!({"items": [
+                assigned("D-3", "review", "other"),
+                assigned("D-4", "review", "me"),
+            ]}),
+        ]);
+        let tasks = cloud.assigned_tasks("me").unwrap();
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["D-1", "D-4"]
+        );
+        assert_eq!(tasks[0].status, tasks::Status::Claimed);
+        assert_eq!(tasks[1].status, tasks::Status::Review);
+        assert!(
+            tasks
+                .iter()
+                .all(|task| task.assignee.as_deref() == Some("me"))
+        );
+        sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/items?status=active&limit=200"),
+                ("GET", "/api/v1/registry/items?status=review&limit=200"),
+            ],
+        );
+    }
+
+    #[test]
+    fn status_assigned_tasks_follows_each_filtered_status_cursor() {
+        let assigned = |id: &str, status: &str| {
+            let mut value = item(status, 1);
+            value["id"] = json!(id);
+            value["assignment"]["executor"] = json!("token:ab:me");
+            value
+        };
+        let (server, cloud) = backend(vec![
+            json!({"items": [assigned("D-1", "active")], "cursor": "active/next"}),
+            json!({"items": [assigned("D-2", "active")], "cursor": null}),
+            json!({"items": [assigned("D-3", "review")], "cursor": "review/next"}),
+            json!({"items": [assigned("D-4", "review")], "cursor": null}),
+        ]);
+        assert_eq!(
+            cloud
+                .assigned_tasks("me")
+                .unwrap()
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["D-1", "D-2", "D-3", "D-4"]
+        );
+        sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/items?status=active&limit=200"),
+                (
+                    "GET",
+                    "/api/v1/registry/items?status=active&limit=200&cursor=active%2Fnext",
+                ),
+                ("GET", "/api/v1/registry/items?status=review&limit=200"),
+                (
+                    "GET",
+                    "/api/v1/registry/items?status=review&limit=200&cursor=review%2Fnext",
+                ),
+            ],
+        );
     }
 
     #[test]

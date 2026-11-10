@@ -2,15 +2,25 @@
 
 use serde_json::{Value, json};
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 fn raw_call(request: &str) -> Value {
     let project = tempfile::tempdir().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lockyard"))
+    raw_call_in(project.path(), None, request)
+}
+
+fn raw_call_in(project: &Path, agent: Option<&str>, request: &str) -> Value {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lockyard"));
+    command
         .args(["mcp", "--tools", "full"])
-        .current_dir(project.path())
+        .current_dir(project)
         .env_remove("LOCKYARD_AGENT")
-        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CLAUDE_CODE_SESSION_ID");
+    if let Some(agent) = agent {
+        command.env("LOCKYARD_AGENT", agent);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -24,6 +34,59 @@ fn raw_call(request: &str) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn local_mcp_status_preserves_owned_claimed_and_review_tasks() {
+    let project = tempfile::tempdir().unwrap();
+    let mut store = lockyard_core::Store::init(project.path()).unwrap();
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let claimed = store.add_task("alice", "owned active", "", now).unwrap();
+    let review = store.add_task("alice", "owned review", "", now).unwrap();
+    let foreign = store.add_task("bob", "foreign active", "", now).unwrap();
+    store.add_task("alice", "unassigned", "", now).unwrap();
+    let cancelled = store.add_task("alice", "cancelled", "", now).unwrap();
+    store
+        .claim_task("alice", claimed.id.as_str(), 10, now)
+        .unwrap();
+    store
+        .claim_task("alice", review.id.as_str(), 10, now)
+        .unwrap();
+    store
+        .submit_task("alice", review.id.as_str(), "evidence", now)
+        .unwrap();
+    store
+        .claim_task("bob", foreign.id.as_str(), 10, now)
+        .unwrap();
+    store
+        .claim_task("alice", cancelled.id.as_str(), 10, now)
+        .unwrap();
+    store
+        .cancel_task("alice", cancelled.id.as_str(), "", now)
+        .unwrap();
+    drop(store);
+    let response = raw_call_in(
+        project.path(),
+        Some("alice"),
+        &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"status", "arguments":{}}})
+            .to_string(),
+    );
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let status = &response["result"]["structuredContent"];
+    assert!(status.get("backlog").is_none());
+    let tasks = status["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 2, "{status}");
+    assert_eq!(tasks[0]["id"], claimed.id.as_str());
+    assert_eq!(tasks[0]["status"], "claimed");
+    assert_eq!(tasks[1]["id"], review.id.as_str());
+    assert_eq!(tasks[1]["status"], "review");
+    assert!(tasks.iter().all(|task| task["assignee"] == "alice"));
 }
 
 #[test]

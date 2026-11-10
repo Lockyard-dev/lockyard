@@ -20,7 +20,8 @@ to stderr and exits non-zero. `kind` values are stable: `no_project`, `invalid`,
 | `about` | `version` |
 | `init` | `root` |
 | `who` | array of `{id, last_seen, …}` |
-| `status` | `unread`, `claims`, `tasks`, `machine_level`, `unannounced` (and `work` in cloud) |
+| `status` (local) | `unread`, `claims`, `tasks`, `machine_level`, `unannounced` |
+| `status` (cloud) | `unread`, `claims`, `tasks`, `work`, `offers`, `machine_level`, `unannounced` |
 | `doctor` | `ok` (bool), `checks` (`[{check, ok, detail}]`) |
 | `monitor` (on stop) | `delivered`, `unannounced`, `rounds`, `backend` (`native` \| `poll` \| `none` \| `off`) |
 | `zone claim` / list | claim objects with `id`, `session`, `paths`, `fence`, `expires_at`, … |
@@ -29,6 +30,14 @@ to stderr and exits non-zero. `kind` values are stable: `no_project`, `invalid`,
 | `msg send` | the sent message (`id`, `to`, `body`, …) |
 | `msg sent` | receipts with `status` (`sent` \| `delivered` \| `read` \| `replied` \| `failed`) |
 
+In cloud CLI and MCP `status`, `tasks` contains only registry tasks assigned to the current session. Since
+0.3.4, cloud status uses paginated server-side `active` and `review` filters and omits the former
+full-registry `backlog` field. Both statuses retain an assignee; other status transitions release it.
+Empty pages require two registry requests; claims, work and unread-mail calls are separate.
+Consumers that need all registry tasks must explicitly call `lockyard task list --json` or MCP
+`task_list`. Local status output and task listing are unchanged. MCP status omits the CLI-specific
+`machine_level` and `unannounced` fields.
+
 Monitor **events** while running (also under `--json`) are one object per line:
 
 ```json
@@ -36,5 +45,5 @@ Monitor **events** while running (also under `--json`) are one object per line:
 {"event":"unannounced","path":"src/a.rs","holder":"alice","claim":7,"hits":1}
 ```
 
-Field names and `kind` strings are part of the 0.1 contract; additive fields may appear, removals
-need a major version.
+Field names and `kind` strings are part of the public contract; additive fields may appear. The 0.3.4
+cloud status removal of `backlog` is an explicit migration described above.
