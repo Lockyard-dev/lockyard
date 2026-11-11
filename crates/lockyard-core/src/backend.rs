@@ -445,6 +445,175 @@ pub fn claim_or_reuse_with_creation_status(
     acquire_claim(backend, agent, request, now).map(|(claim, _, created)| (claim, created))
 }
 
+/// Acquires a claim, then installs a hold through the legacy-compatible renew endpoint.
+/// Only an operation-scoped creation receipt authorizes compensating release.
+pub fn claim_or_reuse_with_hold(
+    backend: &mut dyn Backend,
+    agent: &str,
+    request: &ClaimRequest,
+    hold_reason: Option<String>,
+    hold_until: Option<String>,
+    now: i64,
+) -> Result<(Claim, Option<bool>)> {
+    validate_hold(hold_reason.as_deref(), hold_until.as_deref())?;
+    let (claim, created) = claim_or_reuse_with_creation_status(backend, agent, request, now)?;
+    if !backend.is_cloud() {
+        // Local claims are never released for inactivity, so they need no hold.
+        return Ok((claim, created));
+    }
+    let Some(reason) = hold_reason else {
+        return Ok((claim, created));
+    };
+    let until = hold_until.unwrap_or_else(|| match claim.expires_at.on_the_wire() {
+        Stamp::Text(text) => text,
+        Stamp::Millis(_) => unreachable!("on_the_wire returns text"),
+    });
+    let fence = backend.is_cloud().then_some(claim.fence);
+    let expected_reason = reason.clone();
+    let expected_until = crate::proto::parse_rfc3339(&until);
+    let result = (|| {
+        let renewed = backend.renew(
+            agent,
+            Some(claim.id),
+            &RenewRequest {
+                ttl_minutes: request.ttl_minutes,
+                hold_reason: Some(reason),
+                hold_until: Some(until),
+                fence,
+            },
+            now,
+        )?;
+        if renewed != 1 {
+            return Err(Error::Protocol(
+                "hold renewal did not renew the claim".into(),
+            ));
+        }
+        backend
+            .claims(
+                &ClaimQuery {
+                    session: Some(agent.to_string()),
+                    path: None,
+                },
+                now,
+            )?
+            .into_iter()
+            .find(|current| current.id == claim.id && current.session == agent)
+            .ok_or_else(|| Error::Protocol("held claim is missing after renewal".into()))
+            .and_then(|held| {
+                let until = held.hold_until.as_ref().and_then(|stamp| match stamp {
+                    Stamp::Millis(value) => Some(*value),
+                    Stamp::Text(text) => crate::proto::parse_rfc3339(text),
+                });
+                if held.hold_reason.as_deref() != Some(expected_reason.as_str())
+                    || until != expected_until
+                    || until.is_none()
+                {
+                    return Err(Error::Protocol(
+                        "claim renewal did not install the requested hold".into(),
+                    ));
+                }
+                Ok(held)
+            })
+    })();
+    match result {
+        Ok(held) => Ok((held, created)),
+        Err(error) => {
+            if created == Some(true) && (!backend.is_cloud() || (claim.id > 0 && claim.fence > 0)) {
+                let _ = backend.release(
+                    agent,
+                    Some(claim.id),
+                    &ReleaseRequest {
+                        fence,
+                        ..ReleaseRequest::default()
+                    },
+                    now,
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Checks the hold's shape only. The server owns its 240-minute limit.
+pub fn validate_hold(reason: Option<&str>, until: Option<&str>) -> Result<()> {
+    if until.is_some() && reason.is_none() {
+        return Err(Error::Invalid("hold_until requires hold_reason".into()));
+    }
+    if reason.is_some_and(|reason| reason.trim().is_empty()) {
+        return Err(Error::Invalid("hold_reason must not be empty".into()));
+    }
+    if until.is_some_and(|until| !valid_hold_timestamp(until)) {
+        return Err(Error::Invalid("hold_until must be RFC 3339 text".into()));
+    }
+    Ok(())
+}
+
+// The protocol's permissive timestamp reader also reads historical server spellings.
+// New hold input must satisfy the RFC 3339 calendar, separators and complete timezone.
+fn valid_hold_timestamp(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 20
+        || !bytes.is_ascii()
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b't')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return false;
+    }
+    let digits = |from: usize, to: usize| {
+        let found = text.get(from..to)?;
+        found
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| found.parse::<u32>().ok())
+            .flatten()
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        digits(0, 4),
+        digits(5, 7),
+        digits(8, 10),
+        digits(11, 13),
+        digits(14, 16),
+        digits(17, 19),
+    ) else {
+        return false;
+    };
+    let leap_year = year % 400 == 0 || (year % 4 == 0 && year % 100 != 0);
+    let last_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if day == 0 || day > last_day || hour > 23 || minute > 59 || second > 59 {
+        return false;
+    }
+    let mut zone_at = 19;
+    if bytes[zone_at] == b'.' {
+        zone_at += 1;
+        let fraction_at = zone_at;
+        while bytes.get(zone_at).is_some_and(u8::is_ascii_digit) {
+            zone_at += 1;
+        }
+        if zone_at == fraction_at {
+            return false;
+        }
+    }
+    match bytes.get(zone_at).copied() {
+        Some(b'Z' | b'z') => bytes.len() == zone_at + 1,
+        Some(b'+' | b'-') => {
+            bytes.len() == zone_at + 6
+                && bytes[zone_at + 3] == b':'
+                && digits(zone_at + 1, zone_at + 3).is_some_and(|hour| hour <= 23)
+                && digits(zone_at + 4, zone_at + 6).is_some_and(|minute| minute <= 59)
+        }
+        _ => false,
+    }
+}
+
 fn acquire_claim(
     backend: &mut dyn Backend,
     agent: &str,
@@ -507,6 +676,7 @@ fn claim_record(claim: zones::Claim) -> Claim {
         created_at: Stamp::Millis(claim.created_at),
         expires_at: Stamp::Millis(claim.expires_at),
         hold_until: None,
+        idle_release_at: None,
         hold_reason: None,
         hold_until_ref: None,
         return_to: None,
@@ -923,6 +1093,139 @@ mod tests {
     use super::*;
     use crate::store::test_store;
     use serde_json::json;
+
+    #[test]
+    fn malformed_hold_timestamps_are_rejected_before_acquiring_a_claim() {
+        let (_dir, mut store) = test_store();
+        for until in [
+            "2026-99-99T99:99:99Z",
+            "2026-00-11T21:00:00Z",
+            "2026-11-00T21:00:00Z",
+            "2026-11-31T21:00:00Z",
+            "2026-02-29T21:00:00Z",
+            "1900-02-29T21:00:00Z",
+            "2026-11-11X21:00:00Z",
+            "2026-11-11T21:00x00Z",
+            "2026-11-11T24:00:00Z",
+            "2026-11-11T21:60:00Z",
+            "2026-11-11T21:00:60Z",
+            "2026-11-11T21:00:61Z",
+            "2026-11-11T21:00:00",
+            "2026-11-11T21:00:00.Z",
+            "2026-11-11T21:00:00.123abcZ",
+            "2026-11-11T21:00:00Ztrailing",
+            "2026-11-11T21:00:00+24:00",
+            "2026-11-11T21:00:00+00:60",
+            "2026-11-11T21:00:00+00x00",
+            "2026-11-11T21:00:00+0000",
+            "2026-11-11T21:00:00+00:00extra",
+        ] {
+            let error = claim_or_reuse_with_hold(
+                &mut store,
+                "worker",
+                &request(&["src"]),
+                Some("review".into()),
+                Some(until.into()),
+                1,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&error, Error::Invalid(_)),
+                "accepted {until}: {error}"
+            );
+            assert!(error.to_string().contains("RFC 3339"));
+        }
+        assert!(
+            Backend::claims(&store, &ClaimQuery::default(), 1)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hold_timestamps_accept_valid_offsets_fractions_and_leap_days() {
+        for until in [
+            "2026-11-11T21:00:00Z",
+            "2026-11-11t21:00:00z",
+            "2026-11-11T21:00:00+05:00",
+            "2026-11-11T21:00:00-02:30",
+            "2026-11-11T21:00:00.1Z",
+            "2026-11-11T21:00:00.1234567+02:30",
+            "2000-02-29T00:00:00Z",
+            "2028-02-29T00:00:00Z",
+        ] {
+            validate_hold(Some("review"), Some(until)).unwrap();
+            assert!(crate::proto::parse_rfc3339(until).is_some());
+        }
+        // Hold duration remains a server decision, independent of timestamp input validation.
+        validate_hold(Some("review"), Some("2099-11-11T21:00:00Z")).unwrap();
+    }
+
+    #[test]
+    fn local_hold_inputs_acquire_or_reuse_without_renewing_or_storing_a_hold() {
+        for until in [None, Some("2026-11-11T21:00:00Z")] {
+            for reuse in [false, true] {
+                let (_dir, mut store) = test_store();
+                let original = reuse
+                    .then(|| Backend::claim(&mut store, "worker", &request(&["src"]), 0).unwrap());
+                let (claim, created) = claim_or_reuse_with_hold(
+                    &mut store,
+                    "worker",
+                    &ClaimRequest {
+                        ttl_minutes: 20,
+                        ..request(&["src"])
+                    },
+                    Some("review".into()),
+                    until.map(str::to_string),
+                    1,
+                )
+                .unwrap();
+                assert_eq!(created, Some(!reuse));
+                assert!(claim.hold_until.is_none());
+                assert!(claim.hold_reason.is_none());
+                assert!(claim.idle_release_at.is_none());
+                if let Some(original) = original {
+                    assert_eq!(claim, original);
+                } else {
+                    assert_eq!(claim.expires_at, Stamp::Millis(1 + 20 * 60_000));
+                }
+                assert_eq!(
+                    Backend::claims(&store, &ClaimQuery::default(), 1).unwrap(),
+                    [claim]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_renew_with_hold_still_requires_cloud_mode() {
+        let (_dir, mut store) = test_store();
+        let claim = Backend::claim(&mut store, "worker", &request(&["src"]), 0).unwrap();
+        for (reason, until) in [
+            (Some("review"), None),
+            (None, Some("2026-11-11T21:00:00Z")),
+            (Some("review"), Some("2026-11-11T21:00:00Z")),
+        ] {
+            let error = Backend::renew(
+                &mut store,
+                "worker",
+                Some(claim.id),
+                &RenewRequest {
+                    ttl_minutes: 20,
+                    hold_reason: reason.map(str::to_string),
+                    hold_until: until.map(str::to_string),
+                    fence: None,
+                },
+                1,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("needs cloud mode"));
+        }
+        assert_eq!(
+            Backend::claims(&store, &ClaimQuery::default(), 1).unwrap(),
+            [claim]
+        );
+    }
 
     fn request(paths: &[&str]) -> ClaimRequest {
         ClaimRequest {

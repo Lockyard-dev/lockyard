@@ -2,6 +2,79 @@
 
 use super::*;
 
+fn recent_lost(mut lost: Vec<lockyard_core::proto::LostClaim>, now: i64) -> Vec<Value> {
+    let timestamp = |claim: &lockyard_core::proto::LostClaim| match &claim.lost_at {
+        Some(Stamp::Millis(value)) => Some(*value),
+        Some(Stamp::Text(value)) => lockyard_core::proto::parse_rfc3339(value),
+        None => None,
+    };
+    let cutoff = now.saturating_sub(120 * 60 * 1000);
+    lost.retain(|claim| timestamp(claim).is_none_or(|at| at >= cutoff));
+    lost.sort_by_key(|claim| std::cmp::Reverse(timestamp(claim)));
+    lost.into_iter()
+        .take(10)
+        .map(|claim| {
+            json!({"claim_id": claim.claim_id, "paths": claim.paths,
+                "reason": claim.reason, "lost_at": claim.lost_at})
+        })
+        .collect()
+}
+
+fn status(
+    backend: &mut dyn lockyard_core::Backend,
+    agent: Option<&str>,
+    now: i64,
+) -> Result<Value> {
+    let unread = agent.map(|name| backend.unread(name)).transpose()?;
+    let claims = backend.claims(
+        &ClaimQuery {
+            session: agent.map(str::to_string),
+            path: None,
+        },
+        now,
+    )?;
+    let lost = if backend.is_cloud() {
+        agent
+            .map(|name| backend.lost(name))
+            .transpose()
+            .map(|claims| recent_lost(claims.unwrap_or_default(), now))
+            .ok()
+    } else {
+        Some(Vec::new())
+    };
+    if backend.is_cloud() {
+        let work = visible_work(agent, backend.work_list(agent.unwrap_or("lockyard-cli"))?);
+        let mut work = work;
+        work.truncate(10);
+        let work: Vec<Value> = work
+            .into_iter()
+            .map(|item| json!({"id": item.id, "title": item.title, "status": item.status, "assignee": item.assignee, "to": item.to}))
+            .collect();
+        let (claims, offers) = match agent {
+            Some(name) => split_handover_offers(name, claims),
+            None => (claims, Vec::new()),
+        };
+        let mut tasks = backend.assigned_tasks(agent.unwrap_or("lockyard-cli"))?;
+        tasks.truncate(20);
+        return Ok(
+            json!({"unread": unread, "claims": claims, "work": work, "offers": offers, "tasks": tasks, "lost": lost}),
+        );
+    }
+    let mut tasks = backend.tasks(None, false)?;
+    tasks.retain(|task| task.assignee.as_deref() == agent);
+    tasks.truncate(20);
+    let tasks: Vec<Value> = tasks
+        .into_iter()
+        .map(|task| {
+            json!({
+                "id": task.id, "title": task.title, "status": task.status,
+                "priority": task.priority, "assignee": task.assignee
+            })
+        })
+        .collect();
+    Ok(json!({"unread": unread, "claims": claims, "tasks": tasks, "lost": lost}))
+}
+
 pub(super) fn run_tool(
     name: &str,
     args: Args<'_>,
@@ -213,48 +286,7 @@ pub(super) fn run_tool(
             args.text("key")?,
         ),
         "who" => encode(&opened.backend.agents()?),
-        "status" => {
-            let backend = opened.backend.as_mut();
-            let unread = agent.map(|name| backend.unread(name)).transpose()?;
-            let claims = backend.claims(
-                &ClaimQuery {
-                    session: agent.map(str::to_string),
-                    path: None,
-                },
-                now,
-            )?;
-            if backend.is_cloud() {
-                let work = visible_work(agent, backend.work_list(agent.unwrap_or("lockyard-cli"))?);
-                let mut work = work;
-                work.truncate(10);
-                let work: Vec<Value> = work
-                    .into_iter()
-                    .map(|item| json!({"id": item.id, "title": item.title, "status": item.status, "assignee": item.assignee, "to": item.to}))
-                    .collect();
-                let (claims, offers) = match agent {
-                    Some(name) => split_handover_offers(name, claims),
-                    None => (claims, Vec::new()),
-                };
-                let mut tasks = backend.assigned_tasks(agent.unwrap_or("lockyard-cli"))?;
-                tasks.truncate(20);
-                return Ok(
-                    json!({"unread": unread, "claims": claims, "work": work, "offers": offers, "tasks": tasks}),
-                );
-            }
-            let mut tasks = backend.tasks(None, false)?;
-            tasks.retain(|task| task.assignee.as_deref() == agent);
-            tasks.truncate(20);
-            let tasks: Vec<Value> = tasks
-                .into_iter()
-                .map(|task| {
-                    json!({
-                        "id": task.id, "title": task.title, "status": task.status,
-                        "priority": task.priority, "assignee": task.assignee
-                    })
-                })
-                .collect();
-            Ok(json!({"unread": unread, "claims": claims, "tasks": tasks}))
-        }
+        "status" => status(opened.backend.as_mut(), agent, now),
         "zone_claim" => {
             let request = claim_request(&opened, args, cwd)?;
             let claim =
@@ -412,9 +444,42 @@ pub(super) fn run_tool(
                 leave_dirty: args.flag("leave_dirty")?,
                 fence: args.some_int("fence")?,
             };
-            let released = opened
-                .backend
-                .release(me()?, args.optional_id()?, &request, now)?;
+            let agent = me()?;
+            let all = args.flag("all")?;
+            let id = match (args.optional_id()?, all) {
+                (Some(_), true) => {
+                    return Err(Error::Invalid("pass id or all: true, not both".into()));
+                }
+                (Some(id), false) => Some(id),
+                (None, true) => None,
+                // An omitted id never means "everything": several processes may share one name.
+                (None, false) => {
+                    let owned = super::composite::owned_claim_ids(
+                        Some(agent),
+                        opened.backend.claims(
+                            &ClaimQuery {
+                                session: Some(agent.to_string()),
+                                path: None,
+                            },
+                            now,
+                        )?,
+                    );
+                    match owned.as_slice() {
+                        [] => return Ok(json!({"released": 0})),
+                        [id] => Some(*id),
+                        many => {
+                            return Err(Error::Invalid(format!(
+                                "multiple claims: {}; pass id or all: true",
+                                many.iter()
+                                    .map(i64::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )));
+                        }
+                    }
+                }
+            };
+            let released = opened.backend.release(agent, id, &request, now)?;
             Ok(json!({"released": released}))
         }
         "zone_list" => {
@@ -761,3 +826,7 @@ pub(super) fn run_tool(
         _ => Err(Error::Invalid(format!("unknown tool {name:?}"))),
     }
 }
+
+#[cfg(test)]
+#[path = "tests/status_lost.rs"]
+mod status_lost_tests;

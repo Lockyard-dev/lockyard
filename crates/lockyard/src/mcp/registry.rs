@@ -59,8 +59,10 @@ impl ToolRegistry {
         for wire in [
             tool_def(
                 "start_work",
-                "Claim paths before editing; ttl is in minutes. Accept an offered zone with handover_id, or take a task.",
-                json!({"paths": names, "note": text, "ttl": ttl_minutes, "shared": flag, "zones": names, "task": task_identifier, "handover_id": int}),
+                "Claim paths before editing; ttl is in minutes. Accept an offered zone with handover_id, or take a task. Without hold_reason, the server releases the claim after 20 minutes without reported activity.",
+                json!({"paths": names, "note": text, "ttl": ttl_minutes, "shared": flag, "zones": names, "task": task_identifier, "handover_id": int,
+                    "hold_reason": {"type":"string","description":"Why the claim must be held while idle; without hold_until, hold until the claim expires."},
+                    "hold_until": {"type":"string","format":"date-time","description":"RFC 3339 hold deadline; requires hold_reason."}}),
                 &[],
             ),
             tool_def(
@@ -77,8 +79,8 @@ impl ToolRegistry {
             ),
             tool_def(
                 "finish_work",
-                "Submit evidence; without id or task, releases all your claims.",
-                json!({"task": task_identifier, "evidence": text, "id": text, "note": text}),
+                "Submit evidence and release a claim. Without id, release your sole claim; with multiple claims, choose id or all: true. Do not combine id and all: true.",
+                json!({"task": task_identifier, "evidence": text, "id": text, "note": text, "all": flag}),
                 &[],
             ),
             tool_def(
@@ -411,7 +413,7 @@ fn primitive_definitions() -> Vec<Value> {
         tool_def("who", "List agents seen in this project", json!({}), &[]),
         tool_def(
             "status",
-            "Show active claims, unfinished tasks and the mail count",
+            "Show active claims, unfinished tasks, the mail count and up to 10 recent lost claims.",
             json!({}),
             &[],
         ),
@@ -511,8 +513,8 @@ fn primitive_definitions() -> Vec<Value> {
         ),
         tool_def(
             "zone_release",
-            "Release one claim of this agent, or all of them without an id",
-            json!({"id": int, "note": text, "leave_dirty": flag, "fence": int}),
+            "Release one claim of this agent. Without id, release the sole claim; with several, pass id or all: true",
+            json!({"id": int, "note": text, "leave_dirty": flag, "fence": int, "all": flag}),
             &[],
         ),
         tool_def(

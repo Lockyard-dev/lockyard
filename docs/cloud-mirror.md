@@ -35,6 +35,11 @@ refreshes claims from the server. A periodic upkeep pass also refreshes so a mis
 latency, not a permanent lie. The same "events accelerate, reconcile is truth" rule applies to the
 filesystem monitor on disk.
 
+The lost list may contain `idle`, `expired`, or `unused_grant` entries as well as takeover losses.
+An idle shrink can release only clean paths while retaining the claim's dirty paths. The agent
+keeps lost history separate from live claims; check, activity, and release decisions use the live
+claims. A historical lost entry for the same id cannot invalidate the claim's remaining paths.
+
 ## What this is not
 
 The mirror is not authoritative for mutations. Every claim, renew, release and mail send still goes

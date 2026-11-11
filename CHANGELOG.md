@@ -5,6 +5,24 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-11-11
+
+### Added
+
+- Compact MCP `start_work` and CLI `zone claim` accept cloud idle holds through `hold_reason` and optional RFC 3339 `hold_until`. A reason alone holds until `expires_at`; a deadline requires a reason. Acquisition followed by fenced renewal remains compatible with deployed servers. A failed hold releases only the claim created by that call. Local mode validates these inputs and takes the claim without storing a hold, since local claims are not released for inactivity.
+- Accept the optional public claim timestamp `idle_release_at` from newer servers, while preserving older-server replies.
+- Compact MCP `status` includes `lost` with up to ten recent losses, excluding timestamps older than 120 minutes and retaining entries without timestamps. A failed loss lookup returns `lost: null` while preserving the rest of status. CLI `status --json` keeps its existing output and request count.
+
+### Fixed
+
+- Compact `finish_work` and CLI `zone release` release a sole owned claim by explicit id when no selector is given. Multiple claims require an id or explicit `all: true` / `--all`; combining id and all is invalid. Incoming handover offers do not count as owned claims, and `finish_work` validates before submitting a task. Local `handover` also refuses an ambiguous claim selection. The full MCP `zone_release` tool follows the same rule and accepts `all: true`.
+- Cover the agent daemon's separate lost history and live claims with a regression: a partial idle-loss record for a live claim id keeps its remaining paths valid.
+
+### Changed
+
+- Advance the synchronized Rust, npm, PyPI and MCP registry versions to `0.3.5`.
+- Document that cloud claims without a hold are released after 20 minutes without reported activity.
+
 ## [0.3.4] - 2026-11-10
 
 ### Fixed

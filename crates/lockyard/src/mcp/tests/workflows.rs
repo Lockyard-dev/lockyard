@@ -37,7 +37,12 @@
         // A compact description costs the model context on every turn; keep them one line.
         for tool in tools(Surface::Compact) {
             let description = tool["description"].as_str().unwrap();
-            assert!(description.len() <= 110, "{description}");
+            let limit = match tool["name"].as_str() {
+                Some("start_work") => 200, // Includes the required idle-release warning.
+                Some("finish_work") => 160, // Explains the explicit bulk-release opt-in.
+                _ => 110,
+            };
+            assert!(description.len() <= limit && !description.contains('\n'), "{description}");
         }
     }
 
@@ -292,6 +297,88 @@
         let answer: Value = serde_json::from_str(text(&finished)).unwrap();
         assert_eq!(answer["released"], 1);
         assert_eq!(answer["released_ids"], json!([1]));
+    }
+
+    #[test]
+    fn finish_without_claims_reports_zero() {
+        let dir = project();
+        let finished = compact_call(&dir, "worker", "finish_work", json!({}));
+        assert_eq!(finished["isError"], false, "{finished}");
+        assert_eq!(finished["structuredContent"]["released"], 0);
+        assert_eq!(finished["structuredContent"]["released_ids"], json!([]));
+    }
+
+    #[test]
+    fn ambiguous_finish_refuses_before_submitting_the_task() {
+        let dir = project();
+        call(&dir, "lead", "task_add", json!({"title": "ship"}));
+        call(&dir, "worker", "start_work", json!({"paths": ["src"], "task": "D-1"}));
+        call(&dir, "worker", "start_work", json!({"paths": ["docs"]}));
+        for arguments in [json!({"task": "D-1", "evidence": "abc123:src/lib.rs"}), json!({"id": 1, "all": true, "task": "D-1", "evidence": "abc123:src/lib.rs"})] {
+            let refused = compact_call(&dir, "worker", "finish_work", arguments);
+            assert_eq!(refused["isError"], true, "{refused}");
+            let tasks = call(&dir, "worker", "task_list", json!({}));
+            assert_eq!(tasks["structuredContent"][0]["status"], "claimed");
+            let status = compact_call(&dir, "worker", "status", json!({}));
+            assert_eq!(status["structuredContent"]["claims"].as_array().unwrap().len(), 2);
+        }
+        let refused = compact_call(&dir, "worker", "finish_work", json!({}));
+        assert!(text(&refused).contains('1') && text(&refused).contains('2'));
+        assert!(text(&refused).contains("id") && text(&refused).contains("all: true"));
+        let finished = compact_call(&dir, "worker", "finish_work", json!({"all": true}));
+        assert_eq!(finished["isError"], false, "{finished}");
+        assert_eq!(finished["structuredContent"]["released"], 2);
+        assert_eq!(finished["structuredContent"]["released_ids"], json!([1, 2]));
+    }
+
+    #[test]
+    fn local_handover_requires_a_claim_id_when_multiple_are_owned() {
+        let dir = project();
+        call(&dir, "receiver", "msg_inbox", json!({}));
+        call(&dir, "worker", "start_work", json!({"paths": ["src"]}));
+        call(&dir, "worker", "start_work", json!({"paths": ["docs"]}));
+        let refused = compact_call(&dir, "worker", "handover", json!({"to": "receiver"}));
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert!(text(&refused).contains('1') && text(&refused).contains('2'));
+        let status = compact_call(&dir, "worker", "status", json!({}));
+        assert_eq!(status["structuredContent"]["claims"].as_array().unwrap().len(), 2);
+        let released = compact_call(&dir, "worker", "handover", json!({"to": "receiver", "id": 1}));
+        assert_eq!(released["structuredContent"]["released"], 1, "{released}");
+    }
+
+    #[test]
+    fn start_work_accepts_local_hold_inputs_without_storing_a_hold() {
+        for explicit_until in [false, true] {
+            let dir = project();
+            let mut arguments = json!({"paths": ["src"], "ttl": 30, "hold_reason": "review in progress"});
+            if explicit_until {
+                arguments["hold_until"] = json!(lockyard_core::proto::rfc3339(crate::now_ms() + 600_000));
+            }
+            let started = compact_call(&dir, "worker", "start_work", arguments);
+            assert_eq!(started["isError"], false, "{started}");
+            let claim = &started["structuredContent"]["claim"];
+            assert!(claim["id"].as_i64().unwrap() > 0);
+            assert_eq!(claim["paths"], json!(["src"]));
+            assert!(claim.get("hold_reason").is_none());
+            assert!(claim.get("hold_until").is_none());
+            let status = compact_call(&dir, "worker", "status", json!({}));
+            assert_eq!(status["isError"], false, "{status}");
+            let persisted = &status["structuredContent"]["claims"][0];
+            assert_eq!(persisted["id"], claim["id"]);
+            assert_eq!(persisted["paths"], claim["paths"]);
+            assert!(persisted.get("hold_reason").is_none());
+            assert!(persisted.get("hold_until").is_none());
+        }
+    }
+
+    #[test]
+    fn start_work_rejects_hold_until_without_a_reason_before_claiming() {
+        let dir = project();
+        let refused = compact_call(&dir, "worker", "start_work", json!({"paths": ["src"], "hold_until": "2026-11-11T21:00:00Z"}));
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert!(text(&refused).contains("hold_until requires hold_reason"));
+        let free = call(&dir, "other", "zone_claim", json!({"paths": ["src"]}));
+        assert_eq!(free["isError"], false);
     }
 
     #[test]
@@ -585,6 +672,39 @@
         assert!(text(&missing).contains("Z-999999"), "{}", text(&missing));
         let claims = call(&dir, "a", "zone_list", json!({}));
         assert!(text(&claims).contains("\"id\":1"), "{}", text(&claims));
+    }
+
+    #[test]
+    fn full_zone_release_without_an_id_never_releases_several_claims_silently() {
+        let dir = project();
+        assert_eq!(
+            text(&call(&dir, "a", "zone_release", json!({}))),
+            r#"{"released":0}"#
+        );
+        call(&dir, "a", "zone_claim", json!({"paths": ["src"]}));
+        call(&dir, "a", "zone_claim", json!({"paths": ["docs"]}));
+        let refused = call(&dir, "a", "zone_release", json!({}));
+        assert_eq!(refused["isError"], true);
+        assert!(text(&refused).contains("1, 2"), "{}", text(&refused));
+        let both = call(&dir, "a", "zone_release", json!({"id": 1, "all": true}));
+        assert_eq!(both["isError"], true);
+        let claims = call(&dir, "a", "zone_list", json!({}));
+        assert!(text(&claims).contains("\"id\":1") && text(&claims).contains("\"id\":2"));
+        assert_eq!(
+            text(&call(&dir, "a", "zone_release", json!({"id": 1}))),
+            r#"{"released":1}"#
+        );
+        // One claim left: an omitted id means that claim.
+        assert_eq!(
+            text(&call(&dir, "a", "zone_release", json!({}))),
+            r#"{"released":1}"#
+        );
+        call(&dir, "a", "zone_claim", json!({"paths": ["src"]}));
+        call(&dir, "a", "zone_claim", json!({"paths": ["docs"]}));
+        assert_eq!(
+            text(&call(&dir, "a", "zone_release", json!({"all": true}))),
+            r#"{"released":2}"#
+        );
     }
 
     #[test]

@@ -553,7 +553,10 @@ fn visit(
     if !enc
         && schema == "CoordinationLostEvent"
         && let Some(reason) = v.get_mut("reason")
-        && reason.as_str() != Some("taken")
+        && !matches!(
+            reason.as_str(),
+            Some("taken" | "idle" | "expired" | "unused_grant")
+        )
     {
         decrypt_event_field(reason, "reason", workspace, key, require_encrypted)?;
     }
@@ -581,6 +584,10 @@ fn visit(
             for (property, value) in obj.iter() {
                 if !props.contains_key(property)
                     && !(event_payload && event_payload_alias(schema, property, value))
+                    // New servers add this public timestamp to claims. Keep compatibility with
+                    // the published schema while accepting the same wire types as proto::Stamp.
+                    && !(schema == "CoordinationClaim" && property == "idle_release_at"
+                        && (value.is_null() || value.is_string() || value.as_i64().is_some()))
                 {
                     return Err("required node response contains an unsupported field".into());
                 }
@@ -2751,6 +2758,110 @@ mod tests {
             key.decrypt("w", "note", request["note"].as_str().unwrap())
                 .unwrap(),
             "private work"
+        );
+    }
+
+    #[test]
+    fn idle_release_timestamp_stays_public_in_legacy_and_required_claim_replies() {
+        let key = WorkspaceKey::from_entropy([9; 32]);
+        for required in [false, true] {
+            for stamp in [
+                Value::Null,
+                serde_json::json!(1234),
+                serde_json::json!("2026-11-11T21:00:00Z"),
+            ] {
+                let mut reply = serde_json::json!([{
+                    "id": 7, "note": key.encrypt("w", "note", "private work").unwrap(),
+                    "idle_release_at": stamp
+                }]);
+                transform_fields_policy(
+                    &mut reply,
+                    "GET",
+                    "/api/v1/zones/claims",
+                    "w",
+                    Some(&key),
+                    false,
+                    required,
+                )
+                .unwrap();
+                assert_eq!(reply[0]["idle_release_at"], stamp);
+                assert_eq!(reply[0]["note"], "private work");
+            }
+        }
+        for invalid in [
+            serde_json::json!(true),
+            serde_json::json!({"private":"text"}),
+        ] {
+            let mut reply = serde_json::json!([{"id": 7, "idle_release_at": invalid}]);
+            assert!(
+                transform_fields_policy(
+                    &mut reply,
+                    "GET",
+                    "/api/v1/zones/claims",
+                    "w",
+                    Some(&key),
+                    false,
+                    true
+                )
+                .is_err()
+            );
+        }
+        let mut unknown = serde_json::json!([{"id": 7, "unclassified": "text"}]);
+        assert!(
+            transform_fields_policy(
+                &mut unknown,
+                "GET",
+                "/api/v1/zones/claims",
+                "w",
+                Some(&key),
+                false,
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn lost_claims_accept_public_release_reasons_and_still_decrypt_private_reasons() {
+        let key = WorkspaceKey::from_entropy([9; 32]);
+        for reason in ["taken", "idle", "expired", "unused_grant"] {
+            let mut reply = serde_json::json!([{"claim_id": 7, "reason": reason}]);
+            transform_fields_policy(
+                &mut reply,
+                "GET",
+                "/api/v1/zones/lost",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(reply[0]["reason"], reason);
+        }
+        let mut private = serde_json::json!([{"claim_id": 7, "reason": key.encrypt("w", "reason", "private reason").unwrap()}]);
+        transform_fields_policy(
+            &mut private,
+            "GET",
+            "/api/v1/zones/lost",
+            "w",
+            Some(&key),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(private[0]["reason"], "private reason");
+        let mut plaintext = serde_json::json!([{"claim_id": 7, "reason": "private reason"}]);
+        assert!(
+            transform_fields_policy(
+                &mut plaintext,
+                "GET",
+                "/api/v1/zones/lost",
+                "w",
+                Some(&key),
+                false,
+                true
+            )
+            .is_err()
         );
     }
 

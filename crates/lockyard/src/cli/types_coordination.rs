@@ -13,6 +13,12 @@ pub(super) enum ZoneCommand {
         note: String,
         #[command(flatten)]
         ttl: Ttl,
+        /// Why the claim stays held while idle; defaults to holding until its expiry.
+        #[arg(long)]
+        hold_reason: Option<String>,
+        /// Hold until this RFC 3339 timestamp; requires --hold-reason.
+        #[arg(long)]
+        hold_until: Option<String>,
         /// Start empty and grow through add-path.
         #[arg(long)]
         lazy: bool,
@@ -144,10 +150,13 @@ pub(super) enum ZoneCommand {
         #[arg(long)]
         fence: Option<i64>,
     },
-    /// Release one claim, or all of this agent's claims.
+    /// Release one claim; with several claims, give an id or --all.
     Release {
         #[arg(value_parser = parse_id)]
         id: Option<i64>,
+        /// Release all this agent's claims. Cannot be combined with an id.
+        #[arg(long)]
+        all: bool,
         #[arg(long)]
         note: Option<String>,
         /// Uncommitted changes stay behind on purpose.

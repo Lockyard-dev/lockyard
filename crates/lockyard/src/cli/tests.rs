@@ -204,12 +204,19 @@ fn a_cloud_lease_is_shown_and_never_counted_down() {
     assert!(claim_line(&claim, None).contains("owner: \"other\""));
 }
 
+#[derive(Default)]
 struct Scripted {
+    cloud: bool,
     answers: Vec<Result<Claim>>,
     waits: Vec<Option<i64>>,
+    claims: Vec<Claim>,
+    releases: Vec<(Option<i64>, ReleaseRequest)>,
 }
 
 impl Backend for Scripted {
+    fn is_cloud(&self) -> bool {
+        self.cloud
+    }
     fn touch_agent(&mut self, _: &str, _: i64) -> Result<()> {
         Ok(())
     }
@@ -223,11 +230,18 @@ impl Backend for Scripted {
     fn renew(&mut self, _: &str, _: Option<i64>, _: &RenewRequest, _: i64) -> Result<usize> {
         unreachable!()
     }
-    fn release(&mut self, _: &str, _: Option<i64>, _: &ReleaseRequest, _: i64) -> Result<usize> {
-        unreachable!()
+    fn release(
+        &mut self,
+        _: &str,
+        id: Option<i64>,
+        request: &ReleaseRequest,
+        _: i64,
+    ) -> Result<usize> {
+        self.releases.push((id, request.clone()));
+        Ok(id.map_or(self.claims.len(), |_| 1))
     }
     fn claims(&self, _: &ClaimQuery, _: i64) -> Result<Vec<Claim>> {
-        unreachable!()
+        Ok(self.claims.clone())
     }
     fn check(
         &self,
@@ -248,7 +262,7 @@ impl Backend for Scripted {
         unreachable!()
     }
     fn unread(&self, _: &str) -> Result<i64> {
-        unreachable!()
+        Ok(0)
     }
     fn inbox_seen(&mut self, _: &str, _: &[i64], _: i64) -> Result<usize> {
         unreachable!()
@@ -257,7 +271,13 @@ impl Backend for Scripted {
         unreachable!()
     }
     fn tasks(&self, _: Option<Status>, _: bool) -> Result<Vec<Task>> {
-        unreachable!()
+        Ok(Vec::new())
+    }
+    fn work_list(&self, _: &str) -> Result<Vec<WorkTask>> {
+        Ok(Vec::new())
+    }
+    fn lost(&self, _: &str) -> Result<Vec<lockyard_core::proto::LostClaim>> {
+        panic!("CLI status must not fetch lost claims")
     }
     fn task(&self, _: &str) -> Result<Task> {
         unreachable!()
@@ -318,6 +338,7 @@ fn a_short_wait_retries_a_conflict_and_stops_on_anything_else() {
     let mut backend = Scripted {
         answers: vec![Err(Error::Contended("reserved".into())), Ok(claim())],
         waits: Vec::new(),
+        ..Default::default()
     };
     assert_eq!(
         wait_for_claim(&mut backend, "a", ClaimRequest::default(), 3)
@@ -331,6 +352,7 @@ fn a_short_wait_retries_a_conflict_and_stops_on_anything_else() {
     let mut failing = Scripted {
         answers: vec![Err(Error::Frozen("x".into()))],
         waits: Vec::new(),
+        ..Default::default()
     };
     assert!(matches!(
         wait_for_claim(&mut failing, "a", ClaimRequest::default(), 3),
@@ -344,10 +366,263 @@ fn a_short_wait_gives_up_at_its_limit_and_refuses_a_long_one() {
     let mut backend = Scripted {
         answers: vec![Err(Error::Contended("reserved".into()))],
         waits: Vec::new(),
+        ..Default::default()
     };
     assert!(matches!(
         wait_for_claim(&mut backend, "a", ClaimRequest::default(), 0),
         Err(Error::Contended(_))
     ));
     assert!(wait_for_claim(&mut backend, "a", ClaimRequest::default(), 121).is_err());
+}
+
+fn owned_claim(id: i64, session: &str) -> Claim {
+    serde_json::from_value(json!({"id": id, "session": session})).unwrap()
+}
+
+#[test]
+fn zone_release_without_id_handles_zero_one_and_offered_claims() {
+    for all in [false, true] {
+        let mut backend = Scripted {
+            // A claim offered to this agent still belongs to its sender.
+            claims: vec![owned_claim(99, "sender")],
+            ..Default::default()
+        };
+        assert_eq!(
+            release_claims(&mut backend, "a", None, all, &ReleaseRequest::default(), 0).unwrap(),
+            0
+        );
+        assert!(backend.releases.is_empty());
+
+        backend.claims.push(owned_claim(7, "a"));
+        let request = ReleaseRequest {
+            note: Some("finished".into()),
+            fence: Some(15),
+            ..ReleaseRequest::default()
+        };
+        assert_eq!(
+            release_claims(&mut backend, "a", None, all, &request, 0).unwrap(),
+            1
+        );
+        assert_eq!(backend.releases, [(Some(7), request)]);
+    }
+}
+
+#[test]
+fn zone_release_requires_an_id_or_all_before_any_release_with_multiple_claims() {
+    let mut backend = Scripted {
+        claims: vec![owned_claim(7, "a"), owned_claim(8, "a")],
+        ..Default::default()
+    };
+    let error = release_claims(
+        &mut backend,
+        "a",
+        None,
+        false,
+        &ReleaseRequest::default(),
+        0,
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::Invalid(_)));
+    let text = error.to_string();
+    for expected in ["Z-7", "Z-8", "id", "--all"] {
+        assert!(text.contains(expected), "{text}");
+    }
+    assert!(backend.releases.is_empty());
+
+    assert_eq!(
+        release_claims(&mut backend, "a", None, true, &ReleaseRequest::default(), 0).unwrap(),
+        2
+    );
+    assert_eq!(backend.releases[0].0, None);
+}
+
+#[test]
+fn zone_release_explicit_id_is_scoped_and_id_with_all_is_invalid() {
+    let mut backend = Scripted {
+        claims: vec![owned_claim(7, "a"), owned_claim(8, "a")],
+        ..Default::default()
+    };
+    assert!(matches!(
+        release_claims(
+            &mut backend,
+            "a",
+            Some(7),
+            true,
+            &ReleaseRequest::default(),
+            0,
+        ),
+        Err(Error::Invalid(_))
+    ));
+    assert!(backend.releases.is_empty());
+    assert_eq!(
+        release_claims(
+            &mut backend,
+            "a",
+            Some(7),
+            false,
+            &ReleaseRequest::default(),
+            0,
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(backend.releases[0].0, Some(7));
+}
+
+#[test]
+fn zone_claim_accepts_local_hold_flags_without_storing_a_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    Store::init(dir.path()).unwrap();
+    let out = run(
+        Cli::try_parse_from([
+            "lockyard",
+            "--agent",
+            "a",
+            "zone",
+            "claim",
+            "src",
+            "--hold-reason",
+            "long review",
+        ])
+        .unwrap(),
+        dir.path(),
+    )
+    .unwrap();
+    assert!(out.json.get("hold_reason").is_none());
+    assert!(out.json.get("hold_until").is_none());
+    let held: Claim = serde_json::from_value(out.json).unwrap();
+    assert!(held.id > 0);
+    assert_eq!(held.paths, ["src"]);
+    assert_eq!(held.hold_reason, None);
+    assert_eq!(held.hold_until, None);
+
+    let until = rfc3339(now_ms() + 60_000);
+    let out = run(
+        Cli::try_parse_from([
+            "lockyard",
+            "--agent",
+            "a",
+            "zone",
+            "claim",
+            "src",
+            "--hold-reason",
+            "short review",
+            "--hold-until",
+            until.as_str(),
+        ])
+        .unwrap(),
+        dir.path(),
+    )
+    .unwrap();
+    assert!(out.json.get("hold_reason").is_none());
+    assert!(out.json.get("hold_until").is_none());
+    let reused: Claim = serde_json::from_value(out.json).unwrap();
+    assert_eq!(reused.id, held.id);
+    assert_eq!(reused.expires_at, held.expires_at);
+    assert_eq!(reused.hold_reason, None);
+    assert_eq!(reused.hold_until, None);
+    let claims = Store::open(dir.path()).unwrap().claims(now_ms()).unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].id, held.id);
+}
+
+#[test]
+fn zone_claim_hold_until_without_reason_refuses_before_creating_a_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    Store::init(dir.path()).unwrap();
+    let error = run(
+        Cli::try_parse_from([
+            "lockyard",
+            "--agent",
+            "a",
+            "zone",
+            "claim",
+            "src",
+            "--hold-until",
+            "2026-11-11T20:00:00Z",
+        ])
+        .unwrap(),
+        dir.path(),
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(error, Error::Invalid(_)));
+    assert!(error.to_string().contains("hold_reason"));
+    assert!(
+        Store::open(dir.path())
+            .unwrap()
+            .claims(now_ms())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn zone_release_and_claim_help_explain_the_explicit_flags() {
+    let mut command = Cli::command();
+    command.build();
+    let zone = command.find_subcommand_mut("zone").unwrap();
+    let claim = zone
+        .find_subcommand_mut("claim")
+        .unwrap()
+        .render_long_help()
+        .to_string();
+    for text in ["--hold-reason", "--hold-until", "RFC 3339"] {
+        assert!(claim.contains(text), "{claim}");
+    }
+    let release = zone
+        .find_subcommand_mut("release")
+        .unwrap()
+        .render_long_help()
+        .to_string();
+    assert!(release.contains("give an id or --all"), "{release}");
+    assert!(
+        release.contains("Cannot be combined with an id"),
+        "{release}"
+    );
+    let cli = Cli::try_parse_from(["lockyard", "zone", "release", "--all"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Zone(ZoneCommand::Release {
+            id: None,
+            all: true,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn cli_status_json_keeps_its_fields_and_does_not_request_lost_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    Store::init(dir.path()).unwrap();
+    for cloud in [false, true] {
+        let opened = Opened {
+            backend: Box::new(Scripted {
+                cloud,
+                ..Default::default()
+            }),
+            root: dir.path().to_path_buf(),
+        };
+        let out = run_status(&opened, Some(&"a".to_string())).unwrap();
+        assert_eq!(out.json["claims"], json!([]));
+        assert_eq!(out.json["tasks"], json!([]));
+        assert_eq!(out.json["unread"], 0);
+        assert!(out.json.get("lost").is_none());
+        let mut keys: Vec<_> = out
+            .json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut expected = vec!["claims", "machine_level", "tasks", "unannounced", "unread"];
+        if cloud {
+            assert_eq!(out.json["offers"], json!([]));
+            assert_eq!(out.json["work"], json!([]));
+            expected.extend(["offers", "work"]);
+            expected.sort_unstable();
+        }
+        assert_eq!(keys, expected);
+    }
 }

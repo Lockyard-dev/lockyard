@@ -2483,6 +2483,45 @@ mod tests {
     }
 
     #[test]
+    fn idle_lost_marks_do_not_revoke_a_still_live_narrowed_claim() {
+        let mut rig = start_with(timing(), |server| {
+            server.claim(9, "me", "src/dirty");
+            *server.lost.lock().unwrap() = vec![json!({
+                "claim_id": 9, "session": "me", "paths": ["src"], "reason": "idle"
+            })];
+        });
+        rig.daemon.stop_workers();
+        rig.daemon.shared.refresh_zones();
+        rig.daemon.handle(Request::ZoneSnapshot {
+            session: "me".into(),
+        });
+        rig.daemon.shared.refresh_lost();
+        let snapshot = rig.daemon.handle(Request::ZoneSnapshot {
+            session: "me".into(),
+        });
+        assert_eq!(snapshot.lost.as_ref().unwrap()[0].claim_id, 9);
+        let claims = snapshot.claims.as_ref().unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].id, 9);
+        assert_eq!(claims[0].paths, ["src/dirty"]);
+        // Lost marks are history, separate from the live ownership used by checks/activity.
+        let view = rig.daemon.shared.read_view();
+        assert_eq!(
+            view.check_path("me", "src/dirty/file.rs").status,
+            CheckStatus::Own
+        );
+        assert_eq!(
+            view.check_path("other", "src/dirty/file.rs").status,
+            CheckStatus::Held
+        );
+        assert_eq!(
+            view.check_path("me", "src/clean/file.rs").status,
+            CheckStatus::Free
+        );
+        assert!(rig.server.writes_to("/release").is_empty());
+    }
+
+    #[test]
     fn lost_marks_are_loaded_for_heard_sessions_and_expired_sessions_are_dropped() {
         let mut rig = start_with(timing(), |server| {
             *server.lost.lock().unwrap() =

@@ -50,6 +50,54 @@ pub(super) fn claim_request(
     }
 }
 
+/// Resolve an omitted id before releasing, so another process's claims need explicit consent.
+pub(super) fn release_claims(
+    backend: &mut dyn Backend,
+    agent: &str,
+    id: Option<i64>,
+    all: bool,
+    request: &ReleaseRequest,
+    now: i64,
+) -> Result<usize> {
+    if id.is_some() && all {
+        return Err(Error::Invalid(
+            "provide either id or --all, not both".into(),
+        ));
+    }
+    let id = match id {
+        Some(id) => Some(id),
+        None => {
+            let ids: Vec<_> = backend
+                .claims(
+                    &ClaimQuery {
+                        session: Some(agent.to_string()),
+                        path: None,
+                    },
+                    now,
+                )?
+                .into_iter()
+                .filter(|claim| claim.session == agent)
+                .map(|claim| claim.id)
+                .collect();
+            match ids.as_slice() {
+                [] => return Ok(0),
+                [id] => Some(*id),
+                _ if all => None,
+                _ => {
+                    return Err(Error::Invalid(format!(
+                        "you own multiple claims: {}; provide id or --all",
+                        ids.iter()
+                            .map(|id| format!("Z-{id}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
+        }
+    };
+    backend.release(agent, id, request, now)
+}
+
 /// Keeps asking for a claim until it is granted or the wait ends. Each try is its own write, because a
 /// repeat under one key would only repeat the first refusal.
 pub(crate) fn wait_for_claim(
@@ -90,6 +138,8 @@ pub(super) fn run_zone(
             paths,
             note,
             ttl,
+            hold_reason,
+            hold_until,
             lazy,
             style,
             meta,
@@ -99,8 +149,14 @@ pub(super) fn run_zone(
             let mut request = claim_request(paths, note, ttl.ttl, &style);
             request.lazy = lazy;
             request.meta = meta;
-            let claim =
-                lockyard_core::claim_or_reuse(opened.backend.as_mut(), &agent, &request, now)?;
+            let (claim, _) = lockyard_core::claim_or_reuse_with_hold(
+                opened.backend.as_mut(),
+                &agent,
+                &request,
+                hold_reason,
+                hold_until,
+                now,
+            )?;
             let text = claim_line(&claim, lease);
             output(&claim, text)
         }
@@ -264,6 +320,7 @@ pub(super) fn run_zone(
         }
         ZoneCommand::Release {
             id,
+            all,
             note,
             leave_dirty,
             fence,
@@ -274,7 +331,7 @@ pub(super) fn run_zone(
                 leave_dirty,
                 fence,
             };
-            let released = opened.backend.release(&agent, id, &request, now)?;
+            let released = release_claims(opened.backend.as_mut(), &agent, id, all, &request, now)?;
             output(
                 &json!({ "released": released }),
                 format!("released {released}"),

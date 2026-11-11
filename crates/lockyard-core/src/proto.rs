@@ -164,6 +164,8 @@ pub struct Claim {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_until: Option<Stamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_release_at: Option<Stamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_until_ref: Option<i64>,
@@ -809,6 +811,26 @@ mod tests {
         assert_eq!(printed["session"], "s");
         let again: Claim = serde_json::from_value(printed).unwrap();
         assert_eq!(again, claim);
+    }
+
+    #[test]
+    fn idle_release_at_is_optional_and_preserves_the_servers_timestamp() {
+        let legacy: Claim = serde_json::from_value(json!({"id": 7})).unwrap();
+        assert!(legacy.idle_release_at.is_none());
+        assert!(
+            serde_json::to_value(legacy)
+                .unwrap()
+                .get("idle_release_at")
+                .is_none()
+        );
+        for stamp in [json!(1234), json!("2026-11-11T21:00:00Z")] {
+            let claim: Claim =
+                serde_json::from_value(json!({"id": 7, "idle_release_at": stamp})).unwrap();
+            assert_eq!(
+                serde_json::to_value(claim).unwrap()["idle_release_at"],
+                stamp
+            );
+        }
     }
 
     #[test]

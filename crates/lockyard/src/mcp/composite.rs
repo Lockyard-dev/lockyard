@@ -29,12 +29,24 @@ pub(super) fn run_composite(
     match name {
         "start_work" => {
             let paths = args.strings("paths")?;
+            let hold_reason = args.some_text("hold_reason")?;
+            let hold_until = args.some_text("hold_until")?;
+            lockyard_core::validate_hold(hold_reason.as_deref(), hold_until.as_deref())?;
             if let Some(id) = args.some_int("handover_id")? {
+                if hold_reason.is_some() {
+                    return Err(Error::Invalid(
+                        "a hold needs paths or zones; renew an accepted handover with zone_renew"
+                            .into(),
+                    ));
+                }
                 return Ok(json!({"accepted": step("zone_accept", json!({"id": id}), after)?}));
             }
             // Reject malformed task arguments before creating any lease.
             let task = args.some_task_id("task")?;
             if args.get("task").is_some() && paths.is_empty() && args.strings("zones")?.is_empty() {
+                if hold_reason.is_some() {
+                    return Err(Error::Invalid("a hold needs a path or zone claim".into()));
+                }
                 // A registry task claim does not need a path claim.
                 let id = task.expect("checked above");
                 return Ok(json!({"task": step("task_claim", json!({"id": id}), after)?}));
@@ -58,14 +70,17 @@ pub(super) fn run_composite(
                 let mut opened = open(cwd, agent)?;
                 let mut request = claim_request(&opened, Args(&arguments), cwd)?;
                 let cloud = opened.backend.is_cloud();
-                let nonce = (cloud && task.is_some()).then(lockyard_cloud_client::ulid);
+                let nonce = (cloud && (task.is_some() || hold_reason.is_some()))
+                    .then(lockyard_cloud_client::ulid);
                 if let Some(nonce) = nonce.as_ref() {
                     request.meta = Some(json!({"lockyard_start_work_nonce": nonce}));
                 }
-                let (claim, created) = lockyard_core::claim_or_reuse_with_creation_status(
+                let (claim, created) = lockyard_core::claim_or_reuse_with_hold(
                     opened.backend.as_mut(),
                     me,
                     &request,
+                    hold_reason,
+                    hold_until,
                     crate::now_ms(),
                 )?;
                 // Unknown legacy responses preserve the lease. Ownership and a
@@ -160,7 +175,31 @@ pub(super) fn run_composite(
                     }
                 }
             } else {
-                args.optional_id()?.unwrap_or_default()
+                let selected = args.optional_id()?;
+                let ids = if selected.is_none() {
+                    owned_claim_ids(
+                        agent,
+                        open(cwd, agent)?.backend.claims(
+                            &ClaimQuery {
+                                session: agent.map(str::to_string),
+                                path: None,
+                            },
+                            crate::now_ms(),
+                        )?,
+                    )
+                } else {
+                    Vec::new()
+                };
+                if ids.len() > 1 {
+                    return Err(Error::Invalid(format!(
+                        "choose a claim id: {}",
+                        ids.iter()
+                            .map(i64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+                release_target(selected, false, &ids)?.unwrap_or_default()
             };
             let to = resolve_target(cwd, agent, args.text("to")?)?;
             let body = if cloud {
@@ -176,14 +215,11 @@ pub(super) fn run_composite(
             let mut answer = if cloud {
                 json!({"mode": "offered", "claim": step("zone_handover", json!({"id": id, "to": to}), after)?})
             } else {
-                let released = step(
-                    "zone_release",
-                    match args.optional_id()? {
-                        Some(id) => json!({"id": id, "note": note}),
-                        None => json!({"note": note}),
-                    },
-                    after,
-                )?;
+                let released = if id == 0 && args.optional_id()?.is_none() {
+                    json!({"released": 0})
+                } else {
+                    step("zone_release", json!({"id": id, "note": note}), after)?
+                };
                 json!({"mode": "released", "released": released["released"].clone()})
             };
             answer["message"] = if cloud {
@@ -199,18 +235,11 @@ pub(super) fn run_composite(
         }
         "finish_work" => {
             let mut answer = json!({});
-            if let Some(id) = args.some_task_id("task")? {
-                let evidence = args.some_text("evidence")?.ok_or_else(|| {
-                    Error::Invalid("finishing a task needs evidence of the work".into())
-                })?;
-                let evidence = executor_evidence(&evidence);
-                answer["task"] = step(
-                    "task_submit",
-                    json!({"id": id, "evidence": evidence}),
-                    after,
-                )?;
-            }
             let id = args.optional_claim_id()?;
+            let all = args.flag("all")?;
+            if id.is_some() && all {
+                return Err(Error::Invalid("pass id or all: true, not both".into()));
+            }
             let released_ids = match id {
                 Some(id) => vec![id],
                 None => owned_claim_ids(
@@ -224,16 +253,55 @@ pub(super) fn run_composite(
                     )?,
                 ),
             };
-            let release = match id {
-                Some(id) => json!({"id": id, "note": args.optional_text("note")?}),
-                None => json!({"note": args.optional_text("note")?}),
+            // Resolve ambiguity before task_submit: a refusal must leave the task untouched.
+            let target = release_target(id, all, &released_ids)?;
+            let note = args.optional_text("note")?;
+            if let Some(id) = args.some_task_id("task")? {
+                let evidence = args.some_text("evidence")?.ok_or_else(|| {
+                    Error::Invalid("finishing a task needs evidence of the work".into())
+                })?;
+                let evidence = executor_evidence(&evidence);
+                answer["task"] = step(
+                    "task_submit",
+                    json!({"id": id, "evidence": evidence}),
+                    after,
+                )?;
+            }
+            let release = match target {
+                Some(id) => json!({"id": id, "note": note}),
+                None => json!({"note": note, "all": true}),
             };
-            let released = step("zone_release", release, after)?["released"].clone();
+            let released = if released_ids.is_empty() {
+                json!(0)
+            } else {
+                step("zone_release", release, after)?["released"].clone()
+            };
             answer["released"] = released.clone();
             answer["released_ids"] = json!(released_ids);
             Ok(answer)
         }
         _ => Err(Error::Invalid(format!("unknown tool {name:?}"))),
+    }
+}
+
+fn release_target(id: Option<i64>, all: bool, owned: &[i64]) -> Result<Option<i64>> {
+    if id.is_some() && all {
+        return Err(Error::Invalid("pass id or all: true, not both".into()));
+    }
+    if let Some(id) = id {
+        return Ok(Some(id));
+    }
+    match owned {
+        [] => Ok(None),
+        [id] => Ok(Some(*id)),
+        _ if all => Ok(None),
+        many => Err(Error::Invalid(format!(
+            "multiple claims: {}; pass id or all: true",
+            many.iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
     }
 }
 

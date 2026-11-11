@@ -55,6 +55,10 @@ its lead.
 
 Zone events carry `claim_id, session, paths[], note, reason, fence`. Bus events carry `id, from, to, thread_id, kind, needs`.
 `GET /api/v1/zones/lost?session=` lists lost claims.
+Newer servers also include entries with reasons `idle`, `expired`, and `unused_grant`. An `idle`
+entry may describe a partial shrink while the same claim id remains live with fewer paths; clients
+must not treat that entry as proof that the whole claim has been lost. Compact MCP `status` in
+core 0.3.5 returns up to ten recent entries in `lost`; CLI `status --json` makes no extra request.
 
 ## Cutover
 

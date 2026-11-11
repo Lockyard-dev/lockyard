@@ -6,7 +6,7 @@ a path at a time, a shared bus to talk, and tasks that survive a session. By def
 file under `.lockyard/` in your project, and nothing leaves the machine. Teams across machines use [cloud
 mode](#cloud-mode).
 
-**Status: 0.1.0, the first release.**
+**Version: 0.3.5.**
 
 ## Install
 
@@ -92,6 +92,23 @@ require cloud mode. `zone_renew` extends an owned, live claim with an optional `
 claims are refused, as are stale fences in cloud mode. Underlying authorization and refusal behavior are shared
 by both surfaces. `LOCKYARD_MCP_TOOLS=full` does the same as the flag, and the flag wins.
 
+`start_work` accepts `hold_reason` and an optional RFC 3339 `hold_until`. A deadline requires a reason.
+In cloud mode, a reason alone holds the claim until its `expires_at`. It first acquires the claim, then renews that claim
+with its returned fence and the hold, so deployed servers do not need new claim-request fields. If the hold
+fails, a claim created by this call is released; a reused claim is preserved and the call reports an error.
+Legacy replies without a creation receipt preserve the claim on failure, since its creation cannot be proven.
+Without `hold_reason`, the server releases the claim after 20 minutes without reported activity.
+Local mode validates these inputs and takes the claim without renewal or stored hold fields, since local
+claims are not released for inactivity.
+
+`finish_work` accepts `id` to release one claim or `all: true` to release all owned claims. With neither,
+it releases a sole owned claim, does nothing when there are none, and refuses when there are several,
+listing their ids before submitting any task. `id` and `all: true` cannot be combined. Incoming handover
+offers do not count as owned claims. Local `handover` also requires `id` when several claims are owned.
+Compact MCP `status` includes `lost: []` or up to ten recent losses with `claim_id`, `paths`, `reason`,
+and `lost_at`. Losses older than 120 minutes are omitted; entries without a timestamp are included.
+If the loss lookup fails, `lost` is `null` and the remaining status fields are still returned.
+
 For configuration snippets, use `lockyard setup --print --client claude`, `--client codex` or `--client cursor`. Set `LOCKYARD_AGENT` to a unique name for each agent. The MCP server communicates over standard input and output. The Codex configuration forwards the agent identity and configured Cloud URL/token variables; export them before starting Codex.
 
 ## Zones
@@ -105,6 +122,17 @@ lockyard zone check src/api/mod.rs     # exit 3 when another agent holds the pat
 lockyard zone renew
 lockyard zone release
 ```
+
+`zone claim` accepts `--hold-reason "waiting for review"` and an optional RFC 3339
+`--hold-until 2026-11-11T21:45:00Z`, using the same cloud acquire-then-renew hold path as `start_work`.
+Local mode validates these flags and takes the claim without storing a hold. In cloud mode,
+without `--hold-until`, the hold lasts until the claim expires. A deadline without a reason is refused;
+the server enforces its 240-minute hold limit. Claims may include the optional public `idle_release_at`
+timestamp when the server supplies it; older servers omit it.
+
+`zone release <id>` releases that claim. With no id it releases a sole owned claim or returns zero when
+there are none. If several claims are owned, it lists their ids and requires an id or explicit `--all`.
+An id and `--all` cannot be combined. This protects other processes using the same agent name.
 
 ## Bus
 
@@ -230,6 +258,9 @@ agents stay in `lockyard work`.
 pages require two registry requests. It does not fetch or return the full registry in a `backlog` field.
 Use `lockyard task list --json` (or MCP `task_list`) for the full task list. Local status keeps its existing
 behavior.
+
+Compact MCP `status` additionally fetches recent lost claims. CLI `lockyard status --json` keeps its
+existing fields and request count; it does not fetch the lost list.
 
 ### The agent process
 

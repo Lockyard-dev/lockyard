@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 // Renewal fixtures use a fixed server clock so subprocess scheduling cannot age a claim.
 const RENEW_NOW_MS: i64 = 1_000_000;
+const HOLD_EXPIRES_AT: &str = "2099-11-11T21:45:00Z";
 
 #[derive(Debug, Clone)]
 struct Seen {
@@ -35,6 +36,8 @@ struct State {
     claim_created: Option<Value>,
     omit_claim_meta: bool,
     echo_reused_claim_meta: bool,
+    refuse_renew: Option<(u16, Value)>,
+    ignore_renew_hold: bool,
     refuse_release: Option<(u16, Value)>,
     refuse_registry_claim: bool,
     check_reply: Option<Value>,
@@ -187,7 +190,7 @@ fn route_reply(
                 return (200, claim);
             }
             let id = state.claims.len() as i64 + 1;
-            let claim = json!({"id": id, "session": "alice", "paths": body["paths"], "meta": body["meta"], "fence": 1, "expires_at": "later"});
+            let claim = json!({"id": id, "session": "alice", "paths": body["paths"], "meta": body["meta"], "fence": 1, "expires_at": HOLD_EXPIRES_AT});
             state.claims.push(claim.clone());
             let mut reply = claim;
             if state.omit_claim_meta {
@@ -200,6 +203,9 @@ fn route_reply(
         }
         ("GET", "/api/v1/zones/claims") => (200, json!({"claims": state.claims})),
         ("POST", _) if route.starts_with("/api/v1/zones/claims/") && route.ends_with("/renew") => {
+            if let Some(refusal) = state.refuse_renew.clone() {
+                return refusal;
+            }
             let id = route
                 .trim_end_matches("/renew")
                 .rsplit('/')
@@ -219,7 +225,15 @@ fn route_reply(
                     json!({"error":{"code":"not_found","message":"claim is not yours"}}),
                 );
             }
-            if claim["expires_at"].as_i64().unwrap() <= RENEW_NOW_MS {
+            let expires_at = claim["expires_at"]
+                .as_i64()
+                .or_else(|| {
+                    claim["expires_at"]
+                        .as_str()
+                        .and_then(lockyard_core::proto::parse_rfc3339)
+                })
+                .unwrap();
+            if expires_at <= RENEW_NOW_MS {
                 return (
                     404,
                     json!({"error":{"code":"not_found","message":"claim has expired"}}),
@@ -233,23 +247,42 @@ fn route_reply(
             }
             let ttl = body["ttl_minutes"].as_i64().unwrap();
             assert!((1..=240).contains(&ttl));
-            claim["expires_at"] = json!(RENEW_NOW_MS + ttl * 60_000);
+            if claim["expires_at"].is_number() {
+                claim["expires_at"] = json!(RENEW_NOW_MS + ttl * 60_000);
+            }
+            if !state.ignore_renew_hold {
+                for field in ["hold_reason", "hold_until"] {
+                    if let Some(value) = body.get(field) {
+                        claim[field] = value.clone();
+                    }
+                }
+            }
             (200, claim.clone())
+        }
+        ("DELETE", "/api/v1/zones/claims") => {
+            let before = state.claims.len();
+            state
+                .claims
+                .retain(|claim| claim["session"].as_str() != session);
+            (200, json!({"released":before - state.claims.len()}))
         }
         ("DELETE", _) if route.starts_with("/api/v1/zones/claims/") => {
             if let Some(refusal) = state.refuse_release.clone() {
                 return refusal;
             }
             let id = route.rsplit('/').next().unwrap().parse::<i64>().unwrap();
-            state
-                .claims
-                .retain(|claim| claim["id"] != id || claim["fence"] != body["fence"]);
+            state.claims.retain(|claim| {
+                claim["id"] != id
+                    || (body.get("fence").is_some_and(|fence| !fence.is_null())
+                        && claim["fence"] != body["fence"])
+            });
             (200, json!({"released":1}))
         }
         ("GET", "/api/v1/presence") => (200, json!({"sessions":[]})),
         ("GET", "/api/v1/registry/areas") if !state.registry_areas.is_empty() => {
             (200, json!({"areas": state.registry_areas}))
         }
+        ("GET", "/api/v1/registry/items") => (200, json!({"items":[],"cursor":null})),
         ("POST", "/api/v1/registry/items") if !state.registry_areas.is_empty() => {
             let area = state
                 .registry_areas
@@ -612,6 +645,342 @@ fn compact_zone_renew_preserves_stale_fence_foreign_and_expired_refusals() {
             1
         );
     }
+}
+
+#[test]
+fn start_work_cloud_applies_the_hold_with_a_fenced_renewal_after_claiming() {
+    for explicit_until in [None, Some("2099-11-11T21:30:00Z")] {
+        let server = Server::start();
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        let mut arguments = json!({"paths":["src"],"ttl":45,"hold_reason":"waiting for review"});
+        if let Some(until) = explicit_until {
+            arguments["hold_until"] = json!(until);
+        }
+        let answers = mcp_calls(
+            dir.path(),
+            runtime.path(),
+            "compact",
+            &[("start_work", arguments)],
+        );
+        let answer = &answers[0];
+        assert_eq!(answer["isError"], false, "{answer}");
+        let until = explicit_until.unwrap_or(HOLD_EXPIRES_AT);
+        assert_eq!(
+            answer["structuredContent"]["claim"]["hold_reason"],
+            "waiting for review"
+        );
+        assert_eq!(answer["structuredContent"]["claim"]["hold_until"], until);
+        let claims = server.seen("POST", "/api/v1/zones/claims");
+        let renewals = server.seen("POST", "/api/v1/zones/claims/1/renew");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(renewals.len(), 1);
+        assert_eq!(claims[0].body["ttl_minutes"], 45);
+        assert!(claims[0].body.get("hold_reason").is_none());
+        assert!(claims[0].body.get("hold_until").is_none());
+        assert_eq!(renewals[0].body["ttl_minutes"], 45);
+        assert_eq!(renewals[0].body["fence"], 1);
+        assert_eq!(renewals[0].body["hold_reason"], "waiting for review");
+        assert_eq!(renewals[0].body["hold_until"], until);
+        let state = server.state.lock().unwrap();
+        let claim_at = state
+            .seen
+            .iter()
+            .position(|seen| seen.method == "POST" && seen.path == "/api/v1/zones/claims")
+            .unwrap();
+        let renew_at = state
+            .seen
+            .iter()
+            .position(|seen| seen.method == "POST" && seen.path == "/api/v1/zones/claims/1/renew")
+            .unwrap();
+        assert!(
+            claim_at < renew_at,
+            "hold must use an ordinary claim followed by renewal"
+        );
+    }
+}
+
+#[test]
+fn start_work_cloud_rejects_a_hold_deadline_without_a_reason_before_claiming() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let answers = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "compact",
+        &[(
+            "start_work",
+            json!({"paths":["src"],"hold_until":HOLD_EXPIRES_AT}),
+        )],
+    );
+    assert_eq!(answers[0]["isError"], true);
+    assert!(
+        answers[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("hold_until requires hold_reason")
+    );
+    assert!(server.seen("POST", "/api/v1/zones/claims").is_empty());
+    assert!(server.state.lock().unwrap().claims.is_empty());
+}
+
+#[test]
+fn failed_start_work_hold_releases_only_a_proven_new_claim() {
+    for scenario in ["created", "reused", "preexisting", "unknown"] {
+        let server = Server::start();
+        let existing = json!({"id":42,"session":"alice","paths":["src"],"fence":7,"expires_at":HOLD_EXPIRES_AT});
+        {
+            let mut state = server.state.lock().unwrap();
+            state.refuse_renew = Some((
+                412,
+                json!({"error":{"code":"stale_fence","message":"hold refused"}}),
+            ));
+            match scenario {
+                "created" => state.claim_created = Some(json!(true)),
+                "reused" => {
+                    state.claim_created = Some(json!(false));
+                    state.claim_reused_on_post = Some(existing.clone());
+                }
+                "preexisting" => state.claims = vec![existing.clone()],
+                "unknown" => {}
+                _ => unreachable!(),
+            }
+        }
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        let answers = mcp_calls(
+            dir.path(),
+            runtime.path(),
+            "compact",
+            &[(
+                "start_work",
+                json!({"paths":["src"],"hold_reason":"waiting","task":"D-1"}),
+            )],
+        );
+        assert_eq!(answers[0]["isError"], true, "{scenario}: {}", answers[0]);
+        assert!(
+            answers[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("hold refused"),
+            "{scenario}: {}",
+            answers[0]
+        );
+        assert!(
+            server
+                .seen("POST", "/api/v1/registry/items/D-1/claim")
+                .is_empty()
+        );
+        let id = if matches!(scenario, "reused" | "preexisting") {
+            42
+        } else {
+            1
+        };
+        assert_eq!(
+            server
+                .seen("POST", &format!("/api/v1/zones/claims/{id}/renew"))
+                .len(),
+            1
+        );
+        let state = server.state.lock().unwrap();
+        let deletes: Vec<_> = state
+            .seen
+            .iter()
+            .filter(|seen| seen.method == "DELETE")
+            .collect();
+        if scenario == "created" {
+            assert_eq!(deletes.len(), 1);
+            assert_eq!(deletes[0].path, "/api/v1/zones/claims/1");
+            assert_eq!(deletes[0].body["fence"], 1);
+            assert!(state.claims.is_empty());
+        } else {
+            assert!(deletes.is_empty(), "{scenario}: {deletes:?}");
+            assert_eq!(state.claims.len(), 1, "{scenario}");
+            if matches!(scenario, "reused" | "preexisting") {
+                assert_eq!(state.claims[0], existing);
+            }
+        }
+        assert_eq!(
+            state
+                .seen
+                .iter()
+                .filter(|seen| seen.method == "POST" && seen.path == "/api/v1/zones/claims")
+                .count(),
+            usize::from(scenario != "preexisting")
+        );
+    }
+}
+
+#[test]
+fn start_work_cloud_refuses_a_successful_renewal_that_did_not_install_the_hold() {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.claim_created = Some(json!(true));
+        state.ignore_renew_hold = true;
+    }
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let answers = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "compact",
+        &[(
+            "start_work",
+            json!({"paths":["src"],"hold_reason":"waiting"}),
+        )],
+    );
+    assert_eq!(answers[0]["isError"], true, "{}", answers[0]);
+    assert!(
+        answers[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("did not install the requested hold")
+    );
+    assert_eq!(server.seen("POST", "/api/v1/zones/claims/1/renew").len(), 1);
+    let deletes = server.seen("DELETE", "/api/v1/zones/claims/1");
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].body["fence"], 1);
+    assert!(server.state.lock().unwrap().claims.is_empty());
+}
+
+#[test]
+fn finish_work_cloud_without_an_id_releases_only_a_sole_owned_claim() {
+    for count in [0, 1, 2] {
+        let server = Server::start();
+        {
+            let mut state = server.state.lock().unwrap();
+            state.claims = (0..count).map(|index| json!({"id":11+index,"session":"alice","paths":[format!("src/{index}")],"fence":7,"expires_at":HOLD_EXPIRES_AT})).collect();
+            // An incoming handover is still owned by its sender.
+            state.claims.push(json!({"id":91,"session":"bob","paths":["incoming"],"fence":9,"expires_at":HOLD_EXPIRES_AT,"offered_to_you":true}));
+        }
+        let original = server.state.lock().unwrap().claims.clone();
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        let arguments = if count == 2 {
+            json!({"task":"D-1","evidence":"reviewed"})
+        } else {
+            json!({})
+        };
+        let answers = mcp_calls(
+            dir.path(),
+            runtime.path(),
+            "compact",
+            &[("finish_work", arguments)],
+        );
+        let answer = &answers[0];
+        assert!(
+            server.seen("DELETE", "/api/v1/zones/claims").is_empty(),
+            "{answer}"
+        );
+        if count == 2 {
+            assert_eq!(answer["isError"], true, "{answer}");
+            let text = answer["content"][0]["text"].as_str().unwrap();
+            for expected in ["11", "12", "id", "all: true"] {
+                assert!(text.contains(expected), "{answer}");
+            }
+            assert!(
+                server
+                    .state
+                    .lock()
+                    .unwrap()
+                    .seen
+                    .iter()
+                    .all(|seen| !seen.path.starts_with("/api/v1/registry/items/D-1")),
+                "task submission must not start before claim selection"
+            );
+            assert_eq!(server.state.lock().unwrap().claims, original);
+            assert!(server.seen("DELETE", "/api/v1/zones/claims/11").is_empty());
+        } else {
+            assert_eq!(answer["isError"], false, "{answer}");
+            assert_eq!(answer["structuredContent"]["released"], count);
+            assert_eq!(
+                answer["structuredContent"]["released_ids"],
+                if count == 1 { json!([11]) } else { json!([]) }
+            );
+            assert_eq!(
+                server.seen("DELETE", "/api/v1/zones/claims/11").len(),
+                count as usize
+            );
+            let remaining = server.state.lock().unwrap().claims.clone();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0]["id"], 91);
+        }
+    }
+}
+
+#[test]
+fn finish_work_cloud_all_is_explicit_and_cannot_be_combined_with_id() {
+    for arguments in [
+        json!({"all":true}),
+        json!({"id":"11","all":true,"task":"D-1","evidence":"reviewed"}),
+    ] {
+        let server = Server::start();
+        server.state.lock().unwrap().claims = vec![
+            json!({"id":11,"session":"alice","paths":["src"],"fence":7}),
+            json!({"id":12,"session":"alice","paths":["docs"],"fence":8}),
+        ];
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        let answers = mcp_calls(
+            dir.path(),
+            runtime.path(),
+            "compact",
+            &[("finish_work", arguments.clone())],
+        );
+        let answer = &answers[0];
+        let bulk = server.seen("DELETE", "/api/v1/zones/claims");
+        if arguments.get("id").is_some() {
+            assert_eq!(answer["isError"], true, "{answer}");
+            assert!(
+                answer["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not both")
+            );
+            assert!(bulk.is_empty());
+            let state = server.state.lock().unwrap();
+            assert!(state.seen.iter().all(|seen| seen.method != "DELETE"
+                && !seen.path.starts_with("/api/v1/registry/items/D-1")));
+            assert_eq!(state.claims.len(), 2);
+        } else {
+            assert_eq!(answer["isError"], false, "{answer}");
+            assert_eq!(answer["structuredContent"]["released"], 2);
+            assert_eq!(answer["structuredContent"]["released_ids"], json!([11, 12]));
+            assert_eq!(bulk.len(), 1);
+            assert_eq!(bulk[0].path, "/api/v1/zones/claims?session=alice");
+            assert!(server.state.lock().unwrap().claims.is_empty());
+        }
+    }
+}
+
+#[test]
+fn cloud_cli_status_json_keeps_its_existing_shape_without_fetching_lost_claims() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let result = cli(dir.path(), runtime.path(), &["--json", "status"]);
+    let status = json_of(&result);
+    assert!(status.get("lost").is_none(), "{status}");
+    assert!(status["claims"].is_array(), "{status}");
+    assert!(status["tasks"].is_array(), "{status}");
+    assert!(status["work"].is_array(), "{status}");
+    assert!(status["offers"].is_array(), "{status}");
+    assert!(server.seen("GET", "/api/v1/zones/lost").is_empty());
+    assert_eq!(server.seen("GET", "/api/v1/zones/claims").len(), 1);
+    let registry = server.seen("GET", "/api/v1/registry/items");
+    assert_eq!(registry.len(), 2);
+    assert!(
+        registry
+            .iter()
+            .any(|seen| seen.path == "/api/v1/registry/items?status=active&limit=200")
+    );
+    assert!(
+        registry
+            .iter()
+            .any(|seen| seen.path == "/api/v1/registry/items?status=review&limit=200")
+    );
 }
 
 #[test]

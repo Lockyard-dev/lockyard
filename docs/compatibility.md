@@ -30,6 +30,30 @@ a fence. It uses the existing renewal handler, including refusals for foreign
 and expired claims and, in cloud mode, stale fences. Full-catalog behavior
 remains unchanged. Visibility never supplies authorization.
 
+Since 0.3.5, cloud `start_work` and CLI `zone claim` apply requested idle holds with a separate renewal
+after ordinary acquisition, using the acquired claim's fence and lease length. They work with
+deployed servers that only support `hold_reason` and `hold_until` on renewal. A reason without
+a deadline uses `expires_at`; a deadline without a reason is invalid. Failed hold renewal releases
+only a claim created by this call, preserving a pre-existing reused claim and reporting the error.
+Legacy replies without an operation-scoped creation receipt also preserve the claim on failure;
+an empty earlier claim list cannot distinguish creation from concurrent same-session reuse.
+Local mode validates hold inputs and takes the claim without renewal or stored hold fields; local
+claims are not released for inactivity.
+The optional public `idle_release_at` claim timestamp is accepted when present and omitted otherwise.
+
+Compact `finish_work` and CLI `zone release` require an explicit id or an explicit all selector
+when the agent owns several claims. Without either selector they release a sole claim by id, or
+return zero when none are owned. Combining id with `all: true` / `--all` is invalid. Incoming
+handover offers are excluded from ownership. `finish_work` refuses ambiguous ownership before
+task submission; local `handover` also requires an id for multiple owned claims.
+
+Compact MCP `status` adds `lost` containing up to ten recent losses, excluding timestamps
+older than 120 minutes and retaining entries whose timestamp is absent. A failed loss lookup returns
+`lost: null` while preserving the remaining status fields. CLI `status --json`
+does not fetch lost claims and retains its existing fields and request count. The agent daemon
+keeps historical lost entries separate from live claims. Checks, activity, and release use live
+claims, so an idle-loss record for a still-live claim id cannot mark the whole claim as lost.
+
 Claim, queue, and presence DTOs use canonical `session` in domain serialization.
 Their historical `agent` field is accepted only by the schema-specific SDK codec;
 CLI/MCP JSON now emits `session`. Nested/bare dirty-path task IDs and bus task

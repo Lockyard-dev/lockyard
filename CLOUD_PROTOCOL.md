@@ -33,7 +33,8 @@ A claim holds paths. Paths are `/`-separated and relative to the workspace root;
 component, and an exact file overlaps its parent folder.
 
 `Claim`: `id, session, actor, note, zone?, paths[], mode (exclusive|shared), purpose (work|deploy), lazy (bool), fence (int),
-created_at, expires_at, hold_until?, hold_reason?, last_activity_at, version`.
+created_at, expires_at, hold_until?, hold_reason?, idle_release_at?, last_activity_at, version`.
+`idle_release_at` is optional public timestamp metadata; older servers omit it.
 
 - `POST /api/v1/zones/claims` `{paths[], note, ttl_minutes, mode, purpose, lazy, zone?, zones?[], queue_wait_seconds?}`.
   All paths or none. Shared claims coexist with shared claims only. Own claims never conflict. Conflict: 409 with holders.
@@ -43,6 +44,9 @@ created_at, expires_at, hold_until?, hold_reason?, last_activity_at, version`.
   caller joins that path's queue.
 - `POST /api/v1/zones/claims/{id}/renew` `{ttl_minutes, hold_reason?, hold_until?}`. TTL at most 240, hold at most 240. An
   expired claim cannot be renewed.
+  Core 0.3.5 `start_work` and CLI `zone claim` apply requested holds through this renewal endpoint
+  after ordinary acquisition, using the returned fence and lease length. A reason without a deadline
+  uses `expires_at`; a deadline requires a reason. The server enforces the hold limit.
 - `POST /api/v1/zones/claims/{id}/narrow` `{paths[]}`: shrinks to a subset.
 - `DELETE /api/v1/zones/claims/{id}` `{note?, leave_dirty?}`. Bulk: `DELETE /api/v1/zones/claims?session=<own>`.
 - `GET /api/v1/zones/claims`: active claims, with `?session=` and `?path=`.

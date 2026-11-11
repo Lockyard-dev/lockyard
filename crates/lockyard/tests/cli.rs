@@ -311,6 +311,7 @@ fn cloud_status_with_registry(
                     json!({"sessions":[{"session":"alice", "client":"mcp"}]})
                 }
                 "/api/v1/zones/claims" => claims.clone(),
+                "/api/v1/zones/lost" => json!([]),
                 "/api/v1/bus/inbox" => json!({"messages":[], "skipped":0}),
                 "/api/v1/bus/tasks" => work.clone(),
                 "/api/v1/registry/items" => {
