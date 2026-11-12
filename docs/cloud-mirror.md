@@ -40,6 +40,82 @@ An idle shrink can release only clean paths while retaining the claim's dirty pa
 keeps lost history separate from live claims; check, activity, and release decisions use the live
 claims. A historical lost entry for the same id cannot invalidate the claim's remaining paths.
 
+## Local agent `zone_snapshot` protocol
+
+Since 0.3.6, a local snapshot carries independent board freshness metadata alongside the zone
+claims. Send one JSON line to the local agent socket:
+
+```json
+{"workspace":"your-team","op":"zone_snapshot","session":"alice"}
+```
+
+The snapshot handler copies the board from the in-process view. It never contacts the transport,
+invokes a board refresh, or waits for one. Existing background upkeep refreshes the board
+proactively, including before any client asks to read it. Registering a new session may nudge
+background upkeep independently of the snapshot read. Consumers with a short local deadline
+can read the snapshot without falling back to a network request; this protocol contract does
+not establish a platform-specific 40 ms latency bound.
+
+The following reply fields are additive and optional; a field whose value is unknown is omitted,
+not serialized as `null`. Older clients may ignore fields they do not recognize, and newer clients
+must accept replies from older agents with none of these fields:
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `board` | array of board entries | Present only when the board is initialized and `board_fresh(Timing::fresh)` holds. Includes all cached entries, including entries with `zone: null`; it is not filtered by the requesting session or zone. An initialized, fresh empty board is `[]`. |
+| `board_source` | string | `"view"` when `board` is present; `"none"` when the board is stale or uninitialized. No server source is used by this operation. |
+| `board_age_ms` | nonnegative integer | Elapsed monotonic milliseconds since the cached board timestamp, included even when stale; omitted when that timestamp is unknown. A successful board refresh or clean event-stream confirmation updates the timestamp. |
+
+Board freshness is independent of the existing zone `source` and `age_ms` fields. Consumers must
+inspect `board_source` and the presence of `board` before treating an empty board as authoritative.
+For example, these board fields distinguish fresh empty, stale, and uninitialized snapshots:
+
+```json
+{"board":[],"board_source":"view","board_age_ms":12}
+{"board_source":"none","board_age_ms":31000}
+{"board_source":"none"}
+```
+
+Every entry preserves its `key`, JSON `value`, optional `zone`, author in `session`, `expires_at`,
+`created_at` and the existing `updated_at` field. A global entry has `zone: null`. Timestamps retain
+the server's spelling (normally RFC 3339 strings); local timestamp values may be epoch milliseconds.
+Legacy entries that do not supply provenance decode with `session: ""` and `created_at: 0`, meaning
+the author and creation time are unknown.
+For example, a fresh snapshot with a zone freeze and a global announcement can return:
+
+```json
+{
+  "source": "view",
+  "claims": [],
+  "queue": [],
+  "requests": [],
+  "lost": [],
+  "age_ms": 10,
+  "board": [
+    {
+      "key": "freeze",
+      "value": {"reason": "release in progress"},
+      "zone": "api",
+      "session": "lead",
+      "expires_at": "2026-11-12T12:00:00Z",
+      "created_at": "2026-11-12T11:00:00Z",
+      "updated_at": "2026-11-12T11:00:00Z"
+    },
+    {
+      "key": "notice",
+      "value": "Review the release announcement",
+      "zone": null,
+      "session": "lead",
+      "expires_at": null,
+      "created_at": "2026-11-12T10:00:00Z",
+      "updated_at": "2026-11-12T10:00:00Z"
+    }
+  ],
+  "board_source": "view",
+  "board_age_ms": 12
+}
+```
+
 ## What this is not
 
 The mirror is not authoritative for mutations. Every claim, renew, release and mail send still goes

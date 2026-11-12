@@ -469,6 +469,10 @@ pub struct BoardEntry {
     #[serde(default)]
     pub zone: Option<String>,
     #[serde(default)]
+    pub session: String,
+    #[serde(default)]
+    pub created_at: Stamp,
+    #[serde(default)]
     pub expires_at: Option<Stamp>,
     #[serde(default)]
     pub updated_at: Stamp,
@@ -794,6 +798,25 @@ fn pointer(section: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_board_entry_preserves_server_author_and_creation_time() {
+        let server = json!({
+            "key": "freeze", "value": {"reason": "release"}, "zone": "core",
+            "session": "release-lead", "created_at": "2026-11-12T08:00:00+00:00",
+            "updated_at": "2026-11-12T08:30:00+00:00", "expires_at": "2026-11-12T09:00:00+00:00"
+        });
+        let entry: BoardEntry = serde_json::from_value(server.clone()).unwrap();
+        assert_eq!(serde_json::to_value(entry).unwrap(), server);
+    }
+
+    #[test]
+    fn a_legacy_board_entry_defaults_missing_author_and_creation_time() {
+        let entry: BoardEntry = serde_json::from_value(json!({"key": "notice"})).unwrap();
+        let wire = serde_json::to_value(entry).unwrap();
+        assert_eq!(wire["session"], "");
+        assert_eq!(wire["created_at"], 0);
+    }
 
     #[test]
     fn a_claim_keeps_canonical_session_names_in_the_domain() {

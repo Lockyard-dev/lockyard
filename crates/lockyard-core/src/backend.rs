@@ -717,6 +717,9 @@ fn board_record(entry: coordination::BoardEntry) -> BoardEntry {
         key: entry.key,
         value: Value::String(entry.value),
         zone: entry.zone,
+        // Legacy local records do not store author or creation metadata.
+        session: String::new(),
+        created_at: Stamp::default(),
         expires_at: entry.expires_at.map(Stamp::Millis),
         updated_at: Stamp::Millis(entry.updated_at),
     }

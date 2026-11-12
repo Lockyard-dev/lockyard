@@ -3,7 +3,9 @@
 //! Messages on the agent socket: one JSON object per line, one answer per request.
 
 use lockyard_cloud_client::{Call, ClientError};
-use lockyard_core::proto::{AccessRecord, Claim, LostClaim, Message, PathCheck, QueueEntry};
+use lockyard_core::proto::{
+    AccessRecord, BoardEntry, Claim, LostClaim, Message, PathCheck, QueueEntry,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -119,6 +121,12 @@ pub struct Reply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub age_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<Vec<BoardEntry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_source: Option<Source>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<Message>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<Vec<lockyard_core::proto::Event>>,
@@ -140,6 +148,7 @@ impl Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn a_request_is_one_flat_object() {
@@ -185,6 +194,32 @@ mod tests {
             serde_json::to_value(reply).unwrap()["lost"],
             serde_json::json!([])
         );
+    }
+
+    #[test]
+    fn board_snapshot_fields_are_additive_for_old_socket_clients() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct OldReply {
+            source: Option<Source>,
+            claims: Option<Vec<Claim>>,
+            age_ms: Option<u64>,
+        }
+        let old = json!({"source": "view", "claims": [], "age_ms": 7});
+        let mut extended = old.clone();
+        extended["board"] = json!([]);
+        extended["board_source"] = json!("view");
+        extended["board_age_ms"] = json!(3);
+        let reply: Reply = serde_json::from_value(extended.clone()).unwrap();
+        let wire = serde_json::to_value(&reply).unwrap();
+        assert_eq!(wire, extended);
+        assert_eq!(
+            serde_json::from_value::<OldReply>(wire).unwrap(),
+            serde_json::from_value::<OldReply>(old.clone()).unwrap(),
+        );
+        // The new decoder also accepts an old daemon's reply, and None stays omitted.
+        let old_reply: Reply = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(old_reply).unwrap(), old);
+        assert_eq!(serde_json::to_value(Reply::default()).unwrap(), json!({}));
     }
 
     #[test]

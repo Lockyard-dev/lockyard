@@ -563,6 +563,18 @@ impl<T: Transport + 'static> Shared<T> {
         let age_ms = view
             .zones_at
             .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
+        let board_age_ms = view
+            .board_at
+            .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
+        // Board freshness is independent of claims, and this hook path never refreshes it.
+        let board = view
+            .board_fresh(self.timing().fresh)
+            .then(|| view.board.clone());
+        let board_source = if board.is_some() {
+            Source::View
+        } else {
+            Source::None
+        };
         let claims = view.claims.clone();
         let queue = view.queue.clone();
         let requests = view.requests.clone();
@@ -579,6 +591,9 @@ impl<T: Transport + 'static> Shared<T> {
                 Source::None
             }),
             age_ms,
+            board,
+            board_source: Some(board_source),
+            board_age_ms,
             ..Reply::default()
         }
     }
@@ -1849,6 +1864,7 @@ mod tests {
         queue: Mutex<Vec<Value>>,
         requests: Mutex<Vec<Value>>,
         lost: Mutex<Vec<Value>>,
+        board: Mutex<Option<Vec<Value>>>,
         lost_read_gate: Mutex<Option<LostReadGate>>,
         busy_mail_claim_gate: Mutex<Option<LostReadGate>>,
         unread: Mutex<i64>,
@@ -2022,7 +2038,11 @@ mod tests {
                     Ok(json!({"lost": lost}))
                 }
                 "/api/v1/zones/check" => Ok(json!({"paths": [{"path": "src", "status": "free"}]})),
-                "/api/v1/bus/board" => Ok(json!([{"key": "k", "value": "v"}])),
+                "/api/v1/bus/board" => {
+                    Ok(json!(self.board.lock().unwrap().clone().unwrap_or_else(
+                        || vec![json!({"key": "k", "value": "v"})]
+                    )))
+                }
                 "/api/v1/bus/inbox" => {
                     let unread = *self.unread.lock().unwrap();
                     let messages: Vec<Value> = (1..=unread)
@@ -2415,6 +2435,161 @@ mod tests {
             let reply = rig.daemon.handle(ask());
             reply.unread == Some(3) && reply.source == Some(Source::View)
         });
+    }
+
+    fn board_entries() -> Vec<Value> {
+        vec![
+            json!({
+                "key": "freeze", "value": {"reason": "release"}, "zone": "core",
+                "session": "alice", "created_at": "2026-11-12T08:00:00Z",
+                "updated_at": "2026-11-12T08:05:00Z",
+                "expires_at": "2026-11-12T10:00:00Z"
+            }),
+            json!({
+                "key": "notice", "value": "all zones", "zone": null,
+                "session": "bob", "created_at": "2026-11-12T07:00:00Z",
+                "updated_at": "2026-11-12T07:00:00Z", "expires_at": null
+            }),
+            json!({
+                "key": "freeze", "value": "deploy", "zone": "cloud",
+                "session": "carol", "created_at": "2026-11-12T09:00:00Z",
+                "updated_at": "2026-11-12T09:00:00Z", "expires_at": null
+            }),
+        ]
+    }
+
+    fn board_snapshot(rig: &Rig) -> Value {
+        serde_json::to_value(rig.daemon.handle(Request::ZoneSnapshot {
+            session: "me".into(),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn zone_snapshot_board_is_loaded_in_background_with_zone_and_global_metadata() {
+        let entries = board_entries();
+        let mut rig = start_with(
+            Timing {
+                fresh: Duration::from_secs(30),
+                ..timing()
+            },
+            |server| *server.board.lock().unwrap() = Some(entries.clone()),
+        );
+        // No client request, including a board read, primes the background refresh.
+        wait_for("background board initialization", || {
+            rig.daemon
+                .shared
+                .read_view()
+                .board_fresh(Duration::from_secs(30))
+        });
+        rig.daemon.stop_workers();
+        assert!(rig.server.calls_to("/api/v1/bus/board") > 0);
+        let reply = board_snapshot(&rig);
+        assert_eq!(reply["board_source"], "view");
+        assert_eq!(reply["board"], json!(entries));
+        assert!(reply["board_age_ms"].is_u64());
+    }
+
+    #[test]
+    fn zone_snapshot_board_fresh_empty_is_an_authoritative_array() {
+        let mut rig = start_with(timing(), |_| {});
+        rig.daemon.stop_workers();
+        {
+            let mut view = rig.daemon.shared.write_view();
+            view.board.clear();
+            view.board_clean = view.board_generation;
+            view.board_at = Some(Instant::now());
+            view.board_wall_at = Some(SystemTime::now());
+            // Board freshness is independent of the claims snapshot.
+            view.zones_at = None;
+        }
+        let reply = board_snapshot(&rig);
+        assert_eq!(reply["source"], "none");
+        assert_eq!(reply["board_source"], "view");
+        assert_eq!(reply["board"], json!([]));
+        assert!(reply["board_age_ms"].is_u64());
+    }
+
+    #[test]
+    fn zone_snapshot_board_stale_by_either_clock_or_event_omits_cached_entries() {
+        let mut rig = start_with(timing(), |_| {});
+        rig.daemon.stop_workers();
+        for stale in ["monotonic", "wall", "event"] {
+            {
+                let mut view = rig.daemon.shared.write_view();
+                view.board = serde_json::from_value(json!(board_entries())).unwrap();
+                view.board_at = Some(Instant::now() - Duration::from_millis(900));
+                view.board_wall_at = Some(SystemTime::now());
+                view.board_clean = view.board_generation;
+                view.zones_at = Some(Instant::now());
+                if stale != "monotonic" {
+                    view.board_at = Some(Instant::now());
+                }
+                if stale == "wall" {
+                    view.board_wall_at = Some(SystemTime::now() - Duration::from_millis(900));
+                }
+                if stale == "event" {
+                    view.board_generation += 1;
+                }
+            }
+            let reply = board_snapshot(&rig);
+            assert_eq!(reply["source"], "view");
+            assert_eq!(reply["board_source"], "none", "{stale}");
+            assert!(reply.get("board").is_none(), "{stale}: {reply}");
+            assert!(reply["board_age_ms"].is_u64(), "{stale}");
+            if stale == "monotonic" {
+                assert!(reply["board_age_ms"].as_u64().unwrap() >= 900);
+            }
+        }
+    }
+
+    #[test]
+    fn zone_snapshot_board_uninitialized_is_unknown_without_an_age() {
+        let mut rig = start_with(timing(), |_| {});
+        rig.daemon.stop_workers();
+        *rig.daemon.shared.write_view() = View::default();
+        let reply = board_snapshot(&rig);
+        assert_eq!(reply["board_source"], "none");
+        assert!(reply.get("board").is_none());
+        assert!(reply.get("board_age_ms").is_none());
+    }
+
+    #[test]
+    fn zone_snapshot_board_never_uses_transport_even_when_stale_or_uninitialized() {
+        let mut rig = start_with(timing(), |_| {});
+        rig.daemon.stop_workers();
+        let before = rig.server.calls.lock().unwrap().len();
+        let polls_before = rig.server.event_calls.load(Ordering::SeqCst);
+        for state in ["fresh", "stale", "uninitialized"] {
+            {
+                let mut view = rig.daemon.shared.write_view();
+                *view = View::default();
+                if state != "uninitialized" {
+                    view.board = serde_json::from_value(json!(board_entries())).unwrap();
+                    view.board_at = Some(Instant::now());
+                    view.board_wall_at = Some(SystemTime::now());
+                }
+                if state == "stale" {
+                    view.board_generation += 1;
+                }
+            }
+            for down in [true, false] {
+                rig.server.down.store(down, Ordering::SeqCst);
+                rig.server.hang_ms.store(2_000, Ordering::SeqCst);
+                let started = Instant::now();
+                let reply = board_snapshot(&rig);
+                assert!(
+                    started.elapsed() < Duration::from_millis(40),
+                    "{state}: {reply}"
+                );
+                assert_eq!(rig.server.calls.lock().unwrap().len(), before);
+                assert_eq!(rig.server.event_calls.load(Ordering::SeqCst), polls_before);
+                assert_eq!(
+                    reply["board_source"],
+                    if state == "fresh" { "view" } else { "none" }
+                );
+            }
+        }
     }
 
     #[test]

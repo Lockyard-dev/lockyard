@@ -6,7 +6,7 @@ a path at a time, a shared bus to talk, and tasks that survive a session. By def
 file under `.lockyard/` in your project, and nothing leaves the machine. Teams across machines use [cloud
 mode](#cloud-mode).
 
-**Version: 0.3.5.**
+**Version: 0.3.6.**
 
 ## Install
 

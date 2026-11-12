@@ -5,6 +5,19 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-11-12
+
+### Added
+
+- The agent's memory-only `zone_snapshot` reply includes optional `board`, `board_source` and `board_age_ms` fields. A fresh initialized board includes every entry, including global entries, and an empty board is `[]`. Stale or uninitialized boards omit `board` and report `board_source: "none"`; an age is included when known.
+- Preserve board authors and creation timestamps alongside keys, values, zones and expiry timestamps in local snapshots.
+- Add regression coverage confirming the existing proactive background board refresh starts without a client's first board read, and `zone_snapshot` never directly invokes a refresh or contacts the transport.
+
+### Changed
+
+- Advance the synchronized Rust, npm, PyPI and MCP registry versions to `0.3.6`.
+- Document the additive local agent snapshot contract and independent board freshness metadata in `docs/cloud-mirror.md`.
+
 ## [0.3.5] - 2026-11-11
 
 ### Added
