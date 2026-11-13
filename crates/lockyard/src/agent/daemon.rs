@@ -3073,8 +3073,10 @@ mod tests {
         }
     }
 
+    // A safety net for conditions that must eventually hold, not a speed check: a stalled shared
+    // CI machine once spent more than 5 s before a daemon's first refresh.
     fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-        let end = Instant::now() + Duration::from_secs(5);
+        let end = Instant::now() + Duration::from_secs(30);
         while !done() {
             assert!(Instant::now() < end, "timed out: {what}");
             thread::sleep(Duration::from_millis(5));
@@ -5420,7 +5422,9 @@ mod tests {
         let rig = start_with(
             Timing {
                 fresh: Duration::from_secs(30),
-                upkeep: Duration::from_secs(5),
+                // The normal pass is a minute away, so only the 250 ms retry can deliver mail
+                // inside the 10 s wait below: the order is proven without a tight stopwatch.
+                upkeep: Duration::from_secs(60),
                 retry_min: Duration::from_millis(250),
                 ..timing()
             },
@@ -5440,11 +5444,11 @@ mod tests {
         // nudge so the next pass must be scheduled by the retry, rather than by registration.
         rig.daemon.shared.signal().nudged = false;
         resume.send(()).unwrap();
-        let end = Instant::now() + Duration::from_secs(1);
+        let end = Instant::now() + Duration::from_secs(10);
         while !rig.daemon.shared.read_view().mail.contains_key("me") {
             assert!(
                 Instant::now() < end,
-                "local journal contention postponed mail until the normal 5 s upkeep"
+                "local journal contention postponed mail until the normal 60 s upkeep"
             );
             thread::sleep(Duration::from_millis(5));
         }

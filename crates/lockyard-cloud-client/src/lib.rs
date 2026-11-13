@@ -1585,7 +1585,8 @@ mod tests {
         ]);
         let client = Client::new(&server.url(), "fixture".into()).unwrap();
         let mut call = Call::get("me", "/api/v1/bus/tasks".into());
-        call.deadline_ms = Some(200);
+        // The test is about the Date header order; the deadline only has to survive a loaded host.
+        call.deadline_ms = Some(5000);
         client.call(&call).unwrap();
         let previous = client.server_time_upper_bound().unwrap();
         assert!(matches!(
@@ -1840,6 +1841,9 @@ mod tests {
     #[test]
     fn status_http_cancellation_drops_inflight_result_and_releases_worker() {
         let server = FakeServer::start(vec![
+            // A blocking request is not aborted: its reply arrives after 120 ms and is discarded.
+            // The 10 s call deadline is far beyond the bound below, so a cancel that kept waiting
+            // for the deadline (instead of returning with the reply) still fails the test.
             Reply::json(200, json!({"claims":[]})).delay(Duration::from_millis(120)),
             Reply::json(200, json!({})),
         ]);
@@ -1848,23 +1852,30 @@ mod tests {
         let cancellation = Cancellation::new();
         let mut call = Call::get("me", "/api/v1/zones/claims".into());
         call.cancellation = Some(cancellation.clone());
-        call.deadline_ms = Some(2600);
+        call.deadline_ms = Some(10_000);
         std::thread::scope(|scope| {
             let worker = scope.spawn(|| client.call(&call));
             let started = Instant::now();
             while server.requests().is_empty() {
-                assert!(started.elapsed() < Duration::from_secs(1));
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "the claims read never reached the server"
+                );
                 std::thread::sleep(Duration::from_millis(1));
             }
+            let cancelled = Instant::now();
             cancellation.cancel();
             let error = worker.join().unwrap().unwrap_err();
             assert!(error.to_string().contains("cancelled"));
-            assert!(started.elapsed() < Duration::from_millis(400));
+            assert!(
+                cancelled.elapsed() < Duration::from_secs(3),
+                "cancellation kept the call alive towards its 10 s deadline"
+            );
         });
         assert_eq!(server.requests().len(), 1);
         assert_eq!(client.http_workers.active.lock().unwrap().general, 0);
         let mut live = Call::get("me", "/api/v1/bus/tasks".into());
-        live.deadline_ms = Some(100);
+        live.deadline_ms = Some(10_000);
         client.call(&live).unwrap();
         assert_eq!(server.requests().len(), 2);
     }
