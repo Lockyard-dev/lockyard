@@ -146,17 +146,12 @@ impl ToolRegistry {
             .into_iter()
             .map(|definition| {
                 let mut wire = definition.wire.clone();
-                if surface == Surface::Compact {
-                    match wire["name"].as_str().unwrap() {
-                        "zone_renew" => {
-                            wire["description"] = json!("Renew your live claim; ttl is optional minutes (1-240, default 30); fence is required in cloud mode.");
-                            wire["inputSchema"]["properties"]["ttl"] = json!({
-                                "type": "integer", "minimum": 1, "maximum": 240, "default": 30,
-                                "description": "Optional lease length in minutes, from 1 through 240; defaults to 30."
-                            });
-                        }
-                        _ => {}
-                    }
+                if surface == Surface::Compact && wire["name"].as_str().unwrap() == "zone_renew" {
+                    wire["description"] = json!("Renew your live claim; ttl is optional minutes (1-240, default 30); fence is required in cloud mode.");
+                    wire["inputSchema"]["properties"]["ttl"] = json!({
+                        "type": "integer", "minimum": 1, "maximum": 240, "default": 30,
+                        "description": "Optional lease length in minutes, from 1 through 240; defaults to 30."
+                    });
                 }
                 wire
             })

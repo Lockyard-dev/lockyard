@@ -1893,9 +1893,13 @@ fn private_directory(path: &Path) -> Result<(), ClientError> {
 #[cfg(test)]
 mod status_protocol_cache_tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::Transport;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::io::{BufRead, BufReader, Write};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::net::TcpListener;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -1944,7 +1948,7 @@ mod status_protocol_cache_tests {
                 started.send(()).unwrap();
                 client.cached_registry_assignee_supported(
                     Instant::now() + Duration::from_secs(2),
-                    Some(&cancellation),
+                    Some(cancellation),
                 )
             });
             ready.recv().unwrap();
@@ -2019,6 +2023,7 @@ mod status_protocol_cache_tests {
         assert!(status_protocol_age(&observed, &restarted).is_none());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[derive(Default)]
     struct HintServerState {
         protocol: u16,
@@ -2027,6 +2032,7 @@ mod status_protocol_cache_tests {
         claims: usize,
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn server() -> (String, Arc<Mutex<HintServerState>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());

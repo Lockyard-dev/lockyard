@@ -424,15 +424,10 @@ fn call_tool(
 }
 
 fn validate_surface_args(surface: Surface, name: &str, args: Args<'_>) -> Result<()> {
-    if surface == Surface::Compact {
-        match name {
-            "zone_renew" => {
-                args.some_int("fence")?;
-                if !(1..=240).contains(&args.ttl()?) {
-                    return Err(Error::Invalid("ttl must be 1 to 240 minutes".into()));
-                }
-            }
-            _ => {}
+    if surface == Surface::Compact && name == "zone_renew" {
+        args.some_int("fence")?;
+        if !(1..=240).contains(&args.ttl()?) {
+            return Err(Error::Invalid("ttl must be 1 to 240 minutes".into()));
         }
     }
     Ok(())
