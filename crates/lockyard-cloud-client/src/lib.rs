@@ -1769,11 +1769,11 @@ mod tests {
             });
             assert!(
                 write_result.is_ok(),
-                "outbox write must bypass the status burst"
+                "outbox write must bypass the status burst: {write_result:?}"
             );
             assert!(
                 poll_result.is_ok(),
-                "event poll must bypass the status burst"
+                "event poll must bypass the status burst: {poll_result:?}"
             );
             assert!(started.elapsed() < Duration::from_millis(150));
             assert_eq!(server.requests().len(), 8);
