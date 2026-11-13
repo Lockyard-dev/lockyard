@@ -2102,9 +2102,12 @@ mod status_protocol_cache_tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn client(url: &str, directory: &Path) -> Client {
+        // The pending journal refuses a directory reached through a symlink, and the default
+        // temporary directory on macOS is one (`/var` points to `/private/var`).
+        let directory = directory.canonicalize().unwrap();
         Client::new(url, "fixture".into())
             .unwrap()
-            .with_pending_journal(directory)
+            .with_pending_journal(&directory)
             .unwrap()
             .with_status_protocol_cache()
     }
