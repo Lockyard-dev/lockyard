@@ -336,7 +336,9 @@ impl ClientError {
                 .map(|error| Problem {
                     status: Some(error.status),
                     code: error.code.clone(),
-                    detail: if error.status == 409 {
+                    detail: if let Some(message) = crate::task_area_error(error) {
+                        message
+                    } else if error.status == 409 {
                         let conflicts = crate::holders(error);
                         if conflicts.is_empty() {
                             crate::contended_text(error)
@@ -1018,12 +1020,14 @@ impl Client {
                 ));
             }
             let capability = std::sync::atomic::AtomicBool::new(true);
+            let auto_area_capability = std::sync::atomic::AtomicBool::new(true);
             let result = self.attempt_observed(
                 &call,
                 None,
                 budget,
                 &NegotiatedProtocol::candidate(selected),
                 Some(&capability),
+                Some(&auto_area_capability),
             );
             match result {
                 Ok(value) => {
@@ -1032,6 +1036,9 @@ impl Client {
                         result
                             .capabilities
                             .insert(crate::REGISTRY_ASSIGNEE_SESSION.into());
+                    }
+                    if auto_area_capability.load(std::sync::atomic::Ordering::Relaxed) {
+                        result.capabilities.insert(crate::REGISTRY_AUTO_AREA.into());
                     }
                     self.save_status_protocol_hint(&result);
                     state.cached = Some(CachedProtocol {
@@ -1345,6 +1352,7 @@ impl Client {
                 remaining(),
                 &protocol,
                 registry_capability,
+                None,
             ) {
                 Ok(mut value) => {
                     // Authenticate/decrypt the response before releasing its recovery record.

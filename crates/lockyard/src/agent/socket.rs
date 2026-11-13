@@ -381,6 +381,17 @@ fn connect_bounded(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
 }
 
 impl Transport for AgentSocket {
+    fn registry_auto_area(&self, session: &str) -> Result<bool, ClientError> {
+        match self.call(&Call::get(session, "/api/v1/protocol".into())) {
+            Ok(value) => Ok(value["capabilities"].as_array().is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|capability| capability == "registry_auto_area_v1")
+            })),
+            Err(error) if matches!(error.status(), Some(404 | 405)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
     fn call(&self, call: &Call) -> Result<Value, ClientError> {
         let reply = self.ask_for(&Request::Call { call: call.clone() })?;
         let value = reply.value.unwrap_or(Value::Null);

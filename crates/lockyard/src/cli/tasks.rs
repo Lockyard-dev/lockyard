@@ -9,6 +9,14 @@ pub(super) fn run_task(
 ) -> Result<Output> {
     let now = now_ms();
     let mut command = command;
+    if let TaskCommand::Add { paths, .. } = &mut command {
+        *paths = opened.task_paths(paths)?;
+        if opened.backend.is_cloud() && !paths.is_empty() && !opened.backend.registry_auto_area()? {
+            eprintln!(
+                "warning: this server does not support task paths (registry_auto_area_v1) yet; --path values will not be sent"
+            );
+        }
+    }
     if !opened.backend.is_cloud() {
         let canonicalize = |id: &mut String| -> Result<()> {
             *id = lockyard_compat::LegacyCompatibilityV1::task_id(
@@ -137,6 +145,9 @@ pub(super) fn run_task(
             })?;
             let history = store.task_history(&id)?;
             let mut lines = vec![task_line(&task)];
+            if !task.paths.is_empty() {
+                lines.push(format!("paths: {}", task.paths.join(", ")));
+            }
             if !task.body.is_empty() {
                 lines.push(task.body.clone());
             }
@@ -153,6 +164,7 @@ pub(super) fn run_task(
         }
         TaskCommand::Add {
             title,
+            paths,
             body,
             acceptance,
             priority,
@@ -169,6 +181,7 @@ pub(super) fn run_task(
             &resolve_agent(agent)?,
             &TaskSpec {
                 title,
+                paths,
                 body,
                 acceptance,
                 priority,

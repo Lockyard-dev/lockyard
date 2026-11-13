@@ -598,6 +598,10 @@ pub(super) fn run_tool(
             encode(&safe_receipts(opened.backend.sent(me()?, limit as usize)?))
         }
         "task_add" => {
+            let auto_area = opened.backend.registry_auto_area()?;
+            validate_task_add_area(surface, args, auto_area, is_cloud)?;
+            let paths = args.strings("paths")?;
+            let warn_paths = is_cloud && !auto_area && !paths.is_empty();
             let spec = TaskSpec {
                 title: args.text("title")?.to_string(),
                 body: args.optional_text("body")?.to_string(),
@@ -608,6 +612,7 @@ pub(super) fn run_tool(
                 target: args.some_text("target")?,
                 verification: args.some_text("verification")?,
                 area: args.some_text("area")?,
+                paths: opened.task_paths(&paths)?,
                 prefix: args.some_text("prefix")?,
                 pad: args
                     .some_int("pad")?
@@ -619,7 +624,11 @@ pub(super) fn run_tool(
                 due_at: args.some_text("due")?,
                 evidence: args.some_text("evidence")?,
             };
-            encode(&opened.backend.add_task(me()?, &spec, now)?)
+            let mut answer = encode(&opened.backend.add_task(me()?, &spec, now)?)?;
+            if warn_paths {
+                answer["warning"] = json!(TASK_PATHS_WARNING);
+            }
+            Ok(answer)
         }
         "task_plan" => {
             let plan = TaskPlan {

@@ -454,6 +454,9 @@ struct StatusTransport<T: Transport> {
 }
 
 impl<T: Transport> Transport for StatusTransport<T> {
+    fn registry_auto_area(&self, session: &str) -> Result<bool, ClientError> {
+        self.inner.registry_auto_area(session)
+    }
     fn status_registry_assignee_supported(
         &self,
         deadline: Instant,
@@ -2681,6 +2684,287 @@ mod tests {
             state_root: dir.join("state"),
             timing,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_client_038_keeps_037_task_frames_and_explains_rollback() {
+        // Frozen serialized Call fields from 0.3.7. Its daemon forwards body as arbitrary JSON,
+        // rather than decoding a task DTO that could silently discard the new paths field.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct CallV037 {
+            session: String,
+            method: String,
+            path: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            repository: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            body: Option<Value>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            key: Option<String>,
+            #[serde(default)]
+            long_poll: bool,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            deadline_ms: Option<u64>,
+            #[serde(default)]
+            defer_pending_ack: bool,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        enum RequestV037 {
+            Ping,
+            Call { call: CallV037 },
+        }
+        #[derive(serde::Deserialize)]
+        struct EnvelopeV037 {
+            workspace: String,
+            #[serde(flatten)]
+            request: RequestV037,
+        }
+        let paths_body = json!({"title":"new task","paths":["core/src/lib.rs"]});
+        let legacy_body = json!({"title":"old task","area_id":"area-core"});
+        let mut paths_call = Call::write(
+            "worker",
+            "POST",
+            "/api/v1/registry/items".into(),
+            paths_body.clone(),
+        );
+        paths_call.key = Some("01K00000000000000000000001".into());
+        let mut legacy_call = Call::write(
+            "worker",
+            "POST",
+            "/api/v1/registry/items".into(),
+            legacy_body.clone(),
+        );
+        legacy_call.key = Some("01K00000000000000000000002".into());
+
+        // Client 0.3.8 -> daemon 0.3.7: the old Call decoder and unchanged JSON forwarding
+        // preserve paths and idempotency keys, and live discovery can both enable and disable them.
+        let old_dir = tempfile::tempdir().unwrap();
+        private_dir(old_dir.path()).unwrap();
+        let old_path = old_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&old_path).unwrap();
+        let peer = thread::spawn(move || {
+            let mut tasks = Vec::new();
+            let mut protocol_reads = 0;
+            for _ in 0..7 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let envelope: EnvelopeV037 = serde_json::from_str(&line).unwrap();
+                assert_eq!(envelope.workspace, "team");
+                let reply = match envelope.request {
+                    RequestV037::Ping => json!({"status":{
+                        "url":"https://example.test", "workspace":"team", "token_id":"t",
+                        "pid":1, "view_fresh":false, "view_age_ms":null,
+                        "claims":0, "board":0, "sessions":0, "outbox":0,
+                        "coordination_seq":0, "registry_seq":0
+                    }}),
+                    RequestV037::Call { call } if call.path == "/api/v1/protocol" => {
+                        protocol_reads += 1;
+                        json!({"value":{"selected_protocol":2,"capabilities":
+                            if protocol_reads == 2 {vec![]} else {vec!["registry_auto_area_v1"]}
+                        }})
+                    }
+                    RequestV037::Call { call } => {
+                        assert_eq!(call.method, "POST");
+                        assert_eq!(call.path, "/api/v1/registry/items");
+                        let paths = call
+                            .body
+                            .as_ref()
+                            .and_then(|body| body.get("paths"))
+                            .cloned();
+                        tasks.push(serde_json::to_value(call).unwrap());
+                        if tasks.len() == 3 {
+                            // Frozen 0.3.7 error frame: the old daemon has no new SDK
+                            // guidance and returns the server's missing-area refusal verbatim.
+                            json!({"error":{"http":{
+                                "status":422, "code":"validation_error",
+                                "message":"area_id is required",
+                                "details":{"area_id":["required"],"source":"legacy-daemon"},
+                                "retry_after":null,
+                            }}})
+                        } else {
+                            let mut reply = json!({"value":{"id":"CORE-1"}});
+                            if let Some(paths) = paths {
+                                reply["value"]["paths"] = paths;
+                            }
+                            reply
+                        }
+                    }
+                };
+                serde_json::to_writer(&mut stream, &reply).unwrap();
+                stream.write_all(b"\n").unwrap();
+            }
+            tasks
+        });
+        let socket = AgentSocket::connect(
+            &old_path,
+            "https://example.test",
+            "team",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(socket.registry_auto_area("worker").unwrap());
+        assert_eq!(
+            socket.call(&paths_call).unwrap()["paths"],
+            paths_body["paths"]
+        );
+        assert!(!socket.registry_auto_area("worker").unwrap());
+        socket.call(&legacy_call).unwrap();
+        let mut cloud = CloudBackend::new(socket, "worker");
+        let error = cloud
+            .add_task(
+                "worker",
+                &lockyard_core::tasks::TaskSpec {
+                    title: "rollback task".into(),
+                    paths: vec!["core/src/lib.rs".into()],
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("Повтори команду"), "{text}");
+        assert_eq!(text.matches("Повтори команду").count(), 1, "{text}");
+        assert!(text.contains("--area <область>"), "{text}");
+        assert!(text.contains("area_id is required"), "{text}");
+        match error {
+            Error::Cloud {
+                code,
+                status,
+                details,
+                ..
+            } => {
+                assert_eq!(code, "validation_error");
+                assert_eq!(status, Some(422));
+                assert_eq!(
+                    details,
+                    json!({"area_id":["required"],"source":"legacy-daemon"})
+                );
+            }
+            other => panic!("lost old-daemon refusal metadata: {other:?}"),
+        }
+        let forwarded = peer.join().unwrap();
+        assert_eq!(forwarded[0]["body"], paths_body);
+        assert_eq!(forwarded[0]["key"], paths_call.key.as_deref().unwrap());
+        assert_eq!(forwarded[1]["body"], legacy_body);
+        assert_eq!(forwarded[1]["key"], legacy_call.key.as_deref().unwrap());
+        assert_eq!(
+            forwarded.len(),
+            3,
+            "one write for the refused task, with no retry"
+        );
+        assert_eq!(forwarded[2]["body"]["title"], "rollback task");
+        assert_eq!(forwarded[2]["body"]["paths"], paths_body["paths"]);
+        assert!(forwarded[2]["body"].get("area_id").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_client_037_frames_keep_live_protocol_capabilities_on_daemon_038() {
+        #[derive(serde::Deserialize)]
+        struct ReplyV037 {
+            #[serde(default)]
+            error: Option<ClientError>,
+            #[serde(default)]
+            value: Option<Value>,
+        }
+        let legacy_body = json!({"title":"old task","area_id":"area-core"});
+        struct HeaderServer {
+            inner: FakeServer,
+            supported: AtomicBool,
+            cached_capability_reads: AtomicUsize,
+        }
+        impl Transport for HeaderServer {
+            fn registry_auto_area(&self, _session: &str) -> Result<bool, ClientError> {
+                self.cached_capability_reads.fetch_add(1, Ordering::SeqCst);
+                // An old observation must never override a later live protocol response.
+                Ok(true)
+            }
+            fn call(&self, call: &Call) -> Result<Value, ClientError> {
+                if call.path == "/api/v1/protocol" {
+                    return Ok(json!({"selected_protocol":2,"capabilities":
+                        if self.supported.load(Ordering::SeqCst) {
+                            vec!["registry_auto_area_v1"]
+                        } else {
+                            vec![]
+                        }
+                    }));
+                }
+                self.inner.call(call)
+            }
+        }
+        // Client 0.3.7 -> daemon 0.3.8: use the old serialized envelope over the real listener,
+        // and the old reply reader. The daemon must forward exactly the live capabilities.
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::start(
+            config(dir.path(), timing()),
+            HeaderServer {
+                inner: FakeServer::default(),
+                supported: AtomicBool::new(true),
+                cached_capability_reads: AtomicUsize::new(0),
+            },
+        )
+        .unwrap();
+        let old_call = |call: Value| {
+            let mut stream = UnixStream::connect(&daemon.shared.config.socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &json!({
+                    "workspace":"team", "op":"call", "call":call,
+                }),
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            let reply: ReplyV037 = serde_json::from_str(&line).unwrap();
+            assert!(reply.error.is_none(), "{:?}", reply.error);
+            reply.value.unwrap()
+        };
+        let discovery = json!({
+            "session":"worker", "method":"GET", "path":"/api/v1/protocol",
+            "long_poll":false, "defer_pending_ack":false,
+        });
+        assert_eq!(
+            old_call(discovery.clone())["capabilities"],
+            json!(["registry_auto_area_v1"])
+        );
+        daemon
+            .shared
+            .transport
+            .supported
+            .store(false, Ordering::SeqCst);
+        assert_eq!(old_call(discovery)["capabilities"], json!([]));
+        assert_eq!(
+            daemon
+                .shared
+                .transport
+                .cached_capability_reads
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            old_call(json!({
+                "session":"worker", "method":"POST", "path":"/api/v1/registry/items",
+                "body":legacy_body, "key":"01K00000000000000000000003",
+                "long_poll":false, "defer_pending_ack":false,
+            }))["id"],
+            1
+        );
+        let writes = daemon.shared.transport.inner.writes_to("/registry/items");
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].body.as_ref().unwrap(), &legacy_body);
+        assert_eq!(writes[0].key.as_deref(), Some("01K00000000000000000000003"));
     }
 
     #[test]

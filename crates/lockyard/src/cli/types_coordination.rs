@@ -332,9 +332,13 @@ pub(super) enum TaskCommand {
         #[arg(long)]
         key: Option<String>,
     },
-    /// Add an open task.
+    /// Add an open task about files or directories; the server determines its area.
     Add {
         title: String,
+        /// File or directory relative to the workspace root. Repeat for each path.
+        /// Required when the server supports automatic areas.
+        #[arg(long = "path", value_name = "PATH")]
+        paths: Vec<String>,
         #[arg(long, default_value = "")]
         body: String,
         /// What closes the task. Cloud mode; the title by default.
@@ -355,7 +359,7 @@ pub(super) enum TaskCommand {
         /// auto, owner or none. Cloud mode.
         #[arg(long)]
         verification: Option<String>,
-        /// Key of the area. Cloud mode; the first area by default.
+        /// Optional area override, sent as given. The server derives the area from --path.
         #[arg(long)]
         area: Option<String>,
         /// Prefix to use when creating the default area.

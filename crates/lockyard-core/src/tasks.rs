@@ -66,6 +66,9 @@ pub struct Task {
     pub id: crate::task_id::TaskId,
     pub title: String,
     pub body: String,
+    /// Workspace-relative files or directories returned by an auto-area registry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acceptance: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -99,6 +102,7 @@ pub struct Task {
 pub struct TaskSpec {
     pub title: String,
     pub body: String,
+    pub paths: Vec<String>,
     pub acceptance: Option<String>,
     pub priority: Option<String>,
     pub p0_category: Option<String>,
@@ -488,6 +492,7 @@ fn read_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         })?,
         title: row.get(1)?,
         body: row.get(2)?,
+        paths: Vec::new(),
         status: Status::parse(&status).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
                 3,

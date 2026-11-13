@@ -278,7 +278,10 @@ impl<T: Transport> CloudBackend<T> {
         if let Some(key) = &self.write_idempotency_key {
             call.key = Some(key.clone());
         }
-        Ok(self.transport.call(&call)?)
+        Ok(self.transport.call(&call).map_err(|mut error| {
+            error.explain_task_create_refusal(&call);
+            error
+        })?)
     }
 }
 
@@ -633,10 +636,21 @@ pub(crate) fn task_from(item: &Value) -> Result<tasks::Task> {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default(),
+        paths: item
+            .get("paths")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
     })
 }
 
 impl<T: Transport> Backend for CloudBackend<T> {
+    fn registry_auto_area(&self) -> Result<bool> {
+        Ok(self.transport.registry_auto_area(&self.session)?)
+    }
     fn status_read(
         &self,
         session: &str,
@@ -1246,14 +1260,23 @@ impl<T: Transport> Backend for CloudBackend<T> {
             .iter()
             .map(|value| evidence_body(author, target, value, now))
             .collect();
-        let body = json!({
+        let auto_area = self.registry_auto_area()?;
+        if auto_area && spec.paths.is_empty() {
+            return Err(Error::Invalid(
+                crate::task_area_error(&crate::ApiError {
+                    code: "task_paths_required".into(),
+                    ..crate::ApiError::default()
+                })
+                .expect("known task error"),
+            ));
+        }
+        let mut body = json!({
             "client_key": ulid(),
             "title": spec.title,
             "body": spec.body,
             "acceptance": spec.acceptance.as_deref().unwrap_or(&spec.title),
             "type": spec.kind.as_deref().unwrap_or("code"),
             "actor": "agent",
-            "area_id": self.area_id(author, spec.area.as_deref(), spec.prefix.as_deref(), spec.pad)?,
             "priority": spec.priority.as_deref().unwrap_or(DEFAULT_PRIORITY),
             "p0_category": spec.p0_category,
             "due_at": spec.due_at,
@@ -1262,6 +1285,19 @@ impl<T: Transport> Backend for CloudBackend<T> {
             "audience": [],
             "evidence": evidence,
         });
+        if auto_area {
+            body["paths"] = json!(spec.paths);
+            if let Some(area) = &spec.area {
+                body["area"] = json!(area);
+            }
+        } else {
+            body["area_id"] = json!(self.area_id(
+                author,
+                spec.area.as_deref(),
+                spec.prefix.as_deref(),
+                spec.pad
+            )?);
+        }
         task_from(&self.post(author, ITEMS.into(), &body)?)
     }
 
@@ -3156,6 +3192,42 @@ mod tests {
         assert_eq!(body["type"], "code");
         assert_eq!(body["target"], "code_accepted");
         assert_eq!(body["client_key"].as_str().unwrap().len(), 26);
+    }
+
+    #[test]
+    fn legacy_task_creation_omits_paths_and_preserves_area_lookup() {
+        let (server, mut cloud) =
+            backend(vec![json!([{"id":"a1", "key":"web"}]), item("ready", 1)]);
+        let spec = tasks::TaskSpec {
+            title: "t".into(),
+            area: Some("web".into()),
+            paths: vec!["web/src/main.rs".into()],
+            ..tasks::TaskSpec::default()
+        };
+        assert!(!cloud.registry_auto_area().unwrap());
+        cloud.add_task("me", &spec, 0).unwrap();
+        let seen = sees(
+            &server,
+            &[("GET", "/api/v1/registry/areas"), ("POST", ITEMS)],
+        );
+        assert_eq!(seen[1].body["area_id"], "a1");
+        assert!(seen[1].body.get("paths").is_none());
+        assert!(seen[1].body.get("area").is_none());
+    }
+
+    #[test]
+    fn task_paths_are_retained_when_returned_and_absent_for_legacy_tasks() {
+        let mut row = item("ready", 1);
+        row["paths"] = json!(["web/src/main.rs", "web/tests"]);
+        let task = task_from(&row).unwrap();
+        assert_eq!(task.paths, ["web/src/main.rs", "web/tests"]);
+        assert_eq!(serde_json::to_value(task).unwrap()["paths"], row["paths"]);
+        assert!(
+            serde_json::to_value(task_from(&item("ready", 1)).unwrap())
+                .unwrap()
+                .get("paths")
+                .is_none()
+        );
     }
 
     #[test]

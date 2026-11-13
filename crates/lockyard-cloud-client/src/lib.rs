@@ -81,12 +81,38 @@ impl ApiError {
 
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.message.is_empty() {
+        if let Some(message) = task_area_error(self) {
+            f.write_str(&message)
+        } else if self.message.is_empty() {
             write!(f, "HTTP {}", self.status)
         } else {
             f.write_str(&self.message)
         }
     }
+}
+
+/// Keep stable error codes and details while explaining task-path failures to a person.
+pub(crate) fn task_area_error(error: &ApiError) -> Option<String> {
+    let detail = |name: &str| {
+        error
+            .details
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+    };
+    Some(match error.code.as_str() {
+        "task_paths_required" => "Задаче нужны файлы или каталоги, которых она касается. Передай --path <путь> [--path <путь> …] в CLI или paths: [\"репозиторий/файл\"] в MCP, относительно корня рабочего места.".into(),
+        "task_paths_span_repositories" => {
+            let roots = error.details.get("roots").and_then(Value::as_array)
+                .map(|roots| roots.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))
+                .filter(|roots| !roots.is_empty()).unwrap_or_else(|| "не указаны сервером".into());
+            format!("Пути задачи относятся к нескольким репозиториям: {roots}; заведи по одной задаче на репозиторий (create one task per repository).")
+        }
+        "area_mismatch" => format!("Указанная область не соответствует файлам задачи. Область по путям: {}. Убери --area / area или укажи эту область.", detail("derived")),
+        "area_closed" => "Эта область закрыта для новых задач. Укажи пути файлов задачи и используй открытую область.".into(),
+        "area_template_conflict" => format!("Не удалось автоматически создать область для {}: ключ или префикс {} уже занят областью {}. Ведущий должен явно добавить корень репозитория в подходящую область.", detail("root"), detail("prefix"), detail("existing_area")),
+        _ => return None,
+    })
 }
 
 /// Why a call failed. Crosses the agent socket as JSON.
@@ -161,6 +187,31 @@ impl ClientError {
             Self::Frozen(error) | Self::RateLimited(error) | Self::Http(error) => error.retry_after,
             _ => None,
         }
+    }
+
+    /// Explain a stale auto-area write even when its refusal came through an older
+    /// daemon. Preserve the wire variant and metadata; HTTP and backend layers may
+    /// safely apply this more than once.
+    pub(crate) fn explain_task_create_refusal(&mut self, call: &Call) -> bool {
+        let error = match self {
+            Self::Unauthorized(error)
+            | Self::Denied(error)
+            | Self::NotFound(error)
+            | Self::Conflict(error)
+            | Self::StaleFence(error)
+            | Self::RateLimited(error)
+            | Self::Frozen(error)
+            | Self::Http(error) => error,
+            _ => return false,
+        };
+        if !task_create_missing_legacy_area(call, error) {
+            return false;
+        }
+        const EXPLANATION: &str = "Сервер отклонил создание задачи без области: он больше не подтверждает поддержку paths. Повтори команду с --area <область> в CLI или area в MCP. Запрос автоматически не повторялся. Ответ сервера: ";
+        if !error.message.starts_with(EXPLANATION) {
+            error.message = format!("{EXPLANATION}{}", error.message);
+        }
+        true
     }
 }
 
@@ -381,10 +432,17 @@ pub struct StatusRegistryPage {
 }
 
 pub(crate) const REGISTRY_ASSIGNEE_SESSION: &str = "registry_assignee_session_v1";
+pub(crate) const REGISTRY_AUTO_AREA: &str = "registry_auto_area_v1";
 
 /// How requests reach the server.
 pub trait Transport: Send + Sync {
     fn call(&self, call: &Call) -> Result<Value, ClientError>;
+
+    /// Negotiate whether task creation accepts paths and derives their area on the server.
+    /// Custom transports retain the legacy contract unless they explicitly confirm support.
+    fn registry_auto_area(&self, _session: &str) -> Result<bool, ClientError> {
+        Ok(false)
+    }
 
     /// Existing, unexpired negotiation knowledge only; this must not initiate discovery.
     fn status_registry_assignee_supported(
@@ -467,6 +525,9 @@ pub trait Transport: Send + Sync {
 }
 
 impl<T: Transport + ?Sized> Transport for Arc<T> {
+    fn registry_auto_area(&self, session: &str) -> Result<bool, ClientError> {
+        (**self).registry_auto_area(session)
+    }
     fn status_registry_assignee_supported(
         &self,
         deadline: Instant,
@@ -531,6 +592,7 @@ pub struct Client {
     encryption_enabled: bool,
     expected_e2ee_workspace: Option<String>,
     protocol_state: std::sync::Mutex<protocol::ProtocolState>,
+    registry_auto_area_observed: AtomicBool,
     pending_journal: Option<std::path::PathBuf>,
     status_protocol_cache: Option<std::path::PathBuf>,
     catalog_cache_root: Option<std::path::PathBuf>,
@@ -753,6 +815,7 @@ impl Client {
             encryption_enabled: false,
             expected_e2ee_workspace,
             protocol_state: std::sync::Mutex::new(protocol::ProtocolState::default()),
+            registry_auto_area_observed: AtomicBool::new(false),
             pending_journal: None,
             status_protocol_cache: None,
             catalog_cache_root: None,
@@ -939,7 +1002,7 @@ impl Client {
         remaining: Option<Duration>,
         protocol: &NegotiatedProtocol,
     ) -> Result<Value, Failure> {
-        self.attempt_observed(call, encoded, remaining, protocol, None)
+        self.attempt_observed(call, encoded, remaining, protocol, None, None)
     }
 
     fn attempt_observed(
@@ -949,6 +1012,7 @@ impl Client {
         remaining: Option<Duration>,
         protocol: &NegotiatedProtocol,
         registry_capability: Option<&AtomicBool>,
+        auto_area_capability: Option<&AtomicBool>,
     ) -> Result<Value, Failure> {
         let request_started = Instant::now();
         let _worker = self
@@ -1056,6 +1120,18 @@ impl Client {
                 Ordering::Relaxed,
             );
         }
+        if let (Some(capability), Some(response)) = (auto_area_capability, response) {
+            capability.fetch_and(
+                response
+                    .header("Lockyard-Capabilities")
+                    .is_some_and(|header| {
+                        header
+                            .split(',')
+                            .any(|part| part.trim() == REGISTRY_AUTO_AREA)
+                    }),
+                Ordering::Relaxed,
+            );
+        }
         match result {
             // With redirects off a 3xx arrives as a success. It delivered nothing, so a queued write stays queued.
             Ok(response) if (300..400).contains(&response.status()) => {
@@ -1068,9 +1144,43 @@ impl Client {
                 protocol::verify_echo(&response, protocol).map_err(Failure::Final)?;
                 protocol::verify_repository_echo(&response, call, protocol)
                     .map_err(Failure::Final)?;
-                let value = decode_for_call(response, call, self.encryption_enabled)
+                let header_auto_area =
+                    response
+                        .header("Lockyard-Capabilities")
+                        .is_some_and(|header| {
+                            header
+                                .split(',')
+                                .any(|part| part.trim() == REGISTRY_AUTO_AREA)
+                        });
+                let mut value = decode_for_call(response, call, self.encryption_enabled)
                     .map_err(Failure::Retry)?;
                 call.check_cancelled().map_err(Failure::Final)?;
+                // Only the latest successful response confirms support. Discovery may
+                // advertise it in its body alone; ordinary responses must confirm it in
+                // their headers. Cached negotiation must never resurrect a removed flag.
+                let protocol_response =
+                    call.method == "GET" && call.path.split('?').next() == Some("/api/v1/protocol");
+                let body_auto_area = protocol_response
+                    && value
+                        .get("capabilities")
+                        .and_then(Value::as_array)
+                        .is_some_and(|capabilities| {
+                            capabilities
+                                .iter()
+                                .any(|capability| capability.as_str() == Some(REGISTRY_AUTO_AREA))
+                        });
+                if protocol_response
+                    && header_auto_area
+                    && !body_auto_area
+                    && let Some(capabilities) =
+                        value.get_mut("capabilities").and_then(Value::as_array_mut)
+                {
+                    // A daemon forwards JSON, so carry this live response's header
+                    // confirmation in its body. Never copy an earlier observation.
+                    capabilities.push(Value::String(REGISTRY_AUTO_AREA.into()));
+                }
+                self.registry_auto_area_observed
+                    .store(header_auto_area || body_auto_area, Ordering::Relaxed);
                 Ok(value)
             }
             Err(ureq::Error::Status(status, response)) => {
@@ -1111,7 +1221,14 @@ impl Client {
                     // Error messages are server-authored text, not authenticated application content.
                     api_error.message = format!("Cloud request failed with HTTP {status}");
                 }
-                let error = ClientError::from_api(api_error);
+                let mut error = ClientError::from_api(api_error);
+                if error.explain_task_create_refusal(call) {
+                    // The server may have rolled back after discovery. Keep the refusal's
+                    // stable metadata and never retry the mutation with different fields.
+                    self.registry_auto_area_observed
+                        .store(false, Ordering::Relaxed);
+                    return Err(Failure::Final(error));
+                }
                 // A frozen server stays frozen for its whole window: the caller decides what to do.
                 let again = protocol::safe_retry(&error);
                 Err(if again {
@@ -1130,7 +1247,48 @@ enum Failure {
     Final(ClientError),
 }
 
+/// A paths-only write can reach an older replica after its capability was confirmed.
+/// Recognize only explicit missing-area validation, leaving unrelated errors unchanged.
+fn task_create_missing_legacy_area(call: &Call, error: &ApiError) -> bool {
+    if call.method != "POST"
+        || call.path.split('?').next() != Some("/api/v1/registry/items")
+        || !matches!(error.status, 400 | 422)
+        || !call
+            .body
+            .as_ref()
+            .is_some_and(|body| body.get("paths").is_some() && body.get("area_id").is_none())
+    {
+        return false;
+    }
+    if matches!(
+        error.code.as_str(),
+        "area_required" | "area_id_required" | "missing_area" | "missing_area_id"
+    ) {
+        return true;
+    }
+    let validation = format!("{} {}", error.message, error.details).to_lowercase();
+    (["area_id", "areaid", "area id"]
+        .iter()
+        .any(|field| validation.contains(field))
+        && [
+            "required",
+            "missing",
+            "must be provided",
+            "must be specified",
+            "обязател",
+            "не указан",
+        ]
+        .iter()
+        .any(|word| validation.contains(word)))
+        || validation.contains("area is required")
+        || validation.contains("missing area")
+}
+
 impl Transport for Client {
+    fn registry_auto_area(&self, session: &str) -> Result<bool, ClientError> {
+        self.negotiated_protocol(session)?;
+        Ok(self.registry_auto_area_observed.load(Ordering::Relaxed))
+    }
     fn status_registry_assignee_supported(
         &self,
         deadline: Instant,

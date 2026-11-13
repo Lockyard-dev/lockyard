@@ -266,6 +266,10 @@ pub trait Backend {
     }
     fn task(&self, id: &str) -> Result<tasks::Task>;
     fn task_history(&self, id: &str) -> Result<Vec<tasks::TaskEvent>>;
+    /// Whether the server derives registry areas from workspace-relative task paths.
+    fn registry_auto_area(&self) -> Result<bool> {
+        Ok(false)
+    }
     /// The full cloud registry protocol, without collapsing registry states into local task states.
     fn registry_search(&self, _query: &Value) -> Result<Value> {
         cloud("task search")
