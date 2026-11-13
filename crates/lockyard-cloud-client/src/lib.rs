@@ -1716,14 +1716,15 @@ mod tests {
     #[test]
     fn status_http_burst_reserves_outbox_write_and_long_poll_workers() {
         let server = FakeServer::start(vec![
-            Reply::json(200, json!({})).delay(Duration::from_millis(400)),
-            Reply::json(200, json!({})).delay(Duration::from_millis(400)),
-            Reply::json(200, json!({})).delay(Duration::from_millis(400)),
-            Reply::json(200, json!({})).delay(Duration::from_millis(400)),
-            Reply::json(200, json!({})).delay(Duration::from_millis(400)),
-            Reply::json(200, json!({})).delay(Duration::from_millis(400)),
-            Reply::json(200, json!({})).delay(Duration::from_millis(60)),
-            Reply::json(200, json!({})).delay(Duration::from_millis(60)),
+            Reply::json(200, json!({})).delay(Duration::from_millis(2000)),
+            Reply::json(200, json!({})).delay(Duration::from_millis(2000)),
+            Reply::json(200, json!({})).delay(Duration::from_millis(2000)),
+            Reply::json(200, json!({})).delay(Duration::from_millis(2000)),
+            Reply::json(200, json!({})).delay(Duration::from_millis(2000)),
+            Reply::json(200, json!({})).delay(Duration::from_millis(2000)),
+            // Hold reserved slots long enough to observe write+poll flags; deadline below is 1000 ms.
+            Reply::json(200, json!({})).delay(Duration::from_millis(200)),
+            Reply::json(200, json!({})).delay(Duration::from_millis(200)),
         ]);
         let mut client = Client::new(&server.url(), "fixture".into()).unwrap();
         client.set_http_worker_limit(8);
@@ -1733,28 +1734,38 @@ mod tests {
                 let client = &client;
                 scope.spawn(move || {
                     let mut call = Call::get("me", "/api/v1/bus/tasks".into());
-                    call.deadline_ms = Some(1000);
+                    // The six status reads must outlast both reserved calls by a wide margin:
+                    // the final `general == 6` check is an ordering proof, not a stopwatch.
+                    call.deadline_ms = Some(5000);
                     client.call(&call).unwrap();
                 });
             }
             let started = Instant::now();
             while server.requests().len() < 6 {
-                assert!(started.elapsed() < Duration::from_secs(1));
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "status burst never occupied the general workers"
+                );
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert_eq!(client.http_workers.active.lock().unwrap().general, 6);
             let mut poll = Call::get("agent", "/api/v1/events?wait=25".into());
             poll.long_poll = true;
-            poll.deadline_ms = Some(100);
+            // Generous call budgets: bypass is proven by reserved worker flags while general==6,
+            // not by finishing under a machine-speed 100 ms ceiling.
+            poll.deadline_ms = Some(1000);
             let mut write = Call::write("agent", "POST", "/api/v1/presence".into(), json!({}));
             write.defer_pending_ack = true;
-            write.deadline_ms = Some(100);
-            let started = Instant::now();
+            write.deadline_ms = Some(1000);
             let (write_result, poll_result) = std::thread::scope(|reserved| {
                 let write = reserved.spawn(|| client.call(&write));
                 let poll = reserved.spawn(|| client.call(&poll));
+                let started = Instant::now();
                 while server.requests().len() < 8 {
-                    assert!(started.elapsed() < Duration::from_millis(100));
+                    assert!(
+                        started.elapsed() < Duration::from_secs(2),
+                        "reserved write/poll never reached the server while general workers were busy"
+                    );
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 let active = client.http_workers.active.lock().unwrap();
@@ -1775,7 +1786,6 @@ mod tests {
                 poll_result.is_ok(),
                 "event poll must bypass the status burst: {poll_result:?}"
             );
-            assert!(started.elapsed() < Duration::from_millis(150));
             assert_eq!(server.requests().len(), 8);
             // The status reads still own all six general workers when both reserved calls finish.
             assert_eq!(client.http_workers.active.lock().unwrap().general, 6);

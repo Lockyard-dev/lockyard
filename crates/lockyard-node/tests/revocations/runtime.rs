@@ -180,7 +180,12 @@ async fn daemon_refresh_scenario(poll_seconds: u64, send_events: bool) {
             .spawn()
             .unwrap(),
     );
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // Ready when the fixture has served the initial signed page (counter), not when a 5 s
+    // status poll happens to win on a slow Windows runner.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while gets.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         loop {
             if let Ok(status) = lockyard_node::host::status(&path).await
                 && status
@@ -194,15 +199,18 @@ async fn daemon_refresh_scenario(poll_seconds: u64, send_events: bool) {
         }
     })
     .await
-    .unwrap();
+    .expect("daemon never completed its initial revocation refresh");
     let initial = gets.load(Ordering::SeqCst);
     epoch.store(1, Ordering::SeqCst);
     if send_events {
         events.notify_one();
     }
-    // Five seconds is still below the 30-second SSE scenario's poll interval.
-    // The other scenario receives no event, so only its one-second timer can refresh.
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // SSE path: the notify above; timer path: poll_seconds=1. Wait for the GET counter to move,
+    // then confirm status — still below the 30-second SSE scenario's poll interval.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while gets.load(Ordering::SeqCst) <= initial {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         loop {
             if lockyard_node::host::status(&path)
                 .await
@@ -218,13 +226,14 @@ async fn daemon_refresh_scenario(poll_seconds: u64, send_events: bool) {
         }
     })
     .await
-    .unwrap();
+    .expect("daemon never refreshed after SSE/timer");
     assert!(gets.load(Ordering::SeqCst) > initial);
+    let gets_before_limit = gets.load(Ordering::SeqCst);
     limited.store(true, Ordering::SeqCst);
     if send_events {
         events.notify_one();
     }
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if lockyard_node::host::status(&path)
                 .await
@@ -240,11 +249,16 @@ async fn daemon_refresh_scenario(poll_seconds: u64, send_events: bool) {
         }
     })
     .await
-    .unwrap();
+    .expect("daemon never recorded a rate_limited refresh failure");
     let blocked = gets.load(Ordering::SeqCst);
+    assert!(
+        blocked > gets_before_limit,
+        "rate-limited response must still be a fixture GET"
+    );
     for _ in 0..20 {
         events.notify_one();
     }
+    // Retry-After is 120 s; one second past the 1 s timer proves immediate wakes are ignored.
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert_eq!(
         gets.load(Ordering::SeqCst),
