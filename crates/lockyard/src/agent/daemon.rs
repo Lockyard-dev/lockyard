@@ -441,6 +441,41 @@ struct Shared<T: Transport + 'static> {
     status_reads: Mutex<StatusReads>,
     status_ready: Condvar,
     status_pool_warm: Arc<AtomicBool>,
+    /// Sessions whose caller-driven status read is on the network right now. That read fetches
+    /// the unread count itself, so upkeep must not send a second inbox read for them.
+    status_network_sessions: Mutex<HashMap<String, usize>>,
+}
+
+/// Marks one caller-driven status read as in flight for its session until dropped.
+struct StatusNetworkMark<'a> {
+    sessions: &'a Mutex<HashMap<String, usize>>,
+    session: String,
+}
+
+impl<'a> StatusNetworkMark<'a> {
+    fn new(sessions: &'a Mutex<HashMap<String, usize>>, session: &str) -> Self {
+        *sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(session.to_string())
+            .or_default() += 1;
+        Self {
+            sessions,
+            session: session.to_string(),
+        }
+    }
+}
+
+impl Drop for StatusNetworkMark<'_> {
+    fn drop(&mut self) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = sessions.get_mut(&self.session) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                sessions.remove(&self.session);
+            }
+        }
+    }
 }
 
 /// A per-request read adapter. Only the harmless unread count may come from the daemon's view.
@@ -967,6 +1002,13 @@ impl<T: Transport + 'static> Shared<T> {
         }
         // Keep membership established before unread reconciliation can inspect this entry,
         // but do not launch redundant upkeep/polls ahead of the caller's own network reads.
+        // The mark is taken before the unread entry exists, so upkeep never sees that entry
+        // without also seeing that this read will fetch the count itself. It is released early
+        // when the read reuses a cached count, and before nudging upkeep at the end.
+        let mut in_flight = Some(StatusNetworkMark::new(
+            &self.status_network_sessions,
+            session,
+        ));
         let registered_session = {
             let mut sessions = self.sessions();
             let registered = !sessions.contains_key(session);
@@ -993,6 +1035,11 @@ impl<T: Transport + 'static> Shared<T> {
             });
             (snapshot, entry.generation, registered)
         };
+        if cached_unread.is_some_and(|(_, _, _, fresh)| fresh) {
+            // This read answers unread from the cache and sends no inbox request, so upkeep's
+            // prefetch for this session is not repeated work.
+            drop(in_flight.take());
+        }
         // The zone mirror is deliberately not an authority for this request. An empty event poll
         // confirms a generation, but cannot give a server-time lease or prove there was no revoke
         // during a network gap. A fresh read also handles restart, sleep, handover and idle release.
@@ -1077,6 +1124,9 @@ impl<T: Transport + 'static> Shared<T> {
                     // Events arriving during the read keep the response dirty for the next call.
                     self.store_unread(session, unread_generation, count);
                 }
+                // The count is stored (or the inbox section failed): let the nudged upkeep pass
+                // refresh this session immediately instead of skipping it as still in flight.
+                drop(in_flight.take());
                 if (registered_session || registered) && !cancellation.is_cancelled() {
                     self.nudge();
                 }
@@ -1824,6 +1874,26 @@ impl<T: Transport + 'static> Shared<T> {
                 .collect()
         };
         for (session, generation) in wanted {
+            // A caller's status read for this session is already fetching the count; a second
+            // inbox read would be repeated work, and that read stores the result when it ends.
+            if self
+                .status_network_sessions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&session)
+            {
+                continue;
+            }
+            // The snapshot above is older than this iteration: a status read may have stored a
+            // fresh count while upkeep was busy with an earlier session.
+            if self
+                .read_view()
+                .unread
+                .get(&session)
+                .is_none_or(|entry| entry.fresh(limit))
+            {
+                continue;
+            }
             if let Ok(count) = self.backend(&session).unread(&session) {
                 self.store_unread(&session, generation, count);
             }
@@ -2257,6 +2327,7 @@ impl<T: Transport + 'static> Daemon<T> {
             status_reads: Mutex::new(StatusReads::default()),
             status_ready: Condvar::new(),
             status_pool_warm: Arc::new(AtomicBool::new(false)),
+            status_network_sessions: Mutex::new(HashMap::new()),
             state_dir,
             config,
             view: RwLock::new(View {

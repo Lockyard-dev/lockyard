@@ -2117,6 +2117,9 @@ fn cloud_status_ten_agent_callers_wait_with_bounded_http_workers() {
     let runtime = tempfile::tempdir().unwrap();
     let _agent = start_agent(dir.path(), runtime.path());
     json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    // Let upkeep finish the warm-up pass and go idle first: an idle upkeep that scans while the
+    // ten callers are on the network is what once sent a duplicate inbox read (sixth section read).
+    thread::sleep(Duration::from_millis(800));
     let (requests_before, connections_before) = {
         let mut state = server.state.lock().unwrap();
         state.max_status_reads_in_flight = 0;
