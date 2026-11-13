@@ -201,7 +201,7 @@ impl AgentSocket {
         let line = self.line(request)?;
         let mut pending = line.as_slice();
         while !pending.is_empty() {
-            stream.set_write_timeout(Some(remaining(deadline)?))?;
+            apply_deadline(stream.set_write_timeout(Some(remaining(deadline)?)))?;
             let written = stream.write(pending)?;
             if written == 0 {
                 return Err(io::Error::new(
@@ -215,7 +215,7 @@ impl AgentSocket {
         let mut chunk = [0_u8; 8192];
         loop {
             // A peer that trickles bytes must not restart the deadline on every read.
-            stream.set_read_timeout(Some(remaining(deadline)?))?;
+            apply_deadline(stream.set_read_timeout(Some(remaining(deadline)?)))?;
             let count = stream.read(&mut chunk)?;
             if count == 0 {
                 return Err(io::Error::new(
@@ -257,6 +257,20 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
         ))
     } else {
         Ok(left)
+    }
+}
+
+/// Applies a deadline update to the stream.
+///
+/// macOS answers `EINVAL` to `setsockopt` once the peer has shut its end down. An agent that
+/// replies and closes before the client updates the read deadline would then lose an answer
+/// that is already in the buffer. The deadline set by the previous update stays in force, so
+/// the call remains bounded.
+fn apply_deadline(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        #[cfg(target_os = "macos")]
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        other => other,
     }
 }
 

@@ -1012,10 +1012,15 @@ impl<T: Transport + 'static> Shared<T> {
         };
         let backend = CloudBackend::new(transport, session);
         let left = deadline.saturating_duration_since(Instant::now());
-        // Mail and mandatory reads share the entire HTTP allocation. Leave a small fraction of
-        // the actual remaining aggregate budget for folding optional failures, expiry checks,
-        // JSON serialization and IPC, so a mail timeout cannot consume the reply's own deadline.
-        let reply_reserve = Duration::from_millis(25).min(left / 20);
+        // Mail and mandatory reads share the entire HTTP allocation. Leave enough of the remaining
+        // aggregate budget for folding optional failures, expiry checks, JSON serialization and
+        // IPC. A 25 ms reserve races the caller's socket deadline when optional mail uses nearly
+        // the whole network budget (warm status with a stalled inbox): the daemon finishes just
+        // as the client times out, the CLI falls back to a direct read, and that direct read
+        // waits on the same stall again.
+        let reply_reserve = left
+            .div_f64(10.0)
+            .clamp(Duration::from_millis(25), Duration::from_millis(150));
         let network_budget = left.saturating_sub(reply_reserve);
         match backend.status_read(session, now_ms(), network_budget) {
             Ok(mut status) => {
@@ -2809,7 +2814,7 @@ mod tests {
             "team",
             Duration::from_secs(2),
         )
-        .unwrap();
+        .expect("0.3.7 peer must accept the 0.3.8 Ping before task frames are exercised");
         assert!(socket.registry_auto_area("worker").unwrap());
         assert_eq!(
             socket.call(&paths_call).unwrap()["paths"],
@@ -3926,10 +3931,13 @@ mod tests {
     fn status_read_does_not_block_memory_requests_while_the_network_waits() {
         let mut rig = start_with(timing(), |_| {});
         rig.daemon.stop_workers();
+        // Hang ≫ 100 ms memory budget so a blocking defect stays visible (~100 ms margin).
+        // Two hung network steps need headroom above the reply_reserve floor, so the status
+        // deadline is 800 ms rather than 500 ms (test scope only — not a product change).
         rig.server.hang_ms.store(200, Ordering::SeqCst);
         let before = rig.server.calls_to("/api/v1/zones/claims");
         let shared = Arc::clone(&rig.daemon.shared);
-        let worker = thread::spawn(move || shared.status_read("me", None, 500));
+        let worker = thread::spawn(move || shared.status_read("me", None, 800));
         wait_for("a status network request", || {
             rig.server.calls_to("/api/v1/zones/claims") > before
         });
@@ -3940,7 +3948,35 @@ mod tests {
             session: "me".into(),
         });
         assert!(started.elapsed() < Duration::from_millis(100));
-        assert!(worker.join().unwrap().error.is_none());
+        let finished = worker.join().unwrap();
+        assert!(
+            finished.error.is_none(),
+            "status read must finish without holding memory requests: {:?}",
+            finished.error
+        );
+    }
+
+    #[test]
+    fn status_read_tiny_budget_still_answers_instead_of_becoming_an_error() {
+        // reply_reserve clamps to ≥25 ms. A 25 ms (or shorter) agent budget must not turn into a
+        // hard protocol failure: either a status payload or a transport error that lets the CLI
+        // take its direct-read path.
+        let mut rig = start_with(timing(), |_| {});
+        rig.daemon.stop_workers();
+        for deadline_ms in [25_u64, 10, 1] {
+            let reply = rig.daemon.handle(status_read("me", deadline_ms));
+            assert!(
+                reply.status_read.is_some()
+                    || matches!(reply.error, Some(ClientError::Transport(_))),
+                "tiny status budget {deadline_ms} ms must stay answerable or direct-fallbackable, got {:?}",
+                reply.error
+            );
+            assert!(
+                !matches!(reply.error, Some(ClientError::Protocol(_))),
+                "tiny status budget {deadline_ms} ms must not become a protocol error: {:?}",
+                reply.error
+            );
+        }
     }
 
     #[test]

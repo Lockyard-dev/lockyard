@@ -163,25 +163,53 @@ impl Project {
         requests: Vec<Value>,
         budget: std::time::Duration,
     ) -> Vec<Value> {
-        let mut child = Command::new(
+        // Clear the inherited environment so LOCKYARD_* / XDG_* from the test runner cannot
+        // leak into the child, then restore the Windows Winsock/CRT variables that env_clear
+        // removed. Without SystemRoot (and friends) ureq fails with WSAEPROVIDERFAILEDINIT
+        // (os error 10106) before it can reach the loopback fixture. Neighboring MCP tests that
+        // pass on Windows (mcp_json.rs) never call env_clear and therefore keep those vars.
+        let mut command = Command::new(
             std::env::var_os("LOCKYARD_TEST_BINARY")
                 .unwrap_or_else(|| env!("CARGO_BIN_EXE_lockyard").into()),
-        )
-        .args(["mcp", "--tools", surface])
-        .current_dir(cwd)
-        .env_clear()
-        .env("HOME", self.runtime.path())
-        .env("XDG_RUNTIME_DIR", self.runtime.path())
-        .env("XDG_STATE_HOME", self.runtime.path().join("state"))
-        .env("XDG_CONFIG_HOME", self.runtime.path().join("config"))
-        .env("LOCKYARD_URL", &server.url)
-        .env("LOCKYARD_TOKEN", "synthetic-test-token")
-        .env("LOCKYARD_AGENT", "test-worker")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        );
+        command
+            .args(["mcp", "--tools", surface])
+            .current_dir(cwd)
+            .env_clear()
+            .env("HOME", self.runtime.path())
+            .env("XDG_RUNTIME_DIR", self.runtime.path())
+            .env("XDG_STATE_HOME", self.runtime.path().join("state"))
+            .env("XDG_CONFIG_HOME", self.runtime.path().join("config"))
+            .env("LOCKYARD_URL", &server.url)
+            .env("LOCKYARD_TOKEN", "synthetic-test-token")
+            .env("LOCKYARD_AGENT", "test-worker");
+        #[cfg(windows)]
+        {
+            for key in [
+                "SystemRoot",
+                "SYSTEMROOT",
+                "WINDIR",
+                "SystemDrive",
+                "COMSPEC",
+                "ComSpec",
+                "PATHEXT",
+                "USERPROFILE",
+                "TMP",
+                "TEMP",
+                "NUMBER_OF_PROCESSORS",
+                "PROCESSOR_ARCHITECTURE",
+            ] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
         let mut input = child.stdin.take().unwrap();
         for request in &requests {
             writeln!(input, "{request}").unwrap();
