@@ -47,7 +47,10 @@ pub(super) fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
                 None => Config::token_for(&url)?,
             };
             let token_id = lockyard_cloud_client::token_id(&token);
-            let client = agent_client(open::journal_client(Client::new(&url, token)?)?)?;
+            let mut client = agent_client(open::journal_client(Client::new(&url, token)?)?)?;
+            // Includes upkeep and long polls. The bounded client explicitly reserves one worker
+            // for writes and one for event long polls; general reads share the remaining six.
+            client.set_http_worker_limit(8);
             let socket = agent::socket_path_for(&url, &workspace);
             let settings = AgentConfig {
                 url,

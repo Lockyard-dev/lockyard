@@ -32,6 +32,10 @@ struct State {
     claims: Vec<Value>,
     inbox: Vec<Value>,
     refuse_claims: Option<(u16, Value)>,
+    refuse_claims_get: Option<(u16, Value)>,
+    refuse_claims_get_once: Option<(u16, Value)>,
+    refuse_inbox_get: Option<(u16, Value)>,
+    refuse_work_get: Option<(u16, Value)>,
     claim_reused_on_post: Option<Value>,
     claim_created: Option<Value>,
     omit_claim_meta: bool,
@@ -40,12 +44,44 @@ struct State {
     ignore_renew_hold: bool,
     refuse_release: Option<(u16, Value)>,
     refuse_registry_claim: bool,
+    refuse_registry_get: Option<(u16, Value)>,
+    refuse_filtered_registry_once: Option<(u16, Value)>,
+    registry_hide_protocol_on_refusal: bool,
     check_reply: Option<Value>,
     catalog: Option<Value>,
     encryption_key_id: Option<String>,
     refuse_catalog_put: bool,
     registry_areas: Vec<Value>,
     registry_next_item: u64,
+    registry_items: Vec<Value>,
+    registry_assignee_session: bool,
+    registry_assignee_protocol_hidden: bool,
+    registry_assignee_protocol_header_hidden: bool,
+    registry_assignee_header_hidden: bool,
+    registry_assignee_filter_ignored: bool,
+    registry_page_size: Option<usize>,
+    latency: Latency,
+    requests_started: usize,
+    status_reads_in_flight: usize,
+    max_status_reads_in_flight: usize,
+    status_read_events: Vec<(String, bool)>,
+    status_read_starts: Vec<(String, Option<String>)>,
+    response_bytes: usize,
+    request_timings: Vec<(String, Duration)>,
+    connections: usize,
+}
+
+/// HTTP-level impairment model. TCP/TLS setup costs are delayed after accept, so this
+/// needs no privileged network shaper and does not claim to exercise a TLS stack.
+#[derive(Clone, Default)]
+struct Latency {
+    connect: Duration,
+    handshake: Duration,
+    response: Duration,
+    stall_every: usize,
+    stall: Duration,
+    stall_route: Option<String>,
+    keep_alive: bool,
 }
 
 #[derive(Clone)]
@@ -81,83 +117,181 @@ impl Server {
 }
 
 fn serve(mut stream: TcpStream, state: &Mutex<State>) {
+    let latency = {
+        let mut state = state.lock().unwrap();
+        state.connections += 1;
+        state.latency.clone()
+    };
+    thread::sleep(latency.connect + latency.handshake);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
     let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut first = String::new();
-    if reader.read_line(&mut first).is_err() {
-        return;
-    }
-    let mut parts = first.split(' ');
-    let method = parts.next().unwrap_or_default().to_string();
-    let path = parts.next().unwrap_or_default().to_string();
-    let (mut length, mut key, mut session, mut token, mut repository) = (0, None, None, None, None);
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
-            break;
+        let request_started = Instant::now();
+        let mut first = String::new();
+        if !matches!(reader.read_line(&mut first), Ok(size) if size > 0) {
+            return;
         }
-        if let Some((name, value)) = line.trim_end().split_once(": ") {
-            match name.to_ascii_lowercase().as_str() {
-                "content-length" => length = value.parse().unwrap_or(0),
-                "idempotency-key" => key = Some(value.to_string()),
-                "x-lockyard-session" => session = Some(value.to_string()),
-                "authorization" => token = Some(value.to_string()),
-                "x-lockyard-repository" => repository = Some(value.to_string()),
-                _ => {}
+        let mut parts = first.split(' ');
+        let method = parts.next().unwrap_or_default().to_string();
+        let path = parts.next().unwrap_or_default().to_string();
+        let (mut length, mut key, mut session, mut token, mut repository) =
+            (0, None, None, None, None);
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.trim_end().split_once(": ") {
+                match name.to_ascii_lowercase().as_str() {
+                    "content-length" => length = value.parse().unwrap_or(0),
+                    "idempotency-key" => key = Some(value.to_string()),
+                    "x-lockyard-session" => session = Some(value.to_string()),
+                    "authorization" => token = Some(value.to_string()),
+                    "x-lockyard-repository" => repository = Some(value.to_string()),
+                    _ => {}
+                }
             }
         }
-    }
-    let mut body = vec![0_u8; length];
-    if reader.read_exact(&mut body).is_err() {
-        return;
-    }
-    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    let route = path.split('?').next().unwrap_or_default().to_string();
-    if route.ends_with("/events") {
-        // A short long poll keeps the agent's threads moving and its view fresh.
-        thread::sleep(Duration::from_millis(30));
-    }
-    let (status, answer) = {
-        let mut state = state.lock().unwrap();
-        if !route.ends_with("/events") {
-            let record = Seen {
-                method: method.clone(),
-                path: path.clone(),
-                body: body.clone(),
-                key,
-                session: session.clone(),
+        let mut body = vec![0_u8; length];
+        if reader.read_exact(&mut body).is_err() {
+            return;
+        }
+        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let route = path.split('?').next().unwrap_or_default().to_string();
+        let is_status_read = matches!(
+            route.as_str(),
+            "/api/v1/zones/claims"
+                | "/api/v1/bus/inbox"
+                | "/api/v1/bus/tasks"
+                | "/api/v1/registry/items"
+        ) && method == "GET";
+        let request_number = {
+            let mut state = state.lock().unwrap();
+            state.requests_started += 1;
+            if is_status_read {
+                state.status_read_events.push((path.clone(), true));
+                state
+                    .status_read_starts
+                    .push((path.clone(), session.clone()));
+                state.status_reads_in_flight += 1;
+                state.max_status_reads_in_flight = state
+                    .max_status_reads_in_flight
+                    .max(state.status_reads_in_flight);
+            }
+            state.requests_started
+        };
+        // Setup belongs to the accepted connection, but response impairments may change between
+        // requests on a keep-alive connection (for example, an outage after agent warm-up).
+        let latency = state.lock().unwrap().latency.clone();
+        thread::sleep(latency.response);
+        if (latency.stall_every > 0 && request_number % latency.stall_every == 0)
+            || latency.stall_route.as_deref() == Some(&route)
+        {
+            thread::sleep(latency.stall);
+        }
+        if route.ends_with("/events") {
+            // A short long poll keeps the agent's threads moving and its view fresh.
+            thread::sleep(Duration::from_millis(30));
+        }
+        let (status, answer, capabilities) = {
+            let mut state = state.lock().unwrap();
+            if !route.ends_with("/events") {
+                let record = Seen {
+                    method: method.clone(),
+                    path: path.clone(),
+                    body: body.clone(),
+                    key,
+                    session: session.clone(),
+                };
+                state.seen.push(record);
+            }
+            let (status, answer) = if token.as_deref() != Some("Bearer test-token") {
+                (
+                    401,
+                    json!({"error": {"code": "unauthorized", "message": "bad token"}}),
+                )
+            } else {
+                route_reply(&mut state, &method, &path, &body, session.as_deref())
             };
-            state.seen.push(record);
+            let capabilities = if state.registry_assignee_session
+                && ((route.starts_with("/api/v1/registry/")
+                    && !state.registry_assignee_header_hidden)
+                    || (route == "/api/v1/protocol"
+                        && !state.registry_assignee_protocol_header_hidden))
+            {
+                "Lockyard-Capabilities: registry_assignee_session_v1\r\n"
+            } else {
+                ""
+            };
+            (status, answer, capabilities)
+        };
+        let text = answer.to_string();
+        {
+            let mut state = state.lock().unwrap();
+            state.response_bytes += text.len();
+            state
+                .request_timings
+                .push((path.clone(), request_started.elapsed()));
+            if is_status_read {
+                state.status_read_events.push((path.clone(), false));
+                state.status_reads_in_flight -= 1;
+            }
         }
-        if token.as_deref() != Some("Bearer test-token") {
-            (
-                401,
-                json!({"error": {"code": "unauthorized", "message": "bad token"}}),
-            )
-        } else {
-            route_reply(&mut state, &method, &route, &body, session.as_deref())
+        let response = format!(
+            "HTTP/1.1 {status} X\r\nLockyard-Protocol: 2\r\n{capabilities}X-Lockyard-Repository: {}\r\nCache-Control: no-store\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n{text}",
+            repository.as_deref().unwrap_or("-"),
+            text.len(),
+            if latency.keep_alive {
+                "keep-alive"
+            } else {
+                "close"
+            },
+        );
+        if stream.write_all(response.as_bytes()).is_err() || !latency.keep_alive {
+            return;
         }
-    };
-    let text = answer.to_string();
-    let response = format!(
-        "HTTP/1.1 {status} X\r\nLockyard-Protocol: 2\r\nX-Lockyard-Repository: {}\r\nCache-Control: no-store\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
-        repository.as_deref().unwrap_or("-"),
-        text.len()
-    );
-    let _ = stream.write_all(response.as_bytes());
+    }
+}
+
+fn query_value(path: &str, name: &str) -> Option<String> {
+    let encoded = path.split_once('?')?.1.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then_some(value)
+    })?;
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut bytes = encoded.bytes();
+    while let Some(byte) = bytes.next() {
+        decoded.push(match byte {
+            b'%' => {
+                let hex = [bytes.next()?, bytes.next()?];
+                u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?
+            }
+            b'+' => b' ',
+            byte => byte,
+        });
+    }
+    String::from_utf8(decoded).ok()
 }
 
 fn route_reply(
     state: &mut State,
     method: &str,
-    route: &str,
+    path: &str,
     body: &Value,
     session: Option<&str>,
 ) -> (u16, Value) {
+    let route = path.split('?').next().unwrap_or_default();
     match (method, route) {
-        ("GET", "/api/v1/protocol") => (
-            200,
-            json!({"selected_protocol":2,"min_protocol":1,"max_protocol":2,"capabilities":["zone_catalog_v1","drain_v1"]}),
-        ),
+        ("GET", "/api/v1/protocol") => {
+            let mut capabilities = vec!["zone_catalog_v1", "drain_v1"];
+            if state.registry_assignee_session && !state.registry_assignee_protocol_hidden {
+                capabilities.push("registry_assignee_session_v1");
+            }
+            (
+                200,
+                json!({"selected_protocol":2,"min_protocol":1,"max_protocol":2,"capabilities":capabilities}),
+            )
+        }
         ("GET", "/api/v1/zones/catalog") => (
             200,
             state
@@ -201,7 +335,11 @@ fn route_reply(
             }
             (200, reply)
         }
-        ("GET", "/api/v1/zones/claims") => (200, json!({"claims": state.claims})),
+        ("GET", "/api/v1/zones/claims") => state
+            .refuse_claims_get_once
+            .take()
+            .or_else(|| state.refuse_claims_get.clone())
+            .unwrap_or_else(|| (200, json!({"claims": state.claims}))),
         ("POST", _) if route.starts_with("/api/v1/zones/claims/") && route.ends_with("/renew") => {
             if let Some(refusal) = state.refuse_renew.clone() {
                 return refusal;
@@ -282,7 +420,60 @@ fn route_reply(
         ("GET", "/api/v1/registry/areas") if !state.registry_areas.is_empty() => {
             (200, json!({"areas": state.registry_areas}))
         }
-        ("GET", "/api/v1/registry/items") => (200, json!({"items":[],"cursor":null})),
+        ("GET", "/api/v1/registry/items") => {
+            if let Some(refusal) = state.refuse_registry_get.clone() {
+                return refusal;
+            }
+            if query_value(path, "assignee_session").is_some()
+                && let Some(refusal) = state.refuse_filtered_registry_once.take()
+            {
+                if state.registry_hide_protocol_on_refusal {
+                    state.registry_assignee_protocol_hidden = true;
+                    state.registry_assignee_protocol_header_hidden = true;
+                }
+                return refusal;
+            }
+            let status = query_value(path, "status");
+            let assignee = state
+                .registry_assignee_session
+                .then(|| query_value(path, "assignee_session"))
+                .flatten()
+                .filter(|_| !state.registry_assignee_filter_ignored)
+                .filter(|session| !session.trim().is_empty());
+            let limit = query_value(path, "limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(200)
+                .min(state.registry_page_size.unwrap_or(usize::MAX));
+            let offset = query_value(path, "cursor")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let items = state
+                .registry_items
+                .iter()
+                .filter(|item| {
+                    status
+                        .as_deref()
+                        .is_none_or(|status| item["status"].as_str() == Some(status))
+                })
+                .filter(|item| {
+                    assignee.as_deref().is_none_or(|session| {
+                        let assignment = &item["assignment"];
+                        assignment["released_at"].is_null()
+                            && assignment["executor"].as_str().is_some_and(|executor| {
+                                executor.splitn(3, ':').nth(2).unwrap_or(executor) == session
+                            })
+                    })
+                })
+                .collect::<Vec<_>>();
+            let next =
+                (offset.saturating_add(limit) < items.len()).then(|| (offset + limit).to_string());
+            let page = items
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect::<Vec<_>>();
+            (200, json!({"items":page,"cursor":next}))
+        }
         ("POST", "/api/v1/registry/items") if !state.registry_areas.is_empty() => {
             let area = state
                 .registry_areas
@@ -315,7 +506,10 @@ fn route_reply(
                 || json!({"paths": [{"path": body["paths"][0], "status": "free"}]}),
             ),
         ),
-        ("GET", "/api/v1/bus/inbox") => (200, json!({"messages": state.inbox, "skipped": 0})),
+        ("GET", "/api/v1/bus/inbox") => state
+            .refuse_inbox_get
+            .clone()
+            .unwrap_or_else(|| (200, json!({"messages": state.inbox, "skipped": 0}))),
         ("POST", "/api/v1/bus/inbox/claim") => (200, json!({"claimed": body["ids"]})),
         ("POST", "/api/v1/bus/inbox/seen") => {
             let ids = body["ids"].as_array().cloned().unwrap_or_default();
@@ -326,7 +520,11 @@ fn route_reply(
             200,
             json!({"id": 44, "from_session": "alice", "to": body["to"], "body": body["body"]}),
         ),
-        ("GET", "/api/v1/bus/board") | ("GET", "/api/v1/bus/tasks") => (200, json!([])),
+        ("GET", "/api/v1/bus/board") => (200, json!([])),
+        ("GET", "/api/v1/bus/tasks") => state
+            .refuse_work_get
+            .clone()
+            .unwrap_or_else(|| (200, json!([]))),
         ("POST", "/api/v1/bus/tasks") => (
             200,
             json!({"id": 6, "title": body["title"], "status": "offered", "version": 1}),
@@ -374,6 +572,7 @@ fn binary(dir: &Path, runtime: &Path) -> Command {
         .env("XDG_STATE_HOME", runtime.join("state"))
         .env("XDG_CONFIG_HOME", runtime.join("config"))
         .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("LOCKYARD_STATUS_DEADLINE_MS")
         .env_remove("LOCKYARD_TOKEN_FILE");
     command
 }
@@ -967,6 +1166,44 @@ fn cloud_cli_status_json_keeps_its_existing_shape_without_fetching_lost_claims()
     assert!(status["tasks"].is_array(), "{status}");
     assert!(status["work"].is_array(), "{status}");
     assert!(status["offers"].is_array(), "{status}");
+    // Additive provenance is allowed. Every pre-existing field retains its JSON type/value.
+    let mut compatibility = Value::Object(Default::default());
+    for key in [
+        "unread",
+        "claims",
+        "offers",
+        "work",
+        "tasks",
+        "machine_level",
+        "unannounced",
+    ] {
+        assert!(
+            status.get(key).is_some(),
+            "missing existing field {key}: {status}"
+        );
+        compatibility[key] = status[key].clone();
+    }
+    assert!(
+        status["machine_level"].is_null()
+            || matches!(
+                status["machine_level"].as_str(),
+                Some("ok" | "warn" | "hold" | "critical")
+            )
+    );
+    compatibility["machine_level"] = json!("<machine-dependent>");
+    // Pin stable provenance instead of discarding the entire additive freshness contract.
+    compatibility["freshness"] = json!({
+        "via": status["freshness"]["via"],
+        "source": status["freshness"]["source"],
+        "claims_cached": status["freshness"]["claims_cached"],
+        "sections": {"claims": {
+            "source": status["freshness"]["sections"]["claims"]["source"],
+            "available": status["freshness"]["sections"]["claims"]["available"]
+        }}
+    });
+    let golden: Value =
+        serde_json::from_str(include_str!("status_compatibility_golden.json")).unwrap();
+    assert_eq!(compatibility, golden);
     assert!(server.seen("GET", "/api/v1/zones/lost").is_empty());
     assert_eq!(server.seen("GET", "/api/v1/zones/claims").len(), 1);
     let registry = server.seen("GET", "/api/v1/registry/items");
@@ -981,6 +1218,1418 @@ fn cloud_cli_status_json_keeps_its_existing_shape_without_fetching_lost_claims()
             .iter()
             .any(|seen| seen.path == "/api/v1/registry/items?status=review&limit=200")
     );
+}
+
+#[test]
+fn cloud_status_capability_filters_tasks_before_paging_for_direct_and_agent() {
+    for through_agent in [false, true] {
+        let server = Server::start();
+        {
+            let mut state = server.state.lock().unwrap();
+            state.registry_assignee_session = true;
+            state.registry_page_size = Some(2);
+            state.registry_items = (1..=132)
+                .map(|index| {
+                    json!({
+                        "id": format!("D-{index}"), "title": "unrelated review", "status": "review",
+                        "assignment": {"executor": "token:ab:other", "released_at": null}
+                    })
+                })
+                .collect();
+            for (id, status) in [(1000, "active"), (1001, "review")] {
+                state.registry_items.push(json!({
+                    "id": format!("D-{id}"), "title": "my task", "status": status,
+                    "assignment": {"executor": "token:ab:alice", "session": "not-alice", "released_at": null}
+                }));
+            }
+        }
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        let _agent = through_agent.then(|| start_agent(dir.path(), runtime.path()));
+        let status = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+        assert_eq!(
+            status["freshness"]["assignment_filter"], "server",
+            "{status}"
+        );
+        assert_eq!(
+            status["freshness"]["via"],
+            if through_agent { "agent" } else { "direct" },
+            "{status}"
+        );
+        let ids = status["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["D-1000", "D-1001"]);
+        let registry = server.seen("GET", "/api/v1/registry/items");
+        assert_eq!(registry.len(), 2, "{registry:?}");
+        for stage in ["active", "review"] {
+            assert!(
+                registry.iter().any(|request| {
+                    query_value(&request.path, "status").as_deref() == Some(stage)
+                        && query_value(&request.path, "assignee_session").as_deref()
+                            == Some("alice")
+                        && query_value(&request.path, "cursor").is_none()
+                }),
+                "one filtered page for {stage}: {registry:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cloud_status_capability_http_headers_preserve_full_fallback_and_local_filtering() {
+    for scenario in [
+        "absent",
+        "missing_header",
+        "ignored",
+        "header_only",
+        "filtered_rate_limit",
+        "rate_limit_deadline",
+        "protocol_drop",
+        "protocol_header_only",
+    ] {
+        let server = Server::start();
+        {
+            let mut state = server.state.lock().unwrap();
+            state.registry_assignee_session = scenario != "absent";
+            state.registry_assignee_protocol_hidden =
+                matches!(scenario, "header_only" | "protocol_header_only");
+            state.registry_assignee_protocol_header_hidden = scenario == "header_only";
+            state.registry_assignee_header_hidden = matches!(
+                scenario,
+                "missing_header" | "filtered_rate_limit" | "rate_limit_deadline"
+            );
+            state.registry_assignee_filter_ignored = scenario == "ignored";
+            state.refuse_filtered_registry_once = match scenario {
+                "filtered_rate_limit" | "rate_limit_deadline" => Some((
+                    429,
+                    json!({
+                        "code": "rate_limited", "status": 429, "detail": "one-shot limit"
+                    }),
+                )),
+                "protocol_drop" => Some((
+                    400,
+                    json!({
+                        "code": "protocol_unsupported", "status": 400, "detail": "rediscover capabilities"
+                    }),
+                )),
+                _ => None,
+            };
+            state.registry_hide_protocol_on_refusal = scenario == "protocol_drop";
+            state.registry_page_size = Some(2);
+            for (stage_index, stage) in ["active", "review"].into_iter().enumerate() {
+                for index in 1..=3 {
+                    state.registry_items.push(json!({
+                        "id": format!("D-{}", stage_index * 3 + index),
+                        "title": "unrelated task", "status": stage,
+                        "assignment": {"executor": "token:ab:other", "released_at": null}
+                    }));
+                }
+                state.registry_items.push(json!({
+                    "id": format!("D-{}", 1000 + stage_index),
+                    "title": "my last-page task", "status": stage,
+                    "assignment": {"executor": "token:ab:alice", "session": "wrong", "released_at": null}
+                }));
+            }
+        }
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let output = if scenario == "rate_limit_deadline" {
+            binary(dir.path(), runtime.path())
+                .args(["--json", "status"])
+                .env("LOCKYARD_AGENT", "alice")
+                .env("LOCKYARD_TOKEN", "test-token")
+                .env("LOCKYARD_STATUS_DEADLINE_MS", "500")
+                .output()
+                .unwrap()
+        } else {
+            cli(dir.path(), runtime.path(), &["--json", "status"])
+        };
+        if scenario == "rate_limit_deadline" {
+            assert!(
+                !output.status.success(),
+                "an unaffordable Retry-After must fail closed"
+            );
+            let registry = server.seen("GET", "/api/v1/registry/items");
+            let active = registry
+                .iter()
+                .filter(|request| query_value(&request.path, "status").as_deref() == Some("active"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                active.len(),
+                1,
+                "no active-chain retry fits the deadline: {registry:?}"
+            );
+            assert_eq!(
+                active[0].path,
+                "/api/v1/registry/items?status=active&limit=200&assignee_session=alice",
+                "no active-chain unfiltered replay may bypass Retry-After"
+            );
+            continue;
+        }
+        let status = json_of(&output);
+        if scenario == "filtered_rate_limit" {
+            assert!(
+                started.elapsed() >= Duration::from_secs(1),
+                "unfiltered replay must honor the mock's full Retry-After: 1"
+            );
+        }
+        assert_eq!(
+            status["freshness"]["assignment_filter"],
+            if matches!(scenario, "ignored" | "protocol_header_only") {
+                "server"
+            } else {
+                "client_fallback"
+            },
+            "{scenario}: {status}"
+        );
+        let ids = status["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["D-1000", "D-1001"], "{scenario}: {status}");
+        let active = "/api/v1/registry/items?status=active&limit=200";
+        let review = "/api/v1/registry/items?status=review&limit=200";
+        let active_filtered = format!("{active}&assignee_session=alice");
+        let review_filtered = format!("{review}&assignee_session=alice");
+        let expected = match scenario {
+            "absent" => vec![
+                active.to_string(),
+                format!("{active}&cursor=2"),
+                review.to_string(),
+                format!("{review}&cursor=2"),
+            ],
+            "missing_header" | "filtered_rate_limit" | "protocol_drop" => vec![
+                active_filtered,
+                active.to_string(),
+                format!("{active}&cursor=2"),
+                review.to_string(),
+                format!("{review}&cursor=2"),
+            ],
+            "ignored" => vec![
+                active_filtered.clone(),
+                format!("{active_filtered}&cursor=2"),
+                review_filtered.clone(),
+                format!("{review_filtered}&cursor=2"),
+            ],
+            "header_only" => vec![
+                active.to_string(),
+                format!("{active}&cursor=2"),
+                review_filtered,
+            ],
+            "protocol_header_only" => vec![active_filtered, review_filtered],
+            _ => unreachable!(),
+        };
+        let registry = server.seen("GET", "/api/v1/registry/items");
+        let paths = registry
+            .iter()
+            .map(|request| request.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, expected, "{scenario}");
+        if matches!(scenario, "filtered_rate_limit" | "protocol_drop") {
+            assert_eq!(
+                registry
+                    .iter()
+                    .filter(|request| request.path.contains("assignee_session="))
+                    .count(),
+                1,
+                "an unconfirmed error or lost negotiated capability must stop filtered retries: {scenario}"
+            );
+            assert_eq!(
+                server.seen("GET", "/api/v1/protocol").len(),
+                if scenario == "protocol_drop" { 2 } else { 1 },
+                "{scenario}"
+            );
+        }
+        if scenario == "absent" {
+            assert!(
+                server
+                    .state
+                    .lock()
+                    .unwrap()
+                    .seen
+                    .iter()
+                    .all(|request| { !request.path.contains("assignee_session=") }),
+                "an unannounced capability must never be probed"
+            );
+        }
+    }
+}
+
+#[test]
+fn cloud_status_direct_reads_claims_first_then_each_section_in_turn_on_one_connection() {
+    let server = Server::start();
+    server.state.lock().unwrap().latency.response = Duration::from_millis(120);
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    let state = server.state.lock().unwrap();
+    let events = &state.status_read_events;
+    assert_eq!(events.len(), 10, "exactly five status reads: {events:?}");
+    assert_eq!(
+        events[0],
+        ("/api/v1/zones/claims?session=alice".into(), true)
+    );
+    assert_eq!(
+        events[1],
+        ("/api/v1/zones/claims?session=alice".into(), false)
+    );
+    // A one-shot direct client holds one pooled connection after the claims read. Overlapping the
+    // four follow-ups made each open its own connection (review round 3: 4 connections per call
+    // and a slower cold p95 than 0.3.6), so they now run in turn; the agent still overlaps them.
+    for pair in events[2..].chunks(2) {
+        assert_eq!(
+            pair[0].0, pair[1].0,
+            "a read must finish before the next begins: {events:?}"
+        );
+        assert!(pair[0].1 && !pair[1].1, "{events:?}");
+    }
+    assert_eq!(state.max_status_reads_in_flight, 1, "{events:?}");
+    let order: Vec<&str> = events[2..]
+        .iter()
+        .step_by(2)
+        .map(|(path, _)| path.as_str())
+        .collect();
+    assert!(
+        order[0].contains("/registry/") && order[1].contains("/registry/"),
+        "both task chains precede optional mail and work: {events:?}"
+    );
+}
+
+#[test]
+fn cloud_status_stalled_claims_fail_cleanly_before_three_seconds() {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.latency.stall_route = Some("/api/v1/zones/claims".into());
+        state.latency.stall = Duration::from_secs(10);
+    }
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let started = Instant::now();
+    let output = binary(dir.path(), runtime.path())
+        .args(["--json", "status"])
+        .env("LOCKYARD_AGENT", "alice")
+        .env("LOCKYARD_TOKEN", "test-token")
+        .env("LOCKYARD_STATUS_DEADLINE_MS", "2800")
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "status exceeded its hard deadline: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        !output.status.success(),
+        "stalled mandatory claims returned success: {output:?}"
+    );
+    let error = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    assert!(
+        error.contains("deadline") || error.contains("timed out") || error.contains("timeout"),
+        "unclear error: {output:?}"
+    );
+}
+
+#[test]
+fn cloud_status_absent_agent_falls_back_to_authoritative_network() {
+    let server = Server::start();
+    server.state.lock().unwrap().latency = modelled_bad_link();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let started = Instant::now();
+    let status = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    // Cold TCP/TLS/discovery are paid on the first connection. This must succeed on the same
+    // bad-link model as the benchmark, rather than only on an unimpaired localhost server.
+    assert!(
+        started.elapsed() < Duration::from_millis(6500),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(status["freshness"]["via"], "direct");
+    assert_eq!(status["freshness"]["claims_cached"], false);
+    assert_eq!(server.seen("GET", "/api/v1/zones/claims").len(), 1);
+}
+
+#[test]
+fn cloud_status_hung_agent_falls_back_within_the_probe_budget() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(socket(runtime.path()).parent().unwrap()).unwrap();
+    std::fs::set_permissions(
+        socket(runtime.path()).parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let listener = UnixListener::bind(socket(runtime.path())).unwrap();
+    let accepted = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&accepted);
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            seen.store(true, Ordering::Relaxed);
+            thread::spawn(move || {
+                let _held_open = stream;
+                thread::sleep(Duration::from_secs(5));
+            });
+        }
+    });
+    let started = Instant::now();
+    json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "hung agent consumed the status budget: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        accepted.load(Ordering::Relaxed),
+        "test did not reach the hung socket"
+    );
+    assert_eq!(server.seen("GET", "/api/v1/zones/claims").len(), 1);
+}
+
+#[test]
+fn cloud_status_hung_aggregate_falls_back_to_authoritative_direct_reads() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let server = Server::start();
+    server.state.lock().unwrap().latency = modelled_bad_link();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let folder = socket(runtime.path()).parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(socket(runtime.path())).unwrap();
+    let aggregate_accepted = Arc::new(AtomicBool::new(false));
+    let accepted = Arc::clone(&aggregate_accepted);
+    let url = server.url.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(2).flatten() {
+            let mut stream = stream;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            match request["op"].as_str().unwrap() {
+                "ping" => {
+                    let reply = json!({"status": {
+                        "url": url, "workspace": "team",
+                        "token_id": lockyard_cloud_client::token_id("test-token"),
+                        "status_read_v1": true, "pid": 1, "view_fresh": false,
+                        "view_age_ms": null, "claims": 0, "board": 0, "sessions": 0,
+                        "outbox": 0, "coordination_seq": 0, "registry_seq": 0
+                    }});
+                    writeln!(stream, "{reply}").unwrap();
+                }
+                "status_read" => {
+                    assert_eq!(request["session"], "alice");
+                    assert!(
+                        request["deadline_ms"]
+                            .as_u64()
+                            .is_some_and(|ms| ms > 0 && ms <= 1500)
+                    );
+                    accepted.store(true, Ordering::SeqCst);
+                    // Ping succeeds, but the subsequent aggregate never answers inside its
+                    // 1.5-second budget. Keep the connection open to exercise timeout fallback.
+                    thread::sleep(Duration::from_secs(4));
+                }
+                operation => panic!("unexpected fake-agent operation: {operation}"),
+            }
+        }
+    });
+
+    // This test isolates the aggregate timeout/fallback. Post-link OS image verification can
+    // happen before main starts; the benchmark deliberately retains that raw cold-start cost.
+    json_of(&cli(dir.path(), runtime.path(), &["--json", "about"]));
+    let started = Instant::now();
+    let status = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    let elapsed = started.elapsed();
+    assert!(
+        aggregate_accepted.load(Ordering::SeqCst),
+        "aggregate request was not accepted"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1400),
+        "aggregate did not wait for its timeout: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(6500),
+        "aggregate fallback exceeded the status deadline: {elapsed:?}"
+    );
+    assert_eq!(status["freshness"]["via"], "direct");
+    assert_eq!(status["claims"], json!([]));
+    assert_eq!(status["tasks"], json!([]));
+    assert_eq!(server.seen("GET", "/api/v1/zones/claims").len(), 1);
+    assert_eq!(server.seen("GET", "/api/v1/registry/items").len(), 2);
+}
+
+#[test]
+fn cloud_status_cold_and_restarted_agent_succeeds_on_the_modelled_bad_link() {
+    let server = Server::start();
+    server.state.lock().unwrap().latency = modelled_bad_link();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    for restart in 0..2 {
+        {
+            let mut state = server.state.lock().unwrap();
+            state.claims = if restart == 0 {
+                vec![json!({"id":71,"session":"alice","paths":["src"],"meta":{},
+                    "fence":1,"expires_at":HOLD_EXPIRES_AT})]
+            } else {
+                vec![]
+            };
+        }
+        // Start the actual daemon, waiting only for its local Ping. Do not first run status or
+        // wait for its HTTP snapshots: this exercises a genuinely cold/newly restarted pool.
+        let agent = start_agent_until(dir.path(), runtime.path(), false);
+        let started = Instant::now();
+        let output = cli(dir.path(), runtime.path(), &["--json", "status"]);
+        let status = json_of(&output);
+        assert!(
+            started.elapsed() < Duration::from_millis(6500),
+            "first status after agent start exceeded the deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(
+                status["freshness"]["via"].as_str(),
+                Some("agent" | "direct")
+            ),
+            "{status}"
+        );
+        assert_eq!(status["freshness"]["claims_cached"], false, "{status}");
+        assert_eq!(
+            status["freshness"]["sections"]["claims"]["source"], "network",
+            "{status}"
+        );
+        assert_eq!(
+            status["claims"].as_array().unwrap().len(),
+            if restart == 0 { 1 } else { 0 },
+            "agent restart reused an old claims answer: {status}"
+        );
+        assert!(status["tasks"].is_array(), "{status}");
+        drop(agent);
+    }
+}
+
+#[test]
+fn cloud_status_running_agent_still_observes_claim_revocation() {
+    let server = Server::start();
+    server.state.lock().unwrap().claims = vec![json!({
+        "id": 71, "session": "alice", "paths": ["src"], "meta": {}, "fence": 1,
+        "expires_at": HOLD_EXPIRES_AT
+    })];
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let _agent = start_agent(dir.path(), runtime.path());
+    let before = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    assert_eq!(before["freshness"]["via"], "agent");
+    assert_eq!(before["claims"].as_array().unwrap().len(), 1);
+    server.state.lock().unwrap().claims.clear();
+    let after = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    assert_eq!(
+        after["claims"],
+        json!([]),
+        "revoked claim survived in daemon memory: {after}"
+    );
+}
+
+#[test]
+fn cloud_status_running_agent_preserves_tokenless_cli_support() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let _agent = start_agent(dir.path(), runtime.path());
+    let output = binary(dir.path(), runtime.path())
+        .args(["--json", "status"])
+        .env("LOCKYARD_AGENT", "alice")
+        .env_remove("LOCKYARD_TOKEN")
+        .env_remove("LOCKYARD_TOKEN_FILE")
+        .output()
+        .unwrap();
+    let status = json_of(&output);
+    assert_eq!(status["freshness"]["via"], "agent");
+    assert_eq!(status["claims"], json!([]));
+    assert_eq!(status["tasks"], json!([]));
+}
+
+#[test]
+fn cloud_status_expired_and_idle_released_claims_are_never_reported_held() {
+    for through_agent in [false, true] {
+        let server = Server::start();
+        server.state.lock().unwrap().claims = vec![
+            json!({"id": 71, "session": "alice", "paths": ["expired"], "meta": {},
+                "fence": 1, "expires_at": "2000-01-01T00:00:00Z"}),
+            json!({"id": 72, "session": "alice", "paths": ["idle"], "meta": {},
+                "fence": 1, "expires_at": HOLD_EXPIRES_AT, "idle_release_at": "2000-01-01T00:00:00Z"}),
+        ];
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        let _agent = through_agent.then(|| start_agent(dir.path(), runtime.path()));
+        let status = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+        assert_eq!(
+            status["claims"],
+            json!([]),
+            "expired claim reported as held: {status}"
+        );
+    }
+}
+
+#[test]
+fn cloud_status_outage_never_uses_the_agents_last_claim_snapshot() {
+    let server = Server::start();
+    server.state.lock().unwrap().claims = vec![json!({
+        "id": 71, "session": "alice", "paths": ["src"], "meta": {}, "fence": 1,
+        "expires_at": HOLD_EXPIRES_AT
+    })];
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let _agent = start_agent(dir.path(), runtime.path());
+    assert_eq!(
+        json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]))["claims"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    server.state.lock().unwrap().refuse_claims_get = Some((
+        503,
+        json!({"error": {"code": "unavailable", "message": "network gap"}}),
+    ));
+    let started = Instant::now();
+    let output = cli(dir.path(), runtime.path(), &["--json", "status"]);
+    assert!(
+        !output.status.success(),
+        "last snapshot accepted during network gap: {output:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
+fn cloud_status_task_assignees_and_stop_stages_are_preserved() {
+    for through_agent in [false, true] {
+        let server = Server::start();
+        let item = |id: &str, stage: &str, executor: &str| {
+            json!({
+                "id": id, "title": id, "body": "", "status": stage, "version": 1,
+                "created_by": "token:ab:writer", "assignment": {"executor": executor,
+                "lease_expires_at": HOLD_EXPIRES_AT}, "evidence": []
+            })
+        };
+        server.state.lock().unwrap().registry_items = vec![
+            item("D-41", "active", "token:ab:alice"),
+            item("D-42", "review", "token:ab:alice"),
+            item("D-43", "review", "token:ab:other"),
+            item("D-44", "ready", "token:ab:alice"),
+        ];
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        let _agent = through_agent.then(|| start_agent(dir.path(), runtime.path()));
+        let status = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+        let tasks = status["tasks"].as_array().unwrap();
+        assert_eq!(
+            tasks.len(),
+            2,
+            "foreign or non-assigned stage included: {status}"
+        );
+        assert_eq!(tasks[0]["id"], "D-41");
+        assert_eq!(tasks[0]["assignee"], "alice");
+        assert_eq!(tasks[0]["stage"], "active");
+        assert_eq!(tasks[1]["id"], "D-42");
+        assert_eq!(tasks[1]["stage"], "review");
+    }
+}
+
+#[test]
+fn cloud_status_unconfirmed_tasks_fail_instead_of_looking_empty() {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.latency.stall_route = Some("/api/v1/registry/items".into());
+        state.latency.stall = Duration::from_secs(10);
+    }
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let started = Instant::now();
+    let output = binary(dir.path(), runtime.path())
+        .args(["--json", "status"])
+        .env("LOCKYARD_AGENT", "alice")
+        .env("LOCKYARD_TOKEN", "test-token")
+        .env("LOCKYARD_STATUS_DEADLINE_MS", "2800")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "Stop hook would mistake unconfirmed tasks for none: {output:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
+fn cloud_status_optional_failures_are_explicit_and_keep_existing_json_fields() {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        let refusal = Some((
+            403,
+            json!({"error": {"code": "forbidden", "message": "mail/work unavailable"}}),
+        ));
+        state.refuse_inbox_get = refusal.clone();
+        state.refuse_work_get = refusal;
+    }
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let status = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    assert!(status["claims"].is_array());
+    assert!(status["tasks"].is_array());
+    assert!(status.get("unread").is_some());
+    assert!(status["unread"].is_null());
+    assert_eq!(status["work"], json!([]));
+    assert_eq!(
+        status["freshness"]["sections"]["unread"]["available"],
+        false
+    );
+    assert_eq!(status["freshness"]["sections"]["work"]["available"], false);
+}
+
+#[test]
+fn cloud_status_mail_has_the_remaining_deadline_instead_of_a_half_second_cutoff() {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.inbox = vec![json!({"id":7,"from_session":"bob","to":"alice","body":"read me"})];
+        state.latency.stall_route = Some("/api/v1/bus/inbox".into());
+        state.latency.stall = Duration::from_millis(800);
+    }
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let status = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    assert_eq!(
+        status["unread"], 1,
+        "slow mail was silently discarded: {status}"
+    );
+    assert_eq!(status["freshness"]["sections"]["unread"]["available"], true);
+}
+
+#[test]
+fn cloud_status_optional_mail_timeout_keeps_a_warm_agent_answer() {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.latency.response = Duration::from_millis(20);
+        state.latency.keep_alive = true;
+    }
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let _agent = start_agent(dir.path(), runtime.path());
+    let warm = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    assert_eq!(warm["freshness"]["via"], "agent");
+    {
+        let mut state = server.state.lock().unwrap();
+        state.latency.stall_route = Some("/api/v1/bus/inbox".into());
+        state.latency.stall = Duration::from_secs(2);
+    }
+    // Bob has no prior unread observation. Mail must use its whole remaining read budget,
+    // while leaving enough IPC time to deliver already-confirmed mandatory sections.
+    let started = Instant::now();
+    let output = binary(dir.path(), runtime.path())
+        .args(["--json", "status"])
+        .env("LOCKYARD_AGENT", "bob")
+        .env("LOCKYARD_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    let status = json_of(&output);
+    assert!(
+        started.elapsed() < Duration::from_millis(1900),
+        "optional mail forced an unnecessary direct fallback: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(status["freshness"]["via"], "agent", "{status}");
+    assert!(status["claims"].is_array(), "{status}");
+    assert!(status["tasks"].is_array(), "{status}");
+    assert_eq!(status["freshness"]["sections"]["claims"]["available"], true);
+    assert_eq!(
+        status["freshness"]["sections"]["tasks_active"]["available"],
+        true
+    );
+    assert_eq!(
+        status["freshness"]["sections"]["tasks_review"]["available"],
+        true
+    );
+    assert!(
+        status["unread"].is_null(),
+        "unknown mail must not become zero: {status}"
+    );
+    assert_eq!(
+        status["freshness"]["sections"]["unread"]["available"], false,
+        "{status}"
+    );
+    assert!(
+        status["freshness"]["sections"]["unread"]["elapsed_ms"]
+            .as_u64()
+            .is_some_and(|ms| ms >= 1000),
+        "mail must retain its remaining budget rather than the old 500 ms cutoff: {status}"
+    );
+    let state = server.state.lock().unwrap();
+    assert!(
+        state.status_read_starts.iter().any(|(path, session)| {
+            path == "/api/v1/bus/inbox" && session.as_deref() == Some("bob")
+        }),
+        "test did not actually start Bob's mail read"
+    );
+    assert!(
+        state.seen.iter().all(|request| {
+            request.path != "/api/v1/bus/inbox" || request.session.as_deref() != Some("bob")
+        }),
+        "mail unexpectedly completed before the deadline"
+    );
+    assert_eq!(
+        state
+            .seen
+            .iter()
+            .filter(|request| {
+                request.path.starts_with("/api/v1/registry/items?")
+                    && request.session.as_deref() == Some("bob")
+            })
+            .count(),
+        2,
+        "mandatory assigned-task reads must finish while mail is still pending"
+    );
+}
+
+#[test]
+fn cloud_status_rate_limiting_that_cannot_fit_fails_closed_and_names_the_cause() {
+    for refuse_claims in [true, false] {
+        let server = Server::start();
+        {
+            let mut state = server.state.lock().unwrap();
+            let refusal = Some((
+                429,
+                json!({"error":{"code":"rate_limited","message":"rate limiting test"}}),
+            ));
+            if refuse_claims {
+                state.refuse_claims_get = refusal;
+            } else {
+                state.refuse_registry_get = refusal;
+            }
+        }
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        // Still below Retry-After=1s + the required 1s request estimate, while allowing
+        // CLI setup on this constrained host. Client tests separately pin the 900ms case.
+        let output = binary(dir.path(), runtime.path())
+            .args(["--json", "status"])
+            .env("LOCKYARD_AGENT", "alice")
+            .env("LOCKYARD_TOKEN", "test-token")
+            .env("LOCKYARD_STATUS_DEADLINE_MS", "1900")
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "mandatory rate-limited read must fail: {output:?}"
+        );
+        let error = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        assert!(
+            error.contains("rate limit") || error.contains("rate_limit"),
+            "{error}"
+        );
+        let state = server.state.lock().unwrap();
+        let attempts = state
+            .seen
+            .iter()
+            .filter(|seen| {
+                seen.path.starts_with(if refuse_claims {
+                    "/api/v1/zones/claims"
+                } else {
+                    "/api/v1/registry/items"
+                })
+            })
+            .count();
+        assert_eq!(
+            attempts,
+            if refuse_claims { 1 } else { 2 },
+            "Retry-After=1 plus a request estimate cannot fit a 1900 ms deadline"
+        );
+    }
+}
+
+#[test]
+fn cloud_status_rate_limiting_retries_when_retry_after_fits_the_deadline() {
+    let server = Server::start();
+    server.state.lock().unwrap().refuse_claims_get_once = Some((
+        429,
+        json!({"error":{"code":"rate_limited","message":"retry shortly"}}),
+    ));
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let started = Instant::now();
+    let output = binary(dir.path(), runtime.path())
+        .args(["--json", "status"])
+        .env("LOCKYARD_AGENT", "alice")
+        .env("LOCKYARD_TOKEN", "test-token")
+        .env("LOCKYARD_STATUS_DEADLINE_MS", "2800")
+        .output()
+        .unwrap();
+    json_of(&output);
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "Retry-After was ignored"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "retry extended the deadline"
+    );
+    assert_eq!(server.seen("GET", "/api/v1/zones/claims").len(), 2);
+}
+
+#[test]
+fn cloud_status_ten_agent_callers_wait_with_bounded_http_workers() {
+    use std::os::unix::net::UnixStream;
+    use std::sync::Barrier;
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.latency.response = Duration::from_millis(120);
+        state.latency.keep_alive = true;
+    }
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let _agent = start_agent(dir.path(), runtime.path());
+    json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    let (requests_before, connections_before) = {
+        let mut state = server.state.lock().unwrap();
+        state.max_status_reads_in_flight = 0;
+        (
+            state
+                .status_read_events
+                .iter()
+                .filter(|(_, started)| *started)
+                .count(),
+            state.connections,
+        )
+    };
+    let barrier = Arc::new(Barrier::new(10));
+    thread::scope(|scope| {
+        let handles = (0..10)
+            .map(|index| {
+                let barrier = Arc::clone(&barrier);
+                let socket_path = socket(runtime.path());
+                scope.spawn(move || {
+                    let mut stream = UnixStream::connect(socket_path).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(7)))
+                        .unwrap();
+                    barrier.wait();
+                    writeln!(
+                        stream,
+                        "{}",
+                        json!({"workspace":"team", "op":"status_read",
+                    "session":format!("session-{index}"), "repository":null,"deadline_ms":2600})
+                    )
+                    .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(stream).read_line(&mut line).unwrap();
+                    let response: Value = serde_json::from_str(&line).unwrap();
+                    assert!(
+                        response.get("error").is_none_or(Value::is_null),
+                        "{response}"
+                    );
+                    let status = &response["status_read"];
+                    assert!(status["claims"].is_array(), "{response}");
+                    assert_eq!(status["freshness"]["claims_cached"], false, "{response}");
+                    assert_eq!(
+                        status["freshness"]["sections"]["claims"]["source"], "network",
+                        "{response}"
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+    let state = server.state.lock().unwrap();
+    assert!(
+        state.max_status_reads_in_flight <= 8,
+        "global HTTP cap was exceeded"
+    );
+    assert!(
+        state.connections - connections_before <= 8,
+        "queue must not open a connection per caller"
+    );
+    for index in 0..10 {
+        let session = format!("session-{index}");
+        assert_eq!(
+            state
+                .seen
+                .iter()
+                .filter(|seen| seen.path == format!("/api/v1/zones/claims?session=session-{index}"))
+                .count(),
+            1,
+            "each distinct session requires exactly one fresh claims read"
+        );
+        assert_eq!(
+            state
+                .status_read_starts
+                .iter()
+                .filter(
+                    |(_, observed_session)| observed_session.as_deref() == Some(session.as_str())
+                )
+                .count(),
+            5,
+            "each caller must use exactly five section reads, without repeated work"
+        );
+    }
+    let status_requests = state
+        .status_read_events
+        .iter()
+        .filter(|(_, started)| *started)
+        .count();
+    assert!(
+        status_requests - requests_before <= 60,
+        "read count exceeded exactly 50 caller reads plus at most 10 upkeep reads"
+    );
+}
+
+fn modelled_bad_link() -> Latency {
+    Latency {
+        connect: Duration::from_millis(80),
+        handshake: Duration::from_secs(1),
+        response: Duration::from_millis(300),
+        stall_every: 33,
+        stall: Duration::from_secs(1),
+        stall_route: None,
+        keep_alive: true,
+    }
+}
+
+/// Real executable benchmark, deliberately ignored in routine CI (about four minutes).
+///
+/// Run serially with two build jobs:
+/// `LOCKYARD_STATUS_BASELINE_BIN=/absolute/path/to/old/lockyard cargo test -p lockyard --test cloud status_latency_benchmark -j 2 -- --ignored --nocapture --test-threads=1`
+/// The baseline must be the pre-change binary. `LOCKYARD_STATUS_SAMPLES` defaults to 34.
+/// `LOCKYARD_STATUS_CASE` optionally selects comma-separated printed case labels; after cases
+/// need no baseline. To compare just the cold paths, select
+/// `before_sequential_direct,after_concurrent_direct,after_assignee_filtered_direct`.
+/// `LOCKYARD_STATUS_WARM_EXECUTABLE=1` explicitly runs `about` once before each measured case to
+/// diagnose OS executable-loading costs. The default continues to measure raw cold execution.
+/// The cancellation case kills twenty real CLI processes at 850 ms before measuring one hard
+/// caller, repeating once per sample. It adds a one-second claims-only stall during each soft
+/// phase so all twenty callers survive until killed, then restores the ordinary model. Reported
+/// cancellation-case requests/bytes include those soft bursts, divided by hard samples only.
+/// This HTTP mock models 300 ms RTT per request, 1 s TLS and 80 ms connect cost per
+/// accepted connection, with a 1 s retransmission-like stall every 33 requests (3.03%).
+/// Setup is an application-level delay, not real packet loss/TCP/TLS emulation.
+#[test]
+#[ignore = "opt-in latency benchmark; baseline case needs LOCKYARD_STATUS_BASELINE_BIN"]
+fn status_latency_benchmark() {
+    let selected = std::env::var("LOCKYARD_STATUS_CASE").ok();
+    let selected = selected
+        .as_deref()
+        .map(|labels| labels.split(',').collect::<Vec<_>>());
+    assert!(
+        selected
+            .as_ref()
+            .is_none_or(|labels| labels.iter().all(|label| matches!(
+                *label,
+                "before_sequential_direct"
+                    | "after_concurrent_direct"
+                    | "after_assignee_filtered_direct"
+                    | "after_warm_agent"
+                    | "after_ten_concurrent_agent"
+                    | "after_twenty_cancelled_soft_then_hard"
+            ))),
+        "LOCKYARD_STATUS_CASE must contain comma-separated printed case labels"
+    );
+    let runs = |label| {
+        selected
+            .as_ref()
+            .is_none_or(|labels| labels.contains(&label))
+    };
+    let samples = std::env::var("LOCKYARD_STATUS_SAMPLES")
+        .ok()
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(34);
+    assert!(samples >= 2);
+    let baseline = if runs("before_sequential_direct") {
+        let executable = std::env::var_os("LOCKYARD_STATUS_BASELINE_BIN")
+            .expect("set LOCKYARD_STATUS_BASELINE_BIN to the pre-change executable");
+        Some(latency_case(
+            "before_sequential_direct",
+            Some(Path::new(&executable)),
+            false,
+            samples,
+            1,
+            0,
+            false,
+        ))
+    } else {
+        None
+    };
+    let cold = if runs("after_concurrent_direct") {
+        Some(latency_case(
+            "after_concurrent_direct",
+            None,
+            false,
+            samples,
+            1,
+            0,
+            false,
+        ))
+    } else {
+        None
+    };
+    if runs("after_assignee_filtered_direct") {
+        latency_case(
+            "after_assignee_filtered_direct",
+            None,
+            false,
+            samples,
+            1,
+            0,
+            true,
+        );
+    }
+    if runs("after_warm_agent") {
+        latency_case("after_warm_agent", None, true, samples, 1, 0, false);
+    }
+    if runs("after_ten_concurrent_agent") {
+        latency_case(
+            "after_ten_concurrent_agent",
+            None,
+            true,
+            samples,
+            10,
+            0,
+            false,
+        );
+    }
+    if runs("after_twenty_cancelled_soft_then_hard") {
+        latency_case(
+            "after_twenty_cancelled_soft_then_hard",
+            None,
+            true,
+            samples,
+            1,
+            20,
+            false,
+        );
+    }
+    // Emit every case before comparing the cross-case acceptance threshold, so a failed
+    // cold percentile still leaves every selected diagnostic row.
+    if let (Some(baseline), Some(cold)) = (baseline, cold) {
+        assert!(
+            cold.p95 <= baseline.p95,
+            "cold direct p95 {:?} regressed from 0.3.6 {:?}",
+            cold.p95,
+            baseline.p95
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LatencyStats {
+    p95: Duration,
+}
+
+fn latency_case(
+    label: &str,
+    executable: Option<&Path>,
+    warm_agent: bool,
+    samples: usize,
+    callers: usize,
+    soft_callers_per_hard: usize,
+    registry_assignee_session: bool,
+) -> LatencyStats {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.latency = modelled_bad_link();
+        state.registry_assignee_session = registry_assignee_session;
+        // Keep the same 132 unrelated review items in every case. Capability-aware filtering
+        // removes them before paging; fallback cases still transfer the roughly 470 KB payload.
+        state.registry_items = (1..=132).map(|index| json!({
+            "id": format!("D-{index}"), "title": "foreign review", "body": "x".repeat(3200),
+            "status": "review", "version": 1, "target": "ci_passed",
+            "created_by": "token:ab:writer", "created_at": "2026-11-02T10:00:00+00:00",
+            "updated_at": "2026-11-02T10:00:00+00:00",
+            "assignment": {"executor": "token:ab:other", "lease_expires_at": HOLD_EXPIRES_AT},
+            "evidence": []
+        })).collect();
+    }
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let warmed_executable = std::env::var("LOCKYARD_STATUS_WARM_EXECUTABLE").as_deref() == Ok("1");
+    if warmed_executable {
+        let started = Instant::now();
+        let output = latency_command(dir.path(), runtime.path(), executable)
+            .args(["--json", "about"])
+            .env_remove("LOCKYARD_PERF_TRACE")
+            .output()
+            .unwrap();
+        json_of(&output);
+        eprintln!(
+            "status_latency {label} executable_warmup=about wall_ms={} measured=false",
+            started.elapsed().as_millis()
+        );
+    }
+    let _agent = warm_agent.then(|| start_agent(dir.path(), runtime.path()));
+    if warm_agent {
+        for _ in 0..5 {
+            json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+        }
+    }
+    let mut times = Vec::with_capacity(samples);
+    let mut failures = 0;
+    let (mut agent_routes, mut direct_routes) = (0, 0);
+    let mut soft_killed = 0;
+    let mut soft_completed_success = 0;
+    let mut soft_completed_failure = 0;
+    let mut soft_kill_max = Duration::ZERO;
+    let (bytes_before, requests_before, connections_before) = {
+        let mut state = server.state.lock().unwrap();
+        state.max_status_reads_in_flight = 0;
+        (
+            state.response_bytes,
+            state.requests_started,
+            state.connections,
+        )
+    };
+    // The concurrent case runs full groups of ten and reports its actual sample count.
+    let samples = samples.div_ceil(callers) * callers;
+    for batch in 0..samples / callers {
+        if soft_callers_per_hard > 0 {
+            assert_eq!(callers, 1, "one hard call must follow each soft burst");
+            // Keep every soft CLI alive until the hook's real 850 ms kill point. Only
+            // Claims GETs begun during this phase (including upkeep) receive an extra
+            // one-second stall. Restore the ordinary model before starting the hard caller.
+            // Existing HTTP reads retain the impairment captured at request start.
+            {
+                let mut state = server.state.lock().unwrap();
+                state.latency.stall_route = Some("/api/v1/zones/claims".to_string());
+                state.latency.stall = Duration::from_secs(1);
+            }
+            let mut children = (0..soft_callers_per_hard)
+                .map(|caller| {
+                    let started = Instant::now();
+                    let child = latency_command(dir.path(), runtime.path(), executable)
+                        .args(["--json", "status"])
+                        .env("LOCKYARD_AGENT", format!("soft-{caller}"))
+                        .env_remove("LOCKYARD_PERF_TRACE")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap();
+                    (started, child)
+                })
+                .collect::<Vec<_>>();
+            // Each child receives its own 850 ms budget, including executable startup.
+            for (started, child) in &mut children {
+                thread::sleep(Duration::from_millis(850).saturating_sub(started.elapsed()));
+                let already_done = child.try_wait().unwrap();
+                if already_done.is_none() {
+                    child.kill().unwrap();
+                    soft_kill_max = soft_kill_max.max(started.elapsed());
+                }
+                let status = child.wait().unwrap();
+                if status.success() {
+                    soft_completed_success += 1;
+                } else if already_done.is_some() || status.code().is_some() {
+                    soft_completed_failure += 1;
+                } else {
+                    soft_killed += 1;
+                }
+            }
+            server.state.lock().unwrap().latency = modelled_bad_link();
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(callers));
+        let results = thread::scope(|scope| {
+            let handles = (0..callers)
+                .map(|caller| {
+                    let index = batch * callers + caller;
+                    let mut command = latency_command(dir.path(), runtime.path(), executable);
+                    if callers > 1 {
+                        command.env("LOCKYARD_AGENT", format!("parallel-{caller}"));
+                    }
+                    if index == 0 {
+                        command.env("LOCKYARD_PERF_TRACE", "1");
+                    } else {
+                        command.env_remove("LOCKYARD_PERF_TRACE");
+                    }
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let started = Instant::now();
+                        let output = command.args(["--json", "status"]).output().unwrap();
+                        (index, started.elapsed(), output)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for (index, wall, output) in results {
+            times.push(wall);
+            if soft_callers_per_hard > 0 {
+                assert!(
+                    wall < Duration::from_secs(8),
+                    "hard caller exceeded the hook's eight-second wall bound after soft cancellation: {wall:?}"
+                );
+            }
+            if index == 0 {
+                eprintln!(
+                    "status_latency {label} first_call firstwall_ms={} perf={:?}",
+                    wall.as_millis(),
+                    String::from_utf8_lossy(&output.stderr)
+                        .lines()
+                        .filter(|line| line.starts_with("perf_span "))
+                        .collect::<Vec<_>>()
+                );
+            }
+            if output.status.success() {
+                let value = json_of(&output);
+                assert_eq!(value["claims"], json!([]));
+                assert_eq!(value["tasks"], json!([]));
+                if executable.is_none() {
+                    if registry_assignee_session {
+                        assert_eq!(value["freshness"]["assignment_filter"], "server", "{value}");
+                    }
+                    assert_eq!(value["freshness"]["claims_cached"], false);
+                    assert_eq!(
+                        value["freshness"]["sections"]["claims"]["source"],
+                        "network"
+                    );
+                    match value["freshness"]["via"].as_str() {
+                        Some("agent") => agent_routes += 1,
+                        Some("direct") => direct_routes += 1,
+                        route => panic!("unexpected status route: {route:?}"),
+                    }
+                }
+            } else {
+                failures += 1;
+                eprintln!(
+                    "status_latency {label} sample={index} wall_ms={} failure={}",
+                    wall.as_millis(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            if index == 0 && !warm_agent {
+                let state = server.state.lock().unwrap();
+                eprintln!(
+                    "status_latency {label} first_call setup_cost_ms_per_connection=1080 connections={} request_ms={:?}",
+                    state.connections,
+                    state
+                        .request_timings
+                        .iter()
+                        .map(|(path, duration)| (path, duration.as_millis()))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+    times.sort_unstable();
+    let p50 = times[samples / 2];
+    let p95 = times[(samples * 95 / 100).min(samples - 1)];
+    let state = server.state.lock().unwrap();
+    if registry_assignee_session {
+        let registry = state
+            .seen
+            .iter()
+            .filter(|request| {
+                request.method == "GET" && request.path.starts_with("/api/v1/registry/items?")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(registry.len(), samples * 2, "two task chains per call");
+        assert!(
+            registry.iter().all(|request| {
+                query_value(&request.path, "assignee_session").as_deref() == Some("alice")
+                    && query_value(&request.path, "cursor").is_none()
+            }),
+            "{registry:?}"
+        );
+    }
+    eprintln!(
+        "status_latency {label} samples={samples} callers={callers} warmed_executable={warmed_executable} p50_ms={} p95_ms={} max_ms={} failures={} server_body_bytes_per_call={} requests_per_call={:.2} new_connections={} concurrent_reads={} agent_routes={agent_routes} direct_routes={direct_routes} soft_callers_per_hard={soft_callers_per_hard} soft_killed={soft_killed} soft_completed_success={soft_completed_success} soft_completed_failure={soft_completed_failure} soft_kill_target_ms=850 soft_kill_max_ms={} soft_claim_stall_ms={}",
+        p50.as_millis(),
+        p95.as_millis(),
+        times.last().unwrap().as_millis(),
+        failures,
+        (state.response_bytes - bytes_before) / samples,
+        (state.requests_started - requests_before) as f64 / samples as f64,
+        state.connections - connections_before,
+        state.max_status_reads_in_flight,
+        soft_kill_max.as_millis(),
+        if soft_callers_per_hard > 0 { 1000 } else { 0 }
+    );
+    assert_eq!(
+        failures, 0,
+        "{label}: every sample must confirm mandatory claims/tasks"
+    );
+    if soft_callers_per_hard > 0 {
+        assert_eq!(
+            soft_killed,
+            samples * soft_callers_per_hard,
+            "the cancellation row requires every soft CLI to remain alive until killed"
+        );
+        assert_eq!(soft_completed_success, 0);
+        assert_eq!(soft_completed_failure, 0);
+    }
+    if warm_agent && callers == 1 && soft_callers_per_hard == 0 {
+        assert_eq!(
+            agent_routes, samples,
+            "warm calls must stay on the agent route"
+        );
+        assert!(
+            p50 <= Duration::from_millis(500),
+            "warm p50 {p50:?} exceeds 500 ms"
+        );
+        assert!(
+            p95 <= Duration::from_millis(1500),
+            "warm p95 {p95:?} exceeds 1500 ms"
+        );
+        assert!(*times.last().unwrap() < Duration::from_secs(3));
+    }
+    LatencyStats { p95 }
+}
+
+fn latency_command(dir: &Path, runtime: &Path, executable: Option<&Path>) -> Command {
+    let mut command = binary(dir, runtime);
+    if let Some(executable) = executable {
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(|value| value.to_os_string())))
+            .collect::<Vec<_>>();
+        command = Command::new(executable);
+        command.current_dir(dir);
+        for (key, value) in envs {
+            if let Some(value) = value {
+                command.env(key, value);
+            } else {
+                command.env_remove(key);
+            }
+        }
+    }
+    command
+        .env("LOCKYARD_AGENT", "alice")
+        .env("LOCKYARD_TOKEN", "test-token");
+    command
 }
 
 #[test]
@@ -1578,6 +3227,10 @@ impl Drop for Agent {
 }
 
 fn start_agent(dir: &Path, runtime: &Path) -> Agent {
+    start_agent_until(dir, runtime, true)
+}
+
+fn start_agent_until(dir: &Path, runtime: &Path, wait_for_view: bool) -> Agent {
     let child = binary(dir, runtime)
         .arg("agent")
         .env("LOCKYARD_TOKEN", "test-token")
@@ -1588,7 +3241,7 @@ fn start_agent(dir: &Path, runtime: &Path) -> Agent {
     loop {
         let status = cli(dir, runtime, &["--json", "agent", "status"]);
         let status = json_of(&status);
-        if status["status"]["view_fresh"] == true {
+        if status["running"] == true && (!wait_for_view || status["status"]["view_fresh"] == true) {
             return agent;
         }
         assert!(Instant::now() < end, "the agent never became ready");

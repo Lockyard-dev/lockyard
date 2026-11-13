@@ -620,7 +620,7 @@ fn cli_status_json_keeps_its_fields_and_does_not_request_lost_claims() {
         if cloud {
             assert_eq!(out.json["offers"], json!([]));
             assert_eq!(out.json["work"], json!([]));
-            expected.extend(["offers", "work"]);
+            expected.extend(["offers", "work", "freshness"]);
             expected.sort_unstable();
         }
         assert_eq!(keys, expected);

@@ -14,6 +14,7 @@ pub struct Reply {
     status: u16,
     body: String,
     headers: Vec<(String, String)>,
+    delay: std::time::Duration,
 }
 
 impl Reply {
@@ -26,11 +27,17 @@ impl Reply {
             status,
             body: body.to_string(),
             headers: Vec::new(),
+            delay: std::time::Duration::ZERO,
         }
     }
 
     pub fn header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    pub fn delay(mut self, delay: std::time::Duration) -> Self {
+        self.delay = delay;
         self
     }
 }
@@ -143,7 +150,9 @@ fn answer(mut stream: TcpStream, log: &Mutex<Vec<Seen>>, script: &Mutex<VecDeque
         status: 200,
         body: "{}".into(),
         headers: Vec::new(),
+        delay: std::time::Duration::ZERO,
     });
+    std::thread::sleep(reply.delay);
     if let Some(protocol) = protocol
         && !reply
             .headers

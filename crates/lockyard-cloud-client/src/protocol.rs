@@ -1,7 +1,7 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
 //! HTTP generation negotiation is independent of RPC frames and package versions.
-use crate::{ApiError, Call, Client, ClientError, Failure, WorkspaceEncryption};
+use crate::{ApiError, Call, Cancellation, Client, ClientError, Failure, WorkspaceEncryption};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 const DISCOVERY: &str = "/api/v1/protocol";
 const CACHE_TTL: Duration = Duration::from_secs(30);
+const MAX_STATUS_PROTOCOL_HINT_BYTES: u64 = 16 * 1024;
 const MAX_PENDING: usize = 128;
 const MAX_PENDING_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -109,6 +110,133 @@ impl std::fmt::Debug for PendingWrite {
 pub(crate) struct CachedProtocol {
     value: NegotiatedProtocol,
     obtained: Instant,
+}
+
+/// A negotiation hint only: no workspace policy, claims, mail, work or assignments are stored.
+/// Both clocks must agree that it is younger than CACHE_TTL. Prefer a native boot identity;
+/// sandboxed macOS may instead compare the wall-minus-monotonic boot estimate within one second.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatusProtocolClock {
+    boot: String,
+    wall_ms: u64,
+    monotonic_ms: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatusProtocolHint {
+    version: u16,
+    origin: String,
+    credential_scope: String,
+    clock: StatusProtocolClock,
+    protocol: NegotiatedProtocol,
+}
+
+fn modern_status_protocol(protocol: &NegotiatedProtocol) -> bool {
+    protocol.selected == 2
+        && !protocol.legacy
+        && protocol.capabilities.len() <= 64
+        && protocol.capabilities.iter().all(|capability| {
+            !capability.is_empty()
+                && capability.len() <= 64
+                && capability
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+}
+
+fn status_protocol_age(
+    observed: &StatusProtocolClock,
+    current: &StatusProtocolClock,
+) -> Option<Duration> {
+    if observed.boot != current.boot {
+        return None;
+    }
+    if observed.boot == "clock-estimate" {
+        let previous_boot = observed.wall_ms.checked_sub(observed.monotonic_ms)?;
+        let current_boot = current.wall_ms.checked_sub(current.monotonic_ms)?;
+        if previous_boot.abs_diff(current_boot) > 1000 {
+            return None;
+        }
+    }
+    let wall = current.wall_ms.checked_sub(observed.wall_ms)?;
+    let monotonic = current.monotonic_ms.checked_sub(observed.monotonic_ms)?;
+    let age = Duration::from_millis(wall.max(monotonic));
+    (age < CACHE_TTL).then_some(age)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn status_protocol_clock() -> Option<StatusProtocolClock> {
+    let wall_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis(),
+    )
+    .ok()?;
+    let mut clock = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    #[cfg(target_os = "linux")]
+    let clock_id = libc::CLOCK_BOOTTIME;
+    #[cfg(target_os = "macos")]
+    let clock_id = libc::CLOCK_MONOTONIC;
+    if unsafe { libc::clock_gettime(clock_id, clock.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let clock = unsafe { clock.assume_init() };
+    let monotonic_ms = u64::try_from(clock.tv_sec)
+        .ok()?
+        .checked_mul(1000)?
+        .checked_add(u64::try_from(clock.tv_nsec).ok()? / 1_000_000)?;
+    #[cfg(target_os = "linux")]
+    let boot = {
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        let boot = boot.trim();
+        if boot.len() != 36
+            || !boot
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+        {
+            return None;
+        }
+        boot.to_owned()
+    };
+    #[cfg(target_os = "macos")]
+    let boot = {
+        let mut boot = std::mem::MaybeUninit::<libc::timeval>::uninit();
+        let mut size = std::mem::size_of::<libc::timeval>();
+        let available = unsafe {
+            libc::sysctlbyname(
+                c"kern.boottime".as_ptr(),
+                boot.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0
+            && size == std::mem::size_of::<libc::timeval>();
+        if available {
+            let boot = unsafe { boot.assume_init() };
+            format!("{}:{}", boot.tv_sec, boot.tv_usec)
+        } else {
+            // The native boot sysctl can be denied inside a sandbox. This is only a modern
+            // version hint: both age clocks and the boot estimate must still agree, and the
+            // server must confirm the version on the next live policy/data response. A very
+            // short reboot with indistinguishable clocks may reuse this hint, never data.
+            "clock-estimate".into()
+        }
+    };
+    Some(StatusProtocolClock {
+        boot,
+        wall_ms,
+        monotonic_ms,
+    })
+}
+
+// Missing a tested native boot identity disables only this optional optimization.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn status_protocol_clock() -> Option<StatusProtocolClock> {
+    None
 }
 
 #[derive(Default)]
@@ -403,6 +531,100 @@ fn pre_execution_refusal(error: &ClientError) -> bool {
 }
 
 impl Client {
+    /// Opt into a private, 30-second modern negotiation hint for status-only clients. Live
+    /// encryption policy and every response's protocol/repository echo remain mandatory.
+    /// A missing, unsafe, stale or unreadable hint is simply a normal discovery cache miss.
+    pub fn with_status_protocol_cache(mut self) -> Self {
+        let Some(directory) = self.pending_journal.as_ref() else {
+            return self;
+        };
+        if status_protocol_clock().is_none() || private_directory(directory).is_err() {
+            return self;
+        }
+        let path = directory.join("status-protocol.cache");
+        if let Some(cached) = self.load_status_protocol_hint(&path) {
+            self.protocol_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cached = Some(cached);
+        }
+        self.status_protocol_cache = Some(path);
+        self
+    }
+
+    fn load_status_protocol_hint(&self, path: &Path) -> Option<CachedProtocol> {
+        use std::io::Read;
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        private_file(&metadata).ok()?;
+        if metadata.len() > MAX_STATUS_PROTOCOL_HINT_BYTES {
+            return None;
+        }
+        let mut options = StateOpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options.open(path).ok()?;
+        private_file(&file.metadata().ok()?).ok()?;
+        let mut bytes = Vec::new();
+        file.take(MAX_STATUS_PROTOCOL_HINT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > MAX_STATUS_PROTOCOL_HINT_BYTES {
+            return None;
+        }
+        let hint: StatusProtocolHint =
+            serde_json::from_value(strict_json(std::str::from_utf8(&bytes).ok()?).ok()?).ok()?;
+        if hint.version != 1
+            || hint.origin != self.base_url
+            || hint.credential_scope != crate::credential_fingerprint(&self.token)
+            || !modern_status_protocol(&hint.protocol)
+        {
+            return None;
+        }
+        let age = status_protocol_age(&hint.clock, &status_protocol_clock()?)?;
+        Some(CachedProtocol {
+            value: hint.protocol,
+            obtained: Instant::now().checked_sub(age)?,
+        })
+    }
+
+    fn save_status_protocol_hint(&self, protocol: &NegotiatedProtocol) {
+        let Some(path) = &self.status_protocol_cache else {
+            return;
+        };
+        let Some(clock) = status_protocol_clock() else {
+            return;
+        };
+        if !modern_status_protocol(protocol) {
+            return;
+        }
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if private_directory(parent).is_err() {
+            return;
+        }
+        let hint = StatusProtocolHint {
+            version: 1,
+            origin: self.base_url.clone(),
+            credential_scope: crate::credential_fingerprint(&self.token),
+            clock,
+            protocol: protocol.clone(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&hint) {
+            let _ = lockyard_core::fsio::replace(path, &bytes, 0o600);
+        }
+    }
+
+    fn invalidate_status_protocol_hint(&self) {
+        if let Some(path) = &self.status_protocol_cache {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     pub(crate) fn encryption_context(&self) -> String {
         crate::credential_fingerprint(
             &serde_json::to_string(&(
@@ -731,7 +953,7 @@ impl Client {
 
     /// Resolve the current generation without performing any write or changing origin.
     pub fn negotiated_protocol(&self, session: &str) -> Result<NegotiatedProtocol, ClientError> {
-        self.discover(session, None)
+        self.discover(session, None, None)
     }
 
     pub(crate) fn refresh_protocol(
@@ -742,25 +964,51 @@ impl Client {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .cached = None;
-        self.discover(session, None)
+        self.discover(session, None, None)
     }
 
     fn discover(
         &self,
         session: &str,
         remaining: Option<Duration>,
+        cancellation: Option<&Cancellation>,
     ) -> Result<NegotiatedProtocol, ClientError> {
         let started = Instant::now();
-        let mut state = self
-            .protocol_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Discovery is shared by concurrent status workers. Waiting for another thread's
+        // discovery is part of this caller's deadline, including a long unrelated request.
+        let mut state = if remaining.is_some() || cancellation.is_some() {
+            loop {
+                if let Some(cancellation) = cancellation {
+                    cancellation.check()?;
+                }
+                match self.protocol_state.try_lock() {
+                    Ok(state) => break state,
+                    Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        let left = remaining
+                            .map(|limit| limit.saturating_sub(started.elapsed()))
+                            .unwrap_or(Duration::from_millis(1));
+                        if left.is_zero() {
+                            return Err(ClientError::Transport(
+                                "call deadline elapsed waiting for discovery".into(),
+                            ));
+                        }
+                        std::thread::sleep(left.min(Duration::from_millis(1)));
+                    }
+                }
+            }
+        } else {
+            self.protocol_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
         if let Some(cached) = &state.cached
             && cached.obtained.elapsed() < CACHE_TTL
         {
             return Ok(cached.value.clone());
         }
-        let call = Call::get(session, DISCOVERY.into());
+        let mut call = Call::get(session, DISCOVERY.into());
+        call.cancellation = cancellation.cloned();
         let mut selected = 2;
         for attempt in 0..2 {
             let budget = remaining.map(|limit| limit.saturating_sub(started.elapsed()));
@@ -769,15 +1017,23 @@ impl Client {
                     "call deadline elapsed during discovery".into(),
                 ));
             }
-            let result = self.attempt(
+            let capability = std::sync::atomic::AtomicBool::new(true);
+            let result = self.attempt_observed(
                 &call,
                 None,
                 budget,
                 &NegotiatedProtocol::candidate(selected),
+                Some(&capability),
             );
             match result {
                 Ok(value) => {
-                    let result = parse_discovery(value, selected)?;
+                    let mut result = parse_discovery(value, selected)?;
+                    if capability.load(std::sync::atomic::Ordering::Relaxed) {
+                        result
+                            .capabilities
+                            .insert(crate::REGISTRY_ASSIGNEE_SESSION.into());
+                    }
+                    self.save_status_protocol_hint(&result);
                     state.cached = Some(CachedProtocol {
                         value: result.clone(),
                         obtained: Instant::now(),
@@ -831,7 +1087,14 @@ impl Client {
                         capabilities: BTreeSet::new(),
                         legacy: true,
                     };
-                    let probe = Call::get(session, crate::ENCRYPTION_PATH.into());
+                    let mut probe = Call::get(session, crate::ENCRYPTION_PATH.into());
+                    probe.cancellation = cancellation.cloned();
+                    let budget = remaining.map(|limit| limit.saturating_sub(started.elapsed()));
+                    if budget.is_some_and(|limit| limit.is_zero()) {
+                        return Err(ClientError::Transport(
+                            "call deadline elapsed during discovery".into(),
+                        ));
+                    }
                     let policy = self
                         .attempt(&probe, None, budget, &legacy)
                         .map_err(failure_error)?;
@@ -899,6 +1162,49 @@ impl Client {
     }
 
     pub(crate) fn call_negotiated(&self, call: &Call) -> Result<Value, ClientError> {
+        self.call_negotiated_observed(call, None)
+    }
+
+    pub(crate) fn cached_registry_assignee_supported(
+        &self,
+        deadline: Instant,
+        cancellation: Option<&Cancellation>,
+    ) -> bool {
+        // A warm agent's upkeep also takes this mutex for cached reads. Brief contention must
+        // not hide already-negotiated support. Wait only inside this status read's deadline,
+        // without initiating discovery or waiting unboundedly behind another discovery.
+        loop {
+            if cancellation.is_some_and(Cancellation::is_cancelled) {
+                return false;
+            }
+            let state = match self.protocol_state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return false;
+                    }
+                    std::thread::sleep(left.min(Duration::from_millis(1)));
+                    continue;
+                }
+            };
+            return state.cached.as_ref().is_some_and(|cached| {
+                cached.obtained.elapsed() < CACHE_TTL
+                    && cached
+                        .value
+                        .capabilities
+                        .contains(crate::REGISTRY_ASSIGNEE_SESSION)
+            });
+        }
+    }
+
+    pub(crate) fn call_negotiated_observed(
+        &self,
+        call: &Call,
+        registry_capability: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Value, ClientError> {
+        call.check_cancelled()?;
         if call.is_write() && call.key.as_deref().is_none_or(str::is_empty) {
             return Err(ClientError::Invalid(
                 "writes require an Idempotency-Key".into(),
@@ -943,16 +1249,17 @@ impl Client {
             call.deadline_ms
                 .map(|limit| Duration::from_millis(limit).saturating_sub(started.elapsed()))
         };
-        let mut protocol = match self.discover(&call.session, remaining()) {
-            Ok(protocol) => protocol,
-            Err(error @ ClientError::Transport(_)) => {
-                if let Some(cached) = self.catalog_offline_call(call)? {
-                    return Ok(cached);
+        let mut protocol =
+            match self.discover(&call.session, remaining(), call.cancellation.as_ref()) {
+                Ok(protocol) => protocol,
+                Err(error @ ClientError::Transport(_)) => {
+                    if let Some(cached) = self.catalog_offline_call(call)? {
+                        return Ok(cached);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
+                Err(error) => return Err(error),
+            };
         self.feature_gate(call, &protocol)?;
         let prepared = self.prepare_catalog_call(call)?;
         let call = &prepared;
@@ -991,6 +1298,7 @@ impl Client {
         let mut delay = Duration::from_millis(100);
         let mut refused_pending: Option<PendingWrite> = None;
         for attempt in 1..=attempts {
+            call.check_cancelled()?;
             if remaining().is_some_and(|limit| limit.is_zero()) {
                 return Err(ClientError::Transport("call deadline elapsed".into()));
             }
@@ -1031,8 +1339,13 @@ impl Client {
                     self.retain_pending(pending.clone())?;
                 }
             }
-            let failure = match self.attempt(&wire_call, encoded.as_deref(), remaining(), &protocol)
-            {
+            let failure = match self.attempt_observed(
+                &wire_call,
+                encoded.as_deref(),
+                remaining(),
+                &protocol,
+                registry_capability,
+            ) {
                 Ok(mut value) => {
                     // Authenticate/decrypt the response before releasing its recovery record.
                     if let Some(workspace) = self.workspace.as_deref()
@@ -1109,16 +1422,33 @@ impl Client {
                     self.resolve_pending(&pending.key)?;
                 }
             }
+            if call.path.contains("&assignee_session=")
+                && registry_capability.is_some_and(|capability| {
+                    !capability.load(std::sync::atomic::Ordering::Relaxed)
+                })
+            {
+                return Err(error);
+            }
             if error.code() == Some("protocol_unsupported")
                 && error.status() == Some(400)
                 && !replica_changed
             {
                 replica_changed = true;
+                self.invalidate_status_protocol_hint();
                 self.protocol_state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .cached = None;
-                protocol = self.discover(&call.session, remaining())?;
+                protocol = self.discover(&call.session, remaining(), call.cancellation.as_ref())?;
+                if call.path.contains("&assignee_session=")
+                    && let Some(capability) = registry_capability
+                    && !protocol
+                        .capabilities
+                        .contains(crate::REGISTRY_ASSIGNEE_SESSION)
+                {
+                    capability.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return Err(error);
+                }
                 self.feature_gate(call, &protocol)?;
                 continue;
             }
@@ -1146,7 +1476,7 @@ impl Client {
             {
                 return Err(error);
             }
-            std::thread::sleep(crate::retry_wait(&error, delay));
+            call.wait(crate::retry_wait(&error, delay))?;
             delay *= 2;
         }
         Err(local(
@@ -1550,4 +1880,350 @@ use std::fs::OpenOptions as StateOpenOptions;
 #[cfg(windows)]
 fn private_directory(path: &Path) -> Result<(), ClientError> {
     lockyard_core::windows::private_dir(path).map_err(journal_error)
+}
+
+#[cfg(test)]
+mod status_protocol_cache_tests {
+    use super::*;
+    use crate::Transport;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn status_registry_capability_cache_contention_preserves_support_deadline_and_cancellation() {
+        let client = Client::new("http://127.0.0.1:1", "fixture".into()).unwrap();
+        let mut protocol = NegotiatedProtocol::candidate(2);
+        protocol
+            .capabilities
+            .insert(crate::REGISTRY_ASSIGNEE_SESSION.into());
+        client.protocol_state.lock().unwrap().cached = Some(CachedProtocol {
+            value: protocol,
+            obtained: Instant::now(),
+        });
+        let held = client.protocol_state.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (started, ready) = std::sync::mpsc::channel();
+            let client = &client;
+            let worker = scope.spawn(move || {
+                started.send(()).unwrap();
+                client.cached_registry_assignee_supported(
+                    Instant::now() + Duration::from_secs(1),
+                    None,
+                )
+            });
+            ready.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            drop(held);
+            assert!(
+                worker.join().unwrap(),
+                "brief upkeep contention cannot hide negotiated support"
+            );
+        });
+
+        let _held = client.protocol_state.lock().unwrap();
+        let start = Instant::now();
+        assert!(
+            !client.cached_registry_assignee_supported(start + Duration::from_millis(20), None)
+        );
+        assert!(start.elapsed() < Duration::from_millis(150));
+        let cancellation = Cancellation::new();
+        std::thread::scope(|scope| {
+            let (started, ready) = std::sync::mpsc::channel();
+            let client = &client;
+            let cancellation = &cancellation;
+            let worker = scope.spawn(move || {
+                started.send(()).unwrap();
+                client.cached_registry_assignee_supported(
+                    Instant::now() + Duration::from_secs(2),
+                    Some(&cancellation),
+                )
+            });
+            ready.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            let cancelled = Instant::now();
+            cancellation.cancel();
+            assert!(!worker.join().unwrap());
+            assert!(cancelled.elapsed() < Duration::from_millis(150));
+        });
+    }
+
+    #[test]
+    fn status_protocol_cache_requires_same_boot_and_two_fresh_nonfuture_clocks() {
+        let observed = StatusProtocolClock {
+            boot: "boot".into(),
+            wall_ms: 100_000,
+            monotonic_ms: 100_000,
+        };
+        let mut current = observed.clone();
+        current.wall_ms += 100;
+        current.monotonic_ms += 200;
+        assert_eq!(
+            status_protocol_age(&observed, &current),
+            Some(Duration::from_millis(200))
+        );
+        for (boot, wall, monotonic) in [
+            ("other", 100_100, 100_100),
+            ("boot", 99_999, 100_100),
+            ("boot", 100_100, 99_999),
+            ("boot", 130_000, 100_100),
+            ("boot", 100_100, 130_000),
+        ] {
+            assert!(
+                status_protocol_age(
+                    &observed,
+                    &StatusProtocolClock {
+                        boot: boot.into(),
+                        wall_ms: wall,
+                        monotonic_ms: monotonic,
+                    }
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn status_protocol_cache_fallback_boot_estimate_rejects_clock_drift_or_restart() {
+        let observed = StatusProtocolClock {
+            boot: "clock-estimate".into(),
+            wall_ms: 100_000,
+            monotonic_ms: 20_000,
+        };
+        let current = StatusProtocolClock {
+            boot: "clock-estimate".into(),
+            wall_ms: 100_200,
+            monotonic_ms: 20_100,
+        };
+        assert_eq!(
+            status_protocol_age(&observed, &current),
+            Some(Duration::from_millis(200))
+        );
+        let drifted = StatusProtocolClock {
+            wall_ms: 102_000,
+            ..current.clone()
+        };
+        assert!(status_protocol_age(&observed, &drifted).is_none());
+        let restarted = StatusProtocolClock {
+            monotonic_ms: 100,
+            ..current
+        };
+        assert!(status_protocol_age(&observed, &restarted).is_none());
+    }
+
+    #[derive(Default)]
+    struct HintServerState {
+        protocol: u16,
+        discoveries: usize,
+        policies: usize,
+        claims: usize,
+    }
+
+    fn server() -> (String, Arc<Mutex<HintServerState>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let state = Arc::new(Mutex::new(HintServerState {
+            protocol: 2,
+            ..Default::default()
+        }));
+        let shared = Arc::clone(&state);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let path = first.split_whitespace().nth(1).unwrap_or("");
+                let mut selected = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.trim_end().split_once(": ")
+                        && name.eq_ignore_ascii_case("Lockyard-Protocol")
+                    {
+                        selected = value.parse::<u16>().unwrap();
+                    }
+                }
+                let mut state = shared.lock().unwrap();
+                if path == DISCOVERY {
+                    state.discoveries += 1;
+                } else if path == crate::ENCRYPTION_PATH {
+                    state.policies += 1;
+                } else if path.starts_with("/api/v1/zones/claims") {
+                    state.claims += 1;
+                }
+                let (status, body) = if selected != state.protocol {
+                    (
+                        400,
+                        json!({"error":{"code":"protocol_unsupported","message":"negotiate again", "details": {
+                        "min_protocol":state.protocol,"max_protocol":state.protocol,
+                        "supported_protocols":[state.protocol],"selected_protocol":null}}}),
+                    )
+                } else if path == DISCOVERY {
+                    (
+                        200,
+                        json!({"selected_protocol":selected,"min_protocol":selected,
+                        "max_protocol":selected,"capabilities":[]}),
+                    )
+                } else if path == crate::ENCRYPTION_PATH {
+                    (
+                        200,
+                        json!({"encryption":"off","key_id":null,"workspace_id":"workspace"}),
+                    )
+                } else {
+                    (200, json!({"claims":[]}))
+                };
+                drop(state);
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nLockyard-Protocol: {selected}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (url, state)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn client(url: &str, directory: &Path) -> Client {
+        Client::new(url, "fixture".into())
+            .unwrap()
+            .with_pending_journal(directory)
+            .unwrap()
+            .with_status_protocol_cache()
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn status_protocol_cache_cold_processes_reuse_only_negotiation_not_policy_or_claims() {
+        let directory = tempfile::tempdir().unwrap();
+        let (url, state) = server();
+        for _ in 0..2 {
+            let client = client(&url, directory.path())
+                .configure_content_encryption("me")
+                .unwrap();
+            client
+                .call(&Call::get("me", "/api/v1/zones/claims?session=me".into()))
+                .unwrap();
+        }
+        let state = state.lock().unwrap();
+        assert_eq!(state.discoveries, 1);
+        assert_eq!(state.policies, 2, "workspace policy must stay live");
+        assert_eq!(
+            state.claims, 2,
+            "each status still performs its own network claims GET"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn status_protocol_cache_rejects_other_origin_token_legacy_and_corrupt_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let (url, _) = server();
+        let first = client(&url, directory.path());
+        first.negotiated_protocol("me").unwrap();
+        let path = first.status_protocol_cache.as_ref().unwrap();
+        let record = std::fs::read(path).unwrap();
+        let other_token = Client::new(&url, "other".into()).unwrap();
+        assert!(other_token.load_status_protocol_hint(path).is_none());
+        let other_origin = Client::new("http://127.0.0.1:1", "fixture".into()).unwrap();
+        assert!(other_origin.load_status_protocol_hint(path).is_none());
+        for update in [
+            "legacy",
+            "selected",
+            "origin",
+            "credential_scope",
+            "boot",
+            "stale",
+            "future",
+            "corrupt",
+        ] {
+            let mut hint: Value = serde_json::from_slice(&record).unwrap();
+            match update {
+                "legacy" => hint["protocol"]["legacy"] = json!(true),
+                "selected" => hint["protocol"]["selected"] = json!(1),
+                "origin" => hint["origin"] = json!("http://127.0.0.1:1"),
+                "credential_scope" => hint["credential_scope"] = json!("other"),
+                "boot" => hint["clock"]["boot"] = json!("other"),
+                "stale" => {
+                    hint["clock"]["monotonic_ms"] = json!(0);
+                    hint["clock"]["wall_ms"] = json!(0);
+                }
+                "future" => hint["clock"]["wall_ms"] = json!(u64::MAX),
+                "corrupt" => {}
+                _ => unreachable!(),
+            }
+            let bytes = if update == "corrupt" {
+                b"{".to_vec()
+            } else {
+                serde_json::to_vec(&hint).unwrap()
+            };
+            lockyard_core::fsio::replace(path, &bytes, 0o600).unwrap();
+            assert!(
+                first.load_status_protocol_hint(path).is_none(),
+                "accepted {update}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn status_protocol_cache_stale_or_corrupt_hint_uses_live_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let (url, state) = server();
+        let first = client(&url, directory.path());
+        first.negotiated_protocol("me").unwrap();
+        let path = first.status_protocol_cache.as_ref().unwrap();
+        let mut hint: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        hint["clock"]["monotonic_ms"] = json!(0);
+        hint["clock"]["wall_ms"] = json!(0);
+        lockyard_core::fsio::replace(path, &serde_json::to_vec(&hint).unwrap(), 0o600).unwrap();
+        client(&url, directory.path())
+            .negotiated_protocol("me")
+            .unwrap();
+        assert_eq!(state.lock().unwrap().discoveries, 2);
+        lockyard_core::fsio::replace(path, b"{", 0o600).unwrap();
+        client(&url, directory.path())
+            .negotiated_protocol("me")
+            .unwrap();
+        assert_eq!(state.lock().unwrap().discoveries, 3);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn status_protocol_cache_unsupported_hint_is_invalidated_and_renegotiated() {
+        let directory = tempfile::tempdir().unwrap();
+        let (url, state) = server();
+        let first = client(&url, directory.path());
+        first.configure_content_encryption("me").unwrap();
+        state.lock().unwrap().protocol = 1;
+        let next = client(&url, directory.path());
+        let path = next.status_protocol_cache.clone().unwrap();
+        let next = next.configure_content_encryption("me").unwrap();
+        assert_eq!(next.negotiated_protocol("me").unwrap().selected, 1);
+        assert!(
+            !path.exists(),
+            "a protocol-one result must not preserve a stale modern hint"
+        );
+        assert_eq!(state.lock().unwrap().discoveries, 3);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn status_protocol_cache_unsafe_file_or_symlink_is_a_cache_miss() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = tempfile::tempdir().unwrap();
+        let (url, _) = server();
+        let first = client(&url, directory.path());
+        first.negotiated_protocol("me").unwrap();
+        let path = first.status_protocol_cache.as_ref().unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(first.load_status_protocol_hint(path).is_none());
+        let alias = path.with_extension("link");
+        symlink(path, &alias).unwrap();
+        assert!(first.load_status_protocol_hint(&alias).is_none());
+    }
 }

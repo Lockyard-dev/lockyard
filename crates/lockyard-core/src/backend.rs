@@ -13,7 +13,20 @@ use crate::proto::{
     Undelivered, WorkAction, WorkOffer, WorkStep, WorkTask,
 };
 use crate::{Error, Result, Store, ZonePath, bus, coordination, tasks, zones};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
+
+/// The independent reads needed by status, including their provenance. Claims and assigned tasks
+/// are mandatory: a failed read must never look like an empty set to an action or Stop hook.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StatusRead {
+    pub claims: Vec<Claim>,
+    pub unread: Option<i64>,
+    pub work: Vec<WorkTask>,
+    pub tasks: Vec<tasks::Task>,
+    pub freshness: Value,
+}
 
 fn cloud<T>(feature: &str) -> Result<T> {
     Err(Error::needs_cloud(feature))
@@ -21,6 +34,29 @@ fn cloud<T>(feature: &str) -> Result<T> {
 
 /// Every operation of Lockyard, in either mode.
 pub trait Backend {
+    /// Read status within one caller-owned budget. Cloud implementations share the deadline across
+    /// concurrent reads and all pages; local mode needs no remote deadline.
+    fn status_read(&self, session: &str, now: i64, _budget: Duration) -> Result<StatusRead> {
+        let claims = self.claims(
+            &ClaimQuery {
+                session: Some(session.into()),
+                path: None,
+            },
+            now,
+        )?;
+        Ok(StatusRead {
+            claims,
+            unread: Some(self.unread(session)?),
+            work: if self.is_cloud() {
+                self.work_list(session)?
+            } else {
+                Vec::new()
+            },
+            tasks: self.assigned_tasks(session)?,
+            freshness: serde_json::json!({"source": "local", "age_ms": 0}),
+        })
+    }
+
     /// Override the key for a workflow's single write step. Always clear after the step.
     /// Local writes do not have a remote idempotency ledger; uncertain outcomes must be reconciled.
     fn set_write_idempotency_key(&mut self, _key: Option<String>) {}

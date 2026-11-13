@@ -9,7 +9,7 @@ use lockyard_core::proto::PathCheck;
 use serde_json::Value;
 #[cfg(unix)]
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, OwnedFd};
 #[cfg(unix)]
@@ -19,7 +19,7 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use lockyard_core::windows::ipc::LocalStream as UnixStream;
@@ -43,6 +43,59 @@ impl AgentSocket {
             state_root: super::state_root().ok()?,
         };
         socket.match_target(url, workspace)
+    }
+
+    /// Probes once, within `timeout`, for a status-capable daemon using this target and, when
+    /// available locally, this exact token. Tokenless callers retain the existing daemon-only mode.
+    /// Old daemons are a fast miss, so the caller can use a bounded direct network read instead.
+    pub fn connect_status(
+        path: &Path,
+        url: &str,
+        workspace: &str,
+        token_id: Option<&str>,
+        timeout: Duration,
+    ) -> Option<Self> {
+        let socket = Self {
+            path: path.to_path_buf(),
+            workspace: workspace.to_string(),
+            timeout,
+            #[cfg(windows)]
+            state_root: super::state_root().ok()?,
+        };
+        let status = socket.ping().ok()?;
+        (status.url.trim_end_matches('/') == url.trim_end_matches('/')
+            && status.workspace == workspace
+            && token_id.is_none_or(|expected| status.token_id == expected)
+            && status.status_read_v1
+            // The abandoned worker cannot be interrupted inside ureq. With independent
+            // credentials, preserve the full direct budget rather than spending 1.5s here.
+            // A tokenless caller still needs this authenticated daemon, so keep its route.
+            && !(token_id.is_some() && status.status_read_abandoned == Some(true)))
+        .then_some(socket)
+    }
+
+    /// Reads all cloud status sections through the daemon with one end-to-end local deadline.
+    /// Claims are always read from the server; the daemon's zone mirror is never lock authority here.
+    pub fn status_read(
+        &self,
+        session: &str,
+        repository: Option<&str>,
+        budget: Duration,
+    ) -> Result<lockyard_core::StatusRead, ClientError> {
+        let request = Request::StatusRead {
+            session: session.to_string(),
+            repository: repository.map(str::to_string),
+            deadline_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+        };
+        let reply = self
+            .ask_with_timeout(&request, budget)
+            .map_err(|error| ClientError::Transport(format!("agent status deadline: {error}")))?;
+        if let Some(error) = reply.error {
+            return Err(error);
+        }
+        reply.status_read.ok_or_else(|| {
+            ClientError::Decode("the agent sent no authoritative status response".into())
+        })
     }
 
     fn match_target(self, url: &str, workspace: &str) -> Option<Self> {
@@ -137,17 +190,46 @@ impl AgentSocket {
 
     /// Sends one request and reads its answer.
     pub fn ask(&self, request: &Request) -> io::Result<Reply> {
-        let mut stream = self.open()?;
-        stream.write_all(&self.line(request)?)?;
-        let mut answer = String::new();
-        BufReader::new(stream).read_line(&mut answer)?;
-        if answer.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "the agent closed the socket",
-            ));
+        self.ask_with_timeout(request, self.timeout)
+    }
+
+    fn ask_with_timeout(&self, request: &Request, budget: Duration) -> io::Result<Reply> {
+        let deadline = Instant::now() + budget;
+        #[cfg(windows)]
+        self.trust_folder()?;
+        let mut stream = connect_bounded(&self.path, remaining(deadline)?)?;
+        let line = self.line(request)?;
+        let mut pending = line.as_slice();
+        while !pending.is_empty() {
+            stream.set_write_timeout(Some(remaining(deadline)?))?;
+            let written = stream.write(pending)?;
+            if written == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "the agent closed the socket",
+                ));
+            }
+            pending = &pending[written..];
         }
-        serde_json::from_str(&answer).map_err(io::Error::other)
+        let mut answer = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            // A peer that trickles bytes must not restart the deadline on every read.
+            stream.set_read_timeout(Some(remaining(deadline)?))?;
+            let count = stream.read(&mut chunk)?;
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the agent closed the socket before its answer ended",
+                ));
+            }
+            if let Some(end) = chunk[..count].iter().position(|byte| *byte == b'\n') {
+                answer.extend_from_slice(&chunk[..end]);
+                remaining(deadline)?;
+                return serde_json::from_slice(&answer).map_err(io::Error::other);
+            }
+            answer.extend_from_slice(&chunk[..count]);
+        }
     }
 
     /// Sends one request without waiting for the answer.
@@ -163,6 +245,18 @@ impl AgentSocket {
             Some(error) => Err(error),
             None => Ok(reply),
         }
+    }
+}
+
+fn remaining(deadline: Instant) -> io::Result<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "agent socket deadline exceeded",
+        ))
+    } else {
+        Ok(left)
     }
 }
 
@@ -351,7 +445,29 @@ impl Transport for AgentSocket {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::{BufRead, BufReader};
     use std::os::{fd::AsRawFd, unix::net::UnixListener};
+
+    fn fixture_accept(listener: &UnixListener) -> UnixStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture received no socket request"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("fixture accept: {error}"),
+            }
+        }
+    }
 
     fn socket_reply(call: Call, value: Value) -> Result<Value, ClientError> {
         let dir = tempfile::tempdir().unwrap();
@@ -455,6 +571,143 @@ mod tests {
             }
         }
         assert!(bounded, "listener backlog never filled");
+    }
+
+    #[test]
+    fn status_probe_absent_agent_returns_without_waiting_for_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::agent::private_dir(dir.path()).unwrap();
+        let started = Instant::now();
+        assert!(
+            AgentSocket::connect_status(
+                &dir.path().join("absent.sock"),
+                "https://example.test",
+                "team",
+                Some("token"),
+                Duration::from_millis(100),
+            )
+            .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn status_probe_hung_agent_returns_within_its_small_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::agent::private_dir(dir.path()).unwrap();
+        let path = dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = std::thread::spawn(move || {
+            let stream = fixture_accept(&listener);
+            // Hold the connection open without ever answering the capability probe.
+            std::thread::sleep(Duration::from_millis(200));
+            drop(stream);
+        });
+        let started = Instant::now();
+        assert!(
+            AgentSocket::connect_status(
+                &path,
+                "https://example.test",
+                "team",
+                Some("token"),
+                Duration::from_millis(30),
+            )
+            .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_millis(150));
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn status_probe_uses_one_ping_and_rejects_old_or_wrong_token_daemons() {
+        for (supports_status, token, expected, abandoned, accepted) in [
+            (false, "token", Some("token"), false, false),
+            (true, "other-token", Some("token"), false, false),
+            (true, "token", Some("token"), false, true),
+            (true, "daemon-only-token", None, false, true),
+            (true, "token", Some("token"), true, false),
+            (true, "daemon-only-token", None, true, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            crate::agent::private_dir(dir.path()).unwrap();
+            let path = dir.path().join("agent.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let (ready, listening) = std::sync::mpsc::channel();
+            let peer = std::thread::spawn(move || {
+                ready.send(()).unwrap();
+                let mut stream = fixture_accept(&listener);
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Envelope = serde_json::from_str(&line).unwrap();
+                assert_eq!(request.request, Request::Ping);
+                let mut value = json!({
+                    "status": {
+                        "url": "https://example.test/", "workspace": "team", "token_id": token,
+                        "pid": 42, "view_fresh": false, "view_age_ms": null,
+                        "claims": 0, "board": 0, "sessions": 0, "outbox": 0,
+                        "coordination_seq": 0, "registry_seq": 0
+                    }
+                });
+                if supports_status {
+                    value["status"]["status_read_v1"] = json!(true);
+                }
+                if abandoned {
+                    value["status"]["status_read_abandoned"] = json!(true);
+                }
+                serde_json::to_writer(&mut stream, &value).unwrap();
+                stream.write_all(b"\n").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                assert!(
+                    listener.accept().is_err(),
+                    "the probe must use only one ping"
+                );
+            });
+            listening.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(
+                AgentSocket::connect_status(
+                    &path,
+                    "https://example.test",
+                    "team",
+                    expected,
+                    Duration::from_millis(100),
+                )
+                .is_some(),
+                accepted,
+                "capability={supports_status}, token={token}, expected={expected:?}, abandoned={abandoned}",
+            );
+            peer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn status_local_deadline_is_not_extended_by_trickled_reply_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::agent::private_dir(dir.path()).unwrap();
+        let path = dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut stream = fixture_accept(&listener);
+            for _ in 0..20 {
+                if stream.write_all(b" ").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let socket = AgentSocket {
+            path,
+            workspace: "team".into(),
+            timeout: Duration::from_secs(1),
+        };
+        let started = Instant::now();
+        let error = socket
+            .status_read("me", None, Duration::from_millis(40))
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        assert!(started.elapsed() < Duration::from_millis(150));
+        peer.join().unwrap();
     }
 }
 

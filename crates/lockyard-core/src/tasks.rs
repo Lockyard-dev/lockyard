@@ -6,14 +6,14 @@
 use crate::zones::{DEFAULT_TTL_MINUTES, MAX_TTL_MINUTES};
 use crate::{Error, Result, Store};
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 const MINUTE_MS: i64 = 60_000;
 const COLUMNS: &str = "task_key, title, body, status, author, assignee, lease_until, evidence, created_at, updated_at";
 
 /// Where a task stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Open,
@@ -61,7 +61,7 @@ impl fmt::Display for Status {
 }
 
 /// One task.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub id: crate::task_id::TaskId,
     pub title: String,
@@ -87,9 +87,9 @@ pub struct Task {
     pub priority: Option<String>,
     /// Dependency links are preserved for cloud task consumers.
     /// Registry links and structured evidence are available for cloud registry items.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<serde_json::Value>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registry_evidence: Vec<serde_json::Value>,
 }
 

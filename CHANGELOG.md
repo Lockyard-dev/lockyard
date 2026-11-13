@@ -5,6 +5,21 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-11-13
+
+### Changed
+
+- Cloud CLI `status` warms a cold connection with claims first, then reads the two assigned-task page chains, mail and work in sequence on that connection. A status-capable local agent reuses its authenticated HTTP pool and overlaps warm reads. Bounded admission queues simultaneous callers, coalesces only requests collected before a new claims read starts, and admits three concurrent generations within eight shared HTTP workers, reserving one worker each for outbox writes and event long polls; FIFO general-worker admission prevents later upkeep from overtaking queued reads, and new status sessions defer their upkeep wake until their live answer completes. Disconnected local callers leave admission immediately; only a generation with no remaining members is cancelled. A credentialed CLI skips the local wait when Ping reports abandoned in-flight work and every generation is occupied, preserving its direct-read budget; old peers and tokenless access remain compatible. JSON retains its existing fields and adds freshness metadata.
+- Cloud status uses the registry's `assignee_session` filter only after the server announces `registry_assignee_session_v1` through negotiated capabilities or a registry response header in the same read. Each task chain fixes its choice before its first page and still filters current assignment executors locally. Missing capability confirmation on a filtered response retains the fetched tasks and replays every unfiltered page; older servers keep the existing complete local-filter path. `freshness.assignment_filter` is `server` only when both chains used the filter and every response confirmed it, otherwise `client_fallback`. The CLI/agent wire format is unchanged.
+- Claims always require a server read begun after the caller arrived; completed answers and zone snapshots are never reused. Expiry and idle expiry are rechecked before output using a monotonic server-time upper bound, or an explicit local-clock fallback with a 30-second safety margin. Assigned tasks remain mandatory for Stop hooks. Mail receives the remaining deadline; an unavailable read retains the last known count with explicit stale age when the agent has one.
+- Default the CLI status deadline to 6 seconds, configurable from 1 to 60000 ms with `LOCKYARD_STATUS_DEADLINE_MS` (empty uses the default; invalid values fail closed with the accepted range). Agent probing and aggregate waits use fractions of the remaining budget, preserving time for one claims-first direct fallback. Discovery, paging, worker admission, retries and `Retry-After` share the deadline; a mandatory read that cannot complete fails closed. Local diagnostics retain a separate short budget.
+- Direct status clients reuse a private, origin/credential-scoped modern negotiation hint for at most 30 seconds; encryption policy and status data stay authoritative network reads, and unsupported responses renegotiate.
+- Advance synchronized Rust, npm, PyPI and MCP registry versions to `0.3.7`.
+
+### Added
+
+- A reproducible delayed-link status benchmark that requires successful cold reads, compares cold p95 against 0.3.6, checks warm latency ceilings, and reports ten simultaneous agent callers plus a hard caller after twenty soft CLI processes are killed at 850 ms. Regression coverage pins claims-first overlap, bounded queue/single-flight freshness, rate limiting, monotonic expiry, slow/unavailable mail and JSON provenance.
+
 ## [0.3.6] - 2026-11-12
 
 ### Added

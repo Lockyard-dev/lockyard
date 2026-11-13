@@ -16,6 +16,7 @@ mod registry;
 mod repository;
 pub mod revocations;
 mod signed_results;
+mod status;
 
 pub use backend::CloudBackend;
 pub use crypto::{CONTENT_FIELDS, FieldRule, WorkspaceKey, route_matches, transform_fields};
@@ -38,12 +39,13 @@ use lockyard_core::proto::PathCheck;
 use lockyard_core::zones::Conflict;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::BuildHasher;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A write is sent at most this many times with one key.
 const WRITE_ATTEMPTS: u32 = 3;
@@ -279,9 +281,68 @@ pub struct Call {
     /// Per-request timeout for internal transports such as the agent outbox.
     #[serde(skip)]
     pub attempt_timeout_ms: Option<u64>,
+    /// Process-local cancellation shared by the live members of one status generation. This is
+    /// deliberately absent from RPC/HTTP serialization, including with older agents and CLIs.
+    #[serde(skip)]
+    pub cancellation: Option<Cancellation>,
+}
+
+/// Cancellation of process-local read work. Clones refer to the same generation; separate
+/// generations must use separate tokens so one disconnected peer cannot cancel another caller.
+#[derive(Debug, Clone, Default)]
+pub struct Cancellation(Arc<AtomicBool>);
+
+impl PartialEq for Cancellation {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Cancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn check(&self) -> Result<(), ClientError> {
+        if self.is_cancelled() {
+            Err(ClientError::Transport("local read cancelled".into()))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Call {
+    pub(crate) fn check_cancelled(&self) -> Result<(), ClientError> {
+        self.cancellation
+            .as_ref()
+            .map_or(Ok(()), Cancellation::check)
+    }
+
+    pub(crate) fn wait(&self, duration: Duration) -> Result<(), ClientError> {
+        let started = Instant::now();
+        loop {
+            self.check_cancelled()?;
+            let remaining = duration.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            std::thread::sleep(if self.cancellation.is_some() {
+                remaining.min(Duration::from_millis(10))
+            } else {
+                remaining
+            });
+        }
+    }
+
     /// A read.
     pub fn get(session: &str, path: String) -> Self {
         Self {
@@ -312,9 +373,48 @@ impl Call {
     }
 }
 
+/// Process-local registry response metadata; never added to CLI/agent frames or JSON bodies.
+pub struct StatusRegistryPage {
+    /// Keep error metadata so an unconfirmed filtered refusal still honors Retry-After.
+    pub value: Result<Value, ClientError>,
+    pub assignee_session_supported: bool,
+}
+
+pub(crate) const REGISTRY_ASSIGNEE_SESSION: &str = "registry_assignee_session_v1";
+
 /// How requests reach the server.
 pub trait Transport: Send + Sync {
     fn call(&self, call: &Call) -> Result<Value, ClientError>;
+
+    /// Existing, unexpired negotiation knowledge only; this must not initiate discovery.
+    fn status_registry_assignee_supported(
+        &self,
+        _deadline: Instant,
+        _cancellation: Option<&Cancellation>,
+    ) -> bool {
+        false
+    }
+
+    /// Capture the capability from this response, independently of the negotiated capability.
+    /// Older/custom transports retain the complete local-filtering path by default.
+    fn status_registry_call(&self, call: &Call) -> Result<StatusRegistryPage, ClientError> {
+        self.call(call).map(|value| StatusRegistryPage {
+            value: Ok(value),
+            assignee_session_supported: false,
+        })
+    }
+
+    /// True only when every successful scoped read independently verifies the server's namespace
+    /// echo. Older agent sockets establish that capability only through the explicit probe.
+    fn verifies_repository_reads(&self) -> bool {
+        false
+    }
+
+    /// Conservative current server time from an authenticated HTTP Date, advanced monotonically.
+    /// This is for discarding leases, never for extending their validity.
+    fn server_time_upper_bound(&self) -> Option<i64> {
+        None
+    }
 
     /// Called only after a durable caller has committed its successful outbox receipt.
     fn acknowledge_write(&self, _call: &Call) -> Result<(), ClientError> {
@@ -346,9 +446,43 @@ pub trait Transport: Send + Sync {
     fn fast_unread(&self, _session: &str) -> Option<Result<Option<i64>, ClientError>> {
         None
     }
+
+    /// Only an already-warm daemon pool may overlap claims with the other status reads.
+    /// Direct and restarted/cold transports read claims first to establish one connection.
+    fn status_reads_parallel(&self) -> bool {
+        false
+    }
+
+    /// After a cold claims read, may the remaining sections run side by side? A long-lived pool
+    /// (the agent) keeps the extra connections for later reads. A one-shot direct client would pay
+    /// a fresh connection set-up per parallel section and reads them in sequence instead.
+    fn status_followups_parallel(&self) -> bool {
+        true
+    }
+
+    /// Interrupt status pagination and Retry-After waits once every local caller is gone.
+    fn status_cancelled(&self) -> bool {
+        false
+    }
 }
 
 impl<T: Transport + ?Sized> Transport for Arc<T> {
+    fn status_registry_assignee_supported(
+        &self,
+        deadline: Instant,
+        cancellation: Option<&Cancellation>,
+    ) -> bool {
+        (**self).status_registry_assignee_supported(deadline, cancellation)
+    }
+    fn status_registry_call(&self, call: &Call) -> Result<StatusRegistryPage, ClientError> {
+        (**self).status_registry_call(call)
+    }
+    fn verifies_repository_reads(&self) -> bool {
+        (**self).verifies_repository_reads()
+    }
+    fn server_time_upper_bound(&self) -> Option<i64> {
+        (**self).server_time_upper_bound()
+    }
     fn call(&self, call: &Call) -> Result<Value, ClientError> {
         (**self).call(call)
     }
@@ -372,6 +506,18 @@ impl<T: Transport + ?Sized> Transport for Arc<T> {
     fn fast_unread(&self, session: &str) -> Option<Result<Option<i64>, ClientError>> {
         (**self).fast_unread(session)
     }
+
+    fn status_reads_parallel(&self) -> bool {
+        (**self).status_reads_parallel()
+    }
+
+    fn status_followups_parallel(&self) -> bool {
+        (**self).status_followups_parallel()
+    }
+
+    fn status_cancelled(&self) -> bool {
+        (**self).status_cancelled()
+    }
 }
 
 /// HTTP transport. The token is passed in by the caller and never stored by this crate.
@@ -386,7 +532,167 @@ pub struct Client {
     expected_e2ee_workspace: Option<String>,
     protocol_state: std::sync::Mutex<protocol::ProtocolState>,
     pending_journal: Option<std::path::PathBuf>,
+    status_protocol_cache: Option<std::path::PathBuf>,
     catalog_cache_root: Option<std::path::PathBuf>,
+    server_clock: std::sync::Mutex<Option<(i64, Instant)>>,
+    http_workers: HttpWorkers,
+}
+
+/// Optional process-wide admission for this client's HTTP pool. The permit covers reading the
+/// response body as well as the handshake/headers; waiting consumes the caller's existing deadline.
+struct HttpWorkers {
+    limit: usize,
+    active: Mutex<ActiveHttpWorkers>,
+    available: Condvar,
+}
+
+#[derive(Default)]
+struct ActiveHttpWorkers {
+    general: usize,
+    write: bool,
+    poll: bool,
+    next_ticket: u64,
+    waiting: VecDeque<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum HttpWorkerLane {
+    General,
+    Write,
+    Poll,
+}
+
+impl HttpWorkers {
+    fn remove_ticket(&self, active: &mut ActiveHttpWorkers, ticket: &mut Option<u64>) {
+        if let Some(ticket) = ticket.take() {
+            active.waiting.retain(|queued| *queued != ticket);
+            self.available.notify_all();
+        }
+    }
+
+    fn acquire(
+        &self,
+        call: &Call,
+        budget: Option<Duration>,
+    ) -> Result<HttpWorker<'_>, ClientError> {
+        let started = Instant::now();
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ticket = None;
+        loop {
+            if let Err(error) = call.check_cancelled() {
+                self.remove_ticket(&mut active, &mut ticket);
+                return Err(error);
+            }
+            if budget.is_some_and(|budget| started.elapsed() >= budget) {
+                self.remove_ticket(&mut active, &mut ticket);
+                return Err(ClientError::Transport(
+                    "call deadline elapsed waiting for an HTTP worker".into(),
+                ));
+            }
+            // A bounded daemon pool always retains one worker for outbox writes and one for
+            // the event long poll. Ordinary clients are uncapped; tiny test/custom pools retain
+            // their existing cap without claiming reservations that cannot fit.
+            let reserved = self.limit != usize::MAX && self.limit >= 3;
+            let general_limit = self.limit - if reserved { 2 } else { 0 };
+            let lane = if reserved && call.is_write() && !active.write {
+                self.remove_ticket(&mut active, &mut ticket);
+                active.write = true;
+                Some(HttpWorkerLane::Write)
+            } else if reserved && call.long_poll && !active.poll {
+                self.remove_ticket(&mut active, &mut ticket);
+                active.poll = true;
+                Some(HttpWorkerLane::Poll)
+            } else if self.limit == usize::MAX {
+                // Preserve the historical direct-client policy without ticket bookkeeping.
+                active.general += 1;
+                Some(HttpWorkerLane::General)
+            } else {
+                let own_ticket = match ticket {
+                    Some(ticket) => ticket,
+                    None => {
+                        let next = active.next_ticket;
+                        active.next_ticket = next.wrapping_add(1);
+                        active.waiting.push_back(next);
+                        ticket = Some(next);
+                        next
+                    }
+                };
+                // New section reads and upkeep cannot overtake already queued status work.
+                // Reserved writes/polls may bypass this queue; borrowing general capacity does
+                // follow it, and a later reserved admission removes its old general ticket.
+                if active.general < general_limit && active.waiting.front() == Some(&own_ticket) {
+                    active.waiting.pop_front();
+                    ticket = None;
+                    active.general += 1;
+                    self.available.notify_all();
+                    Some(HttpWorkerLane::General)
+                } else {
+                    None
+                }
+            };
+            if let Some(lane) = lane {
+                return Ok(HttpWorker {
+                    workers: self,
+                    lane,
+                });
+            }
+            active = if let Some(budget) = budget {
+                let remaining = budget.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    self.remove_ticket(&mut active, &mut ticket);
+                    return Err(ClientError::Transport(
+                        "call deadline elapsed waiting for an HTTP worker".into(),
+                    ));
+                }
+                self.available
+                    .wait_timeout(
+                        active,
+                        if call.cancellation.is_some() {
+                            remaining.min(Duration::from_millis(10))
+                        } else {
+                            remaining
+                        },
+                    )
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0
+            } else if call.cancellation.is_some() {
+                self.available
+                    .wait_timeout(active, Duration::from_millis(10))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0
+            } else {
+                self.available
+                    .wait(active)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            };
+        }
+    }
+}
+
+struct HttpWorker<'a> {
+    workers: &'a HttpWorkers,
+    lane: HttpWorkerLane,
+}
+
+impl Drop for HttpWorker<'_> {
+    fn drop(&mut self) {
+        let mut active = self
+            .workers
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match self.lane {
+            HttpWorkerLane::General => active.general -= 1,
+            HttpWorkerLane::Write => active.write = false,
+            HttpWorkerLane::Poll => active.poll = false,
+        }
+        // Lanes have different eligibility: waking only a general waiter can strand a newly
+        // available reserved worker while the outbox or long poll remains asleep.
+        self.workers.available.notify_all();
+    }
 }
 
 impl Client {
@@ -429,6 +735,7 @@ impl Client {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(2))
             .timeout_read(Duration::from_secs(5))
+            .max_idle_connections_per_host(8)
             .redirects(0)
             .build();
         let poll_agent = ureq::AgentBuilder::new()
@@ -447,8 +754,39 @@ impl Client {
             expected_e2ee_workspace,
             protocol_state: std::sync::Mutex::new(protocol::ProtocolState::default()),
             pending_journal: None,
+            status_protocol_cache: None,
             catalog_cache_root: None,
+            server_clock: std::sync::Mutex::new(None),
+            http_workers: HttpWorkers {
+                limit: usize::MAX,
+                active: Mutex::new(ActiveHttpWorkers::default()),
+                available: Condvar::new(),
+            },
         })
+    }
+
+    /// Bound HTTP workers across all callers. A cap of at least three explicitly reserves one
+    /// worker for outbox writes and one for event long polls; all other reads share the remainder.
+    /// Configure before sharing the client. Ordinary clients keep their historical uncapped policy.
+    pub fn set_http_worker_limit(&mut self, limit: usize) {
+        self.http_workers.limit = limit.max(1);
+    }
+
+    fn observe_server_time(&self, upper: i64) {
+        let mut clock = self
+            .server_clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let advanced = clock.as_ref().map(|(previous, observed)| {
+            previous
+                .saturating_add(i64::try_from(observed.elapsed().as_millis()).unwrap_or(i64::MAX))
+        });
+        // Response order is not clock order: a worker/edge/error may carry an older Date. Once
+        // expiry could be ruled out, a later response must never make the lease live again.
+        *clock = Some((
+            advanced.map_or(upper, |previous| previous.max(upper)),
+            Instant::now(),
+        ));
     }
 
     /// Require encryption independently of the legacy server preference, bound to this workspace.
@@ -487,7 +825,30 @@ impl Client {
     /// Read the server setting once. Only legacy clients may use cleartext compatibility
     /// when the endpoint is absent; a node job requires a verified workspace and local key.
     pub fn configure_content_encryption(self, session: &str) -> Result<Self, ClientError> {
-        let response = match self.call(&Call::get(session, ENCRYPTION_PATH.into())) {
+        self.configure_content_encryption_call(session, None)
+    }
+
+    /// Read the same encryption policy within the caller's remaining overall budget, including
+    /// protocol discovery and retries. A deadline failure never enables a cleartext fallback.
+    pub fn configure_content_encryption_with_deadline(
+        self,
+        session: &str,
+        budget: Duration,
+    ) -> Result<Self, ClientError> {
+        self.configure_content_encryption_call(
+            session,
+            Some(budget.as_millis().min(u128::from(u64::MAX)) as u64),
+        )
+    }
+
+    fn configure_content_encryption_call(
+        self,
+        session: &str,
+        deadline_ms: Option<u64>,
+    ) -> Result<Self, ClientError> {
+        let mut call = Call::get(session, ENCRYPTION_PATH.into());
+        call.deadline_ms = deadline_ms;
+        let response = match self.call(&call) {
             Ok(value) => value,
             Err(ClientError::NotFound(_)) if self.expected_e2ee_workspace.is_none() => {
                 return Ok(self);
@@ -578,6 +939,24 @@ impl Client {
         remaining: Option<Duration>,
         protocol: &NegotiatedProtocol,
     ) -> Result<Value, Failure> {
+        self.attempt_observed(call, encoded, remaining, protocol, None)
+    }
+
+    fn attempt_observed(
+        &self,
+        call: &Call,
+        encoded: Option<&str>,
+        remaining: Option<Duration>,
+        protocol: &NegotiatedProtocol,
+        registry_capability: Option<&AtomicBool>,
+    ) -> Result<Value, Failure> {
+        let request_started = Instant::now();
+        let _worker = self
+            .http_workers
+            .acquire(call, remaining)
+            .map_err(Failure::Final)?;
+        call.check_cancelled().map_err(Failure::Final)?;
+        let remaining = remaining.map(|budget| budget.saturating_sub(request_started.elapsed()));
         let url = format!("{}{}", self.base_url, call.path);
         let client = if call.long_poll {
             &self.poll_agent
@@ -624,21 +1003,59 @@ impl Client {
                 },
             );
         }
-        // The caller's remaining wait decides whether a retry fits; it never cuts a request short.
-        // A short per-request timeout broke TLS handshakes on macOS ("Resource temporarily
-        // unavailable"), so only the outbox's own attempt limit bounds a single request.
-        if let Some(limit) = remaining {
+        // A request-level timeout bounds TLS, headers and body. ureq 2 keeps its independent
+        // fixed connect cap and its OS DNS resolver is not cancellable; process deadlines guard
+        // those cases. An attempt override must never extend the caller's overall deadline.
+        let attempt_limit = call.attempt_timeout_ms.map(Duration::from_millis);
+        if let Some(limit) = match (remaining, attempt_limit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        } {
+            if limit.is_zero() {
+                return Err(Failure::Final(ClientError::Transport(
+                    "call deadline elapsed".into(),
+                )));
+            }
             request = request.timeout(limit);
         }
-        if let Some(limit) = call.attempt_timeout_ms.map(Duration::from_millis) {
-            request = request.timeout(limit);
-        }
+        call.check_cancelled().map_err(Failure::Final)?;
         let result = match encoded {
             Some(body) => request
                 .set("Content-Type", "application/json")
                 .send_string(body),
             None => request.call(),
         };
+        // ureq's blocking connect/TLS/read cannot be interrupted by this token. As soon as
+        // headers return, dropping a canceled response avoids starting its body decode and
+        // releases this permit. An already-blocked body read retains its request timeout.
+        call.check_cancelled().map_err(Failure::Final)?;
+        let response = match &result {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => Some(response),
+            _ => None,
+        };
+        if let Some(server_ms) = response
+            .and_then(|response| response.header("Date"))
+            .and_then(http_date_ms)
+        {
+            // Date is rounded to a second. Add a full second and the complete request elapsed
+            // time, an upper bound independent of the machine's wall clock and NTP changes.
+            let elapsed = i64::try_from(request_started.elapsed().as_millis()).unwrap_or(i64::MAX);
+            self.observe_server_time(server_ms.saturating_add(1000).saturating_add(elapsed));
+        }
+        if let (Some(capability), Some(response)) = (registry_capability, response) {
+            // Include error responses and every HTTP retry. Missing confirmation is sticky for
+            // this call; never repeat a filtered request after an unconfirmed response.
+            capability.fetch_and(
+                response
+                    .header("Lockyard-Capabilities")
+                    .is_some_and(|header| {
+                        header
+                            .split(',')
+                            .any(|part| part.trim() == REGISTRY_ASSIGNEE_SESSION)
+                    }),
+                Ordering::Relaxed,
+            );
+        }
         match result {
             // With redirects off a 3xx arrives as a success. It delivered nothing, so a queued write stays queued.
             Ok(response) if (300..400).contains(&response.status()) => {
@@ -651,7 +1068,10 @@ impl Client {
                 protocol::verify_echo(&response, protocol).map_err(Failure::Final)?;
                 protocol::verify_repository_echo(&response, call, protocol)
                     .map_err(Failure::Final)?;
-                decode_for_call(response, call, self.encryption_enabled).map_err(Failure::Retry)
+                let value = decode_for_call(response, call, self.encryption_enabled)
+                    .map_err(Failure::Retry)?;
+                call.check_cancelled().map_err(Failure::Final)?;
+                Ok(value)
             }
             Err(ureq::Error::Status(status, response)) => {
                 let retry_after = response
@@ -711,6 +1131,38 @@ enum Failure {
 }
 
 impl Transport for Client {
+    fn status_registry_assignee_supported(
+        &self,
+        deadline: Instant,
+        cancellation: Option<&Cancellation>,
+    ) -> bool {
+        self.cached_registry_assignee_supported(deadline, cancellation)
+    }
+    fn status_registry_call(&self, call: &Call) -> Result<StatusRegistryPage, ClientError> {
+        let capability = AtomicBool::new(true);
+        let value = self.call_negotiated_observed(call, Some(&capability));
+        Ok(StatusRegistryPage {
+            value,
+            assignee_session_supported: capability.load(Ordering::Relaxed),
+        })
+    }
+    fn verifies_repository_reads(&self) -> bool {
+        true
+    }
+    fn status_followups_parallel(&self) -> bool {
+        // The agent wraps this client and overrides the answer; used directly it is a one-shot
+        // process whose pool holds the single connection the claims read opened.
+        false
+    }
+    fn server_time_upper_bound(&self) -> Option<i64> {
+        let clock = self
+            .server_clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clock.as_ref().map(|(upper, observed)| {
+            upper.saturating_add(i64::try_from(observed.elapsed().as_millis()).unwrap_or(i64::MAX))
+        })
+    }
     fn catalog_expand(&self, call: &Call, names: &[String]) -> Result<Vec<String>, ClientError> {
         self.expand_catalog_call(call, names)
     }
@@ -771,6 +1223,29 @@ fn retry_wait(error: &ClientError, fallback: Duration) -> Duration {
         .min(MAX_RETRY_WAIT)
 }
 
+/// IMF-fixdate, the HTTP Date format required by RFC 9110. Invalid dates provide no clock proof.
+fn http_date_ms(date: &str) -> Option<i64> {
+    let fields: Vec<&str> = date.split_ascii_whitespace().collect();
+    if fields.len() != 6 || fields[5] != "GMT" || fields[0].len() != 4 || !fields[0].ends_with(',')
+    {
+        return None;
+    }
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|month| *month == fields[2])?
+        + 1;
+    let day = fields[1].parse::<u32>().ok()?;
+    let year = fields[3].parse::<u32>().ok()?;
+    if day == 0 || day > 31 || fields[4].len() != 8 || !(1970..=9999).contains(&year) {
+        return None;
+    }
+    let iso = format!("{year:04}-{month:02}-{day:02}T{}Z", fields[4]);
+    let parsed = lockyard_core::proto::parse_rfc3339(&iso)?;
+    (lockyard_core::proto::rfc3339(parsed).get(..19) == iso.get(..19)).then_some(parsed)
+}
+
 fn wait_fits_deadline(
     deadline_ms: Option<u64>,
     started: std::time::Instant,
@@ -781,7 +1256,14 @@ fn wait_fits_deadline(
         return true;
     };
     let remaining = Duration::from_millis(deadline_ms).saturating_sub(started.elapsed());
-    retry_wait(error, fallback).saturating_add(RETRY_ROUND_TRIP_ESTIMATE) <= remaining
+    // Never shorten an explicit Retry-After merely to squeeze another status attempt into its
+    // deadline. The historic sleep cap still applies to ordinary calls without a deadline.
+    error
+        .retry_after()
+        .map(Duration::from_secs)
+        .unwrap_or(fallback)
+        .saturating_add(RETRY_ROUND_TRIP_ESTIMATE)
+        <= remaining
 }
 
 fn valid_workspace_identity(workspace: &str) -> bool {
@@ -913,6 +1395,418 @@ mod fake;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lockyard_core::Backend;
+
+    #[test]
+    fn status_http_date_uses_server_epoch_and_rejects_unusable_dates() {
+        assert_eq!(
+            http_date_ms("Thu, 12 Nov 2026 10:20:30 GMT"),
+            lockyard_core::proto::parse_rfc3339("2026-11-12T10:20:30Z")
+        );
+        for bad in [
+            "",
+            "Thu, 12 Nov 2026 10:20:30 +0100",
+            "Thu, 31 Feb 2026 10:20:30 GMT",
+            "Thu, 12 Nov 2026 99:20:30 GMT",
+            "Thu, 00 Nov 2026 10:20:30 GMT",
+        ] {
+            assert_eq!(http_date_ms(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn status_http_date_never_moves_backward_even_on_rate_limit_response() {
+        let server = FakeServer::start(vec![
+            Reply::json(200, json!({"tasks":[]})).header("Date", "Thu, 12 Nov 2026 10:20:30 GMT"),
+            Reply::json(
+                429,
+                json!({"error":{"code":"rate_limited","message":"slow down"}}),
+            )
+            .header("Date", "Thu, 12 Nov 2026 10:19:30 GMT")
+            .header("Retry-After", "60"),
+        ]);
+        let client = Client::new(&server.url(), "fixture".into()).unwrap();
+        let mut call = Call::get("me", "/api/v1/bus/tasks".into());
+        call.deadline_ms = Some(200);
+        client.call(&call).unwrap();
+        let previous = client.server_time_upper_bound().unwrap();
+        assert!(matches!(
+            client.call(&call),
+            Err(ClientError::RateLimited(_))
+        ));
+        assert!(client.server_time_upper_bound().unwrap() >= previous);
+    }
+
+    #[test]
+    fn status_http_workers_are_globally_capped_and_wait_inside_deadline() {
+        let workers = HttpWorkers {
+            limit: 2,
+            active: Mutex::new(ActiveHttpWorkers::default()),
+            available: Condvar::new(),
+        };
+        let call = Call::get("me", "/api/v1/bus/tasks".into());
+        let first = workers.acquire(&call, None).unwrap();
+        let second = workers.acquire(&call, None).unwrap();
+        let start = Instant::now();
+        let error = match workers.acquire(&call, Some(Duration::from_millis(30))) {
+            Ok(_) => panic!("must wait for an HTTP worker"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("deadline elapsed waiting for an HTTP worker")
+        );
+        assert!(start.elapsed() < Duration::from_millis(150));
+        drop(first);
+        drop(second);
+        let active = AtomicU64::new(0);
+        let peak = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..10 {
+                scope.spawn(|| {
+                    let _permit = workers
+                        .acquire(&call, Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(count, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(10));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn status_http_general_workers_are_fifo_and_cancelled_heads_do_not_block() {
+        let workers = HttpWorkers {
+            limit: 3,
+            active: Mutex::new(ActiveHttpWorkers::default()),
+            available: Condvar::new(),
+        };
+        let read = Call::get("me", "/api/v1/zones/claims".into());
+        let held = workers.acquire(&read, None).unwrap();
+        let cancellation = Cancellation::new();
+        let mut dead = read.clone();
+        dead.cancellation = Some(cancellation.clone());
+        let wait_for_queue = |length| {
+            let started = Instant::now();
+            while workers.active.lock().unwrap().waiting.len() != length {
+                assert!(started.elapsed() < Duration::from_secs(1));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let (admitted, next) = std::sync::mpsc::channel();
+        let (release_first, released_first) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let head = scope.spawn(|| workers.acquire(&dead, Some(Duration::from_millis(2600))));
+            wait_for_queue(1);
+            let first_admitted = admitted.clone();
+            let worker_gate = &workers;
+            let first_read = &read;
+            let first = scope.spawn(move || {
+                let _permit = worker_gate
+                    .acquire(first_read, Some(Duration::from_secs(1)))
+                    .unwrap();
+                first_admitted.send(1).unwrap();
+                released_first.recv().unwrap();
+            });
+            wait_for_queue(2);
+            let second = scope.spawn(|| {
+                let _permit = workers
+                    .acquire(&read, Some(Duration::from_secs(1)))
+                    .unwrap();
+                admitted.send(2).unwrap();
+            });
+            wait_for_queue(3);
+
+            // Both reserved lanes bypass existing general tickets while retaining the cap.
+            let write = Call::write("agent", "POST", "/api/v1/presence".into(), json!({}));
+            let mut poll = Call::get("agent", "/api/v1/events?wait=25".into());
+            poll.long_poll = true;
+            let reserved_write = workers
+                .acquire(&write, Some(Duration::from_millis(50)))
+                .unwrap();
+            let reserved_poll = workers
+                .acquire(&poll, Some(Duration::from_millis(50)))
+                .unwrap();
+            assert_eq!(workers.active.lock().unwrap().waiting.len(), 3);
+            drop(reserved_write);
+            drop(reserved_poll);
+
+            cancellation.cancel();
+            let error = match head.join().unwrap() {
+                Ok(_) => panic!("canceled head must leave the general queue"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("cancelled"));
+            wait_for_queue(2);
+            drop(held);
+            assert_eq!(next.recv_timeout(Duration::from_millis(100)).unwrap(), 1);
+            assert!(next.try_recv().is_err());
+            release_first.send(()).unwrap();
+            assert_eq!(next.recv_timeout(Duration::from_millis(100)).unwrap(), 2);
+            first.join().unwrap();
+            second.join().unwrap();
+        });
+        let active = workers.active.lock().unwrap();
+        assert!(active.waiting.is_empty());
+        assert_eq!(active.general, 0);
+    }
+
+    #[test]
+    fn status_http_burst_reserves_outbox_write_and_long_poll_workers() {
+        let server = FakeServer::start(vec![
+            Reply::json(200, json!({})).delay(Duration::from_millis(400)),
+            Reply::json(200, json!({})).delay(Duration::from_millis(400)),
+            Reply::json(200, json!({})).delay(Duration::from_millis(400)),
+            Reply::json(200, json!({})).delay(Duration::from_millis(400)),
+            Reply::json(200, json!({})).delay(Duration::from_millis(400)),
+            Reply::json(200, json!({})).delay(Duration::from_millis(400)),
+            Reply::json(200, json!({})).delay(Duration::from_millis(60)),
+            Reply::json(200, json!({})).delay(Duration::from_millis(60)),
+        ]);
+        let mut client = Client::new(&server.url(), "fixture".into()).unwrap();
+        client.set_http_worker_limit(8);
+        client.negotiated_protocol("me").unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..6 {
+                let client = &client;
+                scope.spawn(move || {
+                    let mut call = Call::get("me", "/api/v1/bus/tasks".into());
+                    call.deadline_ms = Some(1000);
+                    client.call(&call).unwrap();
+                });
+            }
+            let started = Instant::now();
+            while server.requests().len() < 6 {
+                assert!(started.elapsed() < Duration::from_secs(1));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(client.http_workers.active.lock().unwrap().general, 6);
+            let mut poll = Call::get("agent", "/api/v1/events?wait=25".into());
+            poll.long_poll = true;
+            poll.deadline_ms = Some(100);
+            let mut write = Call::write("agent", "POST", "/api/v1/presence".into(), json!({}));
+            write.defer_pending_ack = true;
+            write.deadline_ms = Some(100);
+            let started = Instant::now();
+            let (write_result, poll_result) = std::thread::scope(|reserved| {
+                let write = reserved.spawn(|| client.call(&write));
+                let poll = reserved.spawn(|| client.call(&poll));
+                while server.requests().len() < 8 {
+                    assert!(started.elapsed() < Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let active = client.http_workers.active.lock().unwrap();
+                assert_eq!(active.general, 6);
+                assert!(active.write && active.poll);
+                assert_eq!(
+                    active.general + usize::from(active.write) + usize::from(active.poll),
+                    8
+                );
+                drop(active);
+                (write.join().unwrap(), poll.join().unwrap())
+            });
+            assert!(
+                write_result.is_ok(),
+                "outbox write must bypass the status burst"
+            );
+            assert!(
+                poll_result.is_ok(),
+                "event poll must bypass the status burst"
+            );
+            assert!(started.elapsed() < Duration::from_millis(150));
+            assert_eq!(server.requests().len(), 8);
+            // The status reads still own all six general workers when both reserved calls finish.
+            assert_eq!(client.http_workers.active.lock().unwrap().general, 6);
+        });
+    }
+
+    #[test]
+    fn status_http_worker_cancellation_stops_queued_read_without_network() {
+        let server = FakeServer::start(Vec::new());
+        let mut client = Client::new(&server.url(), "fixture".into()).unwrap();
+        client.set_http_worker_limit(3);
+        client.negotiated_protocol("me").unwrap();
+        let blocker = Call::get("me", "/api/v1/bus/tasks".into());
+        let _held = client.http_workers.acquire(&blocker, None).unwrap();
+        let cancellation = Cancellation::new();
+        let mut call = Call::get("me", "/api/v1/zones/claims".into());
+        call.cancellation = Some(cancellation.clone());
+        call.deadline_ms = Some(2600);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| client.call(&call));
+            std::thread::sleep(Duration::from_millis(20));
+            let cancelled = Instant::now();
+            cancellation.cancel();
+            let error = worker.join().unwrap().unwrap_err();
+            assert!(error.to_string().contains("cancelled"));
+            assert!(cancelled.elapsed() < Duration::from_millis(100));
+        });
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn status_cancellation_interrupts_shared_protocol_discovery_wait() {
+        let server = FakeServer::start(Vec::new());
+        let client = Client::new(&server.url(), "fixture".into()).unwrap();
+        let _discovery_in_flight = client.protocol_state.lock().unwrap();
+        let cancellation = Cancellation::new();
+        let mut call = Call::get("me", "/api/v1/zones/claims".into());
+        call.cancellation = Some(cancellation.clone());
+        call.deadline_ms = Some(2600);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| client.call(&call));
+            std::thread::sleep(Duration::from_millis(20));
+            let cancelled = Instant::now();
+            cancellation.cancel();
+            let error = worker.join().unwrap().unwrap_err();
+            assert!(error.to_string().contains("cancelled"));
+            assert!(cancelled.elapsed() < Duration::from_millis(100));
+        });
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn status_http_cancellation_drops_inflight_result_and_releases_worker() {
+        let server = FakeServer::start(vec![
+            Reply::json(200, json!({"claims":[]})).delay(Duration::from_millis(120)),
+            Reply::json(200, json!({})),
+        ]);
+        let mut client = Client::new(&server.url(), "fixture".into()).unwrap();
+        client.set_http_worker_limit(3);
+        let cancellation = Cancellation::new();
+        let mut call = Call::get("me", "/api/v1/zones/claims".into());
+        call.cancellation = Some(cancellation.clone());
+        call.deadline_ms = Some(2600);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| client.call(&call));
+            let started = Instant::now();
+            while server.requests().is_empty() {
+                assert!(started.elapsed() < Duration::from_secs(1));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            cancellation.cancel();
+            let error = worker.join().unwrap().unwrap_err();
+            assert!(error.to_string().contains("cancelled"));
+            assert!(started.elapsed() < Duration::from_millis(400));
+        });
+        assert_eq!(server.requests().len(), 1);
+        assert_eq!(client.http_workers.active.lock().unwrap().general, 0);
+        let mut live = Call::get("me", "/api/v1/bus/tasks".into());
+        live.deadline_ms = Some(100);
+        client.call(&live).unwrap();
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    #[test]
+    fn status_cancellation_token_is_local_and_generation_scoped() {
+        let cancellation = Cancellation::new();
+        let mut call = Call::get("me", "/api/v1/zones/claims".into());
+        call.cancellation = Some(cancellation.clone());
+        let same_generation = call.clone();
+        let mut other_generation = call.clone();
+        other_generation.cancellation = Some(Cancellation::new());
+        let wire = serde_json::to_value(&call).unwrap();
+        assert!(wire.get("cancellation").is_none());
+        let older_side: Call = serde_json::from_value(wire).unwrap();
+        assert!(older_side.cancellation.is_none());
+        cancellation.cancel();
+        assert!(same_generation.check_cancelled().is_err());
+        assert!(other_generation.check_cancelled().is_ok());
+    }
+
+    #[test]
+    fn status_retry_after_that_cannot_fit_fails_closed_without_sleeping() {
+        let server = FakeServer::start(vec![
+            Reply::json(
+                429,
+                json!({"error":{"code":"rate_limited","message":"slow down"}}),
+            )
+            .header("Retry-After", "60"),
+        ]);
+        let client = Client::new(&server.url(), "fixture".into()).unwrap();
+        let backend = CloudBackend::new(client, "me");
+        let start = Instant::now();
+        let error = backend
+            .status_read("me", 0, Duration::from_secs(6))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("status claims unavailable within deadline")
+        );
+        assert!(error.to_string().contains("rate limiting"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn status_retry_after_waits_then_retries_inside_remaining_deadline() {
+        let page = json!({"claims":[], "items":[], "messages":[], "tasks":[]});
+        let server = FakeServer::start(vec![
+            Reply::json(
+                429,
+                json!({"error":{"code":"rate_limited","message":"slow down"}}),
+            )
+            .header("Retry-After", "1"),
+            Reply::json(200, page.clone()),
+            Reply::json(200, page.clone()),
+            Reply::json(200, page.clone()),
+            Reply::json(200, page.clone()),
+            Reply::json(200, page),
+        ]);
+        let client = Client::new(&server.url(), "fixture".into()).unwrap();
+        let backend = CloudBackend::new(client, "me");
+        let start = Instant::now();
+        let read = backend
+            .status_read("me", 0, Duration::from_secs(3))
+            .unwrap();
+        assert!(read.claims.is_empty());
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert_eq!(server.requests().len(), 6);
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|call| call.path.starts_with("/api/v1/zones/claims"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn status_encryption_configuration_obeys_remaining_deadline() {
+        let server = FakeServer::start(vec![
+            Reply::json(
+                200,
+                json!({"encryption":"off", "key_id":null, "workspace_id":"workspace"}),
+            )
+            .delay(Duration::from_millis(300)),
+        ]);
+        let client = Client::new(&server.url(), "fixture-token".into()).unwrap();
+        let start = Instant::now();
+        let result =
+            client.configure_content_encryption_with_deadline("me", Duration::from_millis(80));
+        assert!(matches!(result, Err(ClientError::Transport(_))));
+        assert!(start.elapsed() < Duration::from_millis(250));
+        assert_eq!(server.requests().len(), 1);
+        assert_eq!(server.requests()[0].path, ENCRYPTION_PATH);
+    }
+
+    #[test]
+    fn status_encryption_zero_budget_never_contacts_server_or_falls_back() {
+        let server = FakeServer::start(Vec::new());
+        let client = Client::new(&server.url(), "fixture-token".into()).unwrap();
+        assert!(matches!(
+            client.configure_content_encryption_with_deadline("me", Duration::ZERO),
+            Err(ClientError::Transport(_))
+        ));
+        assert!(server.requests().is_empty());
+    }
 
     #[test]
     fn default_catalog_transport_strictly_validates_complete_catalog_before_expansion() {

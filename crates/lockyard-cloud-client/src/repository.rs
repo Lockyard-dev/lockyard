@@ -152,13 +152,48 @@ impl<T> RepositoryTransport<T> {
 }
 
 impl<T: Transport> Transport for RepositoryTransport<T> {
+    fn status_registry_assignee_supported(
+        &self,
+        deadline: std::time::Instant,
+        cancellation: Option<&crate::Cancellation>,
+    ) -> bool {
+        self.inner
+            .status_registry_assignee_supported(deadline, cancellation)
+    }
+
+    fn status_registry_call(&self, call: &Call) -> Result<crate::StatusRegistryPage, ClientError> {
+        // Registry items are workspace-scoped, with no zone path transformation.
+        self.inner.status_registry_call(call)
+    }
+
+    fn status_reads_parallel(&self) -> bool {
+        self.inner.status_reads_parallel()
+    }
+
+    fn status_followups_parallel(&self) -> bool {
+        self.inner.status_followups_parallel()
+    }
+
+    fn status_cancelled(&self) -> bool {
+        self.inner.status_cancelled()
+    }
+
+    fn server_time_upper_bound(&self) -> Option<i64> {
+        self.inner.server_time_upper_bound()
+    }
+
     fn call(&self, call: &Call) -> Result<Value, ClientError> {
+        let started = std::time::Instant::now();
         let zones = call.path.starts_with("/api/v1/zones/")
             || call.path.starts_with("/api/v1/import/zones");
         let catalog = call.path.starts_with("/api/v1/zones/catalog")
             || call.path.starts_with("/api/v1/import/zones");
         let events = call.path.starts_with("/api/v1/events");
-        if zones && self.repository.is_some() && !self.verified.load(Ordering::Acquire) {
+        if zones
+            && (call.is_write() || !self.inner.verifies_repository_reads())
+            && self.repository.is_some()
+            && !self.verified.load(Ordering::Acquire)
+        {
             // Negotiate through a read before a write can acquire a zone on an older server.
             let mut probe = Call::get(
                 &call.session,
@@ -168,10 +203,21 @@ impl<T: Transport> Transport for RepositoryTransport<T> {
                 ),
             );
             probe.repository = self.repository.clone();
+            probe.deadline_ms = call.deadline_ms;
             self.inner.call(&probe)?;
             self.verified.store(true, Ordering::Release);
         }
-        let qualified = self.qualified_call(call)?;
+        let mut qualified = self.qualified_call(call)?;
+        if let Some(limit) = call.deadline_ms {
+            let remaining =
+                std::time::Duration::from_millis(limit).saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(ClientError::Transport(
+                    "call deadline elapsed during repository verification".into(),
+                ));
+            }
+            qualified.deadline_ms = Some(remaining.as_millis().min(u128::from(u64::MAX)) as u64);
+        }
         let answer = self.inner.call(&qualified);
         let mut answer = match answer {
             Err(ClientError::Conflict(mut error)) => {
@@ -180,6 +226,11 @@ impl<T: Transport> Transport for RepositoryTransport<T> {
             }
             other => other?,
         };
+        // A successful scoped read through Client verifies the echo at the HTTP boundary.
+        // Legacy socket transports must first succeed at the explicit capability probe above.
+        if zones && self.repository.is_some() {
+            self.verified.store(true, Ordering::Release);
+        }
         if catalog {
             self.catalog(&mut answer, false)?;
         } else if zones || events {
@@ -269,6 +320,7 @@ mod tests {
     use lockyard_core::Backend;
     use lockyard_core::proto::{ClaimRequest, DirtyPath};
     use serde_json::json;
+    use std::sync::Mutex;
 
     const REQUIRED_WORKSPACE: &str = "123e4567-e89b-12d3-a456-426614174000";
 
@@ -327,6 +379,65 @@ mod tests {
             "private claim note"
         );
         assert!(!requests[1].body.to_string().contains("private claim note"));
+    }
+
+    #[test]
+    fn status_repository_read_verifies_namespace_without_an_extra_probe() {
+        let server = FakeServer::start(vec![
+            Reply::json(
+                200,
+                json!([{"id":1,"session":"alice","paths":[".lockyard-repository/api/src"]}]),
+            )
+            .header("X-Lockyard-Repository", "api"),
+        ]);
+        let client = Client::new(&server.url(), "fixture-token".into()).unwrap();
+        let transport = RepositoryTransport::new(client, Some("api")).unwrap();
+        let value = transport
+            .call(&Call::get(
+                "alice",
+                "/api/v1/zones/claims?session=alice".into(),
+            ))
+            .unwrap();
+        assert_eq!(value[0]["paths"][0], "src");
+        assert!(transport.verified.load(Ordering::Acquire));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/api/v1/zones/claims?session=alice");
+        assert_eq!(requests[0].header("x-lockyard-repository"), Some("api"));
+    }
+
+    #[test]
+    fn status_repository_read_via_legacy_socket_still_requires_namespace_probe() {
+        struct Unsupported(Mutex<Vec<Call>>);
+        impl Transport for Unsupported {
+            fn call(&self, call: &Call) -> Result<Value, ClientError> {
+                self.0.lock().unwrap().push(call.clone());
+                if call.path.contains("namespace_probe=1") {
+                    Err(ClientError::Invalid(
+                        "upgrade agent: repository namespace unsupported".into(),
+                    ))
+                } else {
+                    Ok(json!([]))
+                }
+            }
+        }
+        let transport =
+            RepositoryTransport::new(Unsupported(Mutex::new(Vec::new())), Some("api")).unwrap();
+        let error = transport
+            .call(&Call::get(
+                "alice",
+                "/api/v1/zones/claims?session=alice".into(),
+            ))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("repository namespace unsupported")
+        );
+        assert!(!transport.verified.load(Ordering::Acquire));
+        let calls = transport.inner.0.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].path.contains("namespace_probe=1"));
     }
 
     #[test]

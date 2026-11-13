@@ -128,6 +128,80 @@ pub fn open(cwd: &Path, agent: Option<&str>) -> Result<Opened> {
     Ok(Opened { backend, root })
 }
 
+/// A status-specific open: probing an old or unresponsive daemon must not consume the command's
+/// deadline. Reads use its existing authenticated connection pool when the aggregate is supported.
+pub(crate) fn status_read(
+    cwd: &Path,
+    session: &str,
+    deadline: std::time::Instant,
+) -> Result<(PathBuf, bool, lockyard_core::StatusRead)> {
+    use std::time::Instant;
+    let _span = lockyard_core::perf::Span::new("status.open_and_read");
+    let root = find_root(cwd).ok_or(Error::NoProject)?;
+    let config = Config::load(&root)?;
+    let left = || deadline.saturating_duration_since(Instant::now());
+    if config.mode == Mode::Local {
+        let read = Store::open(&root)?.status_read(session, crate::now_ms(), left())?;
+        return Ok((root, false, read));
+    }
+    let (url, workspace) = endpoint(&config)?;
+    let token = Config::token_for(&url).ok();
+    let expected_token = token.as_deref().map(token_id);
+    // Preserve the direct-client encryption attestation used by ordinary opens.
+    if std::env::var_os("LOCKYARD_REQUIRE_E2EE").is_none()
+        && std::env::var_os("LOCKYARD_E2EE_WORKSPACE_ID").is_none()
+    {
+        let probe = status_probe_budget(left());
+        if !probe.is_zero()
+            && let Some(socket) = crate::agent::socket::AgentSocket::connect_status(
+                &crate::agent::socket_path_for(&url, &workspace),
+                &url,
+                &workspace,
+                expected_token.as_deref(),
+                probe,
+            )
+        {
+            // Spend at most one quarter of what remains on the aggregate, capped at the warm
+            // route's existing 1500 ms. At least three quarters remain for ONE cold claims-first
+            // fallback; a hung agent never consumes a fixed 1500 ms out of a shortened budget.
+            let budget = status_agent_budget(left());
+            match socket.status_read(session, config.repository.as_deref(), budget) {
+                Ok(mut read) => {
+                    read.freshness["via"] = serde_json::json!("agent");
+                    return Ok((root, true, read));
+                }
+                Err(lockyard_cloud_client::ClientError::Transport(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    if left().is_zero() {
+        return Err(Error::Unavailable(
+            "status deadline elapsed before direct fallback".into(),
+        ));
+    }
+    trusted_url(&url)?;
+    let client = journal_client(Client::new(&url, Config::token_for(&url)?)?)?
+        .with_status_protocol_cache()
+        .configure_content_encryption_with_deadline(session, left())?;
+    let backend = CloudBackend::new(
+        RepositoryTransport::new(client, config.repository.as_deref())?,
+        session,
+    );
+    let mut read = backend.status_read(session, crate::now_ms(), left())?;
+    read.freshness["via"] = serde_json::json!("direct");
+    Ok((root, true, read))
+}
+
+fn status_probe_budget(left: std::time::Duration) -> std::time::Duration {
+    left.div_f64(20.0)
+        .min(std::time::Duration::from_millis(100))
+}
+
+fn status_agent_budget(left: std::time::Duration) -> std::time::Duration {
+    (left / 4).min(std::time::Duration::from_millis(1500))
+}
+
 fn direct(url: &str, session: &str, repository: Option<&str>) -> Result<Box<dyn Backend>> {
     trusted_url(url)?;
     let client = journal_client(Client::new(url, Config::token_for(url)?)?)?
@@ -202,7 +276,32 @@ fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
 
 #[cfg(test)]
 mod tests {
-    use super::url_matches;
+    use super::{status_agent_budget, status_probe_budget, url_matches};
+    use std::time::Duration;
+
+    #[test]
+    fn status_fallback_reserves_three_quarters_of_remaining_budget() {
+        for millis in [0, 20, 100, 850, 1500, 2800, 5940, 10000] {
+            let left = Duration::from_millis(millis);
+            let probe = status_probe_budget(left);
+            assert!(probe <= left / 20);
+            assert!(probe <= Duration::from_millis(100));
+            let after_probe = left.saturating_sub(probe);
+            let aggregate = status_agent_budget(after_probe);
+            assert!(aggregate <= after_probe / 4);
+            assert!(aggregate <= Duration::from_millis(1500));
+            assert!(after_probe - aggregate >= after_probe.mul_f64(0.75));
+        }
+        let after_probe = Duration::from_millis(5940 - 100);
+        assert_eq!(
+            status_agent_budget(after_probe),
+            Duration::from_millis(1460)
+        );
+        assert_eq!(
+            after_probe - status_agent_budget(after_probe),
+            Duration::from_millis(4380)
+        );
+    }
 
     #[test]
     fn a_project_url_must_match_the_user_trust_url() {

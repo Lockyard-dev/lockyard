@@ -1,0 +1,20 @@
+{
+  "unread": 0,
+  "claims": [],
+  "offers": [],
+  "work": [],
+  "tasks": [],
+  "machine_level": "<machine-dependent>",
+  "unannounced": [],
+  "freshness": {
+    "via": "direct",
+    "source": "network",
+    "claims_cached": false,
+    "sections": {
+      "claims": {
+        "source": "network",
+        "available": true
+      }
+    }
+  }
+}

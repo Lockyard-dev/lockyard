@@ -30,8 +30,8 @@ pub mod windows;
 pub mod zones;
 
 pub use backend::{
-    Backend, claim_or_reuse, claim_or_reuse_with_creation_status, claim_or_reuse_with_hold,
-    claim_or_reuse_with_status, validate_hold,
+    Backend, StatusRead, claim_or_reuse, claim_or_reuse_with_creation_status,
+    claim_or_reuse_with_hold, claim_or_reuse_with_status, validate_hold,
 };
 pub use error::{Error, Result};
 pub use paths::ZonePath;

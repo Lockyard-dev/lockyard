@@ -270,69 +270,77 @@ fn cloud_status_with_registry(
     let seen_routes = Arc::clone(&registry_routes);
     std::thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut first = String::new();
-            reader.read_line(&mut first).unwrap();
-            let mut protocol = None;
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
-                    break;
+            let claims = claims.clone();
+            let work = work.clone();
+            let items = items.clone();
+            let seen_routes = Arc::clone(&seen_routes);
+            // Status reads are independent and may arrive in either order. Route each socket
+            // by its request path instead of making the fixture's response order significant.
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut protocol = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("Lockyard-Protocol")
+                    {
+                        protocol = Some(value.trim().to_string());
+                    }
                 }
-                if let Some((name, value)) = line.split_once(':')
-                    && name.eq_ignore_ascii_case("Lockyard-Protocol")
-                {
-                    protocol = Some(value.trim().to_string());
+                assert_eq!(protocol.as_deref(), Some("2"));
+                let path = first.split_whitespace().nth(1).unwrap();
+                if path.starts_with("/api/v1/registry/items") {
+                    seen_routes.lock().unwrap().push(path.to_string());
+                    assert!(
+                        matches!(
+                            path,
+                            "/api/v1/registry/items?status=active&limit=200"
+                                | "/api/v1/registry/items?status=review&limit=200"
+                        ),
+                        "status must use a bounded server-side status filter: {path}"
+                    );
                 }
-            }
-            assert_eq!(protocol.as_deref(), Some("2"));
-            let path = first.split_whitespace().nth(1).unwrap();
-            if path.starts_with("/api/v1/registry/items") {
-                seen_routes.lock().unwrap().push(path.to_string());
-                assert!(
-                    matches!(
-                        path,
-                        "/api/v1/registry/items?status=active&limit=200"
-                            | "/api/v1/registry/items?status=review&limit=200"
-                    ),
-                    "status must use a bounded server-side status filter: {path}"
-                );
-            }
-            let answer = match path.split('?').next().unwrap() {
-                // EP-10 requires discovery and selected-version/repository echoes before reads.
-                "/api/v1/protocol" => {
-                    json!({"selected_protocol":2,"min_protocol":1,"max_protocol":2,"capabilities":[]})
-                }
-                "/api/v1/workspace/encryption" => json!({"encryption":"off", "key_id":null,
+                let answer = match path.split('?').next().unwrap() {
+                    // EP-10 requires discovery and selected-version/repository echoes before reads.
+                    "/api/v1/protocol" => {
+                        json!({"selected_protocol":2,"min_protocol":1,"max_protocol":2,"capabilities":[]})
+                    }
+                    "/api/v1/workspace/encryption" => json!({"encryption":"off", "key_id":null,
                     "workspace_id":"00000000-0000-0000-0000-000000000001"}),
-                // MCP checks first-call presence before dispatching status. Model an already-live
-                // session so this read-only fixture does not need to publish a heartbeat.
-                "/api/v1/presence" if first.starts_with("GET ") => {
-                    json!({"sessions":[{"session":"alice", "client":"mcp"}]})
-                }
-                "/api/v1/zones/claims" => claims.clone(),
-                "/api/v1/zones/lost" => json!([]),
-                "/api/v1/bus/inbox" => json!({"messages":[], "skipped":0}),
-                "/api/v1/bus/tasks" => work.clone(),
-                "/api/v1/registry/items" => {
-                    let status = if path.contains("status=active&") {
-                        "active"
-                    } else {
-                        "review"
-                    };
-                    let rows: Vec<_> = items
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .filter(|item| item["status"] == status)
-                        .cloned()
-                        .collect();
-                    json!({"items":rows, "cursor":null})
-                }
-                other => panic!("unexpected status route: {other}"),
-            };
-            let body = answer.to_string();
-            write!(stream, "HTTP/1.1 200 OK\r\nLockyard-Protocol: 2\r\nX-Lockyard-Repository: -\r\nCache-Control: no-store\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    // MCP checks first-call presence before dispatching status. Model an already-live
+                    // session so this read-only fixture does not need to publish a heartbeat.
+                    "/api/v1/presence" if first.starts_with("GET ") => {
+                        json!({"sessions":[{"session":"alice", "client":"mcp"}]})
+                    }
+                    "/api/v1/zones/claims" => claims.clone(),
+                    "/api/v1/zones/lost" => json!([]),
+                    "/api/v1/bus/inbox" => json!({"messages":[], "skipped":0}),
+                    "/api/v1/bus/tasks" => work.clone(),
+                    "/api/v1/registry/items" => {
+                        let status = if path.contains("status=active&") {
+                            "active"
+                        } else {
+                            "review"
+                        };
+                        let rows: Vec<_> = items
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter(|item| item["status"] == status)
+                            .cloned()
+                            .collect();
+                        json!({"items":rows, "cursor":null})
+                    }
+                    other => panic!("unexpected status route: {other}"),
+                };
+                let body = answer.to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nLockyard-Protocol: 2\r\nX-Lockyard-Repository: -\r\nCache-Control: no-store\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
         }
     });
     let dir = tempfile::tempdir().unwrap();
@@ -384,8 +392,10 @@ fn cloud_status_with_registry(
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    let mut actual_registry_routes = registry_routes.lock().unwrap().clone();
+    actual_registry_routes.sort_unstable();
     assert_eq!(
-        *registry_routes.lock().unwrap(),
+        actual_registry_routes,
         [
             "/api/v1/registry/items?status=active&limit=200",
             "/api/v1/registry/items?status=review&limit=200",
@@ -408,7 +418,8 @@ fn cloud_cli_and_mcp_status_keep_only_owned_tasks_without_a_backlog() {
         item("D-4", "review", "token:b:bob"),
         {"id":"D-5", "title":"unassigned backlog", "status":"ready"}
     ]);
-    let claims = json!([{"id":42, "session":"alice", "paths":["owned/path"]}]);
+    let claims = json!([{"id":42, "session":"alice", "paths":["owned/path"],
+        "expires_at":"2099-01-01T00:00:00Z"}]);
     let work = json!([
         {"id":"BT-1", "title":"owned work", "status":"claimed", "assignee":"alice", "to":"*", "version":1}
     ]);
@@ -502,8 +513,9 @@ fn cloud_status_bounds_work_after_filtering() {
 #[test]
 fn cloud_status_separates_incoming_handover_offers_from_owned_claims() {
     let claims = json!([
-        {"id":41, "session":"bob", "paths":["incoming/path"], "note":"please take over", "handover_to":"alice", "offered_to_you":true},
-        {"id":42, "session":"alice", "paths":["owned/path"]}
+        {"id":41, "session":"bob", "paths":["incoming/path"], "note":"please take over", "handover_to":"alice", "offered_to_you":true,
+            "expires_at":"2099-01-01T00:00:00Z"},
+        {"id":42, "session":"alice", "paths":["owned/path"], "expires_at":"2099-01-01T00:00:00Z"}
     ]);
     let status: Value =
         serde_json::from_str(&cloud_status(claims.clone(), json!([]), true)).unwrap();

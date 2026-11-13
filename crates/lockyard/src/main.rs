@@ -217,7 +217,7 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             let text = join(&agents, line, "no agents yet");
             output(&agents, text)
         }
-        Command::Status => run_status(&open()?, agent.as_ref()),
+        Command::Status => run_status_command(cwd, agent.as_ref()),
         Command::Zone(command) => run_zone(open()?, command, agent.as_ref(), cwd),
         Command::Msg(command) => run_msg(open()?, command, agent.as_ref()),
         Command::Task(command) => run_task(open()?, command, agent.as_ref()),

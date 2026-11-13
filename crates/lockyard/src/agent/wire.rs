@@ -34,6 +34,12 @@ pub enum Request {
     Unread { session: String },
     /// A memory-only snapshot of coordination state for one session.
     ZoneSnapshot { session: String },
+    /// A bounded authoritative status read using the daemon's warm HTTP transport.
+    StatusRead {
+        session: String,
+        repository: Option<String>,
+        deadline_ms: u64,
+    },
     /// Reserve mail for showing. It is marked later, through a `Call` to `inbox/seen`.
     TakeMail {
         session: String,
@@ -71,7 +77,7 @@ pub struct Envelope {
 pub enum Source {
     /// Memory, fresher than the limit.
     View,
-    /// One server call inside the deadline.
+    /// Authoritative server reads inside the deadline.
     Server,
     /// Neither: the answer is unknown.
     None,
@@ -87,6 +93,13 @@ pub struct AgentStatus {
     pub token_id: String,
     #[serde(default)]
     pub catalog_expansion_v1: bool,
+    /// This daemon supports the bounded aggregate status request.
+    #[serde(default)]
+    pub status_read_v1: bool,
+    /// Advisory only: abandoned in-flight HTTP still owns aggregate slots. A credentialed
+    /// status caller can preserve its direct-read allocation instead of waiting behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_read_abandoned: Option<bool>,
     pub pid: u32,
     pub view_fresh: bool,
     pub view_age_ms: Option<u64>,
@@ -134,6 +147,8 @@ pub struct Reply {
     pub value: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<AgentStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_read: Option<lockyard_core::StatusRead>,
 }
 
 impl Reply {
@@ -149,6 +164,34 @@ impl Reply {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn status_abandoned_hint_is_optional_and_ignored_by_older_readers() {
+        let mut status = AgentStatus {
+            url: "https://example.test".into(),
+            status_read_v1: true,
+            ..Default::default()
+        };
+        let old_shape = serde_json::to_value(&status).unwrap();
+        assert!(old_shape.get("status_read_abandoned").is_none());
+        assert_eq!(
+            serde_json::from_value::<AgentStatus>(old_shape)
+                .unwrap()
+                .status_read_abandoned,
+            None
+        );
+        status.status_read_abandoned = Some(true);
+        let new_shape = serde_json::to_value(status).unwrap();
+        assert_eq!(new_shape["status_read_abandoned"], true);
+        #[derive(Deserialize)]
+        struct OlderStatus {
+            url: String,
+            status_read_v1: bool,
+        }
+        let older: OlderStatus = serde_json::from_value(new_shape).unwrap();
+        assert_eq!(older.url, "https://example.test");
+        assert!(older.status_read_v1);
+    }
 
     #[test]
     fn a_request_is_one_flat_object() {
@@ -194,6 +237,37 @@ mod tests {
             serde_json::to_value(reply).unwrap()["lost"],
             serde_json::json!([])
         );
+    }
+
+    #[test]
+    fn status_request_and_capability_are_additive_for_old_daemons() {
+        let request = Envelope {
+            workspace: "w".into(),
+            request: Request::StatusRead {
+                session: "s".into(),
+                repository: Some("api".into()),
+                deadline_ms: 2500,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"workspace":"w","op":"status_read","session":"s","repository":"api","deadline_ms":2500}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<Envelope>(&serde_json::to_string(&request).unwrap()).unwrap(),
+            request,
+        );
+        let old = json!({
+            "url": "https://example.test", "workspace": "w", "pid": 1,
+            "view_fresh": false, "view_age_ms": null, "claims": 0, "board": 0,
+            "sessions": 0, "outbox": 0, "coordination_seq": 0, "registry_seq": 0,
+        });
+        assert!(
+            !serde_json::from_value::<AgentStatus>(old)
+                .unwrap()
+                .status_read_v1
+        );
+        assert_eq!(serde_json::to_value(Reply::default()).unwrap(), json!({}));
     }
 
     #[test]

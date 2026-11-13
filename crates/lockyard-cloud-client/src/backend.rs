@@ -303,7 +303,7 @@ fn count(value: &Value, names: &[&str], fallback: usize) -> usize {
         .unwrap_or(fallback)
 }
 
-fn inbox_page(value: Value) -> std::result::Result<InboxPage, ClientError> {
+pub(crate) fn inbox_page(value: Value) -> std::result::Result<InboxPage, ClientError> {
     if value.is_array() {
         return Ok(InboxPage {
             messages: list(value, &[])?,
@@ -584,7 +584,7 @@ fn stage_rank(stage: Option<&str>) -> u8 {
 }
 
 /// A backlog item in the shape of a task. Open covers `ready`, `blocked` and `intake`.
-fn task_from(item: &Value) -> Result<tasks::Task> {
+pub(crate) fn task_from(item: &Value) -> Result<tasks::Task> {
     let id = text(item, "id");
     lockyard_core::task_id::TaskId::parse(id)?;
     let assignment = item.get("assignment").filter(|found| found.is_object());
@@ -637,6 +637,14 @@ fn task_from(item: &Value) -> Result<tasks::Task> {
 }
 
 impl<T: Transport> Backend for CloudBackend<T> {
+    fn status_read(
+        &self,
+        session: &str,
+        now: i64,
+        budget: std::time::Duration,
+    ) -> Result<lockyard_core::StatusRead> {
+        crate::status::read(self, session, now, budget)
+    }
     fn set_write_idempotency_key(&mut self, key: Option<String>) {
         self.write_idempotency_key = key;
     }
