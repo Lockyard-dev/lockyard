@@ -2,10 +2,11 @@
 
 //! Client-side "open mail": asks that still need this agent's reply or ack.
 //!
-//! The server does not yet expose per-reader handled state (LC-0004). Until it does, open mail is
-//! derived from a peek of `GET /bus/inbox?all=…`. Cloud mode closes only on shared `status=ack`
-//! (the `/bus/sent` endpoint does not return `in_reply_to`). Local mode still consults `sent`.
-//! A timed-out or failed optional read omits the open list rather than failing status.
+//! When the server announces `mail_open_v1`, open mail is `GET /bus/inbox?open=true` (per-reader
+//! handled state, including broadcasts). Otherwise open mail is derived from a peek of
+//! `GET /bus/inbox?all=…` as in 0.3.10: cloud closes only on shared `status=ack`, local mode still
+//! consults `sent`. A timed-out or failed optional read omits the open list rather than failing
+//! status.
 
 use lockyard_core::Backend;
 use lockyard_core::OpenMail;
@@ -44,10 +45,38 @@ pub fn open_mail_within(
     let left = || budget.saturating_sub(started.elapsed());
     let request_budget = || left().saturating_sub(CALL_RESERVE).min(SENT_BUDGET);
 
+    // Capability first, inside the caller budget — never spend the open=true window on discovery.
+    let capability_budget = request_budget();
+    if capability_budget.is_zero() {
+        return None;
+    }
+    let supported = match backend.mail_open_v1(capability_budget) {
+        Ok(value) => value,
+        // Capability probe failed: omit the list (do not fall back to the legacy filter).
+        Err(_) => return None,
+    };
+
     let inbox_budget = request_budget();
     if inbox_budget.is_zero() {
         return None;
     }
+
+    if supported {
+        let page = backend
+            .peek_open_inbox_within(me, INBOX_PAGE, now, inbox_budget)
+            .ok()?;
+        return Some(OpenMailSnapshot {
+            // Still drop shared ack/info rows if a rolled-back server listed them.
+            items: page
+                .messages
+                .iter()
+                .filter(|message| !is_shared_handled(message))
+                .map(to_open)
+                .collect(),
+            truncated: page.skipped > 0,
+        });
+    }
+
     let page = backend
         .peek_inbox_within(
             me,
@@ -119,6 +148,10 @@ fn filter_open(messages: &[Message], me: &str, now: i64, replied: &HashSet<i64>)
         .collect()
 }
 
+fn is_shared_handled(message: &Message) -> bool {
+    matches!(message.status.as_deref(), Some("ack") | Some("info"))
+}
+
 fn is_open(message: &Message, me: &str, now: i64, replied: &HashSet<i64>) -> bool {
     if message.from == me {
         return false;
@@ -130,10 +163,9 @@ fn is_open(message: &Message, me: &str, now: i64, replied: &HashSet<i64>) -> boo
     if replied.contains(&message.id) {
         return false;
     }
-    // Server-wide status: ack/info means handled for this reader until LC-0004 lands.
-    match message.status.as_deref() {
-        Some("ack") | Some("info") => return false,
-        _ => {}
+    // Shared status: ack/info means handled for every reader until mail_open_v1 is used.
+    if is_shared_handled(message) {
+        return false;
     }
     // A stored reply is kind=ask, needs=none, in_reply_to set — not an outstanding ask.
     let needs = message.needs.as_deref().unwrap_or("none");
@@ -199,7 +231,14 @@ fn stamp_text(stamp: &Stamp) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lockyard_core::proto::Stamp;
+    use lockyard_core::Error;
+    use lockyard_core::Result;
+    use lockyard_core::proto::{
+        BoardEntry, BoardWrite, Claim, ClaimQuery, ClaimRequest, InboxPage, Message, PresenceBeat,
+        ReleaseRequest, RenewRequest, SendRequest, Stamp, WorkTask,
+    };
+    use lockyard_core::tasks::{Status, Task, TaskEvent, TaskSpec};
+    use std::sync::Mutex;
 
     fn ask(id: i64, from: &str, to: &str, body: &str, created: i64) -> Message {
         Message {
@@ -220,6 +259,167 @@ mod tests {
             created_at: Stamp::Millis(created),
             deduplicated: false,
             queued: false,
+        }
+    }
+
+    #[derive(Default)]
+    struct MailMock {
+        cloud: bool,
+        mail_open: bool,
+        /// When set, `mail_open_v1` returns this error (list omitted).
+        capability_error: Mutex<Option<Error>>,
+        /// When set, `peek_open_inbox_within` / legacy peek return this error.
+        fail: Mutex<Option<Error>>,
+        /// Server `open=true` page (capability path).
+        open_page: Mutex<InboxPage>,
+        /// Legacy `all=true` page.
+        all_page: Mutex<InboxPage>,
+        last_open: Mutex<bool>,
+        last_all: Mutex<bool>,
+    }
+
+    impl MailMock {
+        fn take_fail(&self) -> Result<()> {
+            match self.fail.lock().unwrap().take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl Backend for MailMock {
+        fn is_cloud(&self) -> bool {
+            self.cloud
+        }
+        fn mail_open_v1(&self, _timeout: Duration) -> Result<bool> {
+            match self.capability_error.lock().unwrap().take() {
+                Some(error) => Err(error),
+                None => Ok(self.mail_open),
+            }
+        }
+        fn peek_open_inbox_within(
+            &self,
+            _agent: &str,
+            _limit: usize,
+            _now: i64,
+            _timeout: Duration,
+        ) -> Result<InboxPage> {
+            *self.last_open.lock().unwrap() = true;
+            self.take_fail()?;
+            Ok(self.open_page.lock().unwrap().clone())
+        }
+        fn peek_inbox(&self, _agent: &str, query: InboxQuery, _now: i64) -> Result<InboxPage> {
+            *self.last_all.lock().unwrap() = query.all;
+            self.take_fail()?;
+            Ok(self.all_page.lock().unwrap().clone())
+        }
+        fn touch_agent(&mut self, _: &str, _: i64) -> Result<()> {
+            unreachable!()
+        }
+        fn agents(&self) -> Result<Vec<lockyard_core::proto::AgentSeen>> {
+            unreachable!()
+        }
+        fn claim(&mut self, _: &str, _: &ClaimRequest, _: i64) -> Result<Claim> {
+            unreachable!()
+        }
+        fn renew(&mut self, _: &str, _: Option<i64>, _: &RenewRequest, _: i64) -> Result<usize> {
+            unreachable!()
+        }
+        fn release(
+            &mut self,
+            _: &str,
+            _: Option<i64>,
+            _: &ReleaseRequest,
+            _: i64,
+        ) -> Result<usize> {
+            unreachable!()
+        }
+        fn claims(&self, _: &ClaimQuery, _: i64) -> Result<Vec<Claim>> {
+            unreachable!()
+        }
+        fn check(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<i64>,
+            _: i64,
+        ) -> Result<Vec<lockyard_core::proto::PathCheck>> {
+            unreachable!()
+        }
+        fn send(&mut self, _: &str, _: &SendRequest, _: i64) -> Result<Message> {
+            unreachable!()
+        }
+        fn reply(&mut self, _: &str, _: i64, _: &str, _: i64) -> Result<Message> {
+            unreachable!()
+        }
+        fn inbox(&mut self, _: &str, _: InboxQuery, _: i64) -> Result<InboxPage> {
+            unreachable!()
+        }
+        fn unread(&self, _: &str) -> Result<i64> {
+            Ok(0)
+        }
+        fn inbox_seen(&mut self, _: &str, _: &[i64], _: i64) -> Result<usize> {
+            unreachable!()
+        }
+        fn inbox_claim(&mut self, _: &str, _: &str, _: &[i64], _: i64, _: i64) -> Result<Vec<i64>> {
+            unreachable!()
+        }
+        fn tasks(&self, _: Option<Status>, _: bool) -> Result<Vec<Task>> {
+            Ok(Vec::new())
+        }
+        fn work_list(&self, _: &str) -> Result<Vec<WorkTask>> {
+            Ok(Vec::new())
+        }
+        fn lost(&self, _: &str) -> Result<Vec<lockyard_core::proto::LostClaim>> {
+            Ok(Vec::new())
+        }
+        fn task(&self, _: &str) -> Result<Task> {
+            unreachable!()
+        }
+        fn task_history(&self, _: &str) -> Result<Vec<TaskEvent>> {
+            Ok(Vec::new())
+        }
+        fn add_task(&mut self, _: &str, _: &TaskSpec, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn claim_task(&mut self, _: &str, _: &str, _: i64, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn renew_task(&mut self, _: &str, _: &str, _: i64, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn release_task(&mut self, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn submit_task(&mut self, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn accept_task(&mut self, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn reject_task(&mut self, _: &str, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn cancel_task(&mut self, _: &str, _: &str, _: &str, _: i64) -> Result<Task> {
+            unreachable!()
+        }
+        fn board_set(&mut self, _: &str, _: &BoardWrite, _: i64) -> Result<BoardEntry> {
+            unreachable!()
+        }
+        fn board_get(&self, _: &str, _: i64) -> Result<Option<BoardEntry>> {
+            unreachable!()
+        }
+        fn board_remove(&mut self, _: &str, _: &str) -> Result<bool> {
+            unreachable!()
+        }
+        fn board_list(&self, _: Option<&str>, _: i64) -> Result<Vec<BoardEntry>> {
+            unreachable!()
+        }
+        fn heartbeat(&mut self, _: &str, _: &PresenceBeat, _: i64) -> Result<()> {
+            unreachable!()
+        }
+        fn presence(&self, _: i64, _: i64) -> Result<Vec<lockyard_core::proto::Presence>> {
+            unreachable!()
         }
     }
 
@@ -297,5 +497,101 @@ mod tests {
             lines[0].starts_with("needs a reply: M-1 from bob"),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn with_mail_open_v1_the_server_open_list_is_trusted() {
+        let now = 1_000_000_i64;
+        // Legacy all-page still contains a broadcast this agent already answered — would stay
+        // "open" under 0.3.10 cloud filtering. The server open page correctly omits it.
+        let answered = ask(1, "bob", "*", "broadcast already answered", now);
+        let pending = ask(2, "bob", "*", "still needs a reply", now);
+        let backend = MailMock {
+            cloud: true,
+            mail_open: true,
+            open_page: Mutex::new(InboxPage {
+                messages: vec![pending.clone()],
+                skipped: 0,
+            }),
+            all_page: Mutex::new(InboxPage {
+                messages: vec![answered, pending],
+                skipped: 0,
+            }),
+            ..MailMock::default()
+        };
+        let snap = open_mail_within(&backend, "alice", now, SENT_BUDGET).expect("open mail");
+        assert_eq!(snap.items.iter().map(|m| m.id).collect::<Vec<_>>(), vec![2]);
+        assert!(*backend.last_open.lock().unwrap());
+        assert!(!*backend.last_all.lock().unwrap());
+    }
+
+    #[test]
+    fn without_mail_open_v1_legacy_cloud_filtering_remains() {
+        let now = 1_000_000_i64;
+        let mut answered_broadcast = ask(1, "bob", "*", "acked for everyone", now);
+        answered_broadcast.status = Some("ack".into());
+        let pending = ask(2, "bob", "alice", "still open", now);
+        let backend = MailMock {
+            cloud: true,
+            mail_open: false,
+            all_page: Mutex::new(InboxPage {
+                messages: vec![answered_broadcast, pending],
+                skipped: 0,
+            }),
+            ..MailMock::default()
+        };
+        let snap = open_mail_within(&backend, "alice", now, SENT_BUDGET).expect("open mail");
+        assert_eq!(snap.items.iter().map(|m| m.id).collect::<Vec<_>>(), vec![2]);
+        assert!(!*backend.last_open.lock().unwrap());
+        assert!(*backend.last_all.lock().unwrap());
+    }
+
+    #[test]
+    fn open_inbox_error_omits_the_list() {
+        let backend = MailMock {
+            cloud: true,
+            mail_open: true,
+            fail: Mutex::new(Some(Error::Unavailable("timeout".into()))),
+            ..MailMock::default()
+        };
+        assert!(open_mail_within(&backend, "alice", 1_000_000, SENT_BUDGET).is_none());
+    }
+
+    #[test]
+    fn capability_error_omits_the_list_instead_of_legacy_filter() {
+        let now = 1_000_000_i64;
+        let pending = ask(2, "bob", "alice", "still open", now);
+        let backend = MailMock {
+            cloud: true,
+            mail_open: false,
+            capability_error: Mutex::new(Some(Error::Unavailable("capability unavailable".into()))),
+            all_page: Mutex::new(InboxPage {
+                messages: vec![pending],
+                skipped: 0,
+            }),
+            ..MailMock::default()
+        };
+        assert!(open_mail_within(&backend, "alice", now, SENT_BUDGET).is_none());
+        assert!(!*backend.last_all.lock().unwrap());
+        assert!(!*backend.last_open.lock().unwrap());
+    }
+
+    #[test]
+    fn server_open_page_still_drops_status_info() {
+        let now = 1_000_000_i64;
+        let mut info = ask(1, "bob", "alice", "informational", now);
+        info.status = Some("info".into());
+        let pending = ask(2, "bob", "alice", "still open", now);
+        let backend = MailMock {
+            cloud: true,
+            mail_open: true,
+            open_page: Mutex::new(InboxPage {
+                messages: vec![info, pending],
+                skipped: 0,
+            }),
+            ..MailMock::default()
+        };
+        let snap = open_mail_within(&backend, "alice", now, SENT_BUDGET).expect("open mail");
+        assert_eq!(snap.items.iter().map(|m| m.id).collect::<Vec<_>>(), vec![2]);
     }
 }

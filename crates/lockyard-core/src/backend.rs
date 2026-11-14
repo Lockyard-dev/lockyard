@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
-/// One open letter for status / `msg open` (client-derived until LC-0004).
+/// One open letter for status / `msg open`.
+///
+/// With `mail_open_v1` the server selects the rows; otherwise the client derives them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenMail {
     pub id: i64,
@@ -307,6 +309,27 @@ pub trait Backend {
     /// Whether the server derives registry areas from workspace-relative task paths.
     fn registry_auto_area(&self) -> Result<bool> {
         Ok(false)
+    }
+    /// Whether the server announces `mail_open_v1` (per-reader open inbox via `?open=true`).
+    ///
+    /// Read only already-negotiated / observed capabilities within `timeout` — never start
+    /// discovery or wait unboundedly for another discovery. Miss or timeout → `Ok(false)`.
+    /// Transport errors that are not a simple miss → `Err` so callers can omit the open list.
+    fn mail_open_v1(&self, timeout: Duration) -> Result<bool> {
+        let _ = timeout;
+        Ok(false)
+    }
+    /// Server-selected open asks for this reader (`GET /bus/inbox?open=true`).
+    fn peek_open_inbox_within(
+        &self,
+        _agent: &str,
+        _limit: usize,
+        _now: i64,
+        _timeout: Duration,
+    ) -> Result<InboxPage> {
+        Err(Error::Unavailable(
+            "server open inbox (mail_open_v1) is not supported".into(),
+        ))
     }
     /// The full cloud registry protocol, without collapsing registry states into local task states.
     fn registry_search(&self, _query: &Value) -> Result<Value> {

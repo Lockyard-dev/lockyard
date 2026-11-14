@@ -93,6 +93,9 @@ pub struct AgentStatus {
     pub token_id: String,
     #[serde(default)]
     pub catalog_expansion_v1: bool,
+    /// Server announced `mail_open_v1` in this agent's negotiated / observed capabilities.
+    #[serde(default)]
+    pub mail_open_v1: bool,
     /// This daemon supports the bounded aggregate status request.
     #[serde(default)]
     pub status_read_v1: bool,

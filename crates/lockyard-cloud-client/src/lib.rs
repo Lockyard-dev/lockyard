@@ -437,6 +437,7 @@ pub struct StatusRegistryPage {
 
 pub(crate) const REGISTRY_ASSIGNEE_SESSION: &str = "registry_assignee_session_v1";
 pub(crate) const REGISTRY_AUTO_AREA: &str = "registry_auto_area_v1";
+pub(crate) const MAIL_OPEN_V1: &str = "mail_open_v1";
 
 /// How requests reach the server.
 pub trait Transport: Send + Sync {
@@ -446,6 +447,22 @@ pub trait Transport: Send + Sync {
     /// Custom transports retain the legacy contract unless they explicitly confirm support.
     fn registry_auto_area(&self, _session: &str) -> Result<bool, ClientError> {
         Ok(false)
+    }
+
+    /// Whether negotiated capabilities include per-reader open inbox (`mail_open_v1`).
+    /// Existing, unexpired negotiation / header observation only — must not initiate discovery.
+    fn mail_open_v1(&self, _session: &str) -> Result<bool, ClientError> {
+        Ok(false)
+    }
+
+    /// Same as [`Self::mail_open_v1`], bounded by `timeout` for local agent pings.
+    fn mail_open_v1_within(
+        &self,
+        session: &str,
+        timeout: std::time::Duration,
+    ) -> Result<bool, ClientError> {
+        let _ = timeout;
+        self.mail_open_v1(session)
     }
 
     /// Existing, unexpired negotiation knowledge only; this must not initiate discovery.
@@ -532,6 +549,12 @@ impl<T: Transport + ?Sized> Transport for Arc<T> {
     fn registry_auto_area(&self, session: &str) -> Result<bool, ClientError> {
         (**self).registry_auto_area(session)
     }
+    fn mail_open_v1(&self, session: &str) -> Result<bool, ClientError> {
+        (**self).mail_open_v1(session)
+    }
+    fn mail_open_v1_within(&self, session: &str, timeout: Duration) -> Result<bool, ClientError> {
+        (**self).mail_open_v1_within(session, timeout)
+    }
     fn status_registry_assignee_supported(
         &self,
         deadline: Instant,
@@ -599,6 +622,7 @@ pub struct Client {
     expected_e2ee_workspace: Option<String>,
     protocol_state: std::sync::Mutex<protocol::ProtocolState>,
     registry_auto_area_observed: AtomicBool,
+    mail_open_v1_observed: AtomicBool,
     pending_journal: Option<std::path::PathBuf>,
     status_protocol_cache: Option<std::path::PathBuf>,
     catalog_cache_root: Option<std::path::PathBuf>,
@@ -823,6 +847,7 @@ impl Client {
             expected_e2ee_workspace,
             protocol_state: std::sync::Mutex::new(protocol::ProtocolState::default()),
             registry_auto_area_observed: AtomicBool::new(false),
+            mail_open_v1_observed: AtomicBool::new(false),
             pending_journal: None,
             status_protocol_cache: None,
             catalog_cache_root: None,
@@ -1189,6 +1214,12 @@ impl Client {
                                 .split(',')
                                 .any(|part| part.trim() == REGISTRY_AUTO_AREA)
                         });
+                let header_mail_open =
+                    response
+                        .header("Lockyard-Capabilities")
+                        .is_some_and(|header| {
+                            header.split(',').any(|part| part.trim() == MAIL_OPEN_V1)
+                        });
                 let mut value = decode_for_call(response, call, self.encryption_enabled)
                     .map_err(Failure::Retry)?;
                 call.check_cancelled().map_err(Failure::Final)?;
@@ -1218,6 +1249,48 @@ impl Client {
                 }
                 self.registry_auto_area_observed
                     .store(header_auto_area || body_auto_area, Ordering::Relaxed);
+                let body_mail_open = protocol_response
+                    && value
+                        .get("capabilities")
+                        .and_then(Value::as_array)
+                        .is_some_and(|capabilities| {
+                            capabilities
+                                .iter()
+                                .any(|capability| capability.as_str() == Some(MAIL_OPEN_V1))
+                        });
+                if protocol_response
+                    && header_mail_open
+                    && !body_mail_open
+                    && let Some(capabilities) =
+                        value.get_mut("capabilities").and_then(Value::as_array_mut)
+                {
+                    capabilities.push(Value::String(MAIL_OPEN_V1.into()));
+                }
+                // Routes with a dedicated Lockyard-Capabilities set (revocations) must not
+                // clear a previously observed mail_open_v1 just because that header omits it.
+                let route = call.path.split('?').next().unwrap_or(call.path.as_str());
+                let special_capability_route =
+                    route == "/api/v1/revocations" || route.starts_with("/api/v1/revocations/");
+                if special_capability_route {
+                    if header_mail_open || body_mail_open {
+                        self.mail_open_v1_observed.store(true, Ordering::Relaxed);
+                    }
+                } else {
+                    self.mail_open_v1_observed
+                        .store(header_mail_open || body_mail_open, Ordering::Relaxed);
+                }
+                let open_inbox = call.method == "GET"
+                    && call.path.split('?').next() == Some("/api/v1/bus/inbox")
+                    && call.path.contains("open=true");
+                if open_inbox && !(header_mail_open || body_mail_open) {
+                    // Rolled-back server answered ?open=true without announcing the capability.
+                    return Err(Failure::Final(ClientError::Protocol(protocol::Problem {
+                        code: "feature_unsupported".into(),
+                        status: None,
+                        details: Value::Null,
+                        detail: "open inbox response omitted mail_open_v1".into(),
+                    })));
+                }
                 Ok(value)
             }
             Err(ureq::Error::Status(status, response)) => {
@@ -1326,6 +1399,13 @@ impl Transport for Client {
     fn registry_auto_area(&self, session: &str) -> Result<bool, ClientError> {
         self.negotiated_protocol(session)?;
         Ok(self.registry_auto_area_observed.load(Ordering::Relaxed))
+    }
+    fn mail_open_v1(&self, _session: &str) -> Result<bool, ClientError> {
+        // Hot path (status / renew / msg open): never start discovery or block on its lock.
+        Ok(self.cached_mail_open_v1(Instant::now(), None))
+    }
+    fn mail_open_v1_within(&self, _session: &str, timeout: Duration) -> Result<bool, ClientError> {
+        Ok(self.cached_mail_open_v1(Instant::now() + timeout, None))
     }
     fn status_registry_assignee_supported(
         &self,
@@ -1585,8 +1665,11 @@ pub fn encode(text: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod fake;
+/// HTTP test double used by this crate and by agent integration tests in `lockyard`.
+/// Not part of the public API: compiled only for tests or with the `test-fake` feature.
+#[cfg(any(test, feature = "test-fake"))]
+#[doc(hidden)]
+pub mod fake;
 
 #[cfg(test)]
 mod tests {

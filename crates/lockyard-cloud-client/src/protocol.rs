@@ -108,8 +108,8 @@ impl std::fmt::Debug for PendingWrite {
 }
 
 pub(crate) struct CachedProtocol {
-    value: NegotiatedProtocol,
-    obtained: Instant,
+    pub(crate) value: NegotiatedProtocol,
+    pub(crate) obtained: Instant,
 }
 
 /// A negotiation hint only: no workspace policy, claims, mail, work or assignments are stored.
@@ -241,7 +241,7 @@ fn status_protocol_clock() -> Option<StatusProtocolClock> {
 
 #[derive(Default)]
 pub(crate) struct ProtocolState {
-    cached: Option<CachedProtocol>,
+    pub(crate) cached: Option<CachedProtocol>,
     pending: BTreeMap<String, PendingWrite>,
     active_writes: BTreeSet<String>,
 }
@@ -1049,6 +1049,12 @@ impl Client {
                     if auto_area_capability.load(std::sync::atomic::Ordering::Relaxed) {
                         result.capabilities.insert(crate::REGISTRY_AUTO_AREA.into());
                     }
+                    if self
+                        .mail_open_v1_observed
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        result.capabilities.insert(crate::MAIL_OPEN_V1.into());
+                    }
                     self.save_status_protocol_hint(&result);
                     state.cached = Some(CachedProtocol {
                         value: result.clone(),
@@ -1211,6 +1217,42 @@ impl Client {
                         .value
                         .capabilities
                         .contains(crate::REGISTRY_ASSIGNEE_SESSION)
+            });
+        }
+    }
+
+    /// Fresh negotiated cache or the latest successful `Lockyard-Capabilities` observation.
+    /// Never starts discovery; contention waits only until `deadline`.
+    pub(crate) fn cached_mail_open_v1(
+        &self,
+        deadline: Instant,
+        cancellation: Option<&Cancellation>,
+    ) -> bool {
+        if self
+            .mail_open_v1_observed
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
+        loop {
+            if cancellation.is_some_and(Cancellation::is_cancelled) {
+                return false;
+            }
+            let state = match self.protocol_state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return false;
+                    }
+                    std::thread::sleep(left.min(Duration::from_millis(1)));
+                    continue;
+                }
+            };
+            return state.cached.as_ref().is_some_and(|cached| {
+                cached.obtained.elapsed() < CACHE_TTL
+                    && cached.value.capabilities.contains(crate::MAIL_OPEN_V1)
             });
         }
     }

@@ -18,5 +18,9 @@ ring = "0.17"
 libc.workspace = true
 url = "2"
 
+[features]
+# Exposes the HTTP test double to dev-dependents; never enabled in release builds.
+test-fake = []
+
 [dev-dependencies]
 tempfile.workspace = true

@@ -406,8 +406,37 @@ impl Transport for AgentSocket {
             Err(error) => Err(error),
         }
     }
+    fn mail_open_v1(&self, _session: &str) -> Result<bool, ClientError> {
+        // Already-cached negotiation on the agent (ping/status), never GET /api/v1/protocol.
+        self.mail_open_v1_within(_session, self.timeout)
+    }
+    fn mail_open_v1_within(&self, _session: &str, timeout: Duration) -> Result<bool, ClientError> {
+        let reply = self
+            .ask_with_timeout(&Request::Ping, timeout)
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        if let Some(error) = reply.error {
+            return Err(error);
+        }
+        Ok(reply
+            .status
+            .map(|status| status.mail_open_v1)
+            .unwrap_or(false))
+    }
     fn call(&self, call: &Call) -> Result<Value, ClientError> {
-        let reply = self.ask_for(&Request::Call { call: call.clone() })?;
+        // attempt_timeout_ms is #[serde(skip)] on Call — it never crosses the agent wire.
+        // Bound the local socket wait to the caller's attempt budget so renew/status cannot
+        // sit on CLI_TIMEOUT (40s) while FakeServer/ureq would have cut the attempt short.
+        let budget = call
+            .attempt_timeout_ms
+            .map(Duration::from_millis)
+            .map(|limit| limit.min(self.timeout))
+            .unwrap_or(self.timeout);
+        let reply = self
+            .ask_with_timeout(&Request::Call { call: call.clone() }, budget)
+            .map_err(|error| ClientError::Transport(format!("agent socket: {error}")))?;
+        if let Some(error) = reply.error {
+            return Err(error);
+        }
         let value = reply.value.unwrap_or(Value::Null);
         if let Some(repository) = call.repository.as_deref().filter(|id| !id.is_empty())
             && call.method == "GET"

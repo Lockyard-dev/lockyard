@@ -156,6 +156,17 @@ impl<T: Transport> Transport for RepositoryTransport<T> {
         self.inner.registry_auto_area(session)
     }
 
+    fn mail_open_v1(&self, session: &str) -> Result<bool, ClientError> {
+        self.inner.mail_open_v1(session)
+    }
+    fn mail_open_v1_within(
+        &self,
+        session: &str,
+        timeout: std::time::Duration,
+    ) -> Result<bool, ClientError> {
+        self.inner.mail_open_v1_within(session, timeout)
+    }
+
     fn status_registry_assignee_supported(
         &self,
         deadline: std::time::Instant,
