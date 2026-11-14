@@ -105,6 +105,11 @@ impl fmt::Display for Error {
                 f,
                 "coordination is frozen: {text}. Next: wait for an owner to thaw, or ask in the bus."
             ),
+            Self::Unavailable(text) if text.contains("pending journal is busy") => write!(
+                f,
+                "cloud unavailable: {text}. Next: wait briefly and retry; another Lockyard process \
+                 holds the local write journal."
+            ),
             Self::Unavailable(text) => write!(
                 f,
                 "cloud unavailable: {text}. Next: check the network, then `lockyard doctor`."
@@ -175,5 +180,13 @@ mod tests {
         assert_eq!(text.matches("..").count(), 0);
         assert!(text.contains("Only an active item has a lease. Next:"));
         assert!(text.contains("lockyard zone list"));
+    }
+
+    #[test]
+    fn unavailable_journal_busy_does_not_blame_the_network() {
+        let text = Error::Unavailable("pending journal is busy".into()).to_string();
+        assert!(text.contains("pending journal is busy"));
+        assert!(text.contains("wait briefly"));
+        assert!(!text.contains("check the network"));
     }
 }

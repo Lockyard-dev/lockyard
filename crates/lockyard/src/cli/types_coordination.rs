@@ -8,6 +8,10 @@ pub(super) enum ZoneCommand {
     /// Claim paths, all of them or none.
     Claim {
         paths: Vec<String>,
+        /// Read additional paths from a regular UTF-8 file relative to the current directory
+        /// (unless absolute); one path per line (# comments and blanks ignored); at most 1000 paths; NUL refused.
+        #[arg(long = "paths-file", value_name = "FILE")]
+        paths_file: Option<PathBuf>,
         /// What the claim is for.
         #[arg(long, default_value = "")]
         note: String,
@@ -17,8 +21,15 @@ pub(super) enum ZoneCommand {
         #[arg(long)]
         hold_reason: Option<String>,
         /// Hold until this RFC 3339 timestamp; requires --hold-reason.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "hold_for")]
         hold_until: Option<String>,
+        /// Hold for this many minutes from now (1-240); client writes absolute hold_until.
+        #[arg(
+            long = "hold-for",
+            value_name = "MINUTES",
+            conflicts_with = "hold_until"
+        )]
+        hold_for: Option<i64>,
         /// Start empty and grow through add-path.
         #[arg(long)]
         lazy: bool,
@@ -145,8 +156,15 @@ pub(super) enum ZoneCommand {
         /// Why the claim stays held while idle.
         #[arg(long)]
         hold_reason: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "hold_for")]
         hold_until: Option<String>,
+        /// Hold for this many minutes from now (1-240); client writes absolute hold_until.
+        #[arg(
+            long = "hold-for",
+            value_name = "MINUTES",
+            conflicts_with = "hold_until"
+        )]
+        hold_for: Option<i64>,
         #[arg(long)]
         fence: Option<i64>,
     },
@@ -349,9 +367,21 @@ pub(super) enum TaskCommand {
         paths: Vec<String>,
         #[arg(long, default_value = "")]
         body: String,
+        /// Read the task body from a regular UTF-8 file relative to the current directory
+        /// (unless absolute); at most 64 KiB; NUL refused.
+        #[arg(long = "body-file", value_name = "FILE")]
+        body_file: Option<PathBuf>,
         /// What closes the task. Cloud mode; the title by default.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "acceptance_file")]
         acceptance: Option<String>,
+        /// Read acceptance criteria from a regular UTF-8 file relative to the current directory
+        /// (unless absolute); at most 64 KiB; NUL refused.
+        #[arg(
+            long = "acceptance-file",
+            value_name = "FILE",
+            conflicts_with = "acceptance"
+        )]
+        acceptance_file: Option<PathBuf>,
         /// P0, P1, P2 or P3. Cloud mode; P2 by default.
         #[arg(long)]
         priority: Option<String>,

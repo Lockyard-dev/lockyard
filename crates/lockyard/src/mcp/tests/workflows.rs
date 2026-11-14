@@ -22,7 +22,8 @@
                 "area_update",
                 "cloud_protocol",
                 "task_add",
-                "zone_renew"
+                "zone_renew",
+                "keepalive"
             ]
         );
         let full = listed(Surface::Full, &dir);
@@ -764,4 +765,44 @@
         let response = call(&dir, "worker", "workflow_run", json!({"operation_id":"mcp-source","plan":{"steps":[{"kind":"task_claim","id":1}]}}));
         assert_eq!(response["isError"], false);
         assert!(lockyard_compat::counters().get(metric).copied().unwrap_or(0) > before);
+    }
+
+
+    #[test]
+    fn area_list_structured_content_is_an_object() {
+        let wrapped = wrap_area_list_structured(json!([{"key":"platform"}]));
+        assert!(wrapped.is_object(), "{wrapped}");
+        assert!(
+            wrapped.as_object().unwrap().contains_key("areas"),
+            "{wrapped}"
+        );
+        assert_eq!(wrapped["areas"][0]["key"], "platform");
+        let already = wrap_area_list_structured(json!({"areas":[{"key":"rng"}]}));
+        assert!(already.is_object());
+        assert_eq!(already["areas"][0]["key"], "rng");
+        let scalar = wrap_area_list_structured(json!("unexpected"));
+        assert_eq!(scalar, json!({"areas": "unexpected"}));
+    }
+
+    #[test]
+    fn task_add_with_only_area_on_auto_area_server_hints_reconnect() {
+        let error = validate_task_add_area(
+            Surface::Compact,
+            Args(&json!({"title":"x","area":"engine"})),
+            true,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("reconnect MCP"), "{error}");
+        assert!(error.contains("--path"), "{error}");
+        assert!(
+            validate_task_add_area(
+                Surface::Compact,
+                Args(&json!({"title":"x","area":"engine","paths":["a.rs"]})),
+                true,
+                true
+            )
+            .is_ok()
+        );
     }

@@ -78,13 +78,15 @@ agent does anything — which, with the Claude Code hook installed, is its next 
 ## MCP
 
 ```sh
-lockyard mcp                  # 16 compact tools (listed below)
+lockyard mcp                  # 17 compact tools (listed below)
 lockyard mcp --tools full     # every tool, for a client that can handle a long list
 ```
 
 The compact catalog contains `revoke_access`, `start_work`, `check`, `update`, `handover`, `finish_work`, `status`,
 `tasks`, `task_bulk`, `registry_import`, `area_list`, `area_create`, `area_update`, `cloud_protocol`, `task_add`,
-and `zone_renew`.
+`zone_renew`, and `keepalive`. Stale hosts that still send `task_add` with only `area` on a
+`registry_auto_area_v1` server get an explicit reconnect / `--path` hint; `keepalive` does not extend
+claim leases (`zone_renew` does).
 
 The working loop uses `start_work` to claim paths and take a task, `check` to ask whether a path is free,
 `update` to send a message and read the inbox, `handover` to give work to another agent, `finish_work` to submit
@@ -170,6 +172,11 @@ A task moves from open to claimed to review to accepted. The agent that did the 
 requires evidence. A claim that stops being renewed can be taken by another agent.
 
 ```sh
+lockyard zone claim --paths-file paths.txt --hold-reason "batch" --hold-for 60
+lockyard zone renew --hold-for 120 --hold-reason "overnight wave"
+lockyard task add "Rate limit the login route" --body-file body.md --acceptance-file done.md
+lockyard keepalive --all
+lockyard ping
 lockyard task add "Rate limit the login route" --body "Details here"
 lockyard task claim T-1
 lockyard task submit T-1 --evidence "abc1234, 42/42 tests"

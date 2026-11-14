@@ -400,7 +400,11 @@ fn call_tool(
                 || result.get("ok") == Some(&Value::Bool(false))
                 || result.pointer("/reply/ok") == Some(&Value::Bool(false));
             let mut response = tool_result(result.to_string(), failed);
-            response["structuredContent"] = result;
+            response["structuredContent"] = if name == "area_list" {
+                wrap_area_list_structured(result)
+            } else {
+                result
+            };
             response
         }
         Err(error) => {
@@ -423,6 +427,15 @@ fn call_tool(
     (result, after)
 }
 
+/// MCP structuredContent must be an object; wrap a bare area array.
+pub(crate) fn wrap_area_list_structured(result: Value) -> Value {
+    match result {
+        Value::Array(areas) => json!({"areas": areas}),
+        Value::Object(map) if map.contains_key("areas") => Value::Object(map),
+        other => json!({"areas": other}),
+    }
+}
+
 fn validate_surface_args(surface: Surface, name: &str, args: Args<'_>) -> Result<()> {
     if surface == Surface::Compact && name == "zone_renew" {
         args.some_int("fence")?;
@@ -439,19 +452,31 @@ fn validate_task_add_area(
     auto_area: bool,
     is_cloud: bool,
 ) -> Result<()> {
-    if surface == Surface::Compact
-        && !auto_area
-        && !args
-            .get("area")
-            .and_then(Value::as_str)
-            .is_some_and(|area| !area.trim().is_empty())
-    {
-        let warning = if is_cloud
-            && args
-                .get("paths")
-                .and_then(Value::as_array)
-                .is_some_and(|paths| !paths.is_empty())
-        {
+    let area = args
+        .get("area")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|area| !area.is_empty());
+    let paths_key = args.get("paths");
+    let paths = paths_key
+        .and_then(Value::as_array)
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .count()
+        })
+        .unwrap_or(0);
+    // Stale MCP schemas still send area and omit paths entirely — nudge a reconnect.
+    if auto_area && is_cloud && area.is_some() && paths_key.is_none() {
+        return Err(Error::Invalid(
+            "task_add on a registry_auto_area_v1 server needs paths; reconnect MCP (/mcp) or run `lockyard task add --path <file>`"
+                .into(),
+        ));
+    }
+    if surface == Surface::Compact && !auto_area && area.is_none() {
+        let warning = if is_cloud && paths > 0 {
             format!(" {TASK_PATHS_WARNING}")
         } else {
             String::new()

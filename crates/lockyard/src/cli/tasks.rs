@@ -9,8 +9,22 @@ pub(super) fn run_task(
 ) -> Result<Output> {
     let now = now_ms();
     let mut command = command;
-    if let TaskCommand::Add { paths, .. } = &mut command {
+    if let TaskCommand::Add {
+        paths,
+        body,
+        body_file,
+        acceptance,
+        acceptance_file,
+        ..
+    } = &mut command
+    {
         *paths = opened.task_paths(paths)?;
+        if let Some(file) = body_file.take() {
+            *body = read_text_file(&file)?;
+        }
+        if let Some(file) = acceptance_file.take() {
+            *acceptance = Some(read_text_file(&file)?);
+        }
         if opened.backend.is_cloud() && !paths.is_empty() && !opened.backend.registry_auto_area()? {
             eprintln!(
                 "warning: this server does not support task paths (registry_auto_area_v1) yet; --path values will not be sent"
@@ -177,6 +191,7 @@ pub(super) fn run_task(
             pad,
             due,
             evidence,
+            ..
         } => store.add_task(
             &resolve_agent(agent)?,
             &TaskSpec {

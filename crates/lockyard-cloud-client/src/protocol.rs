@@ -293,6 +293,7 @@ impl ClientError {
         match self {
             Self::Protocol(problem) => Some(&problem.code),
             Self::OutcomeUnknown(pending) => Some(&pending.code),
+            Self::JournalBusy => Some("journal_busy"),
             _ => self
                 .api_error()
                 .map(|error| error.code.as_str())
@@ -525,6 +526,15 @@ pub(crate) fn safe_retry(error: &ClientError) -> bool {
         .is_some_and(|error| error.status == 429 && error.code == "rate_limited")
 }
 
+pub(crate) fn journal_busy(error: &ClientError) -> bool {
+    matches!(error, ClientError::JournalBusy)
+        || matches!(
+            error,
+            ClientError::Transport(text) | ClientError::Invalid(text)
+                if text.contains("pending journal is busy")
+        )
+}
+
 fn pre_execution_refusal(error: &ClientError) -> bool {
     error.api_error().is_some_and(|api| {
         (api.status == 429 && matches!(api.code.as_str(), "rate_limited" | "relay_budget_exceeded"))
@@ -681,13 +691,12 @@ impl Client {
             {
                 use std::os::fd::AsRawFd;
                 if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                    return Err(ClientError::Transport("pending journal is busy".into()));
+                    return Err(ClientError::JournalBusy);
                 }
             }
             #[cfg(not(unix))]
             {
-                lock.try_lock()
-                    .map_err(|_| journal_error("pending journal is busy"))?;
+                lock.try_lock().map_err(|_| ClientError::JournalBusy)?;
             }
             guard._journal = Some(lock);
             // Another client may have sent or completed this operation since we loaded it.
@@ -1217,8 +1226,38 @@ impl Client {
                 "writes require an Idempotency-Key".into(),
             ));
         }
+        // One clock for journal-busy waits, Retry-After pauses, and remaining()/wait_fits_deadline.
+        // Without an explicit call deadline the journal wait budget is MAX_RETRY_WAIT (5 s).
+        let started = Instant::now();
+        let remaining = || {
+            call.deadline_ms
+                .map(|limit| Duration::from_millis(limit).saturating_sub(started.elapsed()))
+        };
         let _send = if call.is_write() {
-            Some(self.claim_pending_send(call.key.as_deref().expect("validated write key"))?)
+            let key = call.key.as_deref().expect("validated write key");
+            // The flock is local and pre-send: wait inside the call deadline without starting a
+            // second create. Creating calls keep one idempotency key for the whole wait.
+            let budget = call
+                .deadline_ms
+                .map(Duration::from_millis)
+                .unwrap_or(crate::MAX_RETRY_WAIT);
+            let mut delay = Duration::from_millis(25);
+            loop {
+                call.check_cancelled()?;
+                match self.claim_pending_send(key) {
+                    Ok(guard) => break Some(guard),
+                    Err(error) if journal_busy(&error) => {
+                        let left = budget.saturating_sub(started.elapsed());
+                        if left.is_zero() {
+                            return Err(error);
+                        }
+                        let wait = delay.min(left).min(Duration::from_millis(250));
+                        call.wait(wait)?;
+                        delay = delay.saturating_mul(2).min(Duration::from_millis(250));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         } else {
             None
         };
@@ -1251,11 +1290,8 @@ impl Client {
                 .map_err(ClientError::Invalid)?;
         }
         let request_digest = crate::request_identity(call);
-        let started = Instant::now();
-        let remaining = || {
-            call.deadline_ms
-                .map(|limit| Duration::from_millis(limit).saturating_sub(started.elapsed()))
-        };
+        // Resolve the content key once so request encryption and response decryption share it.
+        let content_key = self.resolved_content_key()?;
         let mut protocol =
             match self.discover(&call.session, remaining(), call.cancellation.as_ref()) {
                 Ok(protocol) => protocol,
@@ -1289,7 +1325,7 @@ impl Client {
                 &call.method,
                 &call.path,
                 workspace,
-                self.content_key.as_ref(),
+                content_key.as_ref(),
                 self.encryption_enabled,
                 self.expected_e2ee_workspace.is_some(),
             )
@@ -1362,7 +1398,7 @@ impl Client {
                             &call.method,
                             &call.path,
                             workspace,
-                            self.content_key.as_ref(),
+                            content_key.as_ref(),
                             false,
                             self.expected_e2ee_workspace.is_some(),
                         )
@@ -1576,13 +1612,14 @@ impl Client {
                     return Err(self.unknown(pending, &cause, error.status()));
                 }
             };
+        let held = self.resolved_content_key()?;
         if let Some(workspace) = self.workspace.as_deref()
             && let Err(message) = crate::crypto::transform_fields_policy(
                 &mut value,
                 &call.method,
                 &call.path,
                 workspace,
-                self.content_key.as_ref(),
+                held.as_ref(),
                 false,
                 self.expected_e2ee_workspace.is_some(),
             )

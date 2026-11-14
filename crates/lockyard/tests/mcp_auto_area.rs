@@ -410,15 +410,30 @@ fn mcp_auto_area_missing_paths_are_refused_before_the_task_request_with_array_gu
     let server = Server::start("body");
     let project = Project::new(&server);
     for surface in ["compact", "full"] {
-        for args in [
+        let stale = project.call(
+            &server,
+            surface,
+            "task_add",
             json!({"title":"missing","area":"engine"}),
+        );
+        assert_eq!(stale["isError"], true, "{surface}: {stale}");
+        assert!(
+            text(&stale).contains("reconnect MCP"),
+            "{surface}: stale schema without paths should nudge reconnect: {stale}"
+        );
+        assert!(
+            text(&stale).contains("--path") || text(&stale).contains("paths"),
+            "{surface}: reconnect hint should mention paths: {stale}"
+        );
+        let empty = project.call(
+            &server,
+            surface,
+            "task_add",
             json!({"title":"empty","paths":[],"area":"engine"}),
-        ] {
-            let answer = project.call(&server, surface, "task_add", args);
-            assert_eq!(answer["isError"], true, "{surface}: {answer}");
-            assert!(text(&answer).contains("paths: ["), "{answer}");
-            assert!(text(&answer).contains("корня рабочего места"), "{answer}");
-        }
+        );
+        assert_eq!(empty["isError"], true, "{surface}: {empty}");
+        assert!(text(&empty).contains("paths: ["), "{empty}");
+        assert!(text(&empty).contains("корня рабочего места"), "{empty}");
     }
     assert!(server.writes().is_empty());
 }

@@ -3,7 +3,7 @@
   "name": "io.github.lockyard-dev/lockyard",
   "title": "Lockyard",
   "description": "Work zones, a message bus and tasks for coding agents sharing one repository.",
-  "version": "0.3.8",
+  "version": "0.3.10",
   "websiteUrl": "https://lockyard.dev",
   "repository": {
     "url": "https://github.com/lockyard-dev/lockyard",
@@ -13,7 +13,7 @@
     {
       "registryType": "npm",
       "identifier": "lockyard",
-      "version": "0.3.8",
+      "version": "0.3.10",
       "transport": {
         "type": "stdio"
       },
@@ -33,7 +33,7 @@
         },
         {
           "name": "LOCKYARD_MCP_TOOLS",
-          "description": "Set to full to expose every tool instead of the 16 compact tools.",
+          "description": "Set to full to expose every tool instead of the 17 compact tools.",
           "isRequired": false
         }
       ]
@@ -41,7 +41,7 @@
     {
       "registryType": "pypi",
       "identifier": "lockyard",
-      "version": "0.3.8",
+      "version": "0.3.10",
       "transport": {
         "type": "stdio"
       },

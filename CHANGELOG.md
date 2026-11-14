@@ -5,6 +5,22 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.10] - 2026-11-14
+
+### Fixed
+
+- Local pending-journal contention (`pending journal is busy`) waits and retries inside the same call-deadline clock used for HTTP retries (default wait budget 5 s when no deadline is set); the error is a dedicated `JournalBusy` variant and the text no longer blames the network.
+- Workspace encryption keys are re-read from `~/.config/lockyard/keys/<workspace>.key` when missing in memory; an on-disk key is accepted only when its `key_id` matches the workspace encryption setting, otherwise `key id mismatch`. One resolved key is used for both request encryption and response decryption in a call.
+- CLI cloud token discovery no longer reads editor/MCP host configs (`.mcp.json`, `~/.claude.json`, …). Order is `LOCKYARD_TOKEN` → `LOCKYARD_TOKEN_FILE` → login credentials → `~/.config/lockyard/token`. Canonical `owner-token` is refused unless `LOCKYARD_TOKEN_FILE` names it explicitly. The refusal lists only those four sources and hints that MCP gets its token from its own settings.
+- MCP `area_list` returns `structuredContent` as an object `{"areas":[…]}` (MCP schema), not a bare array — a breaking shape change for clients that expected a bare array in `structuredContent`.
+- Stale MCP clients that call `task_add` with only `area` on a `registry_auto_area_v1` server get an explicit reconnect/`--path` hint (no `tools/list_changed` notification).
+
+### Added
+
+- CLI `zone claim --paths-file`, `task add --body-file` / `--acceptance-file` (regular files only, relative to the current directory unless absolute; body ≤64 KiB; paths ≤1000 lines; NUL refused), `zone claim|renew --hold-for <minutes>` (1–240, client computes absolute `hold_until`), `lockyard keepalive [<id>|--all]` (does not extend the lease; use `zone renew`), and `lockyard ping`.
+- Compact MCP `keepalive` (presence + claim activity; shared with CLI; `--all` / `all` with zero claims reports "no claims of yours").
+- Advance synchronized Rust, npm, PyPI and MCP registry versions to `0.3.10`.
+
 ## [0.3.9] - 2026-11-14
 
 ### Fixed

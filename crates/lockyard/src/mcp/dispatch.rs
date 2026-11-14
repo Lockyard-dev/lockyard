@@ -236,6 +236,13 @@ pub(super) fn run_tool(
             .backend
             .registry_import(me()?, &args.required_object("dump")?),
         "area_list" => opened.backend.area_list(agent.unwrap_or("lockyard-cli")),
+        "keepalive" => {
+            let me = me()?.to_string();
+            let id = args.some_int("id")?;
+            let all = args.flag("all")?;
+            let now = crate::now_ms();
+            crate::keepalive::keepalive(opened.backend.as_mut(), &me, id, all, "mcp", now)
+        }
         "area_create" => {
             let request = json!({
                 "key": args.text("key")?,

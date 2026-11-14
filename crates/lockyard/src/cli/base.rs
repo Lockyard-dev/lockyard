@@ -96,6 +96,20 @@ pub(super) enum Command {
     /// Revoke Cloud credentials and propagate signed denies to direct peers.
     #[command(subcommand)]
     Revoke(crate::revoke_access::RevokeCommand),
+    /// Refresh presence and claim activity so holder_available stays true.
+    /// Does not extend the lease; use `zone renew` for more time.
+    Keepalive {
+        #[arg(value_parser = parse_id)]
+        id: Option<i64>,
+        /// Touch every live claim owned by this agent. Errors with "no claims of yours" when none.
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+    },
+    /// Measure status and zone-check round-trip time.
+    Ping {
+        /// Optional path for zone check; defaults to the project root.
+        path: Option<String>,
+    },
     /// Run the MCP server over standard input and output.
     Mcp(McpArgs),
 }
