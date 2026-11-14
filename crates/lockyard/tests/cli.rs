@@ -612,12 +612,12 @@ fn mail_needs_a_known_addressee_and_reads_once() {
     let unknown = lockyard(root, "a", &["msg", "send", "ghost", "hi"]);
     assert_eq!(unknown.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("ghost"));
-    ok(root, "b", &["msg", "inbox"]);
+    ok(root, "b", &["msg", "inbox", "--mark-read"]);
     ok(root, "a", &["msg", "send", "b", "hi there"]);
     assert!(ok(root, "b", &["msg", "inbox", "--peek"]).contains("hi there"));
     assert!(ok(root, "b", &["status"]).contains("unread mail: 1"));
-    assert!(ok(root, "b", &["msg", "inbox"]).contains("hi there"));
-    assert_eq!(ok(root, "b", &["msg", "inbox"]).trim(), "no new mail");
+    assert!(ok(root, "b", &["msg", "inbox", "--mark-read"]).contains("hi there"));
+    assert!(ok(root, "b", &["msg", "inbox"]).contains("no new mail"));
 }
 
 #[test]
@@ -828,12 +828,12 @@ fn every_new_command_accepts_the_json_flag() {
 fn printed_mail_is_marked_after_the_output_and_peek_marks_nothing() {
     let dir = project();
     let root = dir.path();
-    ok(root, "b", &["msg", "inbox"]);
+    ok(root, "b", &["msg", "inbox", "--mark-read"]);
     ok(root, "a", &["msg", "send", "b", "hello"]);
     assert_eq!(ok(root, "b", &["msg", "unread"]).trim(), "unread mail: 1");
     ok(root, "b", &["msg", "inbox", "--peek"]);
     assert_eq!(ok(root, "b", &["msg", "unread"]).trim(), "unread mail: 1");
-    ok(root, "b", &["msg", "inbox"]);
+    ok(root, "b", &["msg", "inbox", "--mark-read"]);
     assert_eq!(ok(root, "b", &["msg", "unread"]).trim(), "unread mail: 0");
 }
 
@@ -1365,7 +1365,7 @@ fn logout_forgets_one_server_and_login_refuses_a_plain_http_one() {
 fn a_sender_can_see_whether_mail_was_delivered_read_or_answered() {
     let dir = project();
     let root = dir.path();
-    ok(root, "b", &["msg", "inbox"]);
+    ok(root, "b", &["msg", "inbox", "--mark-read"]);
     let sent_output = ok(
         root,
         "a",
@@ -1393,7 +1393,7 @@ fn a_sender_can_see_whether_mail_was_delivered_read_or_answered() {
     status("sent");
     ok(root, "b", &["msg", "inbox", "--peek"]);
     status("delivered");
-    ok(root, "b", &["msg", "inbox"]);
+    ok(root, "b", &["msg", "inbox", "--mark-read"]);
     status("read");
     ok(root, "b", &["msg", "reply", &format!("M-{id}"), "on it"]);
     status("replied");

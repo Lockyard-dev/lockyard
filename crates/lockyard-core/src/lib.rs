@@ -30,7 +30,7 @@ pub mod windows;
 pub mod zones;
 
 pub use backend::{
-    Backend, StatusRead, claim_or_reuse, claim_or_reuse_with_creation_status,
+    Backend, OpenMail, StatusRead, claim_or_reuse, claim_or_reuse_with_creation_status,
     claim_or_reuse_with_hold, claim_or_reuse_with_status, validate_hold,
 };
 pub use error::{Error, Result};

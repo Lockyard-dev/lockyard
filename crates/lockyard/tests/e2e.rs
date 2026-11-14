@@ -718,7 +718,7 @@ fn mail(w: &World) {
         .ok();
     assert_eq!(w.ly(&two, &["msg", "unread"]).ok()["unread"], 1);
     assert_eq!(w.inbox_bodies(&two), ["hello"], "peek marks nothing");
-    let read = w.ly(&two, &["msg", "inbox"]).ok();
+    let read = w.ly(&two, &["msg", "inbox", "--mark-read"]).ok();
     assert_eq!(read[0]["from"], json!(one.name));
     assert_eq!(read[0]["needs"], "ack");
     assert_eq!(w.ly(&two, &["msg", "unread"]).ok()["unread"], 0);

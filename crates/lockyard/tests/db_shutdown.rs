@@ -204,6 +204,7 @@ fn monitor_timeout_checkpoints_its_final_receipt() {
             "--reconcile",
             "1",
             "--no-zones",
+            "--mark-read",
         ])
         .output()
         .unwrap();

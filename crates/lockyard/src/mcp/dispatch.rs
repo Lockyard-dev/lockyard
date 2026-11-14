@@ -42,6 +42,9 @@ fn status(
     } else {
         Some(Vec::new())
     };
+    let open_snap = agent.and_then(|name| {
+        crate::open_mail::open_mail_within(backend, name, now, crate::open_mail::SENT_BUDGET)
+    });
     if backend.is_cloud() {
         let work = visible_work(agent, backend.work_list(agent.unwrap_or("lockyard-cli"))?);
         let mut work = work;
@@ -56,9 +59,14 @@ fn status(
         };
         let mut tasks = backend.assigned_tasks(agent.unwrap_or("lockyard-cli"))?;
         tasks.truncate(20);
-        return Ok(
-            json!({"unread": unread, "claims": claims, "work": work, "offers": offers, "tasks": tasks, "lost": lost}),
-        );
+        let mut answer = json!({"unread": unread, "claims": claims, "work": work, "offers": offers, "tasks": tasks, "lost": lost});
+        if let Some(snap) = &open_snap {
+            answer["open_mail"] = json!(snap.items);
+            if snap.truncated {
+                answer["open_mail_truncated"] = json!(true);
+            }
+        }
+        return Ok(answer);
     }
     let mut tasks = backend.tasks(None, false)?;
     tasks.retain(|task| task.assignee.as_deref() == agent);
@@ -72,7 +80,14 @@ fn status(
             })
         })
         .collect();
-    Ok(json!({"unread": unread, "claims": claims, "tasks": tasks, "lost": lost}))
+    let mut answer = json!({"unread": unread, "claims": claims, "tasks": tasks, "lost": lost});
+    if let Some(snap) = &open_snap {
+        answer["open_mail"] = json!(snap.items);
+        if snap.truncated {
+            answer["open_mail_truncated"] = json!(true);
+        }
+    }
+    Ok(answer)
 }
 
 pub(super) fn run_tool(
@@ -433,10 +448,20 @@ pub(super) fn run_tool(
                     fence
                 },
             };
+            let agent = me()?;
             let renewed = opened
                 .backend
-                .renew(me()?, args.optional_id()?, &request, now)?;
-            Ok(json!({"renewed": renewed}))
+                .renew(agent, args.optional_id()?, &request, now)?;
+            let mut answer = json!({"renewed": renewed});
+            if let Some(count) = crate::open_mail::open_mail_count_within(
+                opened.backend.as_ref(),
+                agent,
+                now,
+                crate::open_mail::RENEW_BUDGET,
+            ) {
+                answer["open_mail_count"] = json!(count);
+            }
+            Ok(answer)
         }
         "zone_release" => {
             let request = ReleaseRequest {

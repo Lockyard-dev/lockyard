@@ -341,7 +341,7 @@ fn mcp_auto_area_discovery_ignores_an_unresponsive_server() {
             discovery_requests(),
             std::time::Duration::from_secs(2),
         );
-        assert_eq!(answers[0]["serverInfo"]["version"], "0.3.8");
+        assert_eq!(answers[0]["serverInfo"]["version"], lockyard_core::VERSION);
         assert_eq!(answers[1], answers[2]);
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),

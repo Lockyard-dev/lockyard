@@ -5,6 +5,18 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.9] - 2026-11-14
+
+### Fixed
+
+- `msg inbox` marks mail read only when stdout is a terminal; a pipe or redirect behaves like `--peek`. Scripts that need the mark pass `--mark-read`.
+- MCP `update` with `to`/`body` always peeks mail after sending a note, so sending never marks the inbox read.
+
+### Added
+
+- Client-side open mail: asks that still need this agent's reply stay visible after a mark-read. `status` prints them and exposes `open_mail` in JSON; `msg open` lists only those letters; `zone renew` / MCP `zone_renew` add `open_mail_count`.
+- Advance synchronized Rust, npm, PyPI and MCP registry versions to `0.3.9`.
+
 ## [0.3.8] - 2026-11-13
 
 ### Added

@@ -158,6 +158,9 @@ pub(super) struct MonitorArgs {
     /// Do not print new mail.
     #[arg(long)]
     pub(super) no_mail: bool,
+    /// Mark delivered mail read even when stdout is not a terminal.
+    #[arg(long)]
+    pub(super) mark_read: bool,
     /// Do not watch claimed paths for writes outside the hook.
     #[arg(long)]
     pub(super) no_zones: bool,

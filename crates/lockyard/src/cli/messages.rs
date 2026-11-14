@@ -1,13 +1,27 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
 use super::*;
+use std::io::IsTerminal;
 
-pub(super) fn inbox_text(page: &InboxPage) -> String {
+pub(super) fn inbox_text(page: &InboxPage, marked: bool) -> String {
     let mut text = join(&page.messages, message_line, "no new mail");
     if page.skipped > 0 {
         text.push_str(&format!("\n{} older messages skipped", page.skipped));
     }
+    if !marked {
+        text.push_str("\nMarks read only on a terminal (or with --mark-read).");
+    }
     text
+}
+
+fn inbox_should_mark(peek: bool, mark_read: bool) -> bool {
+    if peek {
+        false
+    } else if mark_read {
+        true
+    } else {
+        std::io::stdout().is_terminal()
+    }
 }
 
 pub(super) fn run_msg(
@@ -52,7 +66,11 @@ pub(super) fn run_msg(
             let text = sent_line(&message);
             output(&safe_message(message), text)
         }
-        MsgCommand::Inbox { all, peek } => {
+        MsgCommand::Inbox {
+            all,
+            peek,
+            mark_read,
+        } => {
             let page = backend.inbox(
                 &agent,
                 InboxQuery {
@@ -61,16 +79,49 @@ pub(super) fn run_msg(
                 },
                 now,
             )?;
-            let text = inbox_text(&page);
+            let marked = inbox_should_mark(peek, mark_read);
+            let text = inbox_text(&page, marked);
             let ids: Vec<i64> = page.messages.iter().map(|message| message.id).collect();
             let mut out = output(&safe_messages(page.messages.clone()), text)?;
-            if !peek && !ids.is_empty() {
+            if marked && !ids.is_empty() {
                 // Marked only after the mail is on screen: a duplicate over a loss.
                 out.after = Some(Box::new(move || {
                     backend.inbox_seen(&agent, &ids, now_ms()).map(|_| ())
                 }));
             }
             Ok(out)
+        }
+        MsgCommand::Open => {
+            // An unknown answer must not read as "nothing open": that is how asks got lost on 14.11.
+            let Some(snap) = crate::open_mail::open_mail_within(
+                backend.as_ref(),
+                &agent,
+                now,
+                crate::open_mail::SENT_BUDGET,
+            ) else {
+                return Err(Error::Unavailable(
+                    "open mail is unknown: the inbox or sent read failed or ran out of time; \
+                     retry, or read `lockyard msg inbox --peek --all`"
+                        .into(),
+                ));
+            };
+            let mut text = if snap.items.is_empty() {
+                "no open mail".into()
+            } else {
+                crate::open_mail::open_mail_lines(&snap.items).join("\n")
+            };
+            if snap.truncated {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str("open mail list is incomplete");
+            }
+            let payload = if snap.truncated {
+                json!({"open_mail": snap.items, "open_mail_truncated": true})
+            } else {
+                json!(snap.items)
+            };
+            output(&payload, text)
         }
         MsgCommand::Unread => {
             let unread = backend.unread(&agent)?;

@@ -6,7 +6,7 @@ a path at a time, a shared bus to talk, and tasks that survive a session. By def
 file under `.lockyard/` in your project, and nothing leaves the machine. Teams across machines use [cloud
 mode](#cloud-mode).
 
-**Version: 0.3.8.**
+**Version: 0.3.9.**
 
 ## Install
 
@@ -70,6 +70,10 @@ outside process to interrupt a running turn. Run `lockyard monitor` in the proje
 print new mail and unannounced writes as the store changes; the file-system events are an accelerator, and a 10-second
 reconcile still runs because FSEvents and inotify can drop events. Without the monitor, mail arrives the next time the
 agent does anything — which, with the Claude Code hook installed, is its next tool call.
+
+## Mail marks and open asks
+
+`lockyard msg inbox` marks a page read only when its stdout is a terminal. Piping or redirecting is the same as `--peek`; scripts that must mark use `--mark-read`. MCP `update` with `to` and `body` sends a note without marking inbox mail. Asks that still need your reply stay visible as open mail in `status`, `msg open`, and `open_mail_count` on renew, even after a mark-read, until you reply or ack (server per-reader handled state is LC-0004).
 
 ## MCP
 

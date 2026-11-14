@@ -17,6 +17,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
+/// One open letter for status / `msg open` (client-derived until LC-0004).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenMail {
+    pub id: i64,
+    pub from: String,
+    pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs: Option<String>,
+    pub subject: String,
+}
+
 /// The independent reads needed by status, including their provenance. Claims and assigned tasks
 /// are mandatory: a failed read must never look like an empty set to an action or Stop hook.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -26,6 +39,9 @@ pub struct StatusRead {
     pub work: Vec<WorkTask>,
     pub tasks: Vec<tasks::Task>,
     pub freshness: Value,
+    /// Open asks for this session. Absent (`None`) when unknown or not computed; old daemons omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_mail: Option<Vec<OpenMail>>,
 }
 
 fn cloud<T>(feature: &str) -> Result<T> {
@@ -54,6 +70,7 @@ pub trait Backend {
             },
             tasks: self.assigned_tasks(session)?,
             freshness: serde_json::json!({"source": "local", "age_ms": 0}),
+            open_mail: None,
         })
     }
 
@@ -238,6 +255,27 @@ pub trait Backend {
     /// This agent's own messages and how far each one got.
     fn sent(&self, _agent: &str, _limit: usize) -> Result<Vec<bus::Receipt>> {
         cloud("msg sent")
+    }
+
+    /// Like [`Backend::peek_inbox`], but the cloud client may bound the HTTP attempt.
+    fn peek_inbox_within(
+        &self,
+        agent: &str,
+        query: InboxQuery,
+        now: i64,
+        _timeout: Duration,
+    ) -> Result<InboxPage> {
+        self.peek_inbox(agent, query, now)
+    }
+
+    /// Like [`Backend::sent`], but the cloud client may bound the HTTP attempt.
+    fn sent_within(
+        &self,
+        agent: &str,
+        limit: usize,
+        _timeout: Duration,
+    ) -> Result<Vec<bus::Receipt>> {
+        self.sent(agent, limit)
     }
 
     fn tasks(&self, status: Option<tasks::Status>, include_final: bool)

@@ -31,6 +31,8 @@ struct State {
     seen: Vec<Seen>,
     claims: Vec<Value>,
     inbox: Vec<Value>,
+    seen_ids: Vec<i64>,
+    sent: Vec<Value>,
     refuse_claims: Option<(u16, Value)>,
     refuse_claims_get: Option<(u16, Value)>,
     refuse_claims_get_once: Option<(u16, Value)>,
@@ -81,6 +83,8 @@ struct Latency {
     stall_every: usize,
     stall: Duration,
     stall_route: Option<String>,
+    /// Stall only inbox peeks that request all=true (open-mail), not mandatory unread.
+    stall_inbox_all: bool,
     keep_alive: bool,
 }
 
@@ -111,6 +115,24 @@ impl Server {
             .seen
             .iter()
             .filter(|r| r.method == method && r.path.split('?').next() == Some(route))
+            .cloned()
+            .collect()
+    }
+
+    /// POST/PUT/DELETE calls whose path ends with `tail` (for example `/bus/inbox/seen`).
+    fn writes_to(&self, tail: &str) -> Vec<Seen> {
+        let state = self.state.lock().unwrap();
+        state
+            .seen
+            .iter()
+            .filter(|r| {
+                r.method != "GET"
+                    && r.method != "HEAD"
+                    && r.path
+                        .split('?')
+                        .next()
+                        .is_some_and(|path| path.ends_with(tail))
+            })
             .cloned()
             .collect()
     }
@@ -184,8 +206,11 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
         // requests on a keep-alive connection (for example, an outage after agent warm-up).
         let latency = state.lock().unwrap().latency.clone();
         thread::sleep(latency.response);
+        let stall_all_inbox =
+            latency.stall_inbox_all && route == "/api/v1/bus/inbox" && path.contains("all=true");
         if (latency.stall_every > 0 && request_number % latency.stall_every == 0)
             || latency.stall_route.as_deref() == Some(&route)
+            || stall_all_inbox
         {
             thread::sleep(latency.stall);
         }
@@ -506,20 +531,41 @@ fn route_reply(
                 || json!({"paths": [{"path": body["paths"][0], "status": "free"}]}),
             ),
         ),
-        ("GET", "/api/v1/bus/inbox") => state
-            .refuse_inbox_get
-            .clone()
-            .unwrap_or_else(|| (200, json!({"messages": state.inbox, "skipped": 0}))),
+        ("GET", "/api/v1/bus/inbox") => {
+            if let Some(refusal) = state.refuse_inbox_get.clone() {
+                return refusal;
+            }
+            let all = query_value(path, "all").as_deref() == Some("true");
+            let messages: Vec<Value> = state
+                .inbox
+                .iter()
+                .filter(|message| {
+                    all || message
+                        .get("id")
+                        .and_then(Value::as_i64)
+                        .is_none_or(|id| !state.seen_ids.contains(&id))
+                })
+                .cloned()
+                .collect();
+            (200, json!({"messages": messages, "skipped": 0}))
+        }
         ("POST", "/api/v1/bus/inbox/claim") => (200, json!({"claimed": body["ids"]})),
         ("POST", "/api/v1/bus/inbox/seen") => {
             let ids = body["ids"].as_array().cloned().unwrap_or_default();
-            state.inbox.retain(|message| !ids.contains(&message["id"]));
+            for id in &ids {
+                if let Some(id) = id.as_i64()
+                    && !state.seen_ids.contains(&id)
+                {
+                    state.seen_ids.push(id);
+                }
+            }
             (200, json!({"seen": ids.len()}))
         }
         ("POST", "/api/v1/bus/messages") => (
             200,
             json!({"id": 44, "from_session": "alice", "to": body["to"], "body": body["body"]}),
         ),
+        ("GET", "/api/v1/bus/sent") => (200, json!({"messages": state.sent.clone()})),
         ("GET", "/api/v1/bus/board") => (200, json!([])),
         ("GET", "/api/v1/bus/tasks") => state
             .refuse_work_get
@@ -531,6 +577,33 @@ fn route_reply(
         ),
         ("POST", "/api/v1/bus/tasks/BT-6/claim") => {
             (200, json!({"id": 6, "status": "claimed", "version": 2}))
+        }
+        _ if method == "POST" && route.contains("/bus/messages/") && route.ends_with("/reply") => {
+            let id = route
+                .rsplit('/')
+                .nth(1)
+                .and_then(|text| text.parse::<i64>().ok())
+                .unwrap_or(0);
+            for message in &mut state.inbox {
+                if message.get("id").and_then(Value::as_i64) == Some(id) {
+                    message["status"] = json!("ack");
+                }
+            }
+            // Match the real server: the reply body may carry in_reply_to, but /bus/sent does not.
+            let reply = json!({
+                "id": 1000 + id,
+                "from_session": session.unwrap_or("alice"),
+                "to": "bob",
+                "body": body["body"],
+                "in_reply_to": id,
+            });
+            state.sent.push(json!({
+                "id": 1000 + id,
+                "from_session": session.unwrap_or("alice"),
+                "to": "bob",
+                "body": body["body"],
+            }));
+            (200, reply)
         }
         _ if route.ends_with("/events") => (200, json!({"events": []})),
         _ => (200, json!({"id": 1})),
@@ -1471,7 +1544,11 @@ fn cloud_status_direct_reads_claims_first_then_each_section_in_turn_on_one_conne
     json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
     let state = server.state.lock().unwrap();
     let events = &state.status_read_events;
-    assert_eq!(events.len(), 10, "exactly five status reads: {events:?}");
+    assert_eq!(
+        events.len(),
+        12,
+        "exactly six status reads (open-mail inbox?all): {events:?}"
+    );
     assert_eq!(
         events[0],
         ("/api/v1/zones/claims?session=alice".into(), true)
@@ -2200,8 +2277,8 @@ fn cloud_status_ten_agent_callers_wait_with_bounded_http_workers() {
                     |(_, observed_session)| observed_session.as_deref() == Some(session.as_str())
                 )
                 .count(),
-            5,
-            "each caller must use exactly five section reads, without repeated work"
+            6,
+            "each caller uses five mandatory section reads plus one open-mail peek"
         );
     }
     let status_requests = state
@@ -2210,8 +2287,8 @@ fn cloud_status_ten_agent_callers_wait_with_bounded_http_workers() {
         .filter(|(_, started)| *started)
         .count();
     assert!(
-        status_requests - requests_before <= 60,
-        "read count exceeded exactly 50 caller reads plus at most 10 upkeep reads"
+        status_requests - requests_before <= 70,
+        "read count exceeded exactly 60 caller reads (5+open-mail) plus at most 10 upkeep reads"
     );
 }
 
@@ -2223,6 +2300,7 @@ fn modelled_bad_link() -> Latency {
         stall_every: 33,
         stall: Duration::from_secs(1),
         stall_route: None,
+        stall_inbox_all: false,
         keep_alive: true,
     }
 }
@@ -3642,4 +3720,267 @@ fn required_cli_catalog_put_encrypts_locally_and_preserves_publisher_denial() {
     let error: Value = serde_json::from_slice(&refused.stderr).unwrap();
     assert_eq!(error["error"]["code"], "forbidden");
     assert_eq!(server.state.lock().unwrap().catalog, stored);
+}
+
+#[test]
+fn msg_inbox_piped_does_not_mark_seen_unless_mark_read() {
+    let server = Server::start();
+    server.state.lock().unwrap().inbox = vec![json!({
+        "id": 7,
+        "from_session": "bob",
+        "to": "alice",
+        "body": "pipe me",
+        "kind": "ask",
+        "needs": "none",
+        "created_at": 0
+    })];
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let piped = cli(dir.path(), runtime.path(), &["msg", "inbox"]);
+    assert!(piped.status.success(), "{piped:?}");
+    assert!(server.writes_to("/bus/inbox/seen").is_empty());
+    let marked = cli(dir.path(), runtime.path(), &["msg", "inbox", "--mark-read"]);
+    assert!(marked.status.success(), "{marked:?}");
+    assert_eq!(server.writes_to("/bus/inbox/seen").len(), 1);
+}
+
+#[test]
+fn mcp_update_with_a_note_does_not_mark_inbox_seen() {
+    let server = Server::start();
+    server.state.lock().unwrap().inbox = vec![json!({
+        "id": 9,
+        "from_session": "bob",
+        "to": "alice",
+        "body": "still open",
+        "kind": "ask",
+        "needs": "none",
+        "created_at": 0
+    })];
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let answers = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "compact",
+        &[("update", json!({"to": "bob", "body": "note only"}))],
+    );
+    assert_eq!(answers[0]["isError"], false, "{}", answers[0]);
+    assert!(server.writes_to("/bus/inbox/seen").is_empty());
+    assert_eq!(
+        server.seen("POST", "/api/v1/bus/messages").len(),
+        1,
+        "the note must still be sent"
+    );
+}
+
+#[test]
+fn status_shows_open_mail_for_a_seen_unanswered_ask_until_reply() {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.inbox = vec![json!({
+            "id": 11,
+            "from_session": "bob",
+            "to": "alice",
+            "body": "please claim src",
+            "kind": "ask",
+            "needs": "none",
+            "created_at": 0
+        })];
+        state.seen_ids = vec![11];
+    }
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let status = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    assert_eq!(status["unread"], 0, "{status}");
+    assert_eq!(status["open_mail"].as_array().unwrap().len(), 1, "{status}");
+    assert_eq!(status["open_mail"][0]["id"], 11);
+    let open = json_of(&cli(dir.path(), runtime.path(), &["--json", "msg", "open"]));
+    assert_eq!(open.as_array().unwrap().len(), 1, "{open}");
+    let replied = cli(
+        dir.path(),
+        runtime.path(),
+        &["msg", "reply", "11", "claimed"],
+    );
+    assert!(replied.status.success(), "{replied:?}");
+    let after = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    assert_eq!(after["open_mail"].as_array().unwrap().len(), 0, "{after}");
+    let open_after = json_of(&cli(dir.path(), runtime.path(), &["--json", "msg", "open"]));
+    assert_eq!(open_after.as_array().unwrap().len(), 0, "{open_after}");
+}
+
+#[test]
+fn zone_renew_reports_open_mail_count() {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.claims = vec![json!({
+            "id": 5,
+            "session": "alice",
+            "paths": ["src"],
+            "fence": 2,
+            "expires_at": "2099-01-01T00:00:00Z",
+            "note": "n"
+        })];
+        state.inbox = vec![json!({
+            "id": 3,
+            "from_session": "bob",
+            "to": "alice",
+            "body": "renew me",
+            "kind": "ask",
+            "needs": "reply",
+            "created_at": 0
+        })];
+        state.seen_ids = vec![3];
+    }
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let renewed = json_of(&cli(
+        dir.path(),
+        runtime.path(),
+        &["--json", "zone", "renew", "5", "--fence", "2"],
+    ));
+    assert_eq!(renewed["open_mail_count"], 1, "{renewed}");
+    let mcp = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "full",
+        &[("zone_renew", json!({"id": 5, "fence": 2}))],
+    );
+    assert_eq!(mcp[0]["isError"], false, "{}", mcp[0]);
+    assert_eq!(mcp[0]["structuredContent"]["open_mail_count"], 1);
+}
+
+#[test]
+fn status_omits_open_mail_when_all_inbox_hangs_after_mandatory_reads() {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.inbox = vec![json!({
+            "id": 11,
+            "from_session": "bob",
+            "to": "alice",
+            "body": "please claim src",
+            "kind": "ask",
+            "needs": "none",
+            "created_at": 0
+        })];
+        state.seen_ids = vec![11];
+        state.latency.stall_inbox_all = true;
+        state.latency.stall = Duration::from_secs(10);
+    }
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let started = Instant::now();
+    let status = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    let elapsed = started.elapsed();
+    assert!(status.get("claims").is_some(), "{status}");
+    assert!(
+        status.get("open_mail").is_none(),
+        "open_mail must be omitted on timeout: {status}"
+    );
+    assert_eq!(
+        status["freshness"]["sections"]["open_mail"]["available"], false,
+        "{status}"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(6),
+        "status took {:?}, longer than the overall deadline",
+        elapsed
+    );
+}
+
+#[test]
+fn status_closes_open_mail_on_ack_not_on_cloud_sent() {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.inbox = vec![json!({
+            "id": 11,
+            "from_session": "bob",
+            "to": "alice",
+            "body": "please claim src",
+            "kind": "ask",
+            "needs": "none",
+            "created_at": 0
+        })];
+        state.seen_ids = vec![11];
+        // Pretend we replied: sent has no in_reply_to (server shape), ask still open.
+        state.sent = vec![json!({
+            "id": 1011,
+            "from_session": "alice",
+            "to": "bob",
+            "body": "claimed"
+        })];
+    }
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let status = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    assert_eq!(status["open_mail"].as_array().unwrap().len(), 1, "{status}");
+    {
+        let mut state = server.state.lock().unwrap();
+        for message in &mut state.inbox {
+            if message.get("id").and_then(Value::as_i64) == Some(11) {
+                message["status"] = json!("ack");
+            }
+        }
+    }
+    let after = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    assert_eq!(after["open_mail"].as_array().unwrap().len(), 0, "{after}");
+}
+
+#[test]
+fn mcp_status_returns_open_mail() {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.inbox = vec![json!({
+            "id": 11,
+            "from_session": "bob",
+            "to": "alice",
+            "body": "please claim src",
+            "kind": "ask",
+            "needs": "none",
+            "created_at": 0
+        })];
+        state.seen_ids = vec![11];
+    }
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let mcp = mcp_calls(dir.path(), runtime.path(), "full", &[("status", json!({}))]);
+    assert_eq!(mcp[0]["isError"], false, "{}", mcp[0]);
+    let content = &mcp[0]["structuredContent"];
+    assert_eq!(
+        content["open_mail"].as_array().unwrap().len(),
+        1,
+        "{content}"
+    );
+}
+
+#[test]
+fn open_mail_escapes_controls_in_status() {
+    let server = Server::start();
+    {
+        let mut state = server.state.lock().unwrap();
+        let mut ask = json!({
+            "id": 11,
+            "from_session": "bob",
+            "to": "alice",
+            "body": "please",
+            "kind": "ask",
+            "needs": "none",
+            "created_at": 0
+        });
+        ask["from_session"] = Value::String("bo\nb".into());
+        ask["body"] = Value::String("line\u{202e}hidden".into());
+        state.inbox = vec![ask];
+        state.seen_ids = vec![11];
+    }
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let status = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    let mail = &status["open_mail"][0];
+    assert_eq!(mail["from"], "bo\\nb", "{mail}");
+    let subject = mail["subject"].as_str().unwrap();
+    assert!(subject.contains("\\u{202e}"), "{mail}");
 }

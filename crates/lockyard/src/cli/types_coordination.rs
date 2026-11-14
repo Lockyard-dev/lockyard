@@ -239,7 +239,7 @@ pub(super) enum MsgCommand {
         id: i64,
         body: String,
     },
-    /// Show unread mail and mark it read once it is printed.
+    /// Show unread mail. Marks it read only when stdout is a terminal; piping acts like --peek.
     Inbox {
         /// Include mail already read.
         #[arg(long)]
@@ -247,7 +247,15 @@ pub(super) enum MsgCommand {
         /// Do not mark anything read.
         #[arg(long)]
         peek: bool,
+        /// Mark the shown page read even when stdout is not a terminal (scripts).
+        #[arg(long, conflicts_with = "peek")]
+        mark_read: bool,
     },
+    /// Show asks that still need a reply or ack from this agent, without marking them read.
+    ///
+    /// A broadcast ask another recipient answered looks closed here (shared server `status=ack`);
+    /// per-reader handled state is LC-0004.
+    Open,
     /// Show the count of unread mail.
     Unread,
     /// Confirm a message that needs an ack.

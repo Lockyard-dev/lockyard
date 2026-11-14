@@ -169,7 +169,24 @@ impl<T: Transport> CloudBackend<T> {
     }
 
     fn get(&self, session: &str, path: String) -> Result<Value> {
-        Ok(self.transport.call(&Call::get(session, path))?)
+        self.get_with_timeout(session, path, None)
+    }
+
+    fn get_with_timeout(
+        &self,
+        session: &str,
+        path: String,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Value> {
+        let mut call = Call::get(session, path);
+        if let Some(limit) = timeout {
+            let ms = u64::try_from(limit.as_millis()).unwrap_or(u64::MAX);
+            if ms == 0 {
+                return Err(Error::Unavailable("open-mail call deadline elapsed".into()));
+            }
+            call.attempt_timeout_ms = Some(ms);
+        }
+        Ok(self.transport.call(&call)?)
     }
 
     fn post(&self, session: &str, path: String, body: &impl Serialize) -> Result<Value> {
@@ -327,6 +344,10 @@ pub(crate) fn inbox_page(value: Value) -> std::result::Result<InboxPage, ClientE
 fn receipt_from(value: &Value) -> bus::Receipt {
     let stamp = |name: &str| value.get(name).and_then(Value::as_i64);
     let status = value.get("status").and_then(Value::as_str).unwrap_or("");
+    let reply_to = value
+        .get("reply_to")
+        .or_else(|| value.get("in_reply_to"))
+        .and_then(Value::as_i64);
     bus::Receipt {
         id: value.get("id").and_then(Value::as_i64).unwrap_or_default(),
         to: value
@@ -340,6 +361,7 @@ fn receipt_from(value: &Value) -> bus::Receipt {
             .unwrap_or_default()
             .to_string(),
         created_at: stamp("created_at").unwrap_or_default(),
+        reply_to,
         status: match status {
             "replied" => bus::Delivery::Replied,
             "read" => bus::Delivery::Read,
@@ -1058,6 +1080,27 @@ impl<T: Transport> Backend for CloudBackend<T> {
         )?)
     }
 
+    fn peek_inbox_within(
+        &self,
+        agent: &str,
+        filter: InboxQuery,
+        _now: i64,
+        timeout: std::time::Duration,
+    ) -> Result<InboxPage> {
+        let tail = query(&[
+            ("all", filter.all.then(|| "true".to_string())),
+            (
+                "limit",
+                (filter.limit > 0).then(|| filter.limit.min(INBOX_PAGE).to_string()),
+            ),
+        ]);
+        Ok(inbox_page(self.get_with_timeout(
+            agent,
+            format!("/api/v1/bus/inbox{tail}"),
+            Some(timeout),
+        )?)?)
+    }
+
     fn unread(&self, agent: &str) -> Result<i64> {
         if let Some(answer) = self.transport.fast_unread(agent) {
             return answer?.ok_or_else(|| Error::Unavailable("unread count unknown".into()));
@@ -1110,6 +1153,28 @@ impl<T: Transport> Backend for CloudBackend<T> {
     fn sent(&self, agent: &str, limit: usize) -> Result<Vec<bus::Receipt>> {
         let tail = query(&[("limit", (limit > 0).then(|| limit.to_string()))]);
         let value = self.get(agent, format!("/api/v1/bus/sent{tail}"))?;
+        let items = value
+            .get("messages")
+            .or_else(|| value.get("items"))
+            .unwrap_or(&value);
+        let empty = Vec::new();
+        Ok(items
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .map(receipt_from)
+            .collect())
+    }
+
+    fn sent_within(
+        &self,
+        agent: &str,
+        limit: usize,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<bus::Receipt>> {
+        let tail = query(&[("limit", (limit > 0).then(|| limit.to_string()))]);
+        let value =
+            self.get_with_timeout(agent, format!("/api/v1/bus/sent{tail}"), Some(timeout))?;
         let items = value
             .get("messages")
             .or_else(|| value.get("items"))
