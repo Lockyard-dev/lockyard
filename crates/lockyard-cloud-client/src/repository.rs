@@ -152,6 +152,10 @@ impl<T> RepositoryTransport<T> {
 }
 
 impl<T: Transport> Transport for RepositoryTransport<T> {
+    fn registry_auto_area(&self, session: &str) -> Result<bool, ClientError> {
+        self.inner.registry_auto_area(session)
+    }
+
     fn status_registry_assignee_supported(
         &self,
         deadline: std::time::Instant,
@@ -562,6 +566,35 @@ mod tests {
             4,
             "the capability read is reused for this transport"
         );
+    }
+
+    #[test]
+    fn auto_area_capability_crosses_arc_and_repository_wrappers_without_changing_workspace_paths() {
+        struct AutoArea;
+        impl Transport for AutoArea {
+            fn registry_auto_area(&self, session: &str) -> Result<bool, ClientError> {
+                assert_eq!(session, "alice");
+                Ok(true)
+            }
+            fn call(&self, call: &Call) -> Result<Value, ClientError> {
+                assert_eq!(call.path, "/api/v1/registry/items");
+                assert_eq!(call.body.as_ref().unwrap()["paths"], json!(["web/src"]));
+                assert!(call.repository.is_none());
+                Ok(json!({"id":"WEB-0001", "paths":["web/src"]}))
+            }
+        }
+        let transport =
+            RepositoryTransport::new(std::sync::Arc::new(AutoArea), Some("api")).unwrap();
+        assert!(transport.registry_auto_area("alice").unwrap());
+        let task = transport
+            .call(&Call::write(
+                "alice",
+                "POST",
+                "/api/v1/registry/items".into(),
+                json!({"paths":["web/src"]}),
+            ))
+            .unwrap();
+        assert_eq!(task["paths"], json!(["web/src"]));
     }
 
     #[test]

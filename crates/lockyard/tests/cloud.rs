@@ -1953,12 +1953,19 @@ fn cloud_status_optional_mail_timeout_keeps_a_warm_agent_answer() {
         .output()
         .unwrap();
     let status = json_of(&output);
+    // Direct fallback re-waits the stalled inbox and is the defect this test catches. Check
+    // via=agent first: wall time alone flaked when the agent finished as the socket expired.
+    assert_eq!(
+        status["freshness"]["via"],
+        "agent",
+        "optional mail forced an unnecessary direct fallback after {:?}: {status}",
+        started.elapsed()
+    );
     assert!(
         started.elapsed() < Duration::from_millis(1900),
         "optional mail forced an unnecessary direct fallback: {:?}",
         started.elapsed()
     );
-    assert_eq!(status["freshness"]["via"], "agent", "{status}");
     assert!(status["claims"].is_array(), "{status}");
     assert!(status["tasks"].is_array(), "{status}");
     assert_eq!(status["freshness"]["sections"]["claims"]["available"], true);
@@ -2110,6 +2117,9 @@ fn cloud_status_ten_agent_callers_wait_with_bounded_http_workers() {
     let runtime = tempfile::tempdir().unwrap();
     let _agent = start_agent(dir.path(), runtime.path());
     json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    // Let upkeep finish the warm-up pass and go idle first: an idle upkeep that scans while the
+    // ten callers are on the network is what once sent a duplicate inbox read (sixth section read).
+    thread::sleep(Duration::from_millis(800));
     let (requests_before, connections_before) = {
         let mut state = server.state.lock().unwrap();
         state.max_status_reads_in_flight = 0;

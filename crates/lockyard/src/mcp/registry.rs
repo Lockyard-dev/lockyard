@@ -146,21 +146,12 @@ impl ToolRegistry {
             .into_iter()
             .map(|definition| {
                 let mut wire = definition.wire.clone();
-                if surface == Surface::Compact {
-                    match wire["name"].as_str().unwrap() {
-                        "task_add" => {
-                            wire["description"] = json!("Add a task in an explicit area, using that area's task prefix.");
-                            wire["inputSchema"]["required"] = json!(["title", "area"]);
-                        }
-                        "zone_renew" => {
-                            wire["description"] = json!("Renew your live claim; ttl is optional minutes (1-240, default 30); fence is required in cloud mode.");
-                            wire["inputSchema"]["properties"]["ttl"] = json!({
-                                "type": "integer", "minimum": 1, "maximum": 240, "default": 30,
-                                "description": "Optional lease length in minutes, from 1 through 240; defaults to 30."
-                            });
-                        }
-                        _ => {}
-                    }
+                if surface == Surface::Compact && wire["name"].as_str().unwrap() == "zone_renew" {
+                    wire["description"] = json!("Renew your live claim; ttl is optional minutes (1-240, default 30); fence is required in cloud mode.");
+                    wire["inputSchema"]["properties"]["ttl"] = json!({
+                        "type": "integer", "minimum": 1, "maximum": 240, "default": 30,
+                        "description": "Optional lease length in minutes, from 1 through 240; defaults to 30."
+                    });
                 }
                 wire
             })
@@ -570,11 +561,13 @@ fn primitive_definitions() -> Vec<Value> {
         ),
         tool_def(
             "task_add",
-            "Add a task. In cloud mode the writer sets its urgency",
+            "Add a task: workspace-relative files/directories in paths; supporting servers derive area, otherwise use area.",
             json!({
                 "title": text, "body": text, "acceptance": text, "priority": text, "p0_category": text,
                 "type": text, "target": text, "verification": text, "area": text, "prefix": text,
-                "pad": int, "due": text, "evidence": text
+                "pad": int, "due": text, "evidence": text,
+                "paths": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64,
+                    "description":"Files or directories the task concerns, relative to the workspace root. Required with registry_auto_area_v1: the server determines the area from these paths. On other servers paths are not sent; supply area."}
             }),
             &["title"],
         ),

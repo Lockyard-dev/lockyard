@@ -175,6 +175,316 @@ fn serialized(error: ClientError) -> String {
 }
 
 #[test]
+fn auto_area_capability_is_negotiated_from_discovery_body_or_header() {
+    for header_only in [false, true] {
+        let mut reply = discovery(
+            2,
+            1,
+            2,
+            if header_only {
+                &[]
+            } else {
+                &["registry_auto_area_v1"]
+            },
+        );
+        if header_only {
+            reply.extra =
+                "Lockyard-Capabilities: registry_assignee_session_v1, registry_auto_area_v1\r\n";
+        }
+        let server = Server::start(vec![reply]);
+        let client = server.client();
+        assert!(client.registry_auto_area("fixture-session").unwrap());
+        assert!(client.registry_auto_area("fixture-session").unwrap());
+        assert_eq!(server.requests().len(), 1, "reuse discovery cache");
+        assert_eq!(server.requests()[0].path, "/api/v1/protocol");
+    }
+}
+
+#[test]
+fn auto_area_capability_is_retained_from_a_later_response_header() {
+    let mut later = Reply::json(200, json!([]), Some("2"));
+    later.extra = "Lockyard-Capabilities: registry_assignee_session_v1, registry_auto_area_v1\r\n";
+    let server = Server::start(vec![discovery(2, 1, 2, &[]), later]);
+    let client = server.client();
+    assert!(!client.registry_auto_area("fixture-session").unwrap());
+    client.call(&read()).unwrap();
+    assert!(client.registry_auto_area("fixture-session").unwrap());
+    assert_eq!(
+        server.requests().len(),
+        2,
+        "later header reuses existing discovery"
+    );
+}
+
+#[test]
+fn auto_area_capability_is_cleared_by_latest_successful_header() {
+    for latest_header in [
+        "",
+        "Lockyard-Capabilities: registry_assignee_session_v1\r\n",
+    ] {
+        let mut enabled = Reply::json(200, json!([]), Some("2"));
+        enabled.extra = "Lockyard-Capabilities: registry_auto_area_v1\r\n";
+        let mut disabled = Reply::json(200, json!([]), Some("2"));
+        disabled.extra = latest_header;
+        let server = Server::start(vec![discovery(2, 1, 2, &[]), enabled, disabled]);
+        let client = server.client();
+        client.call(&read()).unwrap();
+        assert!(client.registry_auto_area("fixture-session").unwrap());
+        client.call(&read()).unwrap();
+        assert!(!client.registry_auto_area("fixture-session").unwrap());
+        assert_eq!(server.requests().len(), 3, "reuse HTTP negotiation only");
+    }
+}
+
+#[test]
+fn live_protocol_without_auto_area_clears_cached_body_or_header_confirmation() {
+    for header_only in [false, true] {
+        let mut initial = discovery(
+            2,
+            1,
+            2,
+            if header_only {
+                &[]
+            } else {
+                &["registry_auto_area_v1"]
+            },
+        );
+        if header_only {
+            initial.extra = "Lockyard-Capabilities: registry_auto_area_v1\r\n";
+        }
+        let server = Server::start(vec![initial, discovery(2, 1, 2, &[])]);
+        let client = server.client();
+        assert!(client.registry_auto_area("fixture-session").unwrap());
+        let value = client
+            .call(&Call::get("fixture-session", "/api/v1/protocol".into()))
+            .unwrap();
+        assert_eq!(value["capabilities"], json!([]));
+        assert!(!client.registry_auto_area("fixture-session").unwrap());
+        assert_eq!(server.requests().len(), 2);
+    }
+}
+
+#[test]
+fn live_protocol_forwarding_uses_only_its_own_capability_header() {
+    let mut enabled = discovery(2, 1, 2, &[]);
+    enabled.extra = "Lockyard-Capabilities: registry_auto_area_v1\r\n";
+    let server = Server::start(vec![
+        discovery(2, 1, 2, &[]),
+        enabled,
+        discovery(2, 1, 2, &[]),
+    ]);
+    let client = server.client();
+    assert!(!client.registry_auto_area("fixture-session").unwrap());
+    let protocol_call = Call::get("fixture-session", "/api/v1/protocol".into());
+    let enabled = client.call(&protocol_call).unwrap();
+    assert_eq!(enabled["capabilities"], json!(["registry_auto_area_v1"]));
+    assert!(client.registry_auto_area("fixture-session").unwrap());
+    let disabled = client.call(&protocol_call).unwrap();
+    assert_eq!(disabled["capabilities"], json!([]));
+    assert!(!client.registry_auto_area("fixture-session").unwrap());
+    assert_eq!(server.requests().len(), 3);
+}
+
+#[test]
+fn failed_response_does_not_replace_latest_auto_area_confirmation() {
+    for supported in [false, true] {
+        let initial = discovery(
+            2,
+            1,
+            2,
+            if supported {
+                &["registry_auto_area_v1"]
+            } else {
+                &[]
+            },
+        );
+        let mut refused = problem(403, "forbidden", json!({}), Some("2"));
+        if !supported {
+            refused.extra = "Lockyard-Capabilities: registry_auto_area_v1\r\n";
+        }
+        let server = Server::start(vec![initial, refused]);
+        let client = server.client();
+        assert_eq!(
+            client.registry_auto_area("fixture-session").unwrap(),
+            supported
+        );
+        assert_eq!(client.call(&read()).unwrap_err().code(), Some("forbidden"));
+        assert_eq!(
+            client.registry_auto_area("fixture-session").unwrap(),
+            supported
+        );
+    }
+}
+
+#[test]
+fn removed_auto_area_uses_legacy_area_lookup_despite_cached_negotiation() {
+    use lockyard_core::{Backend, tasks::TaskSpec};
+    let server = Server::start(vec![
+        discovery(2, 1, 2, &["registry_auto_area_v1"]),
+        Reply::json(200, json!([]), Some("2")),
+        Reply::json(200, json!([{"id":"area-web", "key":"web"}]), Some("2")),
+        Reply::json(200, json!({"id":"WEB-0001", "title":"t"}), Some("2")),
+    ]);
+    let client = server.client();
+    assert!(client.registry_auto_area("fixture-session").unwrap());
+    client.call(&read()).unwrap();
+    let mut cloud = lockyard_cloud_client::CloudBackend::new(client, "fixture-session");
+    let result = cloud.add_task(
+        "fixture-session",
+        &TaskSpec {
+            title: "t".into(),
+            paths: vec!["web/src/main.rs".into()],
+            area: Some("web".into()),
+            ..TaskSpec::default()
+        },
+        0,
+    );
+    let requests = server.requests();
+    assert_eq!(
+        requests.get(2).map(|request| request.path.as_str()),
+        Some("/api/v1/registry/areas"),
+        "rollback must use the legacy area lookup before creating a task"
+    );
+    result.unwrap();
+    assert_eq!(requests.len(), 4);
+    let body: Value = serde_json::from_str(&requests[3].body).unwrap();
+    assert_eq!(body["area_id"], "area-web");
+    assert!(body.get("paths").is_none());
+}
+
+#[test]
+fn auto_area_rollback_refusal_explains_repeat_and_never_retries_the_write() {
+    use lockyard_core::{Backend, tasks::TaskSpec};
+    for (status, code, message, details) in [
+        (400, "area_required", "Area is required", json!({})),
+        (422, "invalid_request", "area_id is required", Value::Null),
+        (
+            422,
+            "validation_error",
+            "Validation rejected",
+            json!({"area_id":["required"]}),
+        ),
+        (
+            400,
+            "invalid_request",
+            "AreaId must be specified",
+            Value::Null,
+        ),
+    ] {
+        let mut refusal = problem(status, code, details.clone(), Some("2"));
+        refusal.body["detail"] = json!(message);
+        let server = Server::start(vec![
+            discovery(2, 1, 2, &["registry_auto_area_v1"]),
+            refusal,
+            Reply::json(200, json!([{"id":"area-web", "key":"web"}]), Some("2")),
+            Reply::json(200, json!({"id":"WEB-0001", "title":"t"}), Some("2")),
+        ]);
+        let mut cloud =
+            lockyard_cloud_client::CloudBackend::new(server.client(), "fixture-session");
+        let spec = TaskSpec {
+            title: "t".into(),
+            paths: vec!["web/src/main.rs".into()],
+            area: Some("web".into()),
+            ..TaskSpec::default()
+        };
+        let error = cloud.add_task("fixture-session", &spec, 0).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("Повтори команду"), "{text}");
+        assert_eq!(text.matches("Повтори команду").count(), 1, "{text}");
+        assert!(text.contains("--area <область>"), "{text}");
+        assert!(text.contains(message), "{text}");
+        match error {
+            lockyard_core::Error::Cloud {
+                code: actual_code,
+                status: actual_status,
+                details: actual_details,
+                ..
+            } => {
+                assert_eq!(actual_code, code);
+                assert_eq!(actual_status, Some(status));
+                assert_eq!(actual_details, details);
+            }
+            other => panic!("lost refusal metadata: {other:?}"),
+        }
+        assert_eq!(
+            server.requests().len(),
+            2,
+            "no automatic retry or area lookup"
+        );
+        cloud.add_task("fixture-session", &spec, 0).unwrap();
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[2].path, "/api/v1/registry/areas");
+        let retry_body: Value = serde_json::from_str(&requests[3].body).unwrap();
+        assert_eq!(retry_body["area_id"], "area-web");
+        assert!(retry_body.get("paths").is_none());
+        assert_ne!(
+            requests[1].header("idempotency-key"),
+            requests[3].header("idempotency-key")
+        );
+    }
+}
+
+#[test]
+fn auto_area_task_creation_sends_paths_and_verbatim_optional_area_without_area_lookup() {
+    use lockyard_core::{Backend, tasks::TaskSpec};
+    for area in [None, Some("My-Override")] {
+        let server = Server::start(vec![
+            discovery(2, 1, 2, &["registry_auto_area_v1"]),
+            Reply::json(
+                200,
+                json!({"id":"WEB-0001", "title":"t", "paths":["web/src/main.rs", "web/tests"]}),
+                Some("2"),
+            ),
+        ]);
+        let mut cloud =
+            lockyard_cloud_client::CloudBackend::new(server.client(), "fixture-session");
+        let spec = TaskSpec {
+            title: "t".into(),
+            paths: vec!["web/src/main.rs".into(), "web/tests".into()],
+            area: area.map(str::to_string),
+            ..TaskSpec::default()
+        };
+        let task = cloud.add_task("fixture-session", &spec, 0).unwrap();
+        assert_eq!(task.paths, spec.paths);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].path, "/api/v1/registry/items");
+        let body: Value = serde_json::from_str(&requests[1].body).unwrap();
+        assert_eq!(body["paths"], json!(spec.paths));
+        assert_eq!(body.get("area"), area.map(|area| json!(area)).as_ref());
+        assert!(body.get("area_id").is_none());
+    }
+}
+
+#[test]
+fn auto_area_task_without_paths_is_refused_before_any_registry_request() {
+    use lockyard_core::{Backend, tasks::TaskSpec};
+    let server = Server::start(vec![discovery(2, 1, 2, &["registry_auto_area_v1"])]);
+    let mut cloud = lockyard_cloud_client::CloudBackend::new(server.client(), "fixture-session");
+    let error = cloud
+        .add_task(
+            "fixture-session",
+            &TaskSpec {
+                title: "t".into(),
+                ..TaskSpec::default()
+            },
+            0,
+        )
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("--path <путь>"), "{message}");
+    assert!(message.contains("paths: ["), "{message}");
+    assert!(
+        message.contains("относительно корня рабочего места"),
+        "{message}"
+    );
+    assert_eq!(server.requests().len(), 1);
+    assert_eq!(server.requests()[0].path, "/api/v1/protocol");
+}
+
+#[test]
 fn discovery_precedes_operations_and_echo_is_checked_on_every_response() {
     let server = Server::start(vec![
         discovery(2, 1, 2, &[]),

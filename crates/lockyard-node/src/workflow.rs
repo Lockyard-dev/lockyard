@@ -3116,15 +3116,17 @@ mod tests {
         let controller = open(root.path(), &driver, 1000);
         controller.submit(definition(), 1000).unwrap();
         controller.tick(&driver, 1000).await.unwrap();
-        controller.cancel(FLOW, 1100).unwrap();
+        // tick() adds real elapsed discovery time to its logical clock; later steps stay
+        // 100 s ahead so a slow host cannot make them look like a clock rollback.
+        controller.cancel(FLOW, 101_100).unwrap();
         let mut other = definition();
         other.id = wire::new_id().unwrap();
-        controller.submit(other.clone(), 1100).unwrap();
+        controller.submit(other.clone(), 101_100).unwrap();
         let other_before = controller.status(&other.id).unwrap();
         let before = controller.status(FLOW).unwrap();
         assert_eq!(
             controller
-                .abandon(abandon_request(&before), 1200, |_| Box::pin(async {
+                .abandon(abandon_request(&before), 101_200, |_| Box::pin(async {
                     Ok(())
                 }))
                 .await
@@ -3137,7 +3139,7 @@ mod tests {
         wrong.definition_sha256 = "f".repeat(64);
         assert_eq!(
             controller
-                .abandon(wrong, 1200, |_| Box::pin(async { Ok(()) }))
+                .abandon(wrong, 101_200, |_| Box::pin(async { Ok(()) }))
                 .await
                 .unwrap_err()
                 .0,
@@ -3147,7 +3149,7 @@ mod tests {
         wrong.expected_local_certificate_sha256 = "d".repeat(64);
         assert_eq!(
             controller
-                .abandon(wrong, 1200, |_| Box::pin(async { Ok(()) }))
+                .abandon(wrong, 101_200, |_| Box::pin(async { Ok(()) }))
                 .await
                 .unwrap_err()
                 .0,
@@ -3155,7 +3157,7 @@ mod tests {
         );
         assert_eq!(
             controller
-                .abandon(abandon_request(&before), 1200, |_| Box::pin(async {
+                .abandon(abandon_request(&before), 101_200, |_| Box::pin(async {
                     Err(WorkflowError("synthetic_local_or_outbound_still_active"))
                 }))
                 .await
@@ -3165,7 +3167,7 @@ mod tests {
         );
         assert_eq!(controller.status(FLOW).unwrap(), before);
         let after = controller
-            .abandon(abandon_request(&before), 1200, |_| {
+            .abandon(abandon_request(&before), 101_200, |_| {
                 Box::pin(async { Ok(()) })
             })
             .await
@@ -3186,7 +3188,7 @@ mod tests {
             .iter()
             .filter(|(op, _, _)| *op == Operation::JobSubmit)
             .count();
-        controller.tick(&driver, 2000).await.unwrap();
+        controller.tick(&driver, 102_000).await.unwrap();
         assert_eq!(
             driver
                 .calls
@@ -3197,9 +3199,9 @@ mod tests {
                 .count(),
             submits
         );
-        controller.cancel(&other.id, 2000).unwrap();
+        controller.cancel(&other.id, 102_000).unwrap();
         drop(controller);
-        let restored = open(root.path(), &driver, 3000);
+        let restored = open(root.path(), &driver, 103_000);
         assert!(restored.status(FLOW).unwrap().abandoned);
         offline_rotation_guard(
             root.path(),

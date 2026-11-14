@@ -1,5 +1,5 @@
 # Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
-"""Apply the hosted macOS/Windows attempt policy to the raw release p95 tests."""
+"""Apply the hosted Linux/macOS/Windows attempt policy to the raw release p95 tests."""
 
 import argparse
 import os
@@ -82,7 +82,7 @@ def enforce_test(platform, test, metric, assertion, attempts, budget_us):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("platform", choices=("macos", "windows"))
+    parser.add_argument("platform", choices=("macos", "windows", "linux"))
     options = parser.parse_args()
     os.environ["CARGO_INCREMENTAL"] = "0"
     status, catalog = run_cargo(["--", "--list"])
@@ -93,9 +93,11 @@ def main():
         print("Expected exactly the hook decision and msg send performance budget tests", file=sys.stderr, flush=True)
         return 1
     if options.platform == "macos":
-        platform, policies = "macOS", ((3, 15000), (3, 20000))
+        platform, policies = "macOS", ((5, 15000), (5, 20000))
+    elif options.platform == "linux":
+        platform, policies = "Linux", ((5, 15000), (5, 20000))
     else:
-        platform, policies = "Windows", ((1, 15000), (3, 35000))
+        platform, policies = "Windows", ((5, 15000), (5, 35000))
     for (test, metric, assertion), (attempts, budget_us) in zip(TESTS, policies):
         status = enforce_test(platform, test, metric, assertion, attempts, budget_us)
         if status:

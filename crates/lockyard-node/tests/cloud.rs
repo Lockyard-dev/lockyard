@@ -111,8 +111,11 @@ async fn fixture(status: u16, count: usize) -> (String, Vec<u8>, tokio::task::Jo
                 body.len()
             );
             stream.write_all(headers.as_bytes()).await.unwrap();
-            stream.write_all(&body).await.unwrap();
-            stream.shutdown().await.unwrap();
+            // A client that refuses the status (a redirect) may close as soon as it has read
+            // the head; a broken pipe on the rest is the client's correct behaviour, and every
+            // assertion about the exchange is made on the client side.
+            let _ = stream.write_all(&body).await;
+            let _ = stream.shutdown().await;
             accepted += 1;
         }
     });

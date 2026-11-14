@@ -30,6 +30,23 @@ impl Opened {
     pub fn zone_paths(&self, cwd: &Path, raw: &[String]) -> Result<Vec<String>> {
         raw.iter().map(|path| self.zone_path(cwd, path)).collect()
     }
+
+    /// Task paths use the same resolver as claims, anchored at the workspace root.
+    pub fn task_paths(&self, raw: &[String]) -> Result<Vec<String>> {
+        if raw.len() > 64 {
+            return Err(Error::Invalid("a task accepts at most 64 paths".into()));
+        }
+        let slashed: Vec<String> = raw.iter().map(|path| path.replace('\\', "/")).collect();
+        let mut paths = self.zone_paths(&self.root, &slashed)?;
+        if paths.iter().any(|path| path.chars().count() > 512) {
+            return Err(Error::Invalid(
+                "each task path must be at most 512 characters".into(),
+            ));
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
 }
 
 /// The URL and label of a cloud project. `load` already refused a config without them.
@@ -276,8 +293,36 @@ fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{status_agent_budget, status_probe_budget, url_matches};
+    use super::{Opened, status_agent_budget, status_probe_budget, url_matches};
     use std::time::Duration;
+
+    #[test]
+    fn task_paths_reuse_claim_resolution_with_workspace_slashes_and_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let backend = Box::new(lockyard_core::Store::init(&root).unwrap());
+        let opened = Opened {
+            root: root.clone(),
+            backend,
+        };
+        let paths = opened
+            .task_paths(&[
+                r"platform\src\login.rs".into(),
+                "./platform/src/../src//login.rs".into(),
+                root.join("platform/new.rs").to_str().unwrap().into(),
+            ])
+            .unwrap();
+        assert_eq!(paths, vec!["platform/new.rs", "platform/src/login.rs"]);
+        assert!(opened.task_paths(&["../outside.rs".into()]).is_err());
+        assert!(opened.task_paths(&[String::new()]).is_err());
+        assert!(opened.task_paths(&vec!["platform/x".into(); 65]).is_err());
+        assert!(
+            opened
+                .task_paths(&[format!("platform/{}", "x".repeat(512))])
+                .is_err()
+        );
+        assert!(opened.task_paths(&[]).unwrap().is_empty());
+    }
 
     #[test]
     fn status_fallback_reserves_three_quarters_of_remaining_budget() {

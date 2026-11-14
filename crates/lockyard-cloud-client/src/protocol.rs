@@ -336,7 +336,9 @@ impl ClientError {
                 .map(|error| Problem {
                     status: Some(error.status),
                     code: error.code.clone(),
-                    detail: if error.status == 409 {
+                    detail: if let Some(message) = crate::task_area_error(error) {
+                        message
+                    } else if error.status == 409 {
                         let conflicts = crate::holders(error);
                         if conflicts.is_empty() {
                             crate::contended_text(error)
@@ -1018,12 +1020,14 @@ impl Client {
                 ));
             }
             let capability = std::sync::atomic::AtomicBool::new(true);
+            let auto_area_capability = std::sync::atomic::AtomicBool::new(true);
             let result = self.attempt_observed(
                 &call,
                 None,
                 budget,
                 &NegotiatedProtocol::candidate(selected),
                 Some(&capability),
+                Some(&auto_area_capability),
             );
             match result {
                 Ok(value) => {
@@ -1032,6 +1036,9 @@ impl Client {
                         result
                             .capabilities
                             .insert(crate::REGISTRY_ASSIGNEE_SESSION.into());
+                    }
+                    if auto_area_capability.load(std::sync::atomic::Ordering::Relaxed) {
+                        result.capabilities.insert(crate::REGISTRY_AUTO_AREA.into());
                     }
                     self.save_status_protocol_hint(&result);
                     state.cached = Some(CachedProtocol {
@@ -1345,6 +1352,7 @@ impl Client {
                 remaining(),
                 &protocol,
                 registry_capability,
+                None,
             ) {
                 Ok(mut value) => {
                     // Authenticate/decrypt the response before releasing its recovery record.
@@ -1885,9 +1893,13 @@ fn private_directory(path: &Path) -> Result<(), ClientError> {
 #[cfg(test)]
 mod status_protocol_cache_tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::Transport;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::io::{BufRead, BufReader, Write};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::net::TcpListener;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -1936,7 +1948,7 @@ mod status_protocol_cache_tests {
                 started.send(()).unwrap();
                 client.cached_registry_assignee_supported(
                     Instant::now() + Duration::from_secs(2),
-                    Some(&cancellation),
+                    Some(cancellation),
                 )
             });
             ready.recv().unwrap();
@@ -2011,6 +2023,7 @@ mod status_protocol_cache_tests {
         assert!(status_protocol_age(&observed, &restarted).is_none());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[derive(Default)]
     struct HintServerState {
         protocol: u16,
@@ -2019,6 +2032,7 @@ mod status_protocol_cache_tests {
         claims: usize,
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn server() -> (String, Arc<Mutex<HintServerState>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -2088,9 +2102,12 @@ mod status_protocol_cache_tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn client(url: &str, directory: &Path) -> Client {
+        // The pending journal refuses a directory reached through a symlink, and the default
+        // temporary directory on macOS is one (`/var` points to `/private/var`).
+        let directory = directory.canonicalize().unwrap();
         Client::new(url, "fixture".into())
             .unwrap()
-            .with_pending_journal(directory)
+            .with_pending_journal(&directory)
             .unwrap()
             .with_status_protocol_cache()
     }

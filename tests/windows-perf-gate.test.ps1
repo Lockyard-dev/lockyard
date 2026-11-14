@@ -61,9 +61,9 @@ switch ($command) {
         if ($env:WINDOWS_PERF_CASE -eq 'send_missing_metric') { exit 0 }
         $p95 = 22000
         switch ($env:WINDOWS_PERF_CASE) {
-            'send_recover_second' { $p95 = @(64000, 29000, 64000)[$runs - 1] }
-            'send_recover_third' { $p95 = @(64000, 134000, 35000)[$runs - 1] }
-            'send_early_pass' { $p95 = @(22000, 64000, 134000)[$runs - 1] }
+            'send_recover_second' { $p95 = @(64000, 29000, 64000, 64000, 64000)[$runs - 1] }
+            'send_recover_third' { $p95 = @(64000, 134000, 35000, 64000, 64000)[$runs - 1] }
+            'send_early_pass' { $p95 = @(22000, 64000, 134000, 64000, 64000)[$runs - 1] }
             'send_all_over_budget' { $p95 = 64000 }
             'send_truncated_overruns' { $p95 = 35000 }
             'send_truncated_then_pass' { $p95 = 35000 }
@@ -144,28 +144,28 @@ exec "$WINDOWS_PERF_ENGINE" -NoProfile -File "$WINDOWS_PERF_MOCK" "$@"
         $attempts = 0
         $bestP95 = $null
         switch ($scenario) {
-            'valid' { $expected = 0; $calls = 9; $attempts = 3; $bestP95 = 22000 }
-            'send_inline_metric' { $expected = 0; $calls = 9; $attempts = 3; $bestP95 = 22000 }
-            'send_stderr_metric' { $expected = 0; $calls = 9; $attempts = 3; $bestP95 = 22000 }
-            'send_recover_second' { $expected = 0; $calls = 9; $attempts = 3; $bestP95 = 29000 }
-            'send_recover_third' { $expected = 0; $calls = 9; $attempts = 3; $bestP95 = 35000 }
-            'send_early_pass' { $expected = 0; $calls = 9; $attempts = 3; $bestP95 = 22000 }
-            'send_all_over_budget' { $expected = 101; $calls = 9; $attempts = 3; $bestP95 = 64000 }
+            'valid' { $expected = 0; $calls = 15; $attempts = 5; $bestP95 = 22000 }
+            'send_inline_metric' { $expected = 0; $calls = 15; $attempts = 5; $bestP95 = 22000 }
+            'send_stderr_metric' { $expected = 0; $calls = 15; $attempts = 5; $bestP95 = 22000 }
+            'send_recover_second' { $expected = 0; $calls = 15; $attempts = 5; $bestP95 = 29000 }
+            'send_recover_third' { $expected = 0; $calls = 15; $attempts = 5; $bestP95 = 35000 }
+            'send_early_pass' { $expected = 0; $calls = 15; $attempts = 5; $bestP95 = 22000 }
+            'send_all_over_budget' { $expected = 101; $calls = 15; $attempts = 5; $bestP95 = 64000 }
             'hook_failed' { $expected = 101; $calls = 6 }
             'hook_flaky' { $expected = 101; $calls = 6 }
             'hook_missing_metric' { $calls = 6 }
-            'send_truncated_overruns' { $expected = 101; $calls = 9; $attempts = 3; $bestP95 = 35000 }
-            'send_truncated_then_pass' { $expected = 0; $calls = 9; $attempts = 3; $bestP95 = 35000 }
-            'send_product_failed' { $expected = 101; $calls = 7 }
-            'send_non_test_failure' { $expected = 2; $calls = 7 }
-            'send_product_after_metric' { $expected = 101; $calls = 7; $attempts = 1 }
-            'send_product_after_pass' { $expected = 101; $calls = 8; $attempts = 2 }
-            'send_budget_missing_panic' { $expected = 101; $calls = 7; $attempts = 1 }
-            'send_duplicate_panic' { $expected = 101; $calls = 7; $attempts = 1 }
-            'send_missing_metric' { $calls = 7 }
-            'send_duplicate_metric' { $calls = 7 }
-            'send_wrong_budget' { $calls = 7 }
-            'send_success_over_budget' { $calls = 7; $attempts = 1 }
+            'send_truncated_overruns' { $expected = 101; $calls = 15; $attempts = 5; $bestP95 = 35000 }
+            'send_truncated_then_pass' { $expected = 0; $calls = 15; $attempts = 5; $bestP95 = 35000 }
+            'send_product_failed' { $expected = 101; $calls = 11 }
+            'send_non_test_failure' { $expected = 2; $calls = 11 }
+            'send_product_after_metric' { $expected = 101; $calls = 11; $attempts = 1 }
+            'send_product_after_pass' { $expected = 101; $calls = 12; $attempts = 2 }
+            'send_budget_missing_panic' { $expected = 101; $calls = 11; $attempts = 1 }
+            'send_duplicate_panic' { $expected = 101; $calls = 11; $attempts = 1 }
+            'send_missing_metric' { $calls = 11 }
+            'send_duplicate_metric' { $calls = 11 }
+            'send_wrong_budget' { $calls = 11 }
+            'send_success_over_budget' { $calls = 11; $attempts = 1 }
             'recovery_missing' { $calls = 1 }
             'recovery_duplicate' { $calls = 1 }
             'recovery_list_failed' { $expected = 101; $calls = 1 }
@@ -180,9 +180,9 @@ exec "$WINDOWS_PERF_ENGINE" -NoProfile -File "$WINDOWS_PERF_MOCK" "$@"
             throw "${scenario}: status=$status (expected $expected), cargo calls=$actualCalls (expected $calls)"
         }
         $output = @(Get-Content -LiteralPath $stdout)
-        $actualAttempts = @($output | Where-Object { $_ -match '^Windows msg_send attempt [123]/3 p95_us=[0-9]+ budget_us=35000$' }).Count
+        $actualAttempts = @($output | Where-Object { $_ -match '^Windows msg_send attempt [1-5]/5 p95_us=[0-9]+ budget_us=35000$' }).Count
         if ($actualAttempts -ne $attempts) { throw "${scenario}: printed $actualAttempts attempt p95s (expected $attempts)" }
-        if ($null -ne $bestP95 -and -not ($output -contains "Windows msg_send best_of=3 p95_us=$bestP95 budget_us=35000")) {
+        if ($null -ne $bestP95 -and -not ($output -contains "Windows msg_send best_of=5 p95_us=$bestP95 budget_us=35000")) {
             throw "${scenario}: missing best p95 $bestP95"
         }
         Write-Output "Windows perf gate ${scenario}: passed"

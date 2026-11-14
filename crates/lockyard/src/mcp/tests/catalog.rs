@@ -12,7 +12,7 @@
             match name.as_str() {
                 "task_add" => {
                     assert_eq!(canonical["inputSchema"]["required"], json!(["title"]));
-                    assert_eq!(compact["inputSchema"]["required"], json!(["title", "area"]));
+                    assert_eq!(compact["inputSchema"]["required"], json!(["title"]));
                     compact["inputSchema"]["required"] = canonical["inputSchema"]["required"].clone();
                     compact["description"] = canonical["description"].clone();
                 }

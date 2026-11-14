@@ -201,7 +201,7 @@ impl AgentSocket {
         let line = self.line(request)?;
         let mut pending = line.as_slice();
         while !pending.is_empty() {
-            stream.set_write_timeout(Some(remaining(deadline)?))?;
+            apply_deadline(stream.set_write_timeout(Some(remaining(deadline)?)))?;
             let written = stream.write(pending)?;
             if written == 0 {
                 return Err(io::Error::new(
@@ -215,7 +215,7 @@ impl AgentSocket {
         let mut chunk = [0_u8; 8192];
         loop {
             // A peer that trickles bytes must not restart the deadline on every read.
-            stream.set_read_timeout(Some(remaining(deadline)?))?;
+            apply_deadline(stream.set_read_timeout(Some(remaining(deadline)?)))?;
             let count = stream.read(&mut chunk)?;
             if count == 0 {
                 return Err(io::Error::new(
@@ -257,6 +257,20 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
         ))
     } else {
         Ok(left)
+    }
+}
+
+/// Applies a deadline update to the stream.
+///
+/// macOS answers `EINVAL` to `setsockopt` once the peer has shut its end down. An agent that
+/// replies and closes before the client updates the read deadline would then lose an answer
+/// that is already in the buffer. The deadline set by the previous update stays in force, so
+/// the call remains bounded.
+fn apply_deadline(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        #[cfg(target_os = "macos")]
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        other => other,
     }
 }
 
@@ -381,6 +395,17 @@ fn connect_bounded(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
 }
 
 impl Transport for AgentSocket {
+    fn registry_auto_area(&self, session: &str) -> Result<bool, ClientError> {
+        match self.call(&Call::get(session, "/api/v1/protocol".into())) {
+            Ok(value) => Ok(value["capabilities"].as_array().is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|capability| capability == "registry_auto_area_v1")
+            })),
+            Err(error) if matches!(error.status(), Some(404 | 405)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
     fn call(&self, call: &Call) -> Result<Value, ClientError> {
         let reply = self.ask_for(&Request::Call { call: call.clone() })?;
         let value = reply.value.unwrap_or(Value::Null);

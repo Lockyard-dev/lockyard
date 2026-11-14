@@ -183,6 +183,192 @@ fn a_task_lookup_error_names_the_requested_identifier() {
 }
 
 #[test]
+fn cli_task_add_accepts_repeated_paths_and_an_optional_area_override() {
+    for extra in [vec![], vec!["--area", "MiXeD-area-key"]] {
+        let mut args = vec![
+            "lockyard",
+            "task",
+            "add",
+            "fix files",
+            "--path",
+            "repo/src/a.rs",
+            "--path",
+            "repo/docs",
+        ];
+        args.extend(extra);
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Command::Task(TaskCommand::Add { area, .. }) = cli.command else {
+            panic!("expected task add")
+        };
+        assert!(area.is_none() || area.as_deref() == Some("MiXeD-area-key"));
+    }
+}
+
+#[test]
+fn cli_task_add_help_explains_workspace_paths_and_automatic_areas() {
+    let mut command = Cli::command();
+    command.build();
+    let help = command
+        .find_subcommand_mut("task")
+        .unwrap()
+        .find_subcommand_mut("add")
+        .unwrap()
+        .render_long_help()
+        .to_string();
+    for text in [
+        "--path <PATH>",
+        "workspace root",
+        "Repeat for each path",
+        "server determines its area",
+        "Optional area override",
+    ] {
+        assert!(help.contains(text), "{text}: {help}");
+    }
+}
+
+fn cli_task_with_paths(paths: &[&str]) -> Task {
+    serde_json::from_value(json!({
+        "id": "PA-0001", "title": "fix files", "body": "details", "status": "open",
+        "author": "lead", "assignee": null, "lease_until": null, "evidence": null,
+        "created_at": 0, "updated_at": 0, "paths": paths,
+    }))
+    .unwrap()
+}
+
+fn cli_task_command(args: &[&str]) -> TaskCommand {
+    let mut argv = vec!["lockyard", "task"];
+    argv.extend_from_slice(args);
+    let Command::Task(command) = Cli::try_parse_from(argv).unwrap().command else {
+        panic!("expected task command")
+    };
+    command
+}
+
+#[test]
+fn cli_task_add_normalizes_workspace_paths_and_preserves_the_area_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let nested = root.join("unrelated/deep");
+    std::fs::create_dir_all(&nested).unwrap();
+    let absolute = root.join("repo/src/new.rs");
+    let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::<TaskSpec>::new()));
+    let opened = Opened {
+        root,
+        backend: Box::new(Scripted {
+            cloud: true,
+            task: Some(cli_task_with_paths(&[])),
+            added_tasks: Some(captured.clone()),
+            ..Default::default()
+        }),
+    };
+    run_task(
+        opened,
+        cli_task_command(&[
+            "add",
+            "fix files",
+            "--path",
+            "repo//src/../lib.rs",
+            "--path",
+            "repo\\docs\\.\\guide.md",
+            "--path",
+            absolute.to_str().unwrap(),
+            "--area",
+            "MiXeD-area-key",
+        ]),
+        Some(&"lead".to_string()),
+    )
+    .unwrap();
+    let captured = captured.borrow();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].area.as_deref(), Some("MiXeD-area-key"));
+    // Compare the request itself: the local store deliberately has no task-path column.
+    let request = format!("{:?}", captured[0]);
+    assert!(
+        request.contains("paths: [\"repo/docs/guide.md\", \"repo/lib.rs\", \"repo/src/new.rs\"]"),
+        "{request}"
+    );
+}
+
+#[test]
+fn cli_task_add_rejects_relative_and_absolute_outside_paths_before_adding() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let absolute = outside.path().join("outside.rs");
+    for path in ["../outside.rs", absolute.to_str().unwrap()] {
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::<TaskSpec>::new()));
+        let opened = Opened {
+            root: root.clone(),
+            backend: Box::new(Scripted {
+                cloud: true,
+                task: Some(cli_task_with_paths(&[])),
+                added_tasks: Some(captured.clone()),
+                ..Default::default()
+            }),
+        };
+        let error = run_task(
+            opened,
+            cli_task_command(&["add", "fix files", "--path", path]),
+            Some(&"lead".to_string()),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("outside"), "{error}");
+        assert!(captured.borrow().is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_task_add_reuses_claim_path_checks_for_symlink_escapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join("escape")).unwrap();
+    let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::<TaskSpec>::new()));
+    let opened = Opened {
+        root,
+        backend: Box::new(Scripted {
+            cloud: true,
+            task: Some(cli_task_with_paths(&[])),
+            added_tasks: Some(captured.clone()),
+            ..Default::default()
+        }),
+    };
+    let error = run_task(
+        opened,
+        cli_task_command(&["add", "fix files", "--path", "escape/new.rs"]),
+        Some(&"lead".to_string()),
+    )
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("outside"), "{error}");
+    assert!(captured.borrow().is_empty());
+}
+
+#[test]
+fn cli_task_show_displays_server_paths_and_keeps_the_legacy_display_without_them() {
+    for paths in [vec!["repo/src/a.rs", "repo/docs"], vec![]] {
+        let opened = Opened {
+            root: std::path::PathBuf::from("/unused"),
+            backend: Box::new(Scripted {
+                cloud: true,
+                task: Some(cli_task_with_paths(&paths)),
+                ..Default::default()
+            }),
+        };
+        let result = run_task(opened, cli_task_command(&["show", "PA-0001"]), None).unwrap();
+        if paths.is_empty() {
+            assert_eq!(result.text, "PA-0001  open  -  fix files\ndetails");
+            assert!(result.json["task"].get("paths").is_none());
+        } else {
+            assert!(result.text.contains("paths: repo/src/a.rs, repo/docs"));
+            assert_eq!(result.json["task"]["paths"], json!(paths));
+        }
+    }
+}
+
+#[test]
 fn minutes_round_up_and_stop_at_zero() {
     assert_eq!(minutes_left(60_001, 0), 2);
     assert_eq!(minutes_left(60_000, 0), 1);
@@ -207,6 +393,8 @@ fn a_cloud_lease_is_shown_and_never_counted_down() {
 #[derive(Default)]
 struct Scripted {
     cloud: bool,
+    task: Option<Task>,
+    added_tasks: Option<std::rc::Rc<std::cell::RefCell<Vec<TaskSpec>>>>,
     answers: Vec<Result<Claim>>,
     waits: Vec<Option<i64>>,
     claims: Vec<Claim>,
@@ -280,13 +468,16 @@ impl Backend for Scripted {
         panic!("CLI status must not fetch lost claims")
     }
     fn task(&self, _: &str) -> Result<Task> {
-        unreachable!()
+        Ok(self.task.clone().expect("scripted task"))
     }
     fn task_history(&self, _: &str) -> Result<Vec<lockyard_core::tasks::TaskEvent>> {
-        unreachable!()
+        Ok(Vec::new())
     }
-    fn add_task(&mut self, _: &str, _: &TaskSpec, _: i64) -> Result<Task> {
-        unreachable!()
+    fn add_task(&mut self, _: &str, task: &TaskSpec, _: i64) -> Result<Task> {
+        if let Some(captured) = &self.added_tasks {
+            captured.borrow_mut().push(task.clone());
+        }
+        Ok(self.task.clone().expect("scripted task"))
     }
     fn claim_task(&mut self, _: &str, _: &str, _: i64, _: i64) -> Result<Task> {
         unreachable!()

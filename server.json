@@ -3,7 +3,7 @@
   "name": "io.github.lockyard-dev/lockyard",
   "title": "Lockyard",
   "description": "Work zones, a message bus and tasks for coding agents sharing one repository.",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "websiteUrl": "https://lockyard.dev",
   "repository": {
     "url": "https://github.com/lockyard-dev/lockyard",
@@ -13,7 +13,7 @@
     {
       "registryType": "npm",
       "identifier": "lockyard",
-      "version": "0.3.7",
+      "version": "0.3.8",
       "transport": {
         "type": "stdio"
       },
@@ -41,7 +41,7 @@
     {
       "registryType": "pypi",
       "identifier": "lockyard",
-      "version": "0.3.7",
+      "version": "0.3.8",
       "transport": {
         "type": "stdio"
       },

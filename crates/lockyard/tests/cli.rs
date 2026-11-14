@@ -1152,12 +1152,11 @@ fn mcp_with(dir: &Path, agent: &str, extra: &[&str], env: &[(&str, &str)], input
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    // A refused invocation (an unknown --tools value) exits before reading its input; the
+    // broken pipe is that exit racing this write, and the caller judges the output and status.
+    if let Err(error) = child.stdin.take().unwrap().write_all(input.as_bytes()) {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+    }
     child.wait_with_output().unwrap()
 }
 

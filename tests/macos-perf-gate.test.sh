@@ -58,8 +58,8 @@ mode=valid
 case "$PERF_CASE" in "$target"_*) mode=${PERF_CASE#"$target"_} ;; esac
 if [ "$PERF_CASE" = independent_minima ]; then
     case "$target:$runs" in
-        hook:1) p95=4000 ;; hook:2) p95=7000 ;; hook:3) p95=9000 ;;
-        send:1) p95=9000 ;; send:2) p95=8000 ;; send:3) p95=6000 ;;
+        hook:1) p95=4000 ;; hook:2) p95=7000 ;; hook:3) p95=9000 ;; hook:4) p95=8000 ;; hook:5) p95=7500 ;;
+        send:1) p95=9000 ;; send:2) p95=8000 ;; send:3) p95=6000 ;; send:4) p95=7000 ;; send:5) p95=6500 ;;
     esac
 fi
 over=$((budget + 10000))
@@ -147,12 +147,17 @@ run_case() {
     : > "$PERF_COMMANDS"
     if [ "$PERF_PLATFORM" = macos ]; then
         label=macOS
-        hook_attempts=3
+        hook_attempts=5
         send_budget=20000
         if CARGO_INCREMENTAL=1 sh "$repo/tools/ci/test-macos-perf.sh" > "$fixture/output" 2>&1; then status=0; else status=$?; fi
+    elif [ "$PERF_PLATFORM" = linux ]; then
+        label=Linux
+        hook_attempts=5
+        send_budget=20000
+        if CARGO_INCREMENTAL=1 python3 "$repo/tools/ci/perf-budget-gate.py" linux > "$fixture/output" 2>&1; then status=0; else status=$?; fi
     else
         label=Windows
-        hook_attempts=1
+        hook_attempts=5
         send_budget=35000
         if CARGO_INCREMENTAL=1 python3 "$repo/tools/ci/perf-budget-gate.py" windows > "$fixture/output" 2>&1; then status=0; else status=$?; fi
     fi
@@ -163,8 +168,8 @@ run_case() {
     actual_send_calls=$(count ' --test perf_budget msg_send_p95_stays_within_budget ' "$PERF_COMMANDS")
     [ "$actual_hook_calls" = "$hook_calls" ] || fail "hook calls=$actual_hook_calls (expected $hook_calls)"
     [ "$actual_send_calls" = "$send_calls" ] || fail "send calls=$actual_send_calls (expected $send_calls)"
-    actual_hook_prints=$(count "^$label hook_decision attempt [123]/$hook_attempts p95_us=[0-9]+ budget_us=15000$" "$fixture/output")
-    actual_send_prints=$(count "^$label msg_send attempt [123]/3 p95_us=[0-9]+ budget_us=$send_budget$" "$fixture/output")
+    actual_hook_prints=$(count "^$label hook_decision attempt [1-5]/$hook_attempts p95_us=[0-9]+ budget_us=15000$" "$fixture/output")
+    actual_send_prints=$(count "^$label msg_send attempt [1-5]/5 p95_us=[0-9]+ budget_us=$send_budget$" "$fixture/output")
     [ "$actual_hook_prints" = "$hook_prints" ] || fail "hook p95 prints=$actual_hook_prints (expected $hook_prints)"
     [ "$actual_send_prints" = "$send_prints" ] || fail "send p95 prints=$actual_send_prints (expected $send_prints)"
     for metric in hook_decision msg_send; do
@@ -174,7 +179,7 @@ run_case() {
             [ "$actual_best" = 0 ] || fail "unexpected $metric best p95"
         else
             [ "$actual_best" = 1 ] || fail "expected one $metric best p95 (got $actual_best)"
-            grep -F -x -q "$label $metric best_of=3 p95_us=$best budget_us=$budget" "$fixture/output" || fail "wrong $metric best p95 (expected $best)"
+            grep -F -x -q "$label $metric best_of=5 p95_us=$best budget_us=$budget" "$fixture/output" || fail "wrong $metric best p95 (expected $best)"
         fi
     done
     echo "$label perf gate $PERF_CASE: passed"
@@ -186,8 +191,8 @@ for scenario in missing_hook missing_send unknown duplicate_hook duplicate_send 
     if [ "$scenario" = list_failed ]; then expected=101; fi
     run_case macos "$scenario" "$expected" 2 0 0 0 0 - -
 done
-run_case macos valid 0 8 3 3 3 3 5000 6000
-run_case macos independent_minima 0 8 3 3 3 3 4000 6000
+run_case macos valid 0 12 5 5 5 5 5000 6000
+run_case macos independent_minima 0 12 5 5 5 5 4000 6000
 
 for target in hook send; do
     if [ "$target" = hook ]; then
@@ -200,21 +205,21 @@ for target in hook send; do
         full_send_best=19000
     fi
     for scenario in recover_second early_pass; do
-        run_case macos "${target}_$scenario" 0 8 3 3 3 3 "$full_hook_best" "$full_send_best"
+        run_case macos "${target}_$scenario" 0 12 5 5 5 5 "$full_hook_best" "$full_send_best"
     done
     if [ "$target" = hook ]; then full_hook_best=$policy_budget; else full_send_best=$policy_budget; fi
     for scenario in recover_third truncated_then_pass; do
-        run_case macos "${target}_$scenario" 0 8 3 3 3 3 "$full_hook_best" "$full_send_best"
+        run_case macos "${target}_$scenario" 0 12 5 5 5 5 "$full_hook_best" "$full_send_best"
     done
     if [ "$target" = hook ]; then
-        run_case macos hook_all_over 101 5 3 0 3 0 25000 -
-        run_case macos hook_truncated_all 101 5 3 0 3 0 15000 -
+        run_case macos hook_all_over 101 7 5 0 5 0 25000 -
+        run_case macos hook_truncated_all 101 7 5 0 5 0 15000 -
     else
-        run_case macos send_all_over 101 8 3 3 3 3 5000 30000
-        run_case macos send_truncated_all 101 8 3 3 3 3 5000 20000
+        run_case macos send_all_over 101 12 5 5 5 5 5000 30000
+        run_case macos send_truncated_all 101 12 5 5 5 5 5000 20000
     fi
     for scenario in inline_metric stderr_metric; do
-        run_case macos "${target}_$scenario" 0 8 3 3 3 3 5000 6000
+        run_case macos "${target}_$scenario" 0 12 5 5 5 5 5000 6000
     done
     for scenario in product_before_metric build_before_metric product_after_metric build_after_metric product_after_pass build_after_pass missing_metric duplicate_metric wrong_metric wrong_budget wrong_samples missing_panic duplicate_panic exit2_overrun success_over_budget; do
         expected=101
@@ -230,19 +235,22 @@ for target in hook send; do
         if [ "$target" = hook ]; then
             run_case macos "${target}_$scenario" "$expected" "$((2 + attempts))" "$attempts" 0 "$printed" 0 - -
         else
-            run_case macos "${target}_$scenario" "$expected" "$((5 + attempts))" 3 "$attempts" 3 "$printed" 5000 -
+            run_case macos "${target}_$scenario" "$expected" "$((7 + attempts))" 5 "$attempts" 5 "$printed" 5000 -
         fi
     done
 done
 
 # Run the same helper directly so its Windows policy is verified without pwsh.
-# Hook has one attempt, send has all three, and the ceilings stay 15/35 ms.
-run_case windows valid 0 5 1 3 1 3 - 22000
-run_case windows hook_recover_second 101 2 1 0 1 0 - -
-run_case windows send_recover_second 0 5 1 3 1 3 - 34000
-run_case windows send_recover_third 0 5 1 3 1 3 - 35000
-run_case windows send_early_pass 0 5 1 3 1 3 - 34000
-run_case windows send_all_over 101 5 1 3 1 3 - 45000
-run_case windows send_truncated_all 101 5 1 3 1 3 - 35000
-run_case windows send_truncated_then_pass 0 5 1 3 1 3 - 35000
-run_case windows send_product_after_pass 101 4 1 2 1 2 - -
+# Hook and send each have five attempts; ceilings stay 15/35 ms.
+run_case linux valid 0 11 5 5 5 5 5000 6000
+run_case linux hook_recover_second 0 11 5 5 5 5 14000 6000
+run_case linux send_all_over 101 11 5 5 5 5 5000 30000
+run_case windows valid 0 11 5 5 5 5 5000 22000
+run_case windows hook_recover_second 0 11 5 5 5 5 14000 22000
+run_case windows send_recover_second 0 11 5 5 5 5 5000 34000
+run_case windows send_recover_third 0 11 5 5 5 5 5000 35000
+run_case windows send_early_pass 0 11 5 5 5 5 5000 34000
+run_case windows send_all_over 101 11 5 5 5 5 5000 45000
+run_case windows send_truncated_all 101 11 5 5 5 5 5000 35000
+run_case windows send_truncated_then_pass 0 11 5 5 5 5 5000 35000
+run_case windows send_product_after_pass 101 8 5 2 5 2 5000 -

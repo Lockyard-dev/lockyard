@@ -5,6 +5,20 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.8] - 2026-11-13
+
+### Added
+
+- CLI `task add --path <file-or-directory>` (repeatable) and both MCP `task_add` catalogs accept workspace-relative task paths. Servers announcing `registry_auto_area_v1` derive the area from these paths; `--area` / `area` is an optional override. Missing paths are refused before creating an item.
+- Normalize task paths with the claim-path resolver, including absolute paths inside the workspace and forward-slash output. `task show` and MCP task results display paths returned by the registry. Explain path/area server errors, including repository roots for tasks spanning repositories.
+
+### Changed
+
+- Older servers retain their previous area behavior, receive no task paths, and produce a warning when paths were supplied. Compact MCP calls still require `area` for these servers. Local task storage remains unchanged and does not persist paths.
+- Keep MCP startup and tool discovery fully local. Both catalogs use one `task_add` schema with only `title` required; calls validate paths or area after checking the server capability.
+- Refresh automatic-area support from the latest successful server response, including removal after a rollback. The background agent forwards live protocol capabilities without adding cached support; missing-area refusals explain how to repeat the command and do not cause a retry.
+- Advance synchronized Rust, npm, PyPI and MCP registry versions to `0.3.8`.
+
 ## [0.3.7] - 2026-11-13
 
 ### Changed

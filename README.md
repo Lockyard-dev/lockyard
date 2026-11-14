@@ -6,7 +6,7 @@ a path at a time, a shared bus to talk, and tasks that survive a session. By def
 file under `.lockyard/` in your project, and nothing leaves the machine. Teams across machines use [cloud
 mode](#cloud-mode).
 
-**Version: 0.3.7.**
+**Version: 0.3.8.**
 
 ## Install
 
@@ -84,9 +84,14 @@ and `zone_renew`.
 
 The working loop uses `start_work` to claim paths and take a task, `check` to ask whether a path is free,
 `update` to send a message and read the inbox, `handover` to give work to another agent, `finish_work` to submit
-evidence and release, and `status` to show where everything stands. `task_add` creates a task and requires an
-explicit `area` on the compact surface; the task number uses that area's prefix. Full mode retains its optional
-`area` and existing default. Local `task_add` supports `area: "general"` with `D-*` numbers; other registry areas
+evidence and release, and `status` to show where everything stands. On servers announcing
+`registry_auto_area_v1`, `task_add` requires `paths`, an array of files or directories relative to the workspace
+root; the server determines the area. `area` is an optional override. For older servers, compact mode still
+requires `area`, while full mode keeps its existing default. Paths are omitted with a warning on older servers.
+Startup and `tools/list` use a local catalog and do not contact the server or background agent. Both catalogs
+declare only `title` required for `task_add`; the server capability is checked when the tool is called, and
+missing paths or area are explained in the refusal.
+Local `task_add` supports `area: "general"` with `D-*` numbers and does not persist paths; other registry areas
 require cloud mode. `zone_renew` extends an owned, live claim with an optional `ttl` of 1–240 minutes
 (default 30). Cloud mode requires the current `fence`; local claims renew without a fence. Foreign and expired
 claims are refused, as are stale fences in cloud mode. Underlying authorization and refusal behavior are shared
@@ -239,12 +244,16 @@ the key. Bus secret scrubbing happens before encryption.
 ### Tasks in cloud mode
 
 `lockyard task` works on the server's backlog, and the agent that writes an item sets its urgency itself. An item is
-ready at once, without triage. It needs an area, and the first area of the workspace is used unless you pass `--area`. A
-lead or an owner creates the first one on their first `task add`.
+ready at once, without triage. Servers announcing `registry_auto_area_v1` require the files or directories the task
+concerns, passed with repeatable `--path`; the server determines the area. Paths are relative to the workspace
+root (the nearest parent containing `.lockyard`), even when running from a subdirectory. Absolute paths inside
+that root are accepted; outside paths are refused. `--area` is an optional override, sent unchanged. Split work
+across repositories into one task per repository. On older servers, paths are omitted with a warning and the
+existing area selection remains: `--area` or the first area, created by a lead/owner when needed.
 
 ```sh
-lockyard task add "Rate limit the login route" --priority P1 --type code --target code_accepted
-lockyard task add "Checkout is down" --priority P0 --p0-category prod_outage --evidence "probe 12:04"
+lockyard task add "Rate limit the login route" --path platform/src/login.rs --priority P1 --type code --target code_accepted
+lockyard task add "Checkout is down" --path platform/src/checkout --priority P0 --p0-category prod_outage --evidence "probe 12:04"
 lockyard task plan D-14 --priority P2 --due 2026-12-01T00:00:00Z
 ```
 
