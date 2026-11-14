@@ -492,6 +492,16 @@ impl<T: Transport> Transport for StatusTransport<T> {
     fn registry_auto_area(&self, session: &str) -> Result<bool, ClientError> {
         self.inner.registry_auto_area(session)
     }
+    fn mail_open_v1(&self, session: &str) -> Result<bool, ClientError> {
+        self.inner.mail_open_v1(session)
+    }
+    fn mail_open_v1_within(
+        &self,
+        session: &str,
+        timeout: std::time::Duration,
+    ) -> Result<bool, ClientError> {
+        self.inner.mail_open_v1_within(session, timeout)
+    }
     fn status_registry_assignee_supported(
         &self,
         deadline: Instant,
@@ -1677,6 +1687,10 @@ impl<T: Transport + 'static> Shared<T> {
             workspace: self.config.workspace.clone(),
             token_id: self.config.token_id.clone(),
             catalog_expansion_v1: true,
+            mail_open_v1: self
+                .transport
+                .mail_open_v1_within(&self.session, std::time::Duration::ZERO)
+                .unwrap_or(false),
             status_read_v1: true,
             status_read_abandoned,
             pid: std::process::id(),
@@ -2537,6 +2551,12 @@ mod tests {
         refuse_with: Mutex<Option<u16>>,
         fail_queue: AtomicBool,
         fail_inbox_for: Mutex<Option<String>>,
+        /// When set, `hang_ms` applies only to `/api/v1/bus/inbox` (not every refresh route).
+        hang_inbox_only: AtomicBool,
+        /// Transport reports `mail_open_v1` without touching the network.
+        mail_open_v1: AtomicBool,
+        /// Full request paths (including query) for non-event calls.
+        full_paths: Mutex<Vec<String>>,
     }
 
     struct LostReadGate {
@@ -2605,6 +2625,16 @@ mod tests {
     }
 
     impl Transport for FakeServer {
+        fn mail_open_v1(&self, _session: &str) -> Result<bool, ClientError> {
+            Ok(self.mail_open_v1.load(Ordering::SeqCst))
+        }
+        fn mail_open_v1_within(
+            &self,
+            _session: &str,
+            _timeout: Duration,
+        ) -> Result<bool, ClientError> {
+            Ok(self.mail_open_v1.load(Ordering::SeqCst))
+        }
         fn call(&self, call: &Call) -> Result<Value, ClientError> {
             if call.path.ends_with("&namespace_probe=1") {
                 self.namespace_probes.fetch_add(1, Ordering::SeqCst);
@@ -2639,6 +2669,7 @@ mod tests {
                 return Ok(json!({"events": tail}));
             }
             self.calls.lock().unwrap().push(route.clone());
+            self.full_paths.lock().unwrap().push(call.path.clone());
             if route == "/api/v1/zones/claims" && call.method == "GET" {
                 self.claims_started
                     .lock()
@@ -2646,8 +2677,22 @@ mod tests {
                     .push((call.session.clone(), Instant::now()));
             }
             let hang = self.hang_ms.load(Ordering::SeqCst);
-            if hang > 0 {
-                thread::sleep(Duration::from_millis(hang as u64));
+            let hang_here = hang > 0
+                && (!self.hang_inbox_only.load(Ordering::SeqCst) || route == "/api/v1/bus/inbox");
+            if hang_here {
+                // Honour attempt_timeout_ms the way ureq does for a real Client: sleep at most
+                // the attempt budget, then fail instead of blocking the caller's renew window.
+                let sleep_ms = call
+                    .attempt_timeout_ms
+                    .map(|limit| hang.min(usize::try_from(limit).unwrap_or(usize::MAX)))
+                    .unwrap_or(hang);
+                thread::sleep(Duration::from_millis(sleep_ms as u64));
+                if call
+                    .attempt_timeout_ms
+                    .is_some_and(|limit| (hang as u64) > limit)
+                {
+                    return Err(ClientError::Transport("call deadline elapsed".into()));
+                }
             }
             if self.down.load(Ordering::SeqCst) {
                 return Err(ClientError::Transport("down".into()));
@@ -5964,6 +6009,133 @@ mod tests {
         assert_eq!(
             class("DELETE", "/api/v1/zones/claims/3"),
             WriteClass::Direct
+        );
+    }
+    #[test]
+    fn renew_open_mail_via_agent_skips_protocol_and_fits_renew_budget_when_server_hangs() {
+        let rig = start_with(timing(), |_| {});
+        // Capability on → open=true path; hang only the inbox; honour attempt_timeout_ms.
+        rig.server.mail_open_v1.store(true, Ordering::SeqCst);
+        rig.server.hang_inbox_only.store(true, Ordering::SeqCst);
+        rig.server.hang_ms.store(2_000, Ordering::SeqCst);
+        // Production CLI agent socket timeout (open.rs CLI_TIMEOUT), not a short test cheat.
+        let socket = AgentSocket::connect(
+            &rig.dir.path().join("run/agent.sock"),
+            "https://example.test",
+            "team",
+            Duration::from_secs(40),
+        )
+        .expect("agent socket");
+        let before = rig.server.calls_to("/api/v1/protocol");
+        let started = Instant::now();
+        let count = crate::open_mail::open_mail_count_within(
+            &CloudBackend::new(socket, "alice"),
+            "alice",
+            1_000_000,
+            crate::open_mail::RENEW_BUDGET,
+        );
+        let elapsed = started.elapsed();
+        let after = rig.server.calls_to("/api/v1/protocol");
+        assert_eq!(
+            before, after,
+            "renew enrichment must not GET /api/v1/protocol"
+        );
+        let open_paths: Vec<_> = rig
+            .server
+            .full_paths
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.starts_with("/api/v1/bus/inbox"))
+            .cloned()
+            .collect();
+        assert!(
+            open_paths.iter().any(|path| path.contains("open=true")),
+            "expected open=true inbox under mail_open_v1, got {open_paths:?}"
+        );
+        assert!(
+            open_paths.iter().all(|path| !path.contains("all=true")),
+            "legacy all=true must not run when mail_open_v1 is on: {open_paths:?}"
+        );
+        assert!(
+            elapsed <= crate::open_mail::RENEW_BUDGET + Duration::from_millis(300),
+            "elapsed {elapsed:?} exceeded renew budget + 300ms slack"
+        );
+        // Hung inbox → omit count; the renew caller still finishes inside the budget.
+        assert!(count.is_none());
+    }
+
+    /// Proof: a real Client over lockyard-cloud-client::fake observes mail_open_v1 on Ping
+    /// and routes open_mail_within through AgentSocket to `?open=true` (not `all=true`).
+    /// Removing `mail_open_v1_observed` updates or `AgentStatus.mail_open_v1` fails this test.
+    #[cfg(unix)]
+    #[test]
+    fn agent_on_real_client_surfaces_mail_open_v1_and_uses_open_true() {
+        use lockyard_cloud_client::fake::FakeServer as HttpFake;
+        use std::os::unix::fs::PermissionsExt;
+
+        let server = HttpFake::start_routed(vec![(
+            "Lockyard-Capabilities".into(),
+            "mail_open_v1".into(),
+        )]);
+        let url = server.url();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let client = std::sync::Arc::new(
+            lockyard_cloud_client::Client::new(&url, "fixture-token".into()).unwrap(),
+        );
+        let mut cfg = config(
+            &root,
+            Timing {
+                // Keep refresh chatty enough to observe the capability header quickly.
+                upkeep: Duration::from_millis(20),
+                ..timing()
+            },
+        );
+        cfg.url = url.clone();
+        let _daemon = Daemon::start(cfg, std::sync::Arc::clone(&client)).unwrap();
+        wait_for("capability observation traffic", || {
+            !server.requests().is_empty() && client.mail_open_v1("probe").unwrap_or(false)
+        });
+        let socket = AgentSocket::connect(
+            &root.join("run/agent.sock"),
+            &url,
+            "team",
+            Duration::from_secs(40),
+        )
+        .expect("agent socket");
+        let status = socket
+            .ask(&Request::Ping)
+            .expect("ping")
+            .status
+            .expect("status");
+        assert!(
+            status.mail_open_v1,
+            "Ping AgentStatus.mail_open_v1 must be true after Lockyard-Capabilities observation"
+        );
+        let before = server.requests().len();
+        let snap = crate::open_mail::open_mail_within(
+            &CloudBackend::new(socket, "alice"),
+            "alice",
+            1_000_000,
+            crate::open_mail::SENT_BUDGET,
+        );
+        assert!(snap.is_some(), "open mail with mail_open_v1 must succeed");
+        let inbox: Vec<_> = server
+            .requests()
+            .into_iter()
+            .skip(before)
+            .map(|seen| seen.path)
+            .filter(|path| path.starts_with("/api/v1/bus/inbox"))
+            .collect();
+        assert!(
+            inbox.iter().any(|path| path.contains("open=true")),
+            "open_mail_within via AgentSocket must hit open=true, got {inbox:?}"
+        );
+        assert!(
+            inbox.iter().all(|path| !path.contains("all=true")),
+            "must not fall back to all=true, got {inbox:?}"
         );
     }
 }

@@ -199,6 +199,25 @@ fn auto_area_capability_is_negotiated_from_discovery_body_or_header() {
         assert_eq!(server.requests()[0].path, "/api/v1/protocol");
     }
 }
+#[test]
+fn mail_open_v1_uses_discovery_cache_without_a_second_protocol_fetch() {
+    let mut reply = discovery(2, 1, 2, &["mail_open_v1"]);
+    reply.extra = "Lockyard-Capabilities: mail_open_v1\r\n";
+    let server = Server::start(vec![reply]);
+    let client = server.client();
+    client.negotiated_protocol("fixture-session").unwrap();
+    assert!(client.mail_open_v1("fixture-session").unwrap());
+    assert!(client.mail_open_v1("fixture-session").unwrap());
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/api/v1/protocol")
+            .count(),
+        1,
+        "hot-path mail_open_v1 must reuse discovery, not refetch protocol"
+    );
+}
 
 #[test]
 fn auto_area_capability_is_retained_from_a_later_response_header() {

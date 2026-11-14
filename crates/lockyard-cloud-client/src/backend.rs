@@ -673,6 +673,29 @@ impl<T: Transport> Backend for CloudBackend<T> {
     fn registry_auto_area(&self) -> Result<bool> {
         Ok(self.transport.registry_auto_area(&self.session)?)
     }
+    fn mail_open_v1(&self, timeout: std::time::Duration) -> Result<bool> {
+        Ok(self.transport.mail_open_v1_within(&self.session, timeout)?)
+    }
+    fn peek_open_inbox_within(
+        &self,
+        agent: &str,
+        limit: usize,
+        _now: i64,
+        timeout: std::time::Duration,
+    ) -> Result<InboxPage> {
+        let tail = query(&[
+            ("open", Some("true".to_string())),
+            (
+                "limit",
+                (limit > 0).then(|| limit.min(INBOX_PAGE).to_string()),
+            ),
+        ]);
+        Ok(inbox_page(self.get_with_timeout(
+            agent,
+            format!("/api/v1/bus/inbox{tail}"),
+            Some(timeout),
+        )?)?)
+    }
     fn status_read(
         &self,
         session: &str,
@@ -1838,6 +1861,7 @@ pub fn claimed_ids(value: Value, asked: &[i64]) -> std::result::Result<Vec<i64>,
 mod tests {
     use super::*;
     use crate::Client;
+    use crate::Transport;
     use crate::fake::{FakeServer, Reply, Seen};
     use lockyard_core::proto::{ClaimMode, Purpose, SessionActivity, SessionState, WorkStatus};
     use std::collections::HashSet;
@@ -3680,5 +3704,128 @@ mod tests {
         let message = message(json!({"queued": true, "key": "k"})).unwrap();
         assert!(message.queued);
         assert_eq!(message.key.as_deref(), Some("k"));
+    }
+
+    fn open_inbox_reply(body: serde_json::Value, announce: bool) -> Reply {
+        let mut reply = Reply::json(200, body).header("Lockyard-Protocol", "2");
+        if announce {
+            reply = reply.header("Lockyard-Capabilities", "mail_open_v1");
+        }
+        reply
+    }
+
+    fn seed_mail_open(client: &Client) {
+        let protocol = crate::NegotiatedProtocol {
+            selected: 2,
+            capabilities: std::collections::BTreeSet::from([crate::MAIL_OPEN_V1.to_string()]),
+            legacy: false,
+        };
+        client.protocol_state.lock().unwrap().cached = Some(crate::protocol::CachedProtocol {
+            value: protocol,
+            obtained: std::time::Instant::now(),
+        });
+        client
+            .mail_open_v1_observed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn revocations_header_does_not_clear_mail_open_observation() {
+        let server = FakeServer::start(vec![
+            Reply::json(200, json!({"claims": []}))
+                .header("Lockyard-Capabilities", "mail_open_v1")
+                .header("Lockyard-Protocol", "2"),
+            Reply::json(200, json!({"items": [], "epoch": 0, "next_since": 0}))
+                .header("Lockyard-Capabilities", "revocations_v1")
+                .header("Lockyard-Protocol", "2"),
+        ]);
+        let client = Client::new(&server.url(), "fixture".into()).unwrap();
+        client
+            .call(&crate::Call::get("me", "/api/v1/zones/claims".into()))
+            .unwrap();
+        assert!(client.mail_open_v1("me").unwrap());
+        client
+            .call(&crate::Call::get(
+                "me",
+                "/api/v1/revocations?since=0&nonce=test".into(),
+            ))
+            .unwrap();
+        assert!(
+            client.mail_open_v1("me").unwrap(),
+            "revocations Lockyard-Capabilities must not clear mail_open_v1_observed"
+        );
+    }
+
+    #[test]
+    fn peek_open_inbox_uses_open_true_without_all() {
+        let open = open_inbox_reply(
+            json!({
+                "messages": [{
+                    "id": 7,
+                    "from_session": "bob",
+                    "to": "me",
+                    "body": "need a path",
+                    "kind": "ask",
+                    "reader_state": "seen",
+                    "seen_at": "2026-11-14T12:00:00Z"
+                }],
+                "skipped": 2
+            }),
+            true,
+        );
+        let server = FakeServer::start(vec![open]);
+        let client = Client::new(&server.url(), "fixture".into()).unwrap();
+        seed_mail_open(&client);
+        assert!(client.mail_open_v1("me").unwrap());
+        assert!(
+            server.requests().is_empty(),
+            "capability read must not hit the network"
+        );
+        let cloud = CloudBackend::new(client, "service");
+        let page = cloud
+            .peek_open_inbox_within("me", 50, 0, std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(page.messages[0].id, 7);
+        assert_eq!(page.skipped, 2);
+        let paths: Vec<_> = server
+            .requests()
+            .into_iter()
+            .map(|seen| seen.path)
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["/api/v1/bus/inbox?open=true&limit=50".to_string()]
+        );
+    }
+
+    #[test]
+    fn mail_open_v1_reads_only_fresh_cache_without_discovery() {
+        let server = FakeServer::start(vec![]);
+        let client = Client::new(&server.url(), "fixture".into()).unwrap();
+        assert!(!client.mail_open_v1("me").unwrap());
+        assert!(
+            server.requests().is_empty(),
+            "cold mail_open_v1 must not hit the network"
+        );
+    }
+
+    #[test]
+    fn open_inbox_without_capability_header_is_rejected() {
+        let open = open_inbox_reply(
+            json!({"messages": [{"id": 1, "from_session": "bob", "to": "me", "body": "x"}], "skipped": 0}),
+            false,
+        );
+        let server = FakeServer::start(vec![open]);
+        let client = Client::new(&server.url(), "fixture".into()).unwrap();
+        seed_mail_open(&client);
+        let cloud = CloudBackend::new(client, "service");
+        let err = cloud
+            .peek_open_inbox_within("me", 50, 0, std::time::Duration::from_secs(2))
+            .unwrap_err();
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("mail_open_v1") || text.contains("feature_unsupported"),
+            "{text}"
+        );
     }
 }

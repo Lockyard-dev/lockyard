@@ -5,6 +5,27 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.11] - 2026-11-14
+
+### Fixed
+
+- Open mail follows the server's per-reader handled state when the cloud announces `mail_open_v1`:
+  `status` / `msg open` / renew enrichment call `GET /bus/inbox?open=true` instead of closing only on
+  shared `status=ack`. Broadcasts this agent already answered no longer stay open after the server
+  cutover. Capability is read only from a fresh negotiated cache or the latest Lockyard-Capabilities
+  observation (agent ping/status) — never GET /api/v1/protocol on the status/renew/msg-open hot path.
+  Capability is checked first inside the caller budget; a capability error omits the open list rather
+  than falling back to the legacy filter. An open=true response without mail_open_v1 in
+  Lockyard-Capabilities also omits the list. Shared status=info/ack rows are dropped even on the
+  server-selected page. Servers without the capability keep the 0.3.10 client-side filter.
+
+
+### Added
+
+- Advance synchronized Rust, npm, PyPI and MCP registry versions to `0.3.11`.
+  After upgrading, restart the agent (`launchctl kickstart -k …` / `lockyard agent restart`) so
+  long-lived processes pick up the new mail_open_v1 status field and observation path.
+
 ## [0.3.10] - 2026-11-14
 
 ### Fixed
