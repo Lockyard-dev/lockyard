@@ -48,8 +48,8 @@ pub(super) fn run_status_command(cwd: &Path, agent: Option<&String>) -> Result<O
         .spawn(move || {
             let session = agent.as_deref().unwrap_or("lockyard-cli");
             let result = open::status_read(&cwd, session, started + read_limit)
-                .and_then(|(root, cloud, read)| {
-                    render_status(&root, cloud, agent.as_deref(), read, started)
+                .and_then(|(root, cloud, read, open_mail)| {
+                    render_status(&root, cloud, agent.as_deref(), read, started, open_mail)
                 })
                 // Output's post-delivery closure is intentionally not Send. Status has no such action.
                 .map(|out| (out.json, out.text));
@@ -74,12 +74,21 @@ pub(super) fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Outp
     let read = opened
         .backend
         .status_read(session, now_ms(), status_read_limit(status_limit()?))?;
+    let open_mail = agent.as_deref().and_then(|name| {
+        crate::open_mail::open_mail_within(
+            opened.backend.as_ref(),
+            name,
+            now_ms(),
+            crate::open_mail::SENT_BUDGET,
+        )
+    });
     render_status(
         &opened.root,
         opened.backend.is_cloud(),
         agent.as_deref(),
         read,
         started,
+        open_mail,
     )
 }
 
@@ -89,6 +98,7 @@ fn render_status(
     agent: Option<&str>,
     mut read: StatusRead,
     started: Instant,
+    open_mail: Option<crate::open_mail::OpenMailSnapshot>,
 ) -> Result<Output> {
     let _span = lockyard_core::perf::Span::new("status.render");
     let session = agent.unwrap_or("lockyard-cli");
@@ -127,6 +137,12 @@ fn render_status(
     let unread = agent.and(read.unread);
     if let Some(unread) = unread {
         lines.push(format!("unread mail: {unread}"));
+    }
+    if let Some(snap) = &open_mail {
+        lines.extend(crate::open_mail::open_mail_lines(&snap.items));
+        if snap.truncated {
+            lines.push("open mail list is incomplete".into());
+        }
     }
     let unannounced: Vec<_> = records
         .unwrap_or_default()
@@ -170,6 +186,11 @@ fn render_status(
             json!({"source": "local", "available": machine_available});
         read.freshness["sections"]["unannounced"] =
             json!({"source": "local", "available": records_available});
+        read.freshness["sections"]["open_mail"] = if open_mail.is_some() {
+            json!({"available": true})
+        } else {
+            json!({"available": false})
+        };
         // Account for IPC and decoration conservatively in each section's age.
         if let Some(sections) = read.freshness["sections"].as_object_mut() {
             for metadata in sections.values_mut() {
@@ -206,6 +227,12 @@ fn render_status(
     lines.push(join(&read.tasks, task_line, "no tasks"));
     let mut data = json!({"unread": unread, "claims": claims, "tasks": read.tasks,
         "machine_level": machine_level, "unannounced": unannounced});
+    if let Some(snap) = open_mail {
+        data["open_mail"] = json!(snap.items);
+        if snap.truncated {
+            data["open_mail_truncated"] = json!(true);
+        }
+    }
     if cloud {
         let mut work = mcp::visible_work(Some(session), read.work);
         work.truncate(10);
@@ -241,6 +268,7 @@ pub(super) fn run_monitor(
         once: args.once,
         timeout: args.timeout.map(Duration::from_secs),
         json,
+        mark_read: args.mark_read,
     };
     let now = || now_ms();
     let mut ports = monitor::Ports {

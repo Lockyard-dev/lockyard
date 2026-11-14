@@ -84,6 +84,7 @@ impl Transport for StatusCloud {
         assert_eq!(call.session, "worker");
         Ok(match call.path.as_str() {
             "/api/v1/bus/inbox" => json!({"messages": [], "skipped": 3}),
+            "/api/v1/bus/inbox?all=true&limit=50" => json!({"messages": [], "skipped": 0}),
             "/api/v1/zones/claims?session=worker" => json!({"claims": [
                 {"id": 11, "session": "worker", "paths": ["src/own"]},
                 {"id": 12, "session": "lead", "paths": ["src/offered"]}

@@ -1072,6 +1072,23 @@ impl<T: Transport + 'static> Shared<T> {
         match backend.status_read(session, now_ms(), network_budget) {
             Ok(mut status) => {
                 status.freshness["transport"] = json!("agent");
+                // Optional open mail on the same warm client; never open a second cold client.
+                // `reply_reserve` is for IPC/folding after this function returns — do not spend it
+                // on another HTTP round trip, or the CLI falls back to a direct read (see
+                // cloud_status_optional_mail_timeout_keeps_a_warm_agent_answer).
+                let leftover = deadline.saturating_duration_since(Instant::now());
+                let mail_budget = leftover
+                    .saturating_sub(reply_reserve)
+                    .min(crate::open_mail::SENT_BUDGET);
+                if !mail_budget.is_zero()
+                    && let Some(snap) =
+                        crate::open_mail::open_mail_within(&backend, session, now_ms(), mail_budget)
+                {
+                    if snap.truncated {
+                        status.freshness["open_mail_truncated"] = json!(true);
+                    }
+                    status.open_mail = Some(snap.items);
+                }
                 let cached_unread = cached_unread.or_else(|| {
                     if status.unread.is_some() {
                         return None;
@@ -3318,7 +3335,8 @@ mod tests {
                 "claims GET must begin after this caller arrived"
             );
         }
-        assert_eq!(rig.server.calls.lock().unwrap().len(), 5);
+        // Five mandatory section reads + one optional open-mail inbox peek (cloud skips sent).
+        assert_eq!(rig.server.calls.lock().unwrap().len(), 6);
         let arrived = Instant::now();
         assert!(rig.daemon.handle(status_read("same", 500)).error.is_none());
         let starts = rig.server.claims_started.lock().unwrap();
@@ -3398,7 +3416,8 @@ mod tests {
                     .any(|(name, start)| name == &session && *start >= arrived)
             );
         }
-        assert_eq!(rig.server.calls.lock().unwrap().len(), 50);
+        // Ten sessions × (five mandatory + one open-mail peek).
+        assert_eq!(rig.server.calls.lock().unwrap().len(), 60);
         let reads = rig.daemon.shared.status_reads.lock().unwrap();
         assert_eq!(reads.running, 0);
         assert!(reads.pending.is_empty() && reads.batches.is_empty());
@@ -3869,11 +3888,13 @@ mod tests {
                         .unwrap()
                         >= 25
                 );
-                assert_eq!(rig.server.calls_to("/api/v1/bus/inbox"), before);
+                // Unread came from the view; open-mail still peeks inbox?all=.
+                assert_eq!(rig.server.calls_to("/api/v1/bus/inbox"), before + 1);
             } else {
                 assert_eq!(read.unread, Some(11), "{condition}");
                 assert_eq!(read.freshness["sections"]["unread"]["source"], "network");
-                assert_eq!(rig.server.calls_to("/api/v1/bus/inbox"), before + 1);
+                // Network unread + open-mail peek.
+                assert_eq!(rig.server.calls_to("/api/v1/bus/inbox"), before + 2);
             }
         }
         let before = rig.server.calls_to("/api/v1/bus/inbox");
@@ -3884,7 +3905,8 @@ mod tests {
             .unwrap();
         assert_eq!(read.unread, Some(11));
         assert_eq!(read.freshness["sections"]["unread"]["source"], "view");
-        assert_eq!(rig.server.calls_to("/api/v1/bus/inbox"), before);
+        // Fresh unread cache: only the open-mail peek hits inbox.
+        assert_eq!(rig.server.calls_to("/api/v1/bus/inbox"), before + 1);
     }
 
     #[test]
@@ -3914,7 +3936,12 @@ mod tests {
         assert_eq!(read.freshness["sections"]["unread"]["source"], "stale");
         assert_eq!(read.freshness["sections"]["unread"]["available"], true);
         assert_eq!(read.freshness["sections"]["unread"]["stale"], true);
-        assert_eq!(rig.server.calls_to("/api/v1/bus/inbox"), before);
+        // Stale unread reused. Open-mail may still peek when parallel hangs leave unused budget.
+        let after = rig.server.calls_to("/api/v1/bus/inbox");
+        assert!(
+            after == before || after == before + 1,
+            "unexpected inbox calls: before={before} after={after}"
+        );
     }
 
     #[test]
@@ -3947,7 +3974,8 @@ mod tests {
                 .unwrap()
                 .contains("inbox unavailable")
         );
-        assert_eq!(rig.server.calls_to("/api/v1/bus/inbox"), before + 1);
+        // Failed unread attempt + open-mail peek (also fails under fail_inbox_for).
+        assert_eq!(rig.server.calls_to("/api/v1/bus/inbox"), before + 2);
         rig.daemon.shared.write_view().unread.remove("me");
         let unknown = rig
             .daemon

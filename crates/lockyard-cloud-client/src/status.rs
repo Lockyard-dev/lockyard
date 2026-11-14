@@ -386,6 +386,7 @@ pub(crate) fn read<T: Transport>(
         work: work.value.unwrap_or_default(),
         tasks,
         freshness,
+        open_mail: None,
     })
 }
 

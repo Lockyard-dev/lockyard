@@ -33,6 +33,7 @@ fn json_mail_body_helpers_escape_messages_and_receipts() {
         to: "b".into(),
         body: "safe\u{202e}hidden".into(),
         created_at: 0,
+        reply_to: None,
         status: lockyard_core::bus::Delivery::Sent,
         delivered_at: None,
         read_at: None,

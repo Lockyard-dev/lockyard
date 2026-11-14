@@ -56,6 +56,8 @@ pub struct Receipt {
     pub body: String,
     pub created_at: i64,
     pub status: Delivery,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -275,7 +277,7 @@ impl Store {
     pub fn sent(&self, agent: &str, limit: usize) -> Result<Vec<Receipt>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut statement = self.conn.prepare(
-            "SELECT m.id, m.to_agent, m.body, m.created_at,
+            "SELECT m.id, m.to_agent, m.body, m.created_at, m.reply_to,
                     (SELECT min(d.delivered_at) FROM deliveries d WHERE d.message_id = m.id),
                     (SELECT min(r.read_at) FROM receipts r WHERE r.message_id = m.id),
                     (SELECT min(a.created_at) FROM messages a
@@ -285,14 +287,15 @@ impl Store {
         )?;
         let mut receipts = statement
             .query_map(params![agent, limit], |row| {
-                let delivered_at: Option<i64> = row.get(4)?;
-                let read_at: Option<i64> = row.get(5)?;
-                let replied_at: Option<i64> = row.get(6)?;
+                let delivered_at: Option<i64> = row.get(5)?;
+                let read_at: Option<i64> = row.get(6)?;
+                let replied_at: Option<i64> = row.get(7)?;
                 Ok(Receipt {
                     id: row.get(0)?,
                     to: row.get(1)?,
                     body: row.get(2)?,
                     created_at: row.get(3)?,
+                    reply_to: row.get(4)?,
                     status: match (replied_at, read_at, delivered_at) {
                         (Some(_), _, _) => Delivery::Replied,
                         (_, Some(_), _) => Delivery::Read,
@@ -319,6 +322,7 @@ impl Store {
                     // The body went with the message; only the fact of it is kept.
                     body: String::new(),
                     created_at: row.get(2)?,
+                    reply_to: None,
                     status: Delivery::Failed,
                     delivered_at: None,
                     read_at: None,

@@ -114,17 +114,23 @@ pub(super) fn run_composite(
         }
         "update" => {
             let mut answer = json!({});
-            if let (Some(to), Some(body)) = (args.some_text("to")?, args.some_text("body")?) {
-                let to = resolve_target(cwd, agent, &to)?;
-                answer["sent"] = step("msg_send", json!({"to": to, "body": body}), after)?;
-            } else if args.get("to").is_some() || args.get("body").is_some() {
-                return Err(Error::Invalid(
-                    "sending a note needs both to and body".into(),
-                ));
-            }
+            let sent_note =
+                if let (Some(to), Some(body)) = (args.some_text("to")?, args.some_text("body")?) {
+                    let to = resolve_target(cwd, agent, &to)?;
+                    answer["sent"] = step("msg_send", json!({"to": to, "body": body}), after)?;
+                    true
+                } else if args.get("to").is_some() || args.get("body").is_some() {
+                    return Err(Error::Invalid(
+                        "sending a note needs both to and body".into(),
+                    ));
+                } else {
+                    false
+                };
+            // Sending a note must not mark inbox mail read: always peek after a send.
+            let peek = sent_note || args.flag("peek")?;
             answer["mail"] = step(
                 "msg_inbox",
-                json!({"peek": args.flag("peek")?, "all": args.flag("all")?}),
+                json!({"peek": peek, "all": args.flag("all")?}),
                 after,
             )?;
             Ok(answer)

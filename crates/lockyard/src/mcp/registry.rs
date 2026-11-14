@@ -67,7 +67,7 @@ impl ToolRegistry {
             ),
             tool_def(
                 "update",
-                "Read your mail, and send a note first when to and body are given.",
+                "Read mail; with to and body, send a note first. Sending always peeks and never marks mail read.",
                 json!({"to": text, "body": text, "peek": flag, "all": flag}),
                 &[],
             ),

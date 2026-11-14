@@ -21,7 +21,7 @@ use lockyard_core::watch::{Backend as WatchBackend, Tick, Watcher};
 use lockyard_core::{Backend, Error, Result, Store, ZonePath, outside, watch};
 use serde_json::json;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,8 @@ pub struct Settings {
     /// Stop after this long, whatever happened.
     pub timeout: Option<Duration>,
     pub json: bool,
+    /// Mark delivered mail read even when stdout is not a terminal.
+    pub mark_read: bool,
 }
 
 /// What a finished run did.
@@ -210,7 +212,10 @@ fn deliver(
     }
     out.flush()?;
     let shown: Vec<i64> = mine.iter().map(|message| message.id).collect();
-    ports.backend.inbox_seen(agent, &shown, now)?;
+    let should_mark = settings.mark_read || std::io::stdout().is_terminal();
+    if should_mark {
+        ports.backend.inbox_seen(agent, &shown, now)?;
+    }
     Ok(shown.len())
 }
 
@@ -432,6 +437,8 @@ mod tests {
             once: true,
             timeout: Some(Duration::from_secs(10)),
             json: false,
+            // Unit tests capture stdout; mark explicitly like `monitor --mark-read`.
+            mark_read: true,
         }
     }
 

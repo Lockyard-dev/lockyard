@@ -147,19 +147,37 @@ pub fn open(cwd: &Path, agent: Option<&str>) -> Result<Opened> {
 
 /// A status-specific open: probing an old or unresponsive daemon must not consume the command's
 /// deadline. Reads use its existing authenticated connection pool when the aggregate is supported.
+///
+/// Open mail is derived on the same backend after the mandatory status reads when time remains,
+/// so status does not open a second cloud client. An agent aggregate carries `StatusRead.open_mail`
+/// computed by the daemon on its warm client.
 pub(crate) fn status_read(
     cwd: &Path,
     session: &str,
     deadline: std::time::Instant,
-) -> Result<(PathBuf, bool, lockyard_core::StatusRead)> {
+) -> Result<(
+    PathBuf,
+    bool,
+    lockyard_core::StatusRead,
+    Option<crate::open_mail::OpenMailSnapshot>,
+)> {
     use std::time::Instant;
     let _span = lockyard_core::perf::Span::new("status.open_and_read");
     let root = find_root(cwd).ok_or(Error::NoProject)?;
     let config = Config::load(&root)?;
     let left = || deadline.saturating_duration_since(Instant::now());
     if config.mode == Mode::Local {
-        let read = Store::open(&root)?.status_read(session, crate::now_ms(), left())?;
-        return Ok((root, false, read));
+        let store = Store::open(&root)?;
+        let read = store.status_read(session, crate::now_ms(), left())?;
+        let budget = left()
+            .saturating_sub(std::time::Duration::from_millis(50))
+            .min(crate::open_mail::SENT_BUDGET);
+        let open_mail = if budget.is_zero() {
+            None
+        } else {
+            crate::open_mail::open_mail_within(&store, session, crate::now_ms(), budget)
+        };
+        return Ok((root, false, read, open_mail));
     }
     let (url, workspace) = endpoint(&config)?;
     let token = Config::token_for(&url).ok();
@@ -185,7 +203,18 @@ pub(crate) fn status_read(
             match socket.status_read(session, config.repository.as_deref(), budget) {
                 Ok(mut read) => {
                     read.freshness["via"] = serde_json::json!("agent");
-                    return Ok((root, true, read));
+                    let open_mail =
+                        read.open_mail
+                            .as_ref()
+                            .map(|items| crate::open_mail::OpenMailSnapshot {
+                                items: items.clone(),
+                                truncated: read
+                                    .freshness
+                                    .get("open_mail_truncated")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false),
+                            });
+                    return Ok((root, true, read, open_mail));
                 }
                 Err(lockyard_cloud_client::ClientError::Transport(_)) => {}
                 Err(error) => return Err(error.into()),
@@ -207,7 +236,18 @@ pub(crate) fn status_read(
     );
     let mut read = backend.status_read(session, crate::now_ms(), left())?;
     read.freshness["via"] = serde_json::json!("direct");
-    Ok((root, true, read))
+    // After a cold-agent fallback the outer deadline may already be nearly spent. Require
+    // comfortable headroom and cap the optional peek so bad-link latency cannot fail status.
+    let remaining = left();
+    let open_mail = if remaining < std::time::Duration::from_millis(800) {
+        None
+    } else {
+        let budget = remaining
+            .saturating_sub(std::time::Duration::from_millis(200))
+            .min(std::time::Duration::from_millis(300));
+        crate::open_mail::open_mail_within(&backend, session, crate::now_ms(), budget)
+    };
+    Ok((root, true, read, open_mail))
 }
 
 fn status_probe_budget(left: std::time::Duration) -> std::time::Duration {

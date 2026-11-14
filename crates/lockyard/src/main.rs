@@ -9,6 +9,7 @@ mod monitor;
 mod node_cli;
 mod onboarding;
 mod open;
+mod open_mail;
 mod revoke_access;
 mod setup;
 mod shutdown;

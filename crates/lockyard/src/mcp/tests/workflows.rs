@@ -494,7 +494,7 @@
     }
 
     #[test]
-    fn update_sends_then_reads_and_marks_the_mail_it_showed() {
+    fn update_with_a_note_peeks_mail_and_does_not_mark_it_read() {
         let dir = project();
         call(&dir, "b", "msg_inbox", json!({}));
         call(&dir, "a", "msg_send", json!({"to": "b", "body": "ping"}));
@@ -502,6 +502,10 @@
         assert!(text(&read).starts_with(MAIL_WARNING));
         assert!(text(&read).contains("ping"));
         assert!(text(&read).contains("on it"));
+        // Sending a note must not consume the inbox; a later plain update still sees it.
+        assert!(text(&call(&dir, "b", "msg_unread", json!({}))).contains("\"unread\":1"));
+        let marked = call(&dir, "b", "update", json!({}));
+        assert!(text(&marked).contains("ping"));
         assert!(text(&call(&dir, "b", "msg_unread", json!({}))).contains("\"unread\":0"));
         let half = call(&dir, "b", "update", json!({"to": "a"}));
         assert_eq!(half["isError"], true);

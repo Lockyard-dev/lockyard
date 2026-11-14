@@ -316,7 +316,16 @@ pub(super) fn run_zone(
                 fence,
             };
             let renewed = opened.backend.renew(&agent, id, &request, now)?;
-            output(&json!({ "renewed": renewed }), format!("renewed {renewed}"))
+            let mut data = json!({ "renewed": renewed });
+            if let Some(count) = crate::open_mail::open_mail_count_within(
+                opened.backend.as_ref(),
+                &agent,
+                now,
+                crate::open_mail::RENEW_BUDGET,
+            ) {
+                data["open_mail_count"] = json!(count);
+            }
+            output(&data, format!("renewed {renewed}"))
         }
         ZoneCommand::Release {
             id,
