@@ -286,8 +286,11 @@ pub(super) fn run_cloud_key(cwd: &Path, command: KeyCommand) -> Result<Output> {
             key.store_for_workspace(&workspace)
                 .map_err(Error::Invalid)?;
             output(
-                &json!({"created":true,"key_id":key.key_id()}),
-                format!("created local key {}", key.key_id()),
+                &json!({"created":true,"key_id":key.key_id(),"reload":"without_restart"}),
+                format!(
+                    "created local key {}; running agent and MCP pick it up without a restart",
+                    key.key_id()
+                ),
             )
         }
         KeyCommand::ShowPhrase => {
@@ -313,8 +316,11 @@ pub(super) fn run_cloud_key(cwd: &Path, command: KeyCommand) -> Result<Output> {
             key.store_for_workspace(&workspace)
                 .map_err(Error::Invalid)?;
             output(
-                &json!({"imported":true,"key_id":key.key_id()}),
-                format!("imported local key {}", key.key_id()),
+                &json!({"imported":true,"key_id":key.key_id(),"reload":"without_restart"}),
+                format!(
+                    "imported local key {}; running agent and MCP pick it up without a restart",
+                    key.key_id()
+                ),
             )
         }
     }

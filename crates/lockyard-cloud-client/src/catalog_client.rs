@@ -67,8 +67,8 @@ impl Client {
                 .workspace
                 .as_deref()
                 .ok_or_else(|| local("catalog_key_unavailable"))?;
-            let key = self
-                .content_key
+            let held = self.resolved_content_key()?;
+            let key = held
                 .as_ref()
                 .ok_or_else(|| local("catalog_key_unavailable"))?;
             let repository = call.repository.as_deref().unwrap_or_default();
@@ -121,8 +121,8 @@ impl Client {
             .workspace
             .as_deref()
             .ok_or_else(|| local("catalog_key_unavailable"))?;
-        let key = self
-            .content_key
+        let held = self.resolved_content_key()?;
+        let key = held
             .as_ref()
             .ok_or_else(|| local("catalog_key_unavailable"))?;
         let repository = prepared.repository.as_deref().expect("set repository");
@@ -169,8 +169,8 @@ impl Client {
             .workspace
             .as_deref()
             .ok_or_else(|| local("catalog_key_unavailable"))?;
-        let key = self
-            .content_key
+        let held = self.resolved_content_key()?;
+        let key = held
             .as_ref()
             .ok_or_else(|| local("catalog_key_unavailable"))?;
         let repository = call.repository.as_deref().unwrap_or_default();
@@ -191,18 +191,15 @@ impl Client {
         if !catalog_call(call) || call.method != "GET" {
             return Ok(None);
         }
-        if self.content_key.is_none()
-            && self.expected_e2ee_workspace.is_none()
-            && !self.encryption_enabled
-        {
+        let held = self.resolved_content_key()?;
+        if held.is_none() && self.expected_e2ee_workspace.is_none() && !self.encryption_enabled {
             return Ok(None);
         }
         let workspace = self
             .workspace
             .as_deref()
             .ok_or_else(|| local("catalog_key_unavailable"))?;
-        let key = self
-            .content_key
+        let key = held
             .as_ref()
             .ok_or_else(|| local("catalog_key_unavailable"))?;
         let repository = call.repository.as_deref().unwrap_or_default();

@@ -50,7 +50,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// A write is sent at most this many times with one key.
 const WRITE_ATTEMPTS: u32 = 3;
 /// A retry waits at most this long, whatever `Retry-After` says. A caller with more patience loops.
-const MAX_RETRY_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const MAX_RETRY_WAIT: Duration = Duration::from_secs(5);
 /// Reserve time for the next request after a `Retry-After` pause.
 const RETRY_ROUND_TRIP_ESTIMATE: Duration = Duration::from_secs(1);
 /// Longest wait of a long poll, in seconds.
@@ -142,6 +142,8 @@ pub enum ClientError {
     Http(ApiError),
     /// The server did not answer.
     Transport(String),
+    /// The local pending-write journal flock is held by another process.
+    JournalBusy,
     /// The server answered with something unreadable.
     Decode(String),
 }
@@ -167,7 +169,7 @@ impl ClientError {
     /// True when the same request may work later, so an outbox entry stays queued.
     pub fn is_outage(&self) -> bool {
         match self {
-            Self::Transport(_) => true,
+            Self::Transport(_) | Self::JournalBusy => true,
             Self::Frozen(error) => matches!(
                 error.code.as_str(),
                 "" | "frozen" | "server_draining" | "temporarily_unavailable"
@@ -221,6 +223,7 @@ impl fmt::Display for ClientError {
             Self::Protocol(problem) => write!(f, "{}: {}", problem.code, problem.detail),
             Self::OutcomeUnknown(pending) => write!(f, "outcome_unknown: {}", pending.cause_code),
             Self::Invalid(text) | Self::Transport(text) | Self::Decode(text) => f.write_str(text),
+            Self::JournalBusy => f.write_str("pending journal is busy"),
             Self::Unauthorized(error)
             | Self::Denied(error)
             | Self::NotFound(error)
@@ -291,6 +294,7 @@ impl From<ClientError> for CoreError {
             }
             ClientError::Http(error) => Self::Unavailable(error.to_string()),
             ClientError::Transport(text) => Self::Unavailable(text),
+            ClientError::JournalBusy => Self::Unavailable("pending journal is busy".into()),
             ClientError::Decode(text) => Self::Protocol(text),
         }
     }
@@ -589,6 +593,8 @@ pub struct Client {
     poll_agent: ureq::Agent,
     workspace: Option<String>,
     content_key: Option<WorkspaceKey>,
+    /// Key id from the workspace encryption setting; disk keys must match when set.
+    expected_key_id: Option<String>,
     encryption_enabled: bool,
     expected_e2ee_workspace: Option<String>,
     protocol_state: std::sync::Mutex<protocol::ProtocolState>,
@@ -812,6 +818,7 @@ impl Client {
             poll_agent,
             workspace: None,
             content_key: None,
+            expected_key_id: None,
             encryption_enabled: false,
             expected_e2ee_workspace,
             protocol_state: std::sync::Mutex::new(protocol::ProtocolState::default()),
@@ -883,6 +890,34 @@ impl Client {
         self.content_key = key;
         self.encryption_enabled = enabled;
         self
+    }
+
+    /// Load the workspace key once for a call. An on-disk key is accepted only when its
+    /// `key_id` matches the workspace encryption setting (when that setting is known).
+    pub(crate) fn resolved_content_key(&self) -> Result<Option<WorkspaceKey>, ClientError> {
+        let Some(workspace) = self.workspace.as_deref() else {
+            return Ok(self.content_key.clone());
+        };
+        let disk = WorkspaceKey::load_for_workspace(workspace).map_err(ClientError::Invalid)?;
+        let expected = self.expected_key_id.as_deref();
+        match (expected, &self.content_key, disk) {
+            (Some(expected), _, Some(disk)) if disk.key_id() == expected => Ok(Some(disk)),
+            (Some(expected), _, Some(disk)) => Err(ClientError::Invalid(format!(
+                "key id mismatch: on-disk key {} does not match workspace key id {expected}",
+                disk.key_id()
+            ))),
+            (Some(expected), Some(memory), None) if memory.key_id() == expected => {
+                Ok(Some(memory.clone()))
+            }
+            (Some(expected), Some(memory), None) => Err(ClientError::Invalid(format!(
+                "key id mismatch: local key {} does not match workspace key id {expected}",
+                memory.key_id()
+            ))),
+            (Some(_), None, None) => Ok(None),
+            // No workspace setting yet: prefer a fresh on-disk key (create/import without restart).
+            (None, _, Some(disk)) => Ok(Some(disk)),
+            (None, memory, None) => Ok(memory.clone()),
+        }
     }
 
     /// Read the server setting once. Only legacy clients may use cleartext compatibility
@@ -960,11 +995,13 @@ impl Client {
             let actual = key.key_id();
             if actual != expected {
                 return Err(ClientError::Invalid(format!(
-                    "local encryption key id {actual} does not match workspace key id {expected}"
+                    "key id mismatch: local key {actual} does not match workspace key id {expected}"
                 )));
             }
         }
-        Ok(self.with_content_encryption(&setting.workspace_id, key, required))
+        let mut configured = self.with_content_encryption(&setting.workspace_id, key, required);
+        configured.expected_key_id = setting.key_id;
+        Ok(configured)
     }
 
     /// Fetch the server's setting without enabling transformations, for encryption management.
@@ -1209,10 +1246,11 @@ impl Client {
                     echo.map_err(Failure::Final)?;
                 }
                 if let Some(workspace) = self.workspace.as_deref() {
+                    let held = self.resolved_content_key().map_err(Failure::Final)?;
                     crypto::transform_error_details(
                         &mut api_error.details,
                         workspace,
-                        self.content_key.as_ref(),
+                        held.as_ref(),
                         self.expected_e2ee_workspace.is_some(),
                     )
                     .map_err(|message| Failure::Final(ClientError::Invalid(message)))?;
@@ -3241,6 +3279,59 @@ mod tests {
             CoreError::from(ClientError::Transport("x".into())),
             CoreError::Unavailable(_)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_content_key_reloads_from_disk_when_memory_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_home = dir.path().canonicalize().unwrap();
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        }
+        let key = WorkspaceKey::from_entropy([42; 32]);
+        key.store_for_workspace("wave2reload").unwrap();
+        let empty = Client::new("http://127.0.0.1:9", "fixture".into())
+            .unwrap()
+            .with_content_encryption("wave2reload", None, true);
+        let resolved = empty.resolved_content_key().unwrap().expect("disk key");
+        assert_eq!(resolved.key_id(), key.key_id());
+        // Without an expected workspace key id, a newer on-disk key wins over memory.
+        let newer = WorkspaceKey::from_entropy([99; 32]);
+        let path = WorkspaceKey::storage_path("wave2reload").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        newer.store_for_workspace("wave2reload").unwrap();
+        let stale = Client::new("http://127.0.0.1:9", "fixture".into())
+            .unwrap()
+            .with_content_encryption("wave2reload", Some(key.clone()), true);
+        let reloaded = stale
+            .resolved_content_key()
+            .unwrap()
+            .expect("newer disk key");
+        assert_eq!(reloaded.key_id(), newer.key_id());
+        // With an expected id, a mismatched on-disk key is refused.
+        let mut pinned = Client::new("http://127.0.0.1:9", "fixture".into())
+            .unwrap()
+            .with_content_encryption("wave2reload", Some(key.clone()), true);
+        pinned.expected_key_id = Some(key.key_id());
+        let err = match pinned.resolved_content_key() {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected key id mismatch"),
+        };
+        assert!(err.contains("key id mismatch"), "{err}");
+        // Matching expected id accepts the disk key.
+        pinned.expected_key_id = Some(newer.key_id());
+        assert_eq!(
+            pinned.resolved_content_key().unwrap().unwrap().key_id(),
+            newer.key_id()
+        );
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
     }
 
     #[test]

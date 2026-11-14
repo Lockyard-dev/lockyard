@@ -4,6 +4,7 @@ mod agent;
 mod context;
 mod guard;
 mod hook;
+mod keepalive;
 mod mcp;
 mod monitor;
 mod node_cli;
@@ -238,6 +239,8 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
         Command::Cloud(CloudCommand::Key(command)) => run_cloud_key(cwd, command),
         Command::Cloud(CloudCommand::Encryption(command)) => run_cloud_encryption(cwd, command),
         Command::Cloud(command) => run_cloud(open()?, command, agent.as_ref()),
+        Command::Keepalive { id, all } => run_keepalive(open()?, agent.as_ref(), id, all),
+        Command::Ping { path } => run_ping(cwd, agent.as_ref(), path),
         Command::Revoke(command) => {
             let (target, config) = command.parts();
             let result = revoke_access::execute(cwd, target, config)?;

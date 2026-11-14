@@ -353,3 +353,96 @@ fn fixture_cleanup_preserves_failure_instead_of_aborting() {
     assert!(stderr.contains("injected fixture failure"), "{stderr}");
     assert!(!stderr.contains("panic in a destructor"), "{stderr}");
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn write_waits_out_a_busy_pending_journal_within_the_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (ready_tx, ready_rx) = mpsc::channel::<TcpStream>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = Arc::clone(&stop);
+    let worker = std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        while !stopping.load(Ordering::Acquire) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            let (path, _body, _key) = read_request(&mut stream);
+            if path == "/api/v1/protocol" {
+                write_reply(
+                    &mut stream,
+                    200,
+                    json!({
+                        "selected_protocol":2,"min_protocol":1,"max_protocol":2,"capabilities":[]
+                    }),
+                );
+            } else {
+                let _ = ready_tx.send(stream);
+            }
+        }
+    });
+
+    let journal = Journal::new();
+    let holder = Client::new(&url, "fixture-token".into())
+        .unwrap()
+        .with_pending_journal(&journal.0)
+        .unwrap();
+    let waiter = Client::new(&url, "fixture-token".into())
+        .unwrap()
+        .with_pending_journal(&journal.0)
+        .unwrap();
+
+    let hold = std::thread::spawn(move || {
+        let mut call = Call::write("me", "POST", "/api/v1/presence".into(), json!({}));
+        call.key = Some("hold-key".into());
+        call.deadline_ms = Some(5_000);
+        holder.call(&call)
+    });
+    let held = ready_rx
+        .recv_timeout(WAIT)
+        .expect("holder reached the server");
+    let started = Instant::now();
+    let wait = std::thread::spawn(move || {
+        let mut call = Call::write("me", "POST", "/api/v1/presence".into(), json!({}));
+        call.key = Some("wait-key".into());
+        call.deadline_ms = Some(2_000);
+        waiter.call(&call)
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    write_reply(&mut { held }, 200, json!({"ok": true}));
+    // Holder kept the journal flock for the whole round-trip; after it finishes the waiter sends.
+    let waiter_stream = ready_rx
+        .recv_timeout(WAIT)
+        .expect("waiter reached the server after the journal unlocked");
+    write_reply(&mut { waiter_stream }, 200, json!({"ok": true}));
+    let waited = wait.join().unwrap();
+    assert!(waited.is_ok(), "{waited:?}");
+    assert!(started.elapsed() >= Duration::from_millis(150));
+    // Journal wait and HTTP share one deadline clock: total elapsed stays within deadline + slack.
+    assert!(
+        started.elapsed() <= Duration::from_millis(2_000) + Duration::from_millis(750),
+        "waiter exceeded deadline_ms + slack: {:?}",
+        started.elapsed()
+    );
+    let _ = hold.join();
+    stop.store(true, Ordering::Release);
+    let _ = worker.join();
+    assert!(
+        !lockyard_core::Error::Unavailable("pending journal is busy".into())
+            .to_string()
+            .contains("check the network")
+    );
+    assert!(matches!(
+        lockyard_cloud_client::ClientError::JournalBusy
+            .to_string()
+            .as_str(),
+        "pending journal is busy"
+    ));
+}

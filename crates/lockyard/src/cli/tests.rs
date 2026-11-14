@@ -817,3 +817,112 @@ fn cli_status_json_keeps_its_fields_and_does_not_request_lost_claims() {
         assert_eq!(keys, expected);
     }
 }
+
+#[test]
+fn keepalive_help_mentions_presence_and_hold_for_is_documented() {
+    let mut command = Cli::command();
+    command.build();
+    let keepalive = command
+        .find_subcommand_mut("keepalive")
+        .unwrap()
+        .render_long_help()
+        .to_string();
+    assert!(
+        keepalive.contains("holder_available") || keepalive.contains("presence"),
+        "{keepalive}"
+    );
+    assert!(
+        keepalive.contains("zone renew") || keepalive.contains("Does not extend"),
+        "{keepalive}"
+    );
+    let renew = command
+        .find_subcommand_mut("zone")
+        .unwrap()
+        .find_subcommand_mut("renew")
+        .unwrap()
+        .render_long_help()
+        .to_string();
+    assert!(renew.contains("hold-for"), "{renew}");
+    let mut command = Cli::command();
+    command.build();
+    let claim = command
+        .find_subcommand_mut("zone")
+        .unwrap()
+        .find_subcommand_mut("claim")
+        .unwrap()
+        .render_long_help()
+        .to_string();
+    assert!(claim.contains("paths-file"), "{claim}");
+    let mut command = Cli::command();
+    command.build();
+    let add = command
+        .find_subcommand_mut("task")
+        .unwrap()
+        .find_subcommand_mut("add")
+        .unwrap()
+        .render_long_help()
+        .to_string();
+    assert!(add.contains("body-file"), "{add}");
+    assert!(add.contains("acceptance-file"), "{add}");
+    let mut command = Cli::command();
+    command.build();
+    let ping = command
+        .find_subcommand_mut("ping")
+        .unwrap()
+        .render_long_help()
+        .to_string();
+    assert!(ping.contains("status") || ping.contains("round"), "{ping}");
+}
+
+#[test]
+fn hold_for_minutes_maps_to_rfc3339_and_rejects_out_of_range() {
+    let until = hold_until_from_minutes(30, 1_700_000_000_000).unwrap();
+    assert!(
+        until.contains("T") || until.ends_with('Z') || until.contains('+'),
+        "{until}"
+    );
+    assert!(hold_until_from_minutes(0, 0).is_err());
+    assert!(hold_until_from_minutes(241, 0).is_err());
+    assert!(hold_until_from_minutes(1, 0).is_ok());
+    assert!(hold_until_from_minutes(240, 0).is_ok());
+}
+
+#[test]
+fn body_and_paths_files_refuse_nul_symlinks_and_oversize() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = dir.path().join("body.txt");
+    std::fs::write(&body, b"ok\0bad").unwrap();
+    let err = read_text_file(&body).unwrap_err().to_string();
+    assert!(err.contains("NUL"), "{err}");
+    let big = dir.path().join("big.txt");
+    std::fs::write(&big, vec![b'a'; BODY_FILE_MAX_BYTES as usize + 1]).unwrap();
+    assert!(
+        read_text_file(&big)
+            .unwrap_err()
+            .to_string()
+            .contains("byte limit")
+    );
+    let paths = dir.path().join("paths.txt");
+    let mut lines = String::new();
+    for i in 0..PATHS_FILE_MAX_LINES + 1 {
+        lines.push_str(&format!("path-{i}\n"));
+    }
+    std::fs::write(&paths, lines).unwrap();
+    assert!(
+        read_lines_file(&paths)
+            .unwrap_err()
+            .to_string()
+            .contains("more than")
+    );
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&body, &link).unwrap();
+        assert!(
+            read_text_file(&link)
+                .unwrap_err()
+                .to_string()
+                .contains("regular file")
+        );
+    }
+}

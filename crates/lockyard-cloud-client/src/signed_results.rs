@@ -81,7 +81,7 @@ impl Client {
         let (_, created) = route(node, job)?;
         Ok(retention_deadline_ms.min(created.saturating_add(YEAR_MS)))
     }
-    fn result_context(&self) -> Result<(&str, &crate::WorkspaceKey), ClientError> {
+    fn result_context(&self) -> Result<(&str, crate::WorkspaceKey), ClientError> {
         let workspace = self.workspace.as_deref().ok_or_else(|| {
             protocol::local("content_encryption_required", "workspace key required")
         })?;
@@ -103,7 +103,7 @@ impl Client {
                 "canonical workspace identity required",
             ));
         }
-        let key = self.content_key.as_ref().ok_or_else(|| {
+        let key = self.resolved_content_key()?.ok_or_else(|| {
             protocol::local("content_encryption_required", "workspace key required")
         })?;
         Ok((workspace, key))

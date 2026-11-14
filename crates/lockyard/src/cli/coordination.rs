@@ -120,3 +120,44 @@ pub(super) fn run_presence(
         }
     }
 }
+
+pub(super) fn run_keepalive(
+    mut opened: Opened,
+    agent: Option<&String>,
+    id: Option<i64>,
+    all: bool,
+) -> Result<Output> {
+    let agent = resolve_agent(agent)?;
+    let now = now_ms();
+    let data = crate::keepalive::keepalive(opened.backend.as_mut(), &agent, id, all, "cli", now)?;
+    let count = data["activity"].as_array().map(Vec::len).unwrap_or(0);
+    output(
+        &data,
+        format!("keepalive on {count} claim(s) (does not extend lease; use zone renew)"),
+    )
+}
+
+pub(super) fn run_ping(cwd: &Path, agent: Option<&String>, path: Option<String>) -> Result<Output> {
+    use std::time::Instant;
+    let agent = resolve_agent(agent)?;
+    let status_started = Instant::now();
+    let (_root, _cloud, _read, _mail) = open::status_read(
+        cwd,
+        &agent,
+        Instant::now() + std::time::Duration::from_secs(6),
+    )?;
+    let status_ms = status_started.elapsed().as_millis() as u64;
+    let check_path = path.unwrap_or_else(|| ".".into());
+    let check_started = Instant::now();
+    let opened = open::open(cwd, Some(&agent))?;
+    let resolved = opened.zone_path(cwd, &check_path)?;
+    let now = now_ms();
+    let _ = opened
+        .backend
+        .check(&agent, std::slice::from_ref(&resolved), None, now)?;
+    let check_ms = check_started.elapsed().as_millis() as u64;
+    output(
+        &json!({"status_ms": status_ms, "zone_check_ms": check_ms, "path": resolved}),
+        format!("status {status_ms} ms; zone check {check_ms} ms"),
+    )
+}

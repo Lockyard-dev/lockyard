@@ -136,16 +136,32 @@ pub(super) fn run_zone(
     match command {
         ZoneCommand::Claim {
             paths,
+            paths_file,
             note,
             ttl,
             hold_reason,
             hold_until,
+            hold_for,
             lazy,
             style,
             meta,
         } => {
             let agent = resolve_agent(agent)?;
+            let mut paths = paths;
+            if let Some(file) = paths_file {
+                paths.extend(read_lines_file(&file)?);
+            }
             let paths = with_zones(&opened, cwd, &paths, &style.zones)?;
+            let hold_until = match (hold_until, hold_for) {
+                (Some(until), None) => Some(until),
+                (None, Some(minutes)) => Some(hold_until_from_minutes(minutes, now)?),
+                (None, None) => None,
+                (Some(_), Some(_)) => {
+                    return Err(Error::Invalid(
+                        "use either --hold-until or --hold-for, not both".into(),
+                    ));
+                }
+            };
             let mut request = claim_request(paths, note, ttl.ttl, &style);
             request.lazy = lazy;
             request.meta = meta;
@@ -306,9 +322,20 @@ pub(super) fn run_zone(
             ttl,
             hold_reason,
             hold_until,
+            hold_for,
             fence,
         } => {
             let agent = resolve_agent(agent)?;
+            let hold_until = match (hold_until, hold_for) {
+                (Some(until), None) => Some(until),
+                (None, Some(minutes)) => Some(hold_until_from_minutes(minutes, now)?),
+                (None, None) => None,
+                (Some(_), Some(_)) => {
+                    return Err(Error::Invalid(
+                        "use either --hold-until or --hold-for, not both".into(),
+                    ));
+                }
+            };
             let request = RenewRequest {
                 ttl_minutes: ttl.ttl,
                 hold_reason,

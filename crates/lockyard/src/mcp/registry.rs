@@ -84,6 +84,12 @@ impl ToolRegistry {
                 &[],
             ),
             tool_def(
+                "keepalive",
+                "Presence + claim activity (holder_available); does not extend lease — use zone_renew.",
+                json!({"id": int, "all": flag}),
+                &[],
+            ),
+            tool_def(
                 "tasks",
                 "Compact registry workflow: list, show, claim, submit, accept, reject, block, unblock, or cancel tasks.",
                 json!({"action": text, "id": task_identifier, "area": text, "prefix": text, "evidence": text, "reason": text, "note": text, "status": text}),
@@ -99,9 +105,13 @@ impl ToolRegistry {
             let name = wire["name"].as_str().unwrap().to_string();
             let handler = if matches!(
                 name.as_str(),
-                "start_work" | "update" | "handover" | "finish_work"
+                "start_work" | "update" | "handover" | "finish_work" | "keepalive"
             ) {
-                ToolHandler::Composite(name.clone())
+                if name == "keepalive" {
+                    ToolHandler::Primitive(name.clone())
+                } else {
+                    ToolHandler::Composite(name.clone())
+                }
             } else {
                 ToolHandler::Primitive(name.clone())
             };
@@ -177,6 +187,7 @@ fn compact_visibility(name: &str) -> Option<usize> {
         "cloud_protocol" => 13,
         "task_add" => 14,
         "zone_renew" => 15,
+        "keepalive" => 16,
         _ => return None,
     })
 }
