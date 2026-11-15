@@ -28,6 +28,13 @@ struct Seen {
 
 #[derive(Default)]
 struct State {
+    survey_handled_failure: bool,
+    survey_release_failure_id: Option<i64>,
+    survey_handled: bool,
+    survey_soft_zones: bool,
+    survey_uncertain_create: bool,
+    survey_echo_client_key: bool,
+    survey_lost: Vec<Value>,
     seen: Vec<Seen>,
     claims: Vec<Value>,
     inbox: Vec<Value>,
@@ -250,7 +257,11 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
             };
             (status, answer, capabilities)
         };
-        let text = answer.to_string();
+        let text = if answer == json!("response lost after commit") {
+            "{".into()
+        } else {
+            answer.to_string()
+        };
         {
             let mut state = state.lock().unwrap();
             state.response_bytes += text.len();
@@ -309,6 +320,12 @@ fn route_reply(
     match (method, route) {
         ("GET", "/api/v1/protocol") => {
             let mut capabilities = vec!["zone_catalog_v1", "drain_v1"];
+            if state.survey_soft_zones {
+                capabilities.push("soft_zones_v1");
+            }
+            if state.survey_handled {
+                capabilities.push("mail_handled_v1");
+            }
             if state.registry_assignee_session && !state.registry_assignee_protocol_hidden {
                 capabilities.push("registry_assignee_session_v1");
             }
@@ -349,7 +366,14 @@ fn route_reply(
                 return (200, claim);
             }
             let id = state.claims.len() as i64 + 1;
-            let claim = json!({"id": id, "session": "alice", "paths": body["paths"], "meta": body["meta"], "fence": 1, "expires_at": HOLD_EXPIRES_AT});
+            let mut claim = json!({"id": id, "session": "alice", "paths": body["paths"], "meta": body["meta"], "fence": 1, "expires_at": HOLD_EXPIRES_AT});
+            if let Some(mode) = body.get("mode") {
+                claim["mode"] = mode.clone();
+            }
+            if state.survey_soft_zones {
+                claim["mode"] = body.get("mode").cloned().unwrap_or_else(|| json!("shared"));
+                claim["held"] = json!(false);
+            }
             state.claims.push(claim.clone());
             let mut reply = claim;
             if state.omit_claim_meta {
@@ -364,7 +388,34 @@ fn route_reply(
             .refuse_claims_get_once
             .take()
             .or_else(|| state.refuse_claims_get.clone())
-            .unwrap_or_else(|| (200, json!({"claims": state.claims}))),
+            .unwrap_or_else(|| {
+                (
+                    200,
+                    if state.encryption_key_id.is_some() {
+                        json!(state.claims)
+                    } else {
+                        json!({"claims": state.claims})
+                    },
+                )
+            }),
+        ("POST", _)
+            if route.starts_with("/api/v1/zones/claims/")
+                && (route.ends_with("/add-path") || route.ends_with("/narrow")) =>
+        {
+            let id = route.rsplit('/').nth(1).unwrap().parse::<i64>().unwrap();
+            let Some(claim) = state.claims.iter_mut().find(|claim| claim["id"] == id) else {
+                return (200, json!({"id":id,"session":"alice","paths":[],"fence":2}));
+            };
+            if route.ends_with("/narrow") {
+                claim["paths"] = body["paths"].clone();
+            } else {
+                claim["paths"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(body["path"].clone());
+            }
+            (200, claim.clone())
+        }
         ("POST", _) if route.starts_with("/api/v1/zones/claims/") && route.ends_with("/renew") => {
             if let Some(refusal) = state.refuse_renew.clone() {
                 return refusal;
@@ -434,6 +485,12 @@ fn route_reply(
                 return refusal;
             }
             let id = route.rsplit('/').next().unwrap().parse::<i64>().unwrap();
+            if state.survey_release_failure_id == Some(id) {
+                return (
+                    403,
+                    json!({"error":{"code":"forbidden","message":"owner changed"}}),
+                );
+            }
             state.claims.retain(|claim| {
                 claim["id"] != id
                     || (body.get("fence").is_some_and(|fence| !fence.is_null())
@@ -441,11 +498,21 @@ fn route_reply(
             });
             (200, json!({"released":1}))
         }
-        ("GET", "/api/v1/presence") => (200, json!({"sessions":[]})),
+        ("GET", "/api/v1/presence") => (
+            200,
+            if state.encryption_key_id.is_some() {
+                json!([])
+            } else {
+                json!({"sessions":[]})
+            },
+        ),
+        ("POST", "/api/v1/presence") if state.encryption_key_id.is_some() => {
+            (200, json!({"session":session.unwrap_or("alice")}))
+        }
         ("GET", "/api/v1/registry/areas") if !state.registry_areas.is_empty() => {
             (200, json!({"areas": state.registry_areas}))
         }
-        ("GET", "/api/v1/registry/items") => {
+        ("GET", "/api/v1/registry/items" | "/api/v1/registry/ready") => {
             if let Some(refusal) = state.refuse_registry_get.clone() {
                 return refusal;
             }
@@ -498,6 +565,39 @@ fn route_reply(
                 .take(limit)
                 .collect::<Vec<_>>();
             (200, json!({"items":page,"cursor":next}))
+        }
+        ("GET", "/api/v1/zones/lost") => (200, json!({"lost":state.survey_lost})),
+        ("POST", "/api/v1/bus/inbox/handled") if state.survey_handled => {
+            if state.survey_handled_failure {
+                return (
+                    403,
+                    json!({"error":{"code":"forbidden","message":"handling refused"}}),
+                );
+            }
+            let ids = body["ids"].as_array().unwrap();
+            for message in &mut state.inbox {
+                if ids.contains(&message["id"]) {
+                    message["status"] = json!("ack");
+                }
+            }
+            (200, json!({"handled":ids.len()}))
+        }
+        ("POST", "/api/v1/registry/items") if state.survey_uncertain_create => {
+            if state.survey_echo_client_key
+                && let Some(task) = state
+                    .registry_items
+                    .iter()
+                    .find(|task| task["client_key"] == body["client_key"])
+            {
+                return (200, task.clone());
+            }
+            let mut task =
+                json!({"id":"FE-77","title":body["title"],"status":"ready","author":"alice"});
+            if state.survey_echo_client_key {
+                task["client_key"] = body["client_key"].clone();
+            }
+            state.registry_items.push(task);
+            (200, json!("response lost after commit"))
         }
         ("POST", "/api/v1/registry/items") if !state.registry_areas.is_empty() => {
             let area = state
@@ -633,7 +733,12 @@ fn binary(dir: &Path, runtime: &Path) -> Command {
         std::env::var_os("LOCKYARD_TEST_BINARY")
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_lockyard").into()),
     );
-    let config = std::fs::read_to_string(dir.join(".lockyard/config.toml")).unwrap_or_default();
+    let config = std::fs::read_to_string(
+        lockyard_core::paths::find_root(dir)
+            .unwrap_or_else(|| dir.to_path_buf())
+            .join(".lockyard/config.toml"),
+    )
+    .unwrap_or_default();
     let url = config
         .lines()
         .find_map(|line| line.strip_prefix("url = '")?.strip_suffix("'"))
@@ -717,10 +822,21 @@ fn json_of(result: &Output) -> Value {
 }
 
 fn mcp_calls(dir: &Path, runtime: &Path, surface: &str, calls: &[(&str, Value)]) -> Vec<Value> {
+    mcp_calls_env(dir, runtime, surface, calls, &[])
+}
+
+fn mcp_calls_env(
+    dir: &Path,
+    runtime: &Path,
+    surface: &str,
+    calls: &[(&str, Value)],
+    env: &[(&str, &str)],
+) -> Vec<Value> {
     let mut child = binary(dir, runtime)
         .args(["mcp", "--tools", surface])
         .env("LOCKYARD_AGENT", "alice")
         .env("LOCKYARD_TOKEN", "test-token")
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -820,16 +936,12 @@ fn compact_zone_renew_checks_fence_and_ttl_before_sending_and_extends_the_claim(
         runtime.path(),
         "compact",
         &[
-            ("zone_renew", json!({"id":1,"ttl":30})),
-            ("zone_renew", json!({"id":1,"ttl":30,"fence":null})),
             ("zone_renew", json!({"id":1,"ttl":30,"fence":"7"})),
             ("zone_renew", json!({"id":1,"ttl":0,"fence":7})),
             ("zone_renew", json!({"id":1,"ttl":241,"fence":7})),
         ],
     );
     for (answer, expected) in invalid.iter().zip([
-        "fence is required in cloud mode",
-        "fence is required in cloud mode",
         "fence must be an integer",
         "ttl must be 1 to 240 minutes",
         "ttl must be 1 to 240 minutes",
@@ -848,6 +960,8 @@ fn compact_zone_renew_checks_fence_and_ttl_before_sending_and_extends_the_claim(
     );
 
     for (arguments, ttl) in [
+        (json!({"id":1,"ttl":30}), 30),
+        (json!({"id":1,"ttl":30,"fence":null}), 30),
         (json!({"id":1,"fence":7}), 30),
         (json!({"id":1,"ttl":1,"fence":7}), 1),
         (json!({"id":1,"ttl":240,"fence":7}), 240),
@@ -867,8 +981,8 @@ fn compact_zone_renew_checks_fence_and_ttl_before_sending_and_extends_the_claim(
         assert_eq!(expiry, RENEW_NOW_MS + ttl * 60_000);
     }
     let writes = server.seen("POST", "/api/v1/zones/claims/1/renew");
-    assert_eq!(writes.len(), 3);
-    for (write, ttl) in writes.iter().zip([30, 1, 240]) {
+    assert_eq!(writes.len(), 5);
+    for (write, ttl) in writes.iter().zip([30, 30, 30, 1, 240]) {
         assert_eq!(write.body["ttl_minutes"], ttl);
         assert_eq!(write.body["fence"], 7);
         assert_eq!(write.session.as_deref(), Some("alice"));
@@ -898,7 +1012,10 @@ fn compact_zone_renew_preserves_stale_fence_foreign_and_expired_refusals() {
             ("zone_renew", json!({"id":3,"ttl":30,"fence":10})),
         ],
     );
-    for (answer, needle) in refused.iter().zip(["stale fence", "not yours", "expired"]) {
+    for (answer, needle) in refused
+        .iter()
+        .zip(["stale fence", "status --lost", "expired"])
+    {
         assert_eq!(answer["isError"], true, "{answer}");
         assert!(
             answer["content"][0]["text"]
@@ -1220,8 +1337,15 @@ fn finish_work_cloud_all_is_explicit_and_cannot_be_combined_with_id() {
             assert_eq!(answer["isError"], false, "{answer}");
             assert_eq!(answer["structuredContent"]["released"], 2);
             assert_eq!(answer["structuredContent"]["released_ids"], json!([11, 12]));
-            assert_eq!(bulk.len(), 1);
-            assert_eq!(bulk[0].path, "/api/v1/zones/claims?session=alice");
+            assert!(bulk.is_empty());
+            for id in [11, 12] {
+                assert_eq!(
+                    server
+                        .seen("DELETE", &format!("/api/v1/zones/claims/{id}"))
+                        .len(),
+                    1
+                );
+            }
             assert!(server.state.lock().unwrap().claims.is_empty());
         }
     }
@@ -4107,3 +4231,7 @@ fn open_mail_escapes_controls_in_status() {
     let subject = mail["subject"].as_str().unwrap();
     assert!(subject.contains("\\u{202e}"), "{mail}");
 }
+
+include!("survey_client/mod.rs");
+include!("survey_client/r2.rs");
+include!("survey_client/r4.rs");

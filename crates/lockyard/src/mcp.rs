@@ -400,10 +400,13 @@ fn call_tool(
                 || result.get("ok") == Some(&Value::Bool(false))
                 || result.pointer("/reply/ok") == Some(&Value::Bool(false));
             let mut response = tool_result(result.to_string(), failed);
-            response["structuredContent"] = if name == "area_list" {
-                wrap_area_list_structured(result)
-            } else {
-                result
+            response["structuredContent"] = match name {
+                "area_list" => wrap_area_list_structured(result),
+                "task_list" => wrap_task_list_structured(result),
+                "tasks" if args.get("action").and_then(Value::as_str) == Some("list") => {
+                    wrap_task_list_structured(result)
+                }
+                _ => result,
             };
             response
         }
@@ -436,14 +439,51 @@ pub(crate) fn wrap_area_list_structured(result: Value) -> Value {
     }
 }
 
+/// MCP structuredContent must be an object; wrap a bare task array (LY-0013).
+pub(crate) fn wrap_task_list_structured(result: Value) -> Value {
+    match result {
+        Value::Array(tasks) => json!({"tasks": tasks}),
+        Value::Object(map) if map.contains_key("tasks") => Value::Object(map),
+        other => json!({"tasks": other}),
+    }
+}
+
 fn validate_surface_args(surface: Surface, name: &str, args: Args<'_>) -> Result<()> {
     if surface == Surface::Compact && name == "zone_renew" {
-        args.some_int("fence")?;
+        // Fence may be omitted for the caller's own claim (filled from status in dispatch).
+        let _ = args.some_int("fence")?;
         if !(1..=240).contains(&args.ttl()?) {
             return Err(Error::Invalid("ttl must be 1 to 240 minutes".into()));
         }
     }
     Ok(())
+}
+
+const P0_CATEGORIES: &[&str] = &[
+    "player_money",
+    "security_breach",
+    "prod_outage",
+    "cert_slip",
+];
+
+fn validate_p0_category(priority: Option<&str>, category: Option<&str>) -> Result<()> {
+    let list = P0_CATEGORIES.join(", ");
+    match (priority, category) {
+        (Some("P0"), None) => Err(Error::Invalid(format!(
+            "P0 requires p0_category; allowed values: {list}"
+        ))),
+        (_, Some(value)) if !P0_CATEGORIES.contains(&value) => Err(Error::Invalid(format!(
+            "invalid p0_category {value:?}; allowed values: {list}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn is_reconciliation(error: &Error) -> bool {
+    let text = error.to_string();
+    text.contains("mutation outcome requires reconciliation")
+        || text.contains("outcome_unknown")
+        || error.kind() == "outcome_unknown"
 }
 
 fn validate_task_add_area(
@@ -506,8 +546,15 @@ fn tool_error_message(name: &str, args: &Value, error: &Error) -> String {
             "finish_work" | "zone_release" | "zone_renew" | "zone_handover" => args
                 .get("id")
                 .and_then(Value::as_i64)
-                .map(|id| format!("claim Z-{id} is not yours or does not exist"))
-                .unwrap_or(raw),
+                .map(|id| {
+                    format!(
+                        "claim Z-{id} is gone: expired, released, or taken; check status --lost (or status.lost) for reason and time"
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "claim is gone: expired, released, or taken; check status --lost (or status.lost) for reason and time"
+                        .into()
+                }),
             "task_show" | "tasks" if args.get("id").and_then(Value::as_str).is_some() => {
                 format!("task {:?} was not found", args["id"].as_str().unwrap())
             }

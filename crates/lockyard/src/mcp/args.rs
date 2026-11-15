@@ -138,6 +138,22 @@ impl<'a> Args<'a> {
             .collect()
     }
 
+    pub(super) fn ints(self, key: &str) -> Result<Vec<i64>> {
+        let Some(value) = self.get(key) else {
+            return Ok(Vec::new());
+        };
+        let items = value
+            .as_array()
+            .ok_or_else(|| wrong_type(key, "an array of integers"))?;
+        items
+            .iter()
+            .map(|item| {
+                item.as_i64()
+                    .ok_or_else(|| wrong_type(key, "an array of integers"))
+            })
+            .collect()
+    }
+
     pub(super) fn task_keys(self, key: &str) -> Result<Vec<String>> {
         let values = self
             .get(key)
@@ -172,12 +188,22 @@ impl<'a> Args<'a> {
         })
     }
 
-    pub(super) fn mode(self) -> Result<ClaimMode> {
-        Ok(if self.flag("shared")? {
-            ClaimMode::Shared
-        } else {
-            ClaimMode::Exclusive
-        })
+    pub(super) fn mode(self) -> Result<Option<ClaimMode>> {
+        self.0
+            .get("shared")
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| wrong_type("shared", "a boolean"))
+                    .map(|shared| {
+                        if shared {
+                            ClaimMode::Shared
+                        } else {
+                            ClaimMode::Exclusive
+                        }
+                    })
+            })
+            .transpose()
     }
 
     pub(super) fn purpose(self) -> Result<Purpose> {
@@ -231,40 +257,80 @@ pub(super) fn safe_receipts(
 }
 
 /// Paths of a tool call, plus those of the zones it names.
+/// Paths are resolved from the workspace root (not the process cwd) — LY-0015.
 pub(super) fn claim_paths(
     opened: &Opened,
     args: Args<'_>,
     cwd: &Path,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let zones = args.strings("zones")?;
-    let mut paths = opened.zone_paths(cwd, &args.strings("paths")?)?;
+    let mut paths = opened.workspace_zone_paths(cwd, &args.strings("paths")?)?;
+    let mut kept_zones = Vec::new();
     if !zones.is_empty() {
-        let expanded = opened
-            .backend
-            .catalog_expand(&zones)
-            .map_err(|error| match error {
-                Error::NeedsCloud(_) => Error::Invalid(format!(
-                    "unknown zone {}; catalog: unavailable in local mode",
+        match opened.backend.catalog_expand(&zones) {
+            Ok(expanded) => {
+                kept_zones = zones;
+                for path in expanded {
+                    if !paths.contains(&path) {
+                        paths.push(path);
+                    }
+                }
+            }
+            Err(Error::NeedsCloud(_)) => {
+                return Err(Error::Invalid(format!(
+                    "unknown zone {}; catalog: unavailable in local mode — pass the same keys in paths instead of zones",
                     zones.join(", ")
-                )),
-                other => other,
-            })?;
-        for path in expanded {
-            if !paths.contains(&path) {
-                paths.push(path);
+                )));
+            }
+            Err(error) => {
+                let text = error.to_string();
+                if text.contains("zone_unknown") || error.kind() == "zone_unknown" {
+                    let message = format!(
+                        "{error}; zones are catalog names; use paths:[\"sun-host/sims\"] for workspace-root paths"
+                    );
+                    return Err(match error {
+                        Error::Cloud {
+                            code,
+                            status,
+                            details,
+                            ..
+                        } => Error::Cloud {
+                            code,
+                            status,
+                            details,
+                            message,
+                        },
+                        _ => Error::Invalid(message),
+                    });
+                } else {
+                    return Err(error);
+                }
             }
         }
     }
     validate_claim_path_count(paths.len())?;
-    Ok((paths, zones))
+    Ok((paths, kept_zones))
 }
 
 pub(super) fn claim_request(opened: &Opened, args: Args<'_>, cwd: &Path) -> Result<ClaimRequest> {
+    let ttl = args.ttl()?;
+    if !(1..=240).contains(&ttl) {
+        return Err(Error::Invalid("ttl must be 1 to 240 minutes".into()));
+    }
     let (paths, zones) = claim_paths(opened, args, cwd)?;
+    // Session label lives in claim meta when the backend stores it (cloud). Local SQLite
+    // refuses meta — neighbours still see the agent id from the claim session field.
+    let meta = if opened.backend.is_cloud() {
+        Some(crate::session_label::merge_session_meta(
+            args.get("meta").cloned(),
+        )?)
+    } else {
+        args.get("meta").cloned()
+    };
     Ok(ClaimRequest {
         paths,
         note: args.optional_text("note")?.to_string(),
-        ttl_minutes: args.ttl()?,
+        ttl_minutes: ttl,
         mode: args.mode()?,
         purpose: args.purpose()?,
         lazy: args.flag("lazy")?,
@@ -275,7 +341,7 @@ pub(super) fn claim_request(opened: &Opened, args: Args<'_>, cwd: &Path) -> Resu
         },
         zones: if zones.len() > 1 { zones } else { Vec::new() },
         queue_wait_seconds: None,
-        meta: args.get("meta").cloned(),
+        meta,
     })
 }
 

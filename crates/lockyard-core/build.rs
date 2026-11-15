@@ -27,7 +27,11 @@ fn main() {
     println!("cargo:rerun-if-changed=..");
     println!("cargo:rerun-if-changed=../../Cargo.toml");
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap_or_else(|| ".".into()));
-    for name in ["HEAD", "refs", "packed-refs"] {
+    // Fetching remote refs does not change the checked-out build identity. Watching
+    // all of refs also watches transient fetch lockfiles and rebuilds every dependent
+    // crate between otherwise identical test runs. Local branch updates (including
+    // worktrees), HEAD switches and packed local refs must still invalidate the build.
+    for name in ["HEAD", "refs/heads", "packed-refs"] {
         if let Some(path) = git(&root, &["rev-parse", "--git-path", name]) {
             let path = PathBuf::from(path);
             let path = if path.is_absolute() {

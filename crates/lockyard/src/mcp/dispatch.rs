@@ -2,7 +2,7 @@
 
 use super::*;
 
-fn recent_lost(mut lost: Vec<lockyard_core::proto::LostClaim>, now: i64) -> Vec<Value> {
+pub(super) fn recent_lost(mut lost: Vec<lockyard_core::proto::LostClaim>, now: i64) -> Vec<Value> {
     let timestamp = |claim: &lockyard_core::proto::LostClaim| match &claim.lost_at {
         Some(Stamp::Millis(value)) => Some(*value),
         Some(Stamp::Text(value)) => lockyard_core::proto::parse_rfc3339(value),
@@ -59,6 +59,18 @@ fn status(
         };
         let mut tasks = backend.assigned_tasks(agent.unwrap_or("lockyard-cli"))?;
         tasks.truncate(20);
+        // Keep registry stages/assignment metadata while omitting task bodies.
+        let tasks: Vec<Value> = tasks
+            .into_iter()
+            .map(|task| {
+                let mut task = json!(task);
+                if let Some(object) = task.as_object_mut() {
+                    object.remove("body");
+                    object.remove("acceptance");
+                }
+                task
+            })
+            .collect();
         let mut answer = json!({"unread": unread, "claims": claims, "work": work, "offers": offers, "tasks": tasks, "lost": lost});
         if let Some(snap) = &open_snap {
             answer["open_mail"] = json!(snap.items);
@@ -349,7 +361,7 @@ pub(super) fn run_tool(
         }
         "zone_request" => {
             let request = AccessRequest {
-                paths: opened.zone_paths(cwd, &args.strings("paths")?)?,
+                paths: opened.workspace_zone_paths(cwd, &args.strings("paths")?)?,
                 text: args.text("text")?.to_string(),
                 urgent: args.flag("urgent")?,
                 need_by: args.some_text("need_by")?,
@@ -370,7 +382,7 @@ pub(super) fn run_tool(
         }
         "zone_accept" => encode(&opened.backend.handover_accept(me()?, args.id()?)?),
         "zone_narrow" => {
-            let paths = opened.zone_paths(cwd, &args.strings("paths")?)?;
+            let paths = opened.workspace_zone_paths(cwd, &args.strings("paths")?)?;
             encode(
                 &opened
                     .backend
@@ -378,12 +390,31 @@ pub(super) fn run_tool(
             )
         }
         "zone_add_path" => {
-            let path = opened.zone_path(cwd, args.text("path")?)?;
-            encode(
-                &opened
-                    .backend
-                    .add_path(me()?, args.id()?, &path, args.some_int("fence")?)?,
-            )
+            let fence = args.some_int("fence")?;
+            let id = args.id()?;
+            let agent = me()?;
+            let mut paths = args.strings("paths")?;
+            if paths.is_empty()
+                && let Some(one) = args.some_text("path")?
+            {
+                paths.push(one);
+            }
+            if paths.is_empty() {
+                return Err(Error::Invalid(
+                    "zone_add_path needs path or paths (workspace-root relative)".into(),
+                ));
+            }
+            let paths = opened.workspace_zone_paths(cwd, &paths)?;
+            let mut claim = None;
+            let mut fence = fence;
+            for path in &paths {
+                let expanded = opened.backend.add_path(agent, id, path, fence)?;
+                if fence.is_some() {
+                    fence = Some(expanded.fence);
+                }
+                claim = Some(expanded);
+            }
+            encode(&claim.expect("checked non-empty"))
         }
         "zone_takeover" => encode(&opened.backend.takeover(
             me()?,
@@ -396,7 +427,7 @@ pub(super) fn run_tool(
                 .some_task_id("task")?
                 .map(|id| lockyard_core::task_id::TaskId::parse(&id))
                 .transpose()?;
-            let paths = opened.zone_paths(cwd, &args.strings("paths")?)?;
+            let paths = opened.workspace_zone_paths(cwd, &args.strings("paths")?)?;
             let report: Vec<DirtyPath> = paths
                 .into_iter()
                 .map(|path| DirtyPath {
@@ -412,17 +443,17 @@ pub(super) fn run_tool(
         "zone_dirty_list" => {
             let path = args
                 .some_text("path")?
-                .map(|raw| opened.zone_path(cwd, &raw))
+                .map(|raw| opened.workspace_zone_path(cwd, &raw))
                 .transpose()?;
             encode(&opened.backend.dirty_list(me()?, path.as_deref())?)
         }
         "zone_dirty_disown" => {
-            let paths = opened.zone_paths(cwd, &args.strings("paths")?)?;
+            let paths = opened.workspace_zone_paths(cwd, &args.strings("paths")?)?;
             opened.backend.dirty_disown(me()?, &paths)?;
             Ok(json!({"disowned": paths}))
         }
         "zone_dirty_adopt" => {
-            let paths = opened.zone_paths(cwd, &args.strings("paths")?)?;
+            let paths = opened.workspace_zone_paths(cwd, &args.strings("paths")?)?;
             opened
                 .backend
                 .dirty_adopt(me()?, &paths, args.text("reason")?)?;
@@ -432,7 +463,7 @@ pub(super) fn run_tool(
             let id = args.id()?;
             let request = ActivityRequest {
                 write: args.flag("write")?,
-                paths: opened.zone_paths(cwd, &args.strings("paths")?)?,
+                paths: opened.workspace_zone_paths(cwd, &args.strings("paths")?)?,
                 fence: args.some_int("fence")?,
             };
             opened.backend.activity(me()?, id, &request)?;
@@ -442,11 +473,14 @@ pub(super) fn run_tool(
         "zone_catalog" => opened.backend.catalog(),
         "zone_renew" => {
             let fence = args.some_int("fence")?;
-            if surface == Surface::Compact && is_cloud && fence.is_none() {
-                return Err(Error::Invalid("fence is required in cloud mode".into()));
+            let agent = me()?;
+            let id = args.optional_id()?;
+            let ttl = args.ttl()?;
+            if !(1..=240).contains(&ttl) {
+                return Err(Error::Invalid("ttl must be 1 to 240 minutes".into()));
             }
             let request = RenewRequest {
-                ttl_minutes: args.ttl()?,
+                ttl_minutes: ttl,
                 hold_reason: args.some_text("hold_reason")?,
                 hold_until: args.some_text("hold_until")?,
                 fence: if surface == Surface::Compact && !is_cloud {
@@ -455,10 +489,7 @@ pub(super) fn run_tool(
                     fence
                 },
             };
-            let agent = me()?;
-            let renewed = opened
-                .backend
-                .renew(agent, args.optional_id()?, &request, now)?;
+            let renewed = opened.backend.renew(agent, id, &request, now)?;
             let mut answer = json!({"renewed": renewed});
             if let Some(count) = crate::open_mail::open_mail_count_within(
                 opened.backend.as_ref(),
@@ -517,7 +548,7 @@ pub(super) fn run_tool(
         "zone_list" => {
             let path = args
                 .some_text("path")?
-                .map(|raw| opened.zone_path(cwd, &raw))
+                .map(|raw| opened.workspace_zone_path(cwd, &raw))
                 .transpose()?;
             let query = ClaimQuery {
                 session: args.some_text("session")?,
@@ -526,7 +557,7 @@ pub(super) fn run_tool(
             encode(&opened.backend.claims(&query, now)?)
         }
         "zone_check" => {
-            let path = opened.zone_path(cwd, args.text("path")?)?;
+            let path = opened.workspace_zone_path(cwd, args.text("path")?)?;
             let mut checks = opened
                 .backend
                 .check(me()?, std::slice::from_ref(&path), None, now)?;
@@ -567,10 +598,11 @@ pub(super) fn run_tool(
             if me()? == to {
                 return Err(Error::Invalid("cannot send a message to yourself".into()));
             }
+            let from_client = Some(crate::session_label::mail_label_for_client(client));
             let request = SendRequest {
                 to,
                 body: args.text("body")?.to_string(),
-                from_client: client.map(str::to_string),
+                from_client,
                 kind: args.some_text("kind")?,
                 needs: args.some_text("needs")?,
                 zone: args.some_text("zone")?,
@@ -583,9 +615,13 @@ pub(super) fn run_tool(
             encode(&message)
         }
         "msg_reply" => {
-            let mut message = opened
-                .backend
-                .reply(me()?, args.id()?, args.text("body")?, now)?;
+            let mut message = opened.backend.reply_with_client(
+                me()?,
+                args.id()?,
+                args.text("body")?,
+                &crate::session_label::mail_label(),
+                now,
+            )?;
             message.body = escape_bidi_controls(&message.body);
             encode(&message)
         }
@@ -634,12 +670,15 @@ pub(super) fn run_tool(
             validate_task_add_area(surface, args, auto_area, is_cloud)?;
             let paths = args.strings("paths")?;
             let warn_paths = is_cloud && !auto_area && !paths.is_empty();
+            let priority = args.some_text("priority")?;
+            let p0_category = args.some_text("p0_category")?;
+            validate_p0_category(priority.as_deref(), p0_category.as_deref())?;
             let spec = TaskSpec {
                 title: args.text("title")?.to_string(),
                 body: args.optional_text("body")?.to_string(),
                 acceptance: args.some_text("acceptance")?,
-                priority: args.some_text("priority")?,
-                p0_category: args.some_text("p0_category")?,
+                priority,
+                p0_category,
                 kind: args.some_text("type")?,
                 target: args.some_text("target")?,
                 verification: args.some_text("verification")?,
@@ -656,11 +695,40 @@ pub(super) fn run_tool(
                 due_at: args.some_text("due")?,
                 evidence: args.some_text("evidence")?,
             };
-            let mut answer = encode(&opened.backend.add_task(me()?, &spec, now)?)?;
-            if warn_paths {
-                answer["warning"] = json!(TASK_PATHS_WARNING);
+            let author = me()?.to_string();
+            match opened.backend.add_task(&author, &spec, now) {
+                Ok(task) => {
+                    let mut answer = encode(&task)?;
+                    answer["created"] = json!(true);
+                    if warn_paths {
+                        answer["warning"] = json!(TASK_PATHS_WARNING);
+                    }
+                    Ok(answer)
+                }
+                Err(error) if is_reconciliation(&error) => {
+                    let message = format!(
+                        "{error}; created=unknown: the idempotent retry with the original client_key could not confirm creation; do not resubmit with a fresh key (it could create a duplicate)"
+                    );
+                    match error {
+                        Error::Cloud {
+                            code,
+                            status,
+                            mut details,
+                            ..
+                        } => {
+                            details["created"] = Value::Null;
+                            Err(Error::Cloud {
+                                code,
+                                status,
+                                details,
+                                message,
+                            })
+                        }
+                        _ => Err(Error::Invalid(message)),
+                    }
+                }
+                Err(error) => Err(error),
             }
-            Ok(answer)
         }
         "task_plan" => {
             let plan = TaskPlan {

@@ -8,13 +8,21 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 fn lockyard(dir: &Path, agent: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_lockyard"))
-        .args(args)
-        .current_dir(dir)
-        .env("LOCKYARD_AGENT", agent)
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .output()
-        .unwrap()
+    Command::new(
+        std::env::var_os("LOCKYARD_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_lockyard").into()),
+    )
+    .args(args)
+    .current_dir(dir)
+    .env("LOCKYARD_AGENT", agent)
+    .env("XDG_STATE_HOME", dir.join(".test-state"))
+    .env("XDG_CONFIG_HOME", dir.join(".test-config"))
+    .env_remove("LOCKYARD_AGENT_ROOT")
+    .env_remove("LOCKYARD_TOKEN")
+    .env_remove("LOCKYARD_TOKEN_FILE")
+    .env_remove("CLAUDE_CODE_SESSION_ID")
+    .output()
+    .unwrap()
 }
 
 fn ok(dir: &Path, agent: &str, args: &[&str]) -> String {
@@ -117,19 +125,22 @@ fn zones_collide_across_folders_and_exit_with_the_conflict_code() {
         &["zone", "claim", "src", "--note", "refactor"],
     );
 
-    let refused = lockyard(&deep, "b", &["zone", "claim", "x.rs"]);
+    let refused = lockyard(&deep, "b", &["zone", "claim", "src/deep/x.rs"]);
     assert_eq!(refused.status.code(), Some(3));
     let message = String::from_utf8_lossy(&refused.stderr);
     assert!(message.contains("src/deep/x.rs is held by a"));
     assert!(message.contains("refactor"));
 
     assert_eq!(
-        lockyard(&deep, "b", &["zone", "check", "x.rs"])
+        lockyard(&deep, "b", &["zone", "check", "src/deep/x.rs"])
             .status
             .code(),
         Some(3)
     );
-    assert_eq!(ok(&deep, "a", &["zone", "check", "x.rs"]).trim(), "free");
+    assert_eq!(
+        ok(&deep, "a", &["zone", "check", "src/deep/x.rs"]).trim(),
+        "free"
+    );
 
     ok(dir.path(), "a", &["zone", "release"]);
     ok(&deep, "b", &["zone", "claim", "x.rs"]);
@@ -1427,4 +1438,48 @@ fn json_mailbox_outputs_escape_bidi_controls_and_remain_valid_json() {
     assert!(!receipts.contains('\u{202e}'), "{receipts}");
     let receipts: Value = serde_json::from_str(&receipts).unwrap();
     assert_eq!(receipts[0]["body"], "safe\\u{202e}hidden");
+}
+
+#[test]
+fn survey_0013_task_json_round_trips_control_characters_and_title_search() {
+    let dir = project();
+    let title = "look here\nline\r\ttab\u{001b}\u{0001}\u{202e}";
+    ok(
+        dir.path(),
+        "a",
+        &["task", "add", title, "--body", "body\nwith\tcontrols"],
+    );
+    let raw = ok(dir.path(), "a", &["task", "list", "--json"]);
+    let tasks: Value = serde_json::from_str(&raw).unwrap();
+    assert!(
+        tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["title"] == title)
+    );
+    assert_eq!(tasks[0]["body"], "body\nwith\tcontrols");
+    let text = ok(dir.path(), "a", &["task", "list"]);
+    assert!(
+        !text.contains('\u{001b}') && !text.contains('\u{202e}'),
+        "{text:?}"
+    );
+}
+
+#[test]
+fn survey_0015_claims_are_workspace_relative_and_ttl_uses_minutes() {
+    let dir = project();
+    let nested = dir.path().join("meta");
+    std::fs::create_dir(&nested).unwrap();
+    let claim: Value = serde_json::from_str(&ok(
+        &nested,
+        "a",
+        &["zone", "claim", "src", "--ttl", "10", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(claim["paths"], json!(["src"]));
+    let id = claim["id"].as_i64().unwrap().to_string();
+    let refused = lockyard(&nested, "a", &["zone", "renew", &id, "--ttl", "1800"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("minutes"));
 }

@@ -17,6 +17,28 @@ fn escapes_bidi_controls_in_mail() {
 }
 
 #[test]
+fn task_list_json_escapes_controls_in_titles() {
+    let task: super::Task = serde_json::from_value(serde_json::json!({
+        "id": "D-1",
+        "title": "line\nbreak\u{202e}",
+        "body": "body\t",
+        "status": "open",
+        "author": "a",
+        "assignee": null,
+        "lease_until": null,
+        "evidence": null,
+        "created_at": 1,
+        "updated_at": 1
+    }))
+    .unwrap();
+    let output = super::output(&vec![task], "").unwrap();
+    let encoded = serde_json::to_string(&output.json).unwrap();
+    assert!(encoded.contains("\\n"), "{encoded}");
+    assert!(serde_json::from_str::<serde_json::Value>(&encoded).is_ok());
+    let _ = serde_json::from_str::<serde_json::Value>(&encoded).unwrap();
+}
+
+#[test]
 fn json_mail_body_helpers_escape_messages_and_receipts() {
     let message: super::Message = serde_json::from_value(serde_json::json!({
         "id": 1,

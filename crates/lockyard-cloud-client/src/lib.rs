@@ -439,10 +439,23 @@ pub struct StatusRegistryPage {
 pub(crate) const REGISTRY_ASSIGNEE_SESSION: &str = "registry_assignee_session_v1";
 pub(crate) const REGISTRY_AUTO_AREA: &str = "registry_auto_area_v1";
 pub(crate) const MAIL_OPEN_V1: &str = "mail_open_v1";
+pub(crate) const SOFT_ZONES_V1: &str = "soft_zones_v1";
 
 /// How requests reach the server.
 pub trait Transport: Send + Sync {
     fn call(&self, call: &Call) -> Result<Value, ClientError>;
+
+    /// Confirm that an omitted claim/queue mode is accepted and defaulted by the server.
+    /// Socket transports must require a new agent capability, not just forward discovery
+    /// through an older process that cannot preserve server-default semantics.
+    fn soft_zones_v1(&self, _session: &str) -> Result<bool, ClientError> {
+        Ok(false)
+    }
+
+    /// Already-negotiated support only. Agent Ping must never start discovery or block on it.
+    fn cached_soft_zones_v1(&self) -> bool {
+        false
+    }
 
     /// Negotiate whether task creation accepts paths and derives their area on the server.
     /// Custom transports retain the legacy contract unless they explicitly confirm support.
@@ -547,6 +560,12 @@ pub trait Transport: Send + Sync {
 }
 
 impl<T: Transport + ?Sized> Transport for Arc<T> {
+    fn soft_zones_v1(&self, session: &str) -> Result<bool, ClientError> {
+        (**self).soft_zones_v1(session)
+    }
+    fn cached_soft_zones_v1(&self) -> bool {
+        (**self).cached_soft_zones_v1()
+    }
     fn registry_auto_area(&self, session: &str) -> Result<bool, ClientError> {
         (**self).registry_auto_area(session)
     }
@@ -1397,6 +1416,23 @@ fn task_create_missing_legacy_area(call: &Call, error: &ApiError) -> bool {
 }
 
 impl Transport for Client {
+    fn soft_zones_v1(&self, session: &str) -> Result<bool, ClientError> {
+        Ok(self
+            .negotiated_protocol(session)?
+            .capabilities
+            .contains(SOFT_ZONES_V1))
+    }
+    fn cached_soft_zones_v1(&self) -> bool {
+        let state = match self.protocol_state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        state.cached.as_ref().is_some_and(|cached| {
+            cached.obtained.elapsed() < protocol::CACHE_TTL
+                && cached.value.capabilities.contains(SOFT_ZONES_V1)
+        })
+    }
     fn registry_auto_area(&self, session: &str) -> Result<bool, ClientError> {
         self.negotiated_protocol(session)?;
         Ok(self.registry_auto_area_observed.load(Ordering::Relaxed))

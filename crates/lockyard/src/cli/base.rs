@@ -28,7 +28,11 @@ pub(super) enum Command {
     /// List the agents seen in this project.
     Who,
     /// Show this agent's mail count, all active claims and unfinished tasks.
-    Status,
+    Status {
+        /// Show claims lost to expiry, idle release, or takeover, with server reasons and times.
+        #[arg(long)]
+        lost: bool,
+    },
     /// Show local machine pressure. Works outside a project.
     Machine,
     /// Run a command through the local heavy-work gate.
@@ -217,15 +221,26 @@ pub(super) struct RunArgs {
 #[derive(Args)]
 pub(super) struct Ttl {
     /// Lease in minutes.
-    #[arg(long, default_value_t = DEFAULT_TTL_MINUTES)]
+    #[arg(long, default_value_t = DEFAULT_TTL_MINUTES, value_name = "MINUTES", value_parser = parse_lease_minutes)]
     pub(super) ttl: i64,
+}
+
+fn parse_lease_minutes(value: &str) -> std::result::Result<i64, String> {
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|ttl| (1..=240).contains(ttl))
+        .ok_or_else(|| "ttl must be 1 to 240 minutes".into())
 }
 
 #[derive(Args)]
 pub(super) struct ClaimStyle {
-    /// Share the paths with other shared claims.
-    #[arg(long)]
+    /// Shared claims can overlap; only dirty files are held exclusively. Omit both flags for the server default.
+    #[arg(long, conflicts_with = "exclusive")]
     pub(super) shared: bool,
+    /// Reserve paths exclusively for migrations, contracts or hosts: --exclusive.
+    #[arg(long, conflicts_with = "shared")]
+    pub(super) exclusive: bool,
     /// Claim for a deploy rather than for work.
     #[arg(long)]
     pub(super) deploy: bool,
@@ -235,11 +250,13 @@ pub(super) struct ClaimStyle {
 }
 
 impl ClaimStyle {
-    pub(super) fn mode(&self) -> ClaimMode {
+    pub(super) fn mode(&self) -> Option<ClaimMode> {
         if self.shared {
-            ClaimMode::Shared
+            Some(ClaimMode::Shared)
+        } else if self.exclusive {
+            Some(ClaimMode::Exclusive)
         } else {
-            ClaimMode::Exclusive
+            None
         }
     }
 

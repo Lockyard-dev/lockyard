@@ -395,6 +395,13 @@ fn connect_bounded(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
 }
 
 impl Transport for AgentSocket {
+    fn soft_zones_v1(&self, _session: &str) -> Result<bool, ClientError> {
+        // A protocol GET forwarded by an old daemon is not proof that the daemon
+        // implements default-mode negotiation. Only the new Ping flag is proof.
+        self.ping()
+            .map(|status| status.soft_zones_v1)
+            .map_err(|error| ClientError::Transport(format!("agent capability ping: {error}")))
+    }
     fn registry_auto_area(&self, session: &str) -> Result<bool, ClientError> {
         match self.call(&Call::get(session, "/api/v1/protocol".into())) {
             Ok(value) => Ok(value["capabilities"].as_array().is_some_and(|values| {
@@ -500,6 +507,95 @@ mod tests {
     use serde_json::json;
     use std::io::{BufRead, BufReader};
     use std::os::{fd::AsRawFd, unix::net::UnixListener};
+
+    #[test]
+    fn survey_r5_claim_and_queue_defaults_cross_old_and_new_agent_frames() {
+        use lockyard_cloud_client::CloudBackend;
+        use lockyard_core::{
+            Backend,
+            proto::{ClaimMode, ClaimRequest, QueueRequest},
+        };
+
+        for soft in [false, true] {
+            for mode in [None, Some(ClaimMode::Shared), Some(ClaimMode::Exclusive)] {
+                let dir = tempfile::tempdir().unwrap();
+                crate::agent::private_dir(dir.path()).unwrap();
+                let path = dir.path().join("agent.sock");
+                let listener = UnixListener::bind(&path).unwrap();
+                let peer = std::thread::spawn(move || {
+                    let mut writes = Vec::new();
+                    while writes.len() < 2 {
+                        let mut stream = fixture_accept(&listener);
+                        let mut line = String::new();
+                        BufReader::new(stream.try_clone().unwrap())
+                            .read_line(&mut line)
+                            .unwrap();
+                        let envelope: Envelope = serde_json::from_str(&line).unwrap();
+                        let answer = match envelope.request {
+                            Request::Ping => {
+                                let mut status =
+                                    serde_json::to_value(AgentStatus::default()).unwrap();
+                                // A 0.3.12 process omits this flag, even if its server is newer.
+                                status.as_object_mut().unwrap().remove("soft_zones_v1");
+                                if soft {
+                                    status["soft_zones_v1"] = json!(true);
+                                }
+                                json!({"status":status})
+                            }
+                            Request::Call { call } => {
+                                let route = call.path.as_str();
+                                assert!(matches!(
+                                    route,
+                                    "/api/v1/zones/claims" | "/api/v1/zones/queue"
+                                ));
+                                writes.push(call.body.unwrap());
+                                json!({"value":{"id":7,"session":"me","paths":["src"]}})
+                            }
+                            other => panic!("unexpected agent request: {other:?}"),
+                        };
+                        serde_json::to_writer(&mut stream, &answer).unwrap();
+                        stream.write_all(b"\n").unwrap();
+                    }
+                    writes
+                });
+                let socket = AgentSocket {
+                    path,
+                    workspace: "team".into(),
+                    timeout: Duration::from_secs(2),
+                };
+                let mut backend = CloudBackend::new(socket, "me");
+                backend
+                    .claim(
+                        "me",
+                        &ClaimRequest {
+                            paths: vec!["src".into()],
+                            mode,
+                            queue_wait_seconds: Some(1),
+                            ..Default::default()
+                        },
+                        0,
+                    )
+                    .unwrap();
+                backend
+                    .queue_add(
+                        "me",
+                        &QueueRequest {
+                            paths: vec!["src".into()],
+                            mode,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                let writes = peer.join().unwrap();
+                for body in writes {
+                    let expected = mode
+                        .or((!soft).then_some(ClaimMode::Exclusive))
+                        .map(|mode| serde_json::to_value(mode).unwrap());
+                    assert_eq!(body.get("mode"), expected.as_ref(), "soft={soft}: {body}");
+                }
+            }
+        }
+    }
 
     fn fixture_accept(listener: &UnixListener) -> UnixStream {
         listener.set_nonblocking(true).unwrap();

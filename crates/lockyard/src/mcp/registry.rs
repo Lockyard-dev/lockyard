@@ -5,9 +5,28 @@ use super::*;
 pub(super) fn tool_def(
     name: &str,
     description: &str,
-    properties: Value,
+    mut properties: Value,
     required: &[&str],
 ) -> Value {
+    let mut description = description.to_string();
+    if let Some(shared) = properties.get_mut("shared") {
+        shared["description"] = json!(
+            "Omit for the server default (soft_zones_v1: shared file/folder claims, exclusive hosts; older servers: exclusive). true allows overlapping shared claims; dirty files remain exclusive. false reserves paths exclusively for migrations, contracts or hosts. Use shared:false in MCP or --exclusive in CLI."
+        );
+    }
+    if properties.get("paths").is_some() || properties.get("path").is_some() {
+        let hint = "Paths are relative to the workspace root; absolute paths are accepted.";
+        if compact_visibility(name).is_none() && name != "zone_check" {
+            description.push(' ');
+            description.push_str(hint);
+        }
+        for name in ["paths", "path"] {
+            if let Some(schema) = properties.get_mut(name) {
+                let previous = schema["description"].as_str().unwrap_or("");
+                schema["description"] = json!(format!("{previous} {hint}").trim());
+            }
+        }
+    }
     json!({
         "name": name,
         "description": description,
@@ -59,16 +78,16 @@ impl ToolRegistry {
         for wire in [
             tool_def(
                 "start_work",
-                "Claim paths before editing; ttl is in minutes. Accept an offered zone with handover_id, or take a task. Without hold_reason, the server releases the claim after 20 minutes without reported activity.",
-                json!({"paths": names, "note": text, "ttl": ttl_minutes, "shared": flag, "zones": names, "task": task_identifier, "handover_id": int,
+                "Claim workspace-root paths (absolute accepted); optional shared sets mode. ttl: minutes. Without hold_reason, idle file claims release after 20 minutes. Accept handover_id or a task.",
+                json!({"paths": names, "note": text, "ttl": ttl_minutes, "shared": flag, "zones": names, "task": task_identifier, "handover_id": int, "meta": {"type":"object"},
                     "hold_reason": {"type":"string","description":"Why the claim must be held while idle; without hold_until, hold until the claim expires."},
                     "hold_until": {"type":"string","format":"date-time","description":"RFC 3339 hold deadline; requires hold_reason."}}),
                 &[],
             ),
             tool_def(
                 "update",
-                "Read mail; with to and body, send a note first. Sending always peeks and never marks mail read.",
-                json!({"to": text, "body": text, "peek": flag, "all": flag}),
+                "New mail (all:true for all). Send: to+body; reply: reply_to+body. handled:[ids] closes mail. Sends peek.",
+                json!({"to": text, "body": text, "reply_to": {"type":"integer","description":"Reply in this thread; exclusive with to. Server 579d557 does not persist the reply sender label."}, "handled": {"type":"array","items":{"type":"integer","minimum":1},"description":"Close messages for this reader; requires server capability mail_handled_v1, checked before sending; independent of read receipts"}, "peek": flag, "all": flag}),
                 &[],
             ),
             tool_def(
@@ -79,7 +98,7 @@ impl ToolRegistry {
             ),
             tool_def(
                 "finish_work",
-                "Submit evidence and release a claim. Without id, release your sole claim; with multiple claims, choose id or all: true. Do not combine id and all: true.",
+                "Release your sole claim, id, or all:true (exclusive). Returns released_ids/already_gone/failed; continues after failures. Submit task with evidence.",
                 json!({"task": task_identifier, "evidence": text, "id": text, "note": text, "all": flag}),
                 &[],
             ),
@@ -157,7 +176,7 @@ impl ToolRegistry {
             .map(|definition| {
                 let mut wire = definition.wire.clone();
                 if surface == Surface::Compact && wire["name"].as_str().unwrap() == "zone_renew" {
-                    wire["description"] = json!("Renew your live claim; ttl is optional minutes (1-240, default 30); fence is required in cloud mode.");
+                    wire["description"] = json!("Renew your claim; ttl: minutes (1-240, default 30); fence is filled from status when owned.");
                     wire["inputSchema"]["properties"]["ttl"] = json!({
                         "type": "integer", "minimum": 1, "maximum": 240, "default": 30,
                         "description": "Optional lease length in minutes, from 1 through 240; defaults to 30."
@@ -421,13 +440,13 @@ fn primitive_definitions() -> Vec<Value> {
         ),
         tool_def(
             "zone_claim",
-            "Claim project paths, all of them or none; ttl is in minutes",
+            "Claim paths atomically; server chooses mode unless shared is set. shared:false reserves migrations, contracts or hosts exclusively; shared:true allows overlap. ttl: minutes.",
             json!({"paths": names, "note": text, "ttl": int, "lazy": flag, "shared": flag, "deploy": flag, "zones": names, "meta": object}),
             &[],
         ),
         tool_def(
             "zone_wait",
-            "Claim paths, keeping a place in line for up to 120 seconds",
+            "Claim paths with server-selected mode unless shared is set. seconds: wait time (up to 120); ttl: lease minutes (1-240).",
             json!({"paths": names, "note": text, "ttl": int, "seconds": int, "shared": flag, "deploy": flag, "zones": names}),
             &[],
         ),
@@ -465,9 +484,9 @@ fn primitive_definitions() -> Vec<Value> {
         ),
         tool_def(
             "zone_add_path",
-            "Add one path to a claim",
-            json!({"id": int, "path": text, "fence": int}),
-            &["id", "path"],
+            "Add one or more paths to a claim (workspace-root relative).",
+            json!({"id": int, "path": text, "paths": names, "fence": int}),
+            &["id"],
         ),
         tool_def(
             "zone_takeover",
@@ -509,7 +528,7 @@ fn primitive_definitions() -> Vec<Value> {
         tool_def("zone_catalog", "Show the zone catalog", json!({}), &[]),
         tool_def(
             "zone_renew",
-            "Renew one claim of this agent, or all of them without an id",
+            "Renew own claims; ttl is minutes (1-240, default 30); omitted fence is read from your current claims.",
             json!({"id": int, "ttl": int, "hold_reason": text, "hold_until": text, "fence": int}),
             &[],
         ),
@@ -527,7 +546,7 @@ fn primitive_definitions() -> Vec<Value> {
         ),
         tool_def(
             "zone_check",
-            "Is this path free to edit? Reports when you or another agent holds it.",
+            "Check paths from the workspace root (absolute accepted); reports your or another agent's claim.",
             json!({"path": text}),
             &["path"],
         ),
@@ -572,9 +591,11 @@ fn primitive_definitions() -> Vec<Value> {
         ),
         tool_def(
             "task_add",
-            "Add a task: workspace-relative files/directories in paths; supporting servers derive area, otherwise use area.",
+            "Add task by workspace-root paths (absolute accepted); supporting servers derive area, otherwise use area. P0: player_money, security_breach, prod_outage, cert_slip.",
             json!({
-                "title": text, "body": text, "acceptance": text, "priority": text, "p0_category": text,
+                "title": text, "body": text, "acceptance": text, "priority": text,
+                "p0_category": {"type":"string","enum":["player_money","security_breach","prod_outage","cert_slip"],
+                    "description":"Required with priority P0: player_money, security_breach, prod_outage, or cert_slip."},
                 "type": text, "target": text, "verification": text, "area": text, "prefix": text,
                 "pad": int, "due": text, "evidence": text,
                 "paths": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64,

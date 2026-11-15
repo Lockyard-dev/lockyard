@@ -1,6 +1,40 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
     #[test]
+    fn survey_r4_mode_schema_explains_omission_and_explicit_exclusive() {
+        for tool in tools(Surface::Full) {
+            if let Some(shared) = tool["inputSchema"]["properties"].get("shared") {
+                assert_eq!(shared["type"], "boolean");
+                assert!(shared.get("default").is_none());
+                let description = shared["description"].as_str().unwrap();
+                for word in ["soft_zones_v1", "shared:false", "--exclusive", "migrations", "contracts", "hosts", "dirty files"] {
+                    assert!(description.contains(word), "{description}");
+                }
+            }
+        }
+        assert_eq!(Args(&json!({})).mode().unwrap(), None);
+        assert_eq!(Args(&json!({"shared":true})).mode().unwrap(), Some(ClaimMode::Shared));
+        assert_eq!(Args(&json!({"shared":false})).mode().unwrap(), Some(ClaimMode::Exclusive));
+        for invalid in [Value::Null, json!(0), json!("false")] {
+            assert!(Args(&json!({"shared":invalid})).mode().is_err());
+        }
+    }
+
+    #[test]
+    fn survey_r2_path_schemas_and_changelog_describe_workspace_root_and_reply_limits() {
+        for tool in tools(Surface::Full) {
+            if let Some(paths) = tool["inputSchema"]["properties"].get("paths") {
+                let description = paths["description"].as_str().unwrap_or("");
+                assert!(description.contains("workspace root") && description.contains("absolute"), "{}: {description}", tool["name"]);
+            }
+        }
+        let changelog = include_str!("../../../../../CHANGELOG.md");
+        let release = changelog.split("## [0.3.12]").next().unwrap();
+        assert!(release.contains("absolute paths"));
+        assert!(release.contains("579d557") && release.contains("reply") && release.contains("does not persist"));
+    }
+
+    #[test]
     fn compact_definitions_are_projection_of_full_registry() {
         let full = tools(Surface::Full);
         for mut compact in tools(Surface::Compact) {
@@ -25,7 +59,7 @@
                     assert_eq!(ttl["minimum"], 1);
                     assert_eq!(ttl["maximum"], 240);
                     assert_eq!(ttl["default"], 30);
-                    assert!(compact["description"].as_str().unwrap().contains("fence is required in cloud mode"));
+                    assert!(compact["description"].as_str().unwrap().contains("fence is filled from status"));
                     compact["inputSchema"]["required"] = canonical["inputSchema"]["required"].clone();
                     compact["inputSchema"]["properties"]["ttl"] = canonical["inputSchema"]["properties"]["ttl"].clone();
                     compact["description"] = canonical["description"].clone();

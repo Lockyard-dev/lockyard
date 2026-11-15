@@ -3,18 +3,45 @@
 use super::*;
 
 /// Paths named on the command line plus those of named zones. The server knows paths only.
+/// Relative paths are anchored at the workspace root, not the process cwd (LY-0015).
 pub(super) fn with_zones(
     opened: &Opened,
     cwd: &Path,
     raw: &[String],
     zones: &[String],
 ) -> Result<Vec<String>> {
-    let mut paths = opened.zone_paths(cwd, raw)?;
+    let mut paths = opened.workspace_zone_paths(cwd, raw)?;
     if !zones.is_empty() {
-        for path in opened.backend.catalog_expand(zones)? {
-            if !paths.contains(&path) {
-                paths.push(path);
+        match opened.backend.catalog_expand(zones) {
+            Ok(expanded) => {
+                for path in expanded {
+                    if !paths.contains(&path) {
+                        paths.push(path);
+                    }
+                }
             }
+            Err(error)
+                if error.to_string().contains("zone_unknown") || error.kind() == "zone_unknown" =>
+            {
+                let message = format!(
+                    "{error}; zones are catalog names; pass workspace-root paths as positional paths instead of --zone"
+                );
+                return Err(match error {
+                    Error::Cloud {
+                        code,
+                        status,
+                        details,
+                        ..
+                    } => Error::Cloud {
+                        code,
+                        status,
+                        details,
+                        message,
+                    },
+                    _ => Error::Invalid(message),
+                });
+            }
+            Err(error) => return Err(error),
         }
     }
     validate_claim_path_count(paths.len())?;
@@ -48,6 +75,16 @@ pub(super) fn claim_request(
         },
         ..ClaimRequest::default()
     }
+}
+
+/// Attach the session label when the backend stores claim meta (cloud only).
+pub(super) fn with_session_meta(mut request: ClaimRequest, cloud: bool) -> Result<ClaimRequest> {
+    if cloud {
+        request.meta = Some(crate::session_label::merge_session_meta(
+            request.meta.take(),
+        )?);
+    }
+    Ok(request)
 }
 
 /// Resolve an omitted id before releasing, so another process's claims need explicit consent.
@@ -162,9 +199,11 @@ pub(super) fn run_zone(
                     ));
                 }
             };
+            let cloud = opened.backend.is_cloud();
             let mut request = claim_request(paths, note, ttl.ttl, &style);
             request.lazy = lazy;
             request.meta = meta;
+            let request = with_session_meta(request, cloud)?;
             let (claim, _) = lockyard_core::claim_or_reuse_with_hold(
                 opened.backend.as_mut(),
                 &agent,
@@ -185,7 +224,10 @@ pub(super) fn run_zone(
         } => {
             let agent = resolve_agent(agent)?;
             let paths = with_zones(&opened, cwd, &paths, &style.zones)?;
-            let request = claim_request(paths, note, ttl.ttl, &style);
+            let request = with_session_meta(
+                claim_request(paths, note, ttl.ttl, &style),
+                opened.backend.is_cloud(),
+            )?;
             let claim = wait_for_claim(opened.backend.as_mut(), &agent, request, seconds)?;
             let text = claim_line(&claim, lease);
             output(&claim, text)
@@ -228,7 +270,7 @@ pub(super) fn run_zone(
             urgent,
             need_by,
         } => {
-            let paths = opened.zone_paths(cwd, &paths)?;
+            let paths = opened.workspace_zone_paths(cwd, &paths)?;
             let request = AccessRequest {
                 paths,
                 text,
@@ -264,18 +306,27 @@ pub(super) fn run_zone(
             output(&claim, text)
         }
         ZoneCommand::Narrow { id, paths, fence } => {
-            let paths = opened.zone_paths(cwd, &paths)?;
+            let paths = opened.workspace_zone_paths(cwd, &paths)?;
             let claim = opened
                 .backend
                 .narrow(&resolve_agent(agent)?, id, &paths, fence)?;
             let text = claim_line(&claim, lease);
             output(&claim, text)
         }
-        ZoneCommand::AddPath { id, path, fence } => {
-            let path = opened.zone_path(cwd, &path)?;
-            let claim = opened
-                .backend
-                .add_path(&resolve_agent(agent)?, id, &path, fence)?;
+        ZoneCommand::AddPath { id, paths, fence } => {
+            let agent = resolve_agent(agent)?;
+            let paths = opened.workspace_zone_paths(cwd, &paths)?;
+            let mut claim = None;
+            let mut fence = fence;
+            for path in &paths {
+                let expanded = opened.backend.add_path(&agent, id, path, fence)?;
+                if fence.is_some() {
+                    fence = Some(expanded.fence);
+                }
+                claim = Some(expanded);
+            }
+            let claim =
+                claim.ok_or_else(|| Error::Invalid("add-path needs at least one path".into()))?;
             let text = claim_line(&claim, lease);
             output(&claim, text)
         }
@@ -293,7 +344,7 @@ pub(super) fn run_zone(
             write,
             fence,
         } => {
-            let paths = opened.zone_paths(cwd, &paths)?;
+            let paths = opened.workspace_zone_paths(cwd, &paths)?;
             let request = ActivityRequest {
                 write,
                 paths,
@@ -335,6 +386,12 @@ pub(super) fn run_zone(
             fence,
         } => {
             let agent = resolve_agent(agent)?;
+            if !(1..=240).contains(&ttl.ttl) {
+                return Err(Error::Invalid(format!(
+                    "ttl must be 1 to 240 minutes (got {}); seconds are not accepted — use minutes",
+                    ttl.ttl
+                )));
+            }
             let hold_until = match (hold_until, hold_for) {
                 (Some(until), None) => Some(until),
                 (None, Some(minutes)) => Some(hold_until_from_minutes(minutes, now)?),
@@ -392,7 +449,9 @@ pub(super) fn run_zone(
             )
         }
         ZoneCommand::List { session, path } => {
-            let path = path.map(|raw| opened.zone_path(cwd, &raw)).transpose()?;
+            let path = path
+                .map(|raw| opened.workspace_zone_path(cwd, &raw))
+                .transpose()?;
             let claims = opened.backend.claims(&ClaimQuery { session, path }, now)?;
             let text = join(
                 &claims,
@@ -403,7 +462,7 @@ pub(super) fn run_zone(
         }
         ZoneCommand::Check { path } => {
             let agent = resolve_agent(agent)?;
-            let path = opened.zone_path(cwd, &path)?;
+            let path = opened.workspace_zone_path(cwd, &path)?;
             let mut checks =
                 opened
                     .backend
@@ -443,7 +502,7 @@ pub(super) fn run_dirty(
             reason,
             task,
         } => {
-            let paths = opened.zone_paths(cwd, &paths)?;
+            let paths = opened.workspace_zone_paths(cwd, &paths)?;
             let task = task
                 .as_deref()
                 .map(lockyard_core::task_id::TaskId::parse)
@@ -461,7 +520,9 @@ pub(super) fn run_dirty(
             output(&report, format!("reported {}", report.len()))
         }
         DirtyCommand::List { path } => {
-            let path = path.map(|raw| opened.zone_path(cwd, &raw)).transpose()?;
+            let path = path
+                .map(|raw| opened.workspace_zone_path(cwd, &raw))
+                .transpose()?;
             let list = opened.backend.dirty_list(&agent, path.as_deref())?;
             let line = |entry: &DirtyPath| {
                 format!(
@@ -474,7 +535,7 @@ pub(super) fn run_dirty(
             output(&list, text)
         }
         DirtyCommand::Disown { paths } => {
-            let paths = opened.zone_paths(cwd, &paths)?;
+            let paths = opened.workspace_zone_paths(cwd, &paths)?;
             opened.backend.dirty_disown(&agent, &paths)?;
             output(
                 &json!({"disowned": paths}),
@@ -482,7 +543,7 @@ pub(super) fn run_dirty(
             )
         }
         DirtyCommand::Adopt { paths, reason } => {
-            let paths = opened.zone_paths(cwd, &paths)?;
+            let paths = opened.workspace_zone_paths(cwd, &paths)?;
             opened.backend.dirty_adopt(&agent, &paths, &reason)?;
             output(
                 &json!({"adopted": paths}),

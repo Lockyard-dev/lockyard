@@ -57,13 +57,16 @@ pub(super) fn run_composite(
                     "start_work needs paths or zones (or handover_id to accept an offer)".into(),
                 ));
             }
-            let arguments = json!({
+            let mut arguments = json!({
                 "paths": paths,
                 "note": args.optional_text("note")?,
                 "ttl": args.get("ttl").cloned(),
-                "shared": args.flag("shared")?,
                 "zones": zones,
+                "meta": args.get("meta").cloned(),
             });
+            if let Some(shared) = args.0.get("shared") {
+                arguments["shared"] = shared.clone();
+            }
             let (claim, rollback) = {
                 let me =
                     agent.ok_or_else(|| Error::Invalid("this write needs an agent name".into()))?;
@@ -73,7 +76,8 @@ pub(super) fn run_composite(
                 let nonce = (cloud && (task.is_some() || hold_reason.is_some()))
                     .then(lockyard_cloud_client::ulid);
                 if let Some(nonce) = nonce.as_ref() {
-                    request.meta = Some(json!({"lockyard_start_work_nonce": nonce}));
+                    request.meta.get_or_insert_with(|| json!({}))["lockyard_start_work_nonce"] =
+                        json!(nonce);
                 }
                 let (claim, created) = lockyard_core::claim_or_reuse_with_hold(
                     opened.backend.as_mut(),
@@ -114,25 +118,58 @@ pub(super) fn run_composite(
         }
         "update" => {
             let mut answer = json!({});
-            let sent_note =
-                if let (Some(to), Some(body)) = (args.some_text("to")?, args.some_text("body")?) {
-                    let to = resolve_target(cwd, agent, &to)?;
-                    answer["sent"] = step("msg_send", json!({"to": to, "body": body}), after)?;
-                    true
-                } else if args.get("to").is_some() || args.get("body").is_some() {
-                    return Err(Error::Invalid(
-                        "sending a note needs both to and body".into(),
-                    ));
-                } else {
-                    false
-                };
+            let reply_to = args.some_int("reply_to")?;
+            let handled = args.ints("handled")?;
+            if reply_to.is_some() && args.get("to").is_some() {
+                return Err(Error::Invalid("pass reply_to or to, not both".into()));
+            }
+            let peek = args.flag("peek")?;
+            let all = args.flag("all")?;
+            if !handled.is_empty() {
+                agent.ok_or_else(|| Error::Invalid("this write needs an agent name".into()))?;
+                open(cwd, agent)?.backend.validate_handled(&handled)?;
+            }
+            let sent_note = if let Some(id) = reply_to {
+                let body = args
+                    .some_text("body")?
+                    .ok_or_else(|| Error::Invalid("reply_to needs body (the reply text)".into()))?;
+                let mut sent = step("msg_reply", json!({"id": id, "body": body}), after)?;
+                annotate_queued_delivery(&mut sent);
+                answer["sent"] = sent;
+                true
+            } else if let (Some(to), Some(body)) = (args.some_text("to")?, args.some_text("body")?)
+            {
+                let to = resolve_target(cwd, agent, &to)?;
+                let mut sent = step("msg_send", json!({"to": to, "body": body}), after)?;
+                annotate_queued_delivery(&mut sent);
+                answer["sent"] = sent;
+                true
+            } else if args.get("to").is_some() || args.get("body").is_some() {
+                return Err(Error::Invalid(
+                    "sending a note needs both to and body (or reply_to with body)".into(),
+                ));
+            } else {
+                false
+            };
+            if !handled.is_empty() {
+                let me =
+                    agent.ok_or_else(|| Error::Invalid("this write needs an agent name".into()))?;
+                match open(cwd, agent)
+                    .and_then(|mut opened| opened.backend.mark_handled(me, &handled))
+                {
+                    Ok(marked) => answer["handled"] = json!({"marked": marked, "ids": handled}),
+                    Err(error) if sent_note => answer["handled_error"] = json!(error.to_string()),
+                    Err(error) => return Err(error),
+                }
+            }
             // Sending a note must not mark inbox mail read: always peek after a send.
-            let peek = sent_note || args.flag("peek")?;
-            answer["mail"] = step(
-                "msg_inbox",
-                json!({"peek": peek, "all": args.flag("all")?}),
-                after,
-            )?;
+            // Default inbox is new mail only; pass all:true for the whole mailbox.
+            let peek = sent_note || peek;
+            match step("msg_inbox", json!({"peek": peek, "all": all}), after) {
+                Ok(mail) => answer["mail"] = mail,
+                Err(error) if sent_note => answer["mail_error"] = json!(error.to_string()),
+                Err(error) => return Err(error),
+            }
             Ok(answer)
         }
         "handover" => {
@@ -273,17 +310,73 @@ pub(super) fn run_composite(
                     after,
                 )?;
             }
-            let release = match target {
-                Some(id) => json!({"id": id, "note": note}),
-                None => json!({"note": note, "all": true}),
-            };
-            let released = if released_ids.is_empty() {
-                json!(0)
+            let mut freed = Vec::new();
+            let mut failed = Vec::new();
+            let mut already_gone = if all {
+                let opened = open(cwd, agent)?;
+                if opened.backend.is_cloud() {
+                    recent_lost(
+                        opened
+                            .backend
+                            .lost(agent.unwrap_or("lockyard-cli"))
+                            .unwrap_or_default(),
+                        crate::now_ms(),
+                    )
+                    .iter()
+                    .filter_map(|claim| claim["claim_id"].as_i64())
+                    .filter(|id| !released_ids.contains(id))
+                    .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                }
             } else {
-                step("zone_release", release, after)?["released"].clone()
+                Vec::new()
             };
-            answer["released"] = released.clone();
-            answer["released_ids"] = json!(released_ids);
+            if released_ids.is_empty() {
+                answer["released"] = json!(0);
+                answer["released_ids"] = json!([]);
+                answer["already_gone"] = json!(already_gone);
+                answer["failed"] = json!([]);
+                return Ok(answer);
+            }
+            let targets: Vec<i64> = match target {
+                Some(id) => vec![id],
+                None => released_ids.clone(),
+            };
+            for id in targets {
+                let release = json!({"id": id, "note": note});
+                match step("zone_release", release, after) {
+                    Ok(result) => {
+                        if result.get("released").and_then(Value::as_u64).unwrap_or(0) > 0 {
+                            freed.push(id);
+                        } else {
+                            already_gone.push(id);
+                        }
+                    }
+                    Err(error) => {
+                        if error.kind() == "not_found"
+                            || matches!(
+                                &error,
+                                Error::Cloud {
+                                    status: Some(404),
+                                    ..
+                                }
+                            )
+                        {
+                            already_gone.push(id);
+                        } else {
+                            failed.push(json!({"id": id, "error": error.to_string()}));
+                        }
+                    }
+                }
+            }
+            answer["released"] = json!(freed.len());
+            answer["released_ids"] = json!(freed);
+            answer["already_gone"] = json!(already_gone);
+            if freed.is_empty() && !failed.is_empty() {
+                answer["ok"] = json!(false);
+            }
+            answer["failed"] = json!(failed);
             Ok(answer)
         }
         _ => Err(Error::Invalid(format!("unknown tool {name:?}"))),
@@ -317,6 +410,17 @@ pub(super) fn owned_claim_ids(agent: Option<&str>, claims: Vec<Claim>) -> Vec<i6
         .filter(|claim| Some(claim.session.as_str()) == agent)
         .map(|claim| claim.id)
         .collect()
+}
+
+/// Surface when/how a queued note will leave the local agent (LY-0011).
+pub(super) fn annotate_queued_delivery(sent: &mut Value) {
+    let queued = sent.get("queued").and_then(Value::as_bool) == Some(true);
+    if !queued {
+        return;
+    }
+    sent["delivery"] = json!(
+        "queued locally: the running agent retries automatically when the write journal is free and the server accepts delivery; delivery time is not confirmed. Check msg_sent or status for a receipt."
+    );
 }
 
 pub(super) fn resolve_target(cwd: &Path, agent: Option<&str>, target: &str) -> Result<String> {

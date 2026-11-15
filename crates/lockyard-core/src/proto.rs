@@ -125,6 +125,15 @@ pub enum ClaimMode {
     Shared,
 }
 
+impl fmt::Display for ClaimMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Exclusive => "exclusive",
+            Self::Shared => "shared",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Purpose {
@@ -166,6 +175,8 @@ pub struct Claim {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_release_at: Option<Stamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_until_ref: Option<i64>,
@@ -195,7 +206,9 @@ pub struct ClaimRequest {
     pub paths: Vec<String>,
     pub note: String,
     pub ttl_minutes: i64,
-    pub mode: ClaimMode,
+    /// None delegates the default to a capable server; legacy transports send exclusive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ClaimMode>,
     pub purpose: Purpose,
     pub lazy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -253,13 +266,18 @@ pub struct PathCheck {
     pub status: CheckStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder: Option<Conflict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ClaimMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_grantable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct QueueRequest {
     pub paths: Vec<String>,
     pub note: String,
-    pub mode: ClaimMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ClaimMode>,
     pub purpose: Purpose,
     pub ttl_minutes: i64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -343,6 +361,10 @@ pub struct AccessRecord {
     pub created_at: Option<Stamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<Stamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<Claim>,
 }
 
 /// One path whose changes are not committed, and who owns them.
@@ -414,6 +436,8 @@ pub struct Message {
     pub expires_at: Option<Stamp>,
     #[serde(default)]
     pub created_at: Stamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replied_at: Option<Stamp>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub deduplicated: bool,
     /// The agent process holds this message in its outbox: the server has not seen it yet.
@@ -805,6 +829,45 @@ fn pointer(section: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn survey_r4_requests_distinguish_server_default_from_explicit_modes() {
+        for mode in [None, Some(ClaimMode::Shared), Some(ClaimMode::Exclusive)] {
+            let claim = ClaimRequest {
+                mode,
+                ..ClaimRequest::default()
+            };
+            let queue = QueueRequest {
+                mode,
+                ..QueueRequest::default()
+            };
+            for wire in [
+                serde_json::to_value(claim).unwrap(),
+                serde_json::to_value(queue).unwrap(),
+            ] {
+                assert_eq!(wire.get("mode"), mode.map(|mode| json!(mode)).as_ref());
+            }
+        }
+    }
+
+    #[test]
+    fn survey_r4_granted_requests_and_mail_preserve_additive_response_fields() {
+        let request: AccessRecord = serde_json::from_value(json!({"id":4,"granted":true,"claim":{
+            "id":7,"mode":"shared","held":false,"idle_release_at":1234
+        }}))
+        .unwrap();
+        let output = serde_json::to_value(request).unwrap();
+        assert_eq!(output["granted"], true);
+        assert_eq!(output["claim"]["mode"], "shared");
+        assert_eq!(output["claim"]["held"], false);
+        assert_eq!(output["claim"]["idle_release_at"], 1234);
+        let mail: Message =
+            serde_json::from_value(json!({"id":1,"replied_at":"2026-11-15T12:00:00Z"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(mail).unwrap()["replied_at"],
+            "2026-11-15T12:00:00Z"
+        );
+    }
 
     #[test]
     fn a_board_entry_preserves_server_author_and_creation_time() {

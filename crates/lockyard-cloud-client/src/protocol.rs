@@ -9,10 +9,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const DISCOVERY: &str = "/api/v1/protocol";
-const CACHE_TTL: Duration = Duration::from_secs(30);
+pub(crate) const CACHE_TTL: Duration = Duration::from_secs(30);
 const MAX_STATUS_PROTOCOL_HINT_BYTES: u64 = 16 * 1024;
 const MAX_PENDING: usize = 128;
 const MAX_PENDING_BYTES: u64 = 16 * 1024 * 1024;
+// An empty, lazily created directory flags released-journal ownership/cleanup. Its
+// absence is a single metadata lookup, not a scan of the ordinary pending journal.
+const LONG_POLL_MAINTENANCE: &str = ".long-poll";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolRange {
@@ -244,21 +247,176 @@ pub(crate) struct ProtocolState {
     pub(crate) cached: Option<CachedProtocol>,
     pending: BTreeMap<String, PendingWrite>,
     active_writes: BTreeSet<String>,
+    completed_writes: BTreeSet<String>,
 }
 
 pub(crate) struct PendingSendGuard<'a> {
     state: &'a std::sync::Mutex<ProtocolState>,
     key: String,
-    _journal: Option<std::fs::File>,
+    /// Directory whose flock serializes journal writes across processes. Held only while
+    /// mutating the journal or a short non-poll send — never for the whole long poll.
+    journal_dir: Option<&'a Path>,
+    journal: Option<std::fs::File>,
+    /// Per-key ownership survives releasing the shared journal during a long poll.
+    operation: Option<std::fs::File>,
+}
+
+impl PendingSendGuard<'_> {
+    fn lock_operation(path: &Path) -> Result<std::fs::File, ClientError> {
+        let mut options = StateOpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options.open(path).map_err(journal_error)?;
+        private_file(&file.metadata().map_err(journal_error)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(ClientError::JournalBusy);
+            }
+        }
+        #[cfg(not(unix))]
+        file.try_lock().map_err(|_| ClientError::JournalBusy)?;
+        Ok(file)
+    }
+
+    /// All contenders open operation locks while owning the shared journal lock.
+    /// Under that lock an unlocked inode can be removed without leaving stale waiters.
+    fn clean_operation_locks(directory: &Path) -> Result<bool, ClientError> {
+        #[cfg(test)]
+        pending_completion_tests::record_maintenance_scan();
+        let mut active = false;
+        for entry in std::fs::read_dir(directory).map_err(journal_error)? {
+            let path = entry.map_err(journal_error)?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("inflight") {
+                continue;
+            }
+            match Self::lock_operation(&path) {
+                Ok(lock) => {
+                    // The shared journal excludes new openers. Close our probe before
+                    // unlinking so Windows does not race an outstanding file handle.
+                    drop(lock);
+                    std::fs::remove_file(path).map_err(journal_error)?;
+                }
+                Err(error) if journal_busy(&error) => active = true,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(active)
+    }
+
+    /// Drop the cross-process flock so siblings can release / claim / add tasks while this
+    /// call waits on the server. The in-process active-write key stays reserved.
+    pub(crate) fn release_journal(&mut self) -> Result<(), ClientError> {
+        if let Some(directory) = self.journal_dir
+            && self.operation.is_none()
+        {
+            // Create ownership only when actually releasing the journal, while its
+            // flock still excludes all openers/cleaners. Short calls need neither file.
+            private_directory(&directory.join(LONG_POLL_MAINTENANCE))?;
+            self.operation = Some(Self::lock_operation(
+                &journal_path(directory, &self.key).with_extension("inflight"),
+            )?);
+        }
+        self.journal = None;
+        Ok(())
+    }
+
+    fn lock_journal(directory: &Path) -> Result<std::fs::File, ClientError> {
+        private_directory(directory)?;
+        let mut options = StateOpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        #[cfg(unix)]
+        let lock = options.open(directory).map_err(journal_error)?;
+        #[cfg(windows)]
+        let lock = StateOpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(directory.join(".journal.lock"))
+            .map_err(journal_error)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(ClientError::JournalBusy);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            lock.try_lock().map_err(|_| ClientError::JournalBusy)?;
+        }
+        Ok(lock)
+    }
+
+    /// Re-take the flock before journal cleanup after a long poll. Retries inside `budget`.
+    pub(crate) fn reacquire_journal(
+        &mut self,
+        budget: Duration,
+        wait: impl Fn(Duration) -> Result<(), ClientError>,
+    ) -> Result<(), ClientError> {
+        let Some(directory) = self.journal_dir else {
+            return Ok(());
+        };
+        if self.journal.is_some() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let mut delay = Duration::from_millis(25);
+        loop {
+            match Self::lock_journal(directory) {
+                Ok(lock) => {
+                    self.journal = Some(lock);
+                    return Ok(());
+                }
+                Err(error) if journal_busy(&error) => {
+                    let left = budget.saturating_sub(started.elapsed());
+                    if left.is_zero() {
+                        return Err(error);
+                    }
+                    let pause = delay.min(left).min(Duration::from_millis(250));
+                    wait(pause)?;
+                    delay = delay.saturating_mul(2).min(Duration::from_millis(250));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
 }
 
 impl Drop for PendingSendGuard<'_> {
     fn drop(&mut self) {
+        let had_operation = self.operation.is_some();
+        // Fields otherwise drop in declaration order (journal before operation).
+        // Close the operation handle while the shared journal still excludes cleanup
+        // in other processes, including on Windows where open handles impede unlink.
+        drop(self.operation.take());
+        // No process can open this inode while we own the shared journal lock.
+        // Without it, leave the inode for clean_operation_locks on the next acquisition.
+        if self.journal.is_some()
+            && had_operation
+            && let Some(directory) = self.journal_dir
+        {
+            let _ =
+                std::fs::remove_file(journal_path(directory, &self.key).with_extension("inflight"));
+        }
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .active_writes
             .remove(&self.key);
+        drop(self.journal.take());
     }
 }
 
@@ -662,43 +820,51 @@ impl Client {
             .active_writes
             .insert(key.to_owned())
         {
-            return Err(ClientError::Transport("write is already in flight".into()));
+            return Err(ClientError::JournalBusy);
         }
         let mut guard = PendingSendGuard {
             state: &self.protocol_state,
             key: key.to_owned(),
-            _journal: None,
+            journal_dir: self.pending_journal.as_deref(),
+            journal: None,
+            operation: None,
         };
         if let Some(directory) = &self.pending_journal {
-            private_directory(directory)?;
-            let mut options = StateOpenOptions::new();
-            options.read(true);
-            #[cfg(unix)]
+            guard.journal = Some(PendingSendGuard::lock_journal(directory)?);
+            if directory
+                .join(LONG_POLL_MAINTENANCE)
+                .try_exists()
+                .map_err(journal_error)?
             {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-            }
-            #[cfg(unix)]
-            let lock = options.open(directory).map_err(journal_error)?;
-            #[cfg(windows)]
-            let lock = StateOpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(directory.join(".journal.lock"))
-                .map_err(journal_error)?;
-            #[cfg(unix)]
-            {
-                use std::os::fd::AsRawFd;
-                if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let active = PendingSendGuard::clean_operation_locks(directory)?;
+                let retry_cleanup = self.retire_completed_pending(directory)?;
+                // Only locked inodes remain after cleanup. Do not create a second
+                // per-key inode for an ordinary send; the journal protects this check.
+                if journal_path(directory, key)
+                    .with_extension("inflight")
+                    .try_exists()
+                    .map_err(journal_error)?
+                {
                     return Err(ClientError::JournalBusy);
                 }
+                if !active && !retry_cleanup {
+                    // Completion removal already synced the journal. Removing an empty
+                    // hint requires no durability: a stale hint only costs one scan.
+                    std::fs::remove_dir(directory.join(LONG_POLL_MAINTENANCE))
+                        .map_err(journal_error)?;
+                }
+            } else {
+                // A sibling may already have removed the sidecars and their hint.
+                // Retire our verified in-memory completions too, without scanning.
+                // This also retries durable cleanup if publishing their marker failed.
+                let keys = self
+                    .protocol_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .completed_writes
+                    .clone();
+                self.retire_completed_keys(keys)?;
             }
-            #[cfg(not(unix))]
-            {
-                lock.try_lock().map_err(|_| ClientError::JournalBusy)?;
-            }
-            guard._journal = Some(lock);
             // Another client may have sent or completed this operation since we loaded it.
             // Never recreate a stale entry or trust a cached pre-execution refusal.
             let path = journal_path(directory, key);
@@ -760,8 +926,17 @@ impl Client {
         private_directory(&directory)?;
         let mut pending = BTreeMap::new();
         let mut total = 0_u64;
+        let mut maintenance = false;
         for entry in std::fs::read_dir(&directory).map_err(journal_error)? {
             let entry = entry.map_err(journal_error)?;
+            // Upgrade old journals during the scan we already need for restoration.
+            // Older clients wrote these sidecars directly without the cheap hint.
+            if matches!(
+                entry.path().extension().and_then(|value| value.to_str()),
+                Some("inflight" | "completed")
+            ) {
+                maintenance = true;
+            }
             if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
@@ -799,6 +974,9 @@ impl Client {
                     "pending journal operation does not match its origin or credential",
                 ));
             }
+        }
+        if maintenance {
+            private_directory(&directory.join(LONG_POLL_MAINTENANCE))?;
         }
         self.protocol_state
             .lock()
@@ -880,6 +1058,133 @@ impl Client {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pending
             .remove(key);
+        if let Some(directory) = &self.pending_journal
+            && directory
+                .join(LONG_POLL_MAINTENANCE)
+                .try_exists()
+                .map_err(journal_error)?
+        {
+            match std::fs::remove_file(journal_path(directory, key).with_extension("completed")) {
+                Ok(()) => lockyard_core::fsio::sync_dir(directory).map_err(journal_error)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(journal_error(error)),
+            }
+        }
+        Ok(())
+    }
+
+    /// The per-operation lock protects this terminal marker even while another key owns
+    /// the shared journal. It never edits the pending record without the shared lock.
+    fn complete_pending_later(&self, pending: &PendingWrite) {
+        self.protocol_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .completed_writes
+            .insert(pending.key.clone());
+        if let Some(directory) = &self.pending_journal
+            && let Ok(bytes) = serde_json::to_string(pending)
+        {
+            let marker = json!({"key":pending.key,"digest":crate::credential_fingerprint(&bytes)});
+            let _ = lockyard_core::fsio::replace(
+                &journal_path(directory, &pending.key).with_extension("completed"),
+                marker.to_string().as_bytes(),
+                0o600,
+            );
+        }
+    }
+
+    /// Called only with the shared journal lock; survives a short-lived CLI exiting.
+    fn retire_completed_pending(&self, directory: &Path) -> Result<bool, ClientError> {
+        #[cfg(test)]
+        pending_completion_tests::record_maintenance_scan();
+        let mut retry_cleanup = false;
+        let mut keys = self
+            .protocol_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .completed_writes
+            .clone();
+        for entry in std::fs::read_dir(directory).map_err(journal_error)? {
+            let path = entry.map_err(journal_error)?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("completed") {
+                continue;
+            }
+            let validated = (|| {
+                let marker: Value = read_private_json(&path)?;
+                let key = marker["key"]
+                    .as_str()
+                    .filter(|key| !key.is_empty())
+                    .ok_or_else(|| journal_error("invalid completion marker"))?;
+                let marker_digest = marker["digest"]
+                    .as_str()
+                    .filter(|digest| {
+                        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                    .ok_or_else(|| journal_error("invalid completion marker digest"))?;
+                let pending_path = journal_path(directory, key);
+                if path != pending_path.with_extension("completed") {
+                    return Err(journal_error("invalid completion marker path"));
+                }
+                if pending_path.try_exists().map_err(journal_error)? {
+                    let pending: PendingWrite = read_private_json(&pending_path)?;
+                    let digest = crate::credential_fingerprint(
+                        &serde_json::to_string(&pending).map_err(journal_error)?,
+                    );
+                    if pending.key != key
+                        || pending.origin != self.base_url
+                        || pending.credential_scope != crate::credential_fingerprint(&self.token)
+                        || marker_digest != digest
+                    {
+                        return Err(journal_error(
+                            "completion marker does not match pending operation",
+                        ));
+                    }
+                }
+                Ok(key.to_owned())
+            })();
+            match validated {
+                Ok(key) => {
+                    keys.insert(key);
+                }
+                Err(_) => {
+                    // A marker is only a cleanup hint. Preserve the pending bytes and
+                    // isolate a bad hint instead of blocking every key/process forever.
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    let quarantine = path.with_extension(format!("completed.bad-{timestamp}"));
+                    match lockyard_core::fsio::rename(&path, &quarantine)
+                        .and_then(|()| lockyard_core::fsio::sync_dir(directory))
+                    {
+                        Ok(()) => eprintln!(
+                            "warning: quarantined invalid pending completion marker: {}",
+                            quarantine.display()
+                        ),
+                        Err(error) => {
+                            retry_cleanup = true;
+                            eprintln!(
+                                "warning: cannot quarantine invalid pending completion marker {}: {error}",
+                                path.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        self.retire_completed_keys(keys)?;
+        Ok(retry_cleanup)
+    }
+
+    fn retire_completed_keys(&self, keys: BTreeSet<String>) -> Result<(), ClientError> {
+        for key in keys {
+            self.resolve_pending(&key)?;
+            self.protocol_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .completed_writes
+                .remove(&key);
+        }
         Ok(())
     }
 
@@ -1275,7 +1580,7 @@ impl Client {
             call.deadline_ms
                 .map(|limit| Duration::from_millis(limit).saturating_sub(started.elapsed()))
         };
-        let _send = if call.is_write() {
+        let mut send_guard = if call.is_write() {
             let key = call.key.as_deref().expect("validated write key");
             // The flock is local and pre-send: wait inside the call deadline without starting a
             // second create. Creating calls keep one idempotency key for the whole wait.
@@ -1349,6 +1654,16 @@ impl Client {
         let prepared = self.prepare_catalog_call(call)?;
         let call = &prepared;
         let mut body = call.body.clone();
+        // 579d557 requires mode. Only LC-0019 servers advertising this capability
+        // may choose their own default. Freeze the selected wire bytes for retries.
+        if call.method == "POST"
+            && matches!(route, "/api/v1/zones/claims" | "/api/v1/zones/queue")
+            && !protocol.capabilities.contains(crate::SOFT_ZONES_V1)
+            && let Some(object) = body.as_mut().and_then(Value::as_object_mut)
+            && !object.contains_key("mode")
+        {
+            object.insert("mode".into(), Value::String("exclusive".into()));
+        }
         if (self.encryption_enabled || self.expected_e2ee_workspace.is_some())
             && call.method == "POST"
             && matches!(
@@ -1424,6 +1739,13 @@ impl Client {
                     self.retain_pending(pending.clone())?;
                 }
             }
+            // zone wait / long poll can sit on the server for tens of seconds; holding the
+            // local write journal that whole time deadlocks sibling release / finish_work.
+            if call.long_poll
+                && let Some(guard) = send_guard.as_mut()
+            {
+                guard.release_journal()?;
+            }
             let failure = match self.attempt_observed(
                 &wire_call,
                 encoded.as_deref(),
@@ -1433,6 +1755,15 @@ impl Client {
                 None,
             ) {
                 Ok(mut value) => {
+                    let journal_owned = !call.long_poll
+                        || send_guard.as_mut().is_none_or(|guard| {
+                            guard
+                                .reacquire_journal(
+                                    remaining().unwrap_or(crate::MAX_RETRY_WAIT),
+                                    |pause| call.wait(pause),
+                                )
+                                .is_ok()
+                        });
                     // Authenticate/decrypt the response before releasing its recovery record.
                     if let Some(workspace) = self.workspace.as_deref()
                         && let Err(message) = crate::crypto::transform_fields_policy(
@@ -1446,6 +1777,9 @@ impl Client {
                         )
                     {
                         if let Some(pending) = pending {
+                            if !journal_owned {
+                                return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+                            }
                             let cause = if message.starts_with("catalog_") {
                                 message.as_str()
                             } else {
@@ -1457,6 +1791,9 @@ impl Client {
                     }
                     if let Err(error) = self.finish_catalog_call(call, &mut value) {
                         if let Some(pending) = pending {
+                            if !journal_owned {
+                                return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+                            }
                             let cause = error
                                 .code()
                                 .unwrap_or("catalog_authentication_failed")
@@ -1468,11 +1805,36 @@ impl Client {
                     if let Some(pending) = pending
                         && !call.defer_pending_ack
                     {
-                        self.resolve_pending(&pending.key)?;
+                        if !journal_owned {
+                            self.complete_pending_later(&pending);
+                            return Ok(value);
+                        }
+                        if let Err(error) = self.resolve_pending(&pending.key) {
+                            if call.long_poll {
+                                self.complete_pending_later(&pending);
+                                return Ok(value);
+                            }
+                            return Err(error);
+                        }
                     }
                     return Ok(value);
                 }
-                Err(failure) => failure,
+                Err(failure) => {
+                    if call.long_poll
+                        && let Some(guard) = send_guard.as_mut()
+                    {
+                        let budget = remaining().unwrap_or(crate::MAX_RETRY_WAIT);
+                        if guard
+                            .reacquire_journal(budget, |pause| call.wait(pause))
+                            .is_err()
+                        {
+                            return Err(ClientError::OutcomeUnknown(Box::new(
+                                pending.expect("write pending record"),
+                            )));
+                        }
+                    }
+                    failure
+                }
             };
             let (error, may_retry) = match failure {
                 Failure::Final(error) => (error, false),
@@ -1597,6 +1959,24 @@ impl Client {
             });
         // Leave a clock-skew margin inside the ledger guarantee, never extend it on retry.
         let retained = age.is_some_and(|age| age < 30 * 24 * 60 * 60 - 60);
+        // RegistryService.CreateAsync deduplicates by workspace/client_key independently
+        // of the HTTP receipt ledger. Replay its exact frozen bytes, never a fresh create.
+        let registry_create = call.method == "POST"
+            && route == "/api/v1/registry/items"
+            && call
+                .body
+                .as_ref()
+                .and_then(|body| body["client_key"].as_str())
+                .is_some_and(|key| {
+                    !key.is_empty()
+                        && key.len() <= 256
+                        && key.bytes().all(|byte| byte.is_ascii_graphic())
+                        && pending
+                            .body
+                            .as_deref()
+                            .and_then(|body| serde_json::from_str::<Value>(body).ok())
+                            .is_some_and(|body| body["client_key"].as_str() == Some(key))
+                });
         let context_ready = self
             .expected_e2ee_workspace
             .as_deref()
@@ -1605,7 +1985,7 @@ impl Client {
                     && self.content_key.is_some()
                     && self.workspace.as_deref() == Some(expected)
             });
-        if (!refused && (!call.defer_pending_ack || !known_ledger || !retained))
+        if (!refused && !registry_create && (!call.defer_pending_ack || !known_ledger || !retained))
             || !context_ready
             || pending.encryption_context.as_deref() != Some(self.encryption_context().as_str())
             || pending.request_digest.as_deref() != Some(crate::request_identity(call).as_str())
@@ -1821,6 +2201,24 @@ fn journal_path(directory: &Path, key: &str) -> PathBuf {
     directory.join(format!("{}.json", crate::credential_fingerprint(key)))
 }
 
+fn read_private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ClientError> {
+    private_file(&std::fs::symlink_metadata(path).map_err(journal_error)?)?;
+    let mut options = StateOpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path).map_err(journal_error)?;
+    let metadata = file.metadata().map_err(journal_error)?;
+    private_file(&metadata)?;
+    if metadata.len() > MAX_PENDING_BYTES {
+        return Err(journal_error("pending record exceeds budget"));
+    }
+    serde_json::from_reader(file).map_err(journal_error)
+}
+
 #[cfg(unix)]
 fn private_directory(path: &Path) -> Result<(), ClientError> {
     let mut ancestor = PathBuf::new();
@@ -1970,6 +2368,274 @@ fn private_directory(path: &Path) -> Result<(), ClientError> {
 }
 
 #[cfg(test)]
+mod pending_completion_tests {
+    use super::*;
+
+    std::thread_local! {
+        static MAINTENANCE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn record_maintenance_scan() {
+        MAINTENANCE_SCANS.set(MAINTENANCE_SCANS.get() + 1);
+    }
+
+    fn journal_files(directory: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            // Windows already used this global journal lock in 0.3.12.
+            .filter(|path| path.file_name().unwrap() != ".journal.lock")
+            .collect()
+    }
+
+    #[test]
+    fn survey_r6_short_sends_do_not_create_long_poll_files() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let client = Client::new("http://127.0.0.1:1", "fixture".into())
+            .unwrap()
+            .with_pending_journal(&root)
+            .unwrap();
+        let directory = client.pending_journal.as_ref().unwrap();
+        let scans = MAINTENANCE_SCANS.get();
+        for _ in 0..3 {
+            let guard = client.claim_pending_send("short").unwrap();
+            assert!(journal_files(directory).is_empty());
+            client.retain_pending(pending(&client, "short")).unwrap();
+            let paths = journal_files(directory);
+            assert_eq!(paths, vec![journal_path(directory, "short")]);
+            client.resolve_pending("short").unwrap();
+            drop(guard);
+            assert!(journal_files(directory).is_empty());
+        }
+        assert_eq!(MAINTENANCE_SCANS.get(), scans);
+    }
+
+    #[test]
+    fn survey_r6_existing_client_sees_released_ownership_and_durable_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let new_client = || {
+            Client::new("http://127.0.0.1:1", "fixture".into())
+                .unwrap()
+                .with_pending_journal(&root)
+                .unwrap()
+        };
+        let sender = new_client();
+        // Created before any hint exists: an in-memory-only flag would miss it.
+        let sibling = new_client();
+        let directory = sibling.pending_journal.as_ref().unwrap();
+        let record = pending(&sender, "poll");
+        let mut guard = sender.claim_pending_send("poll").unwrap();
+        sender.retain_pending(record.clone()).unwrap();
+        guard.release_journal().unwrap();
+        assert!(journal_busy(
+            &sibling.claim_pending_send("poll").err().unwrap()
+        ));
+        drop(sibling.claim_pending_send("unrelated").unwrap());
+        sender.complete_pending_later(&record);
+        let marker = journal_path(directory, "poll").with_extension("completed");
+        assert!(marker.exists());
+        drop(guard);
+        drop(sender);
+        drop(sibling.claim_pending_send("unrelated").unwrap());
+        assert!(!journal_path(directory, "poll").exists());
+        assert!(!marker.exists());
+        assert!(!directory.join(LONG_POLL_MAINTENANCE).exists());
+        let scans = MAINTENANCE_SCANS.get();
+        for _ in 0..3 {
+            drop(sibling.claim_pending_send("short").unwrap());
+        }
+        assert_eq!(MAINTENANCE_SCANS.get(), scans);
+    }
+
+    #[test]
+    fn survey_r6_sender_retires_local_completion_after_sibling_removes_hint() {
+        for marker_persisted in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let root = root.path().canonicalize().unwrap();
+            let new_client = || {
+                Client::new("http://127.0.0.1:1", "fixture".into())
+                    .unwrap()
+                    .with_pending_journal(&root)
+                    .unwrap()
+            };
+            let sender = new_client();
+            let sibling = new_client();
+            let directory = sender.pending_journal.as_ref().unwrap();
+            let record = pending(&sender, "poll");
+            let mut guard = sender.claim_pending_send("poll").unwrap();
+            sender.retain_pending(record.clone()).unwrap();
+            guard.release_journal().unwrap();
+            sender.complete_pending_later(&record);
+            if !marker_persisted {
+                // Model a failed marker publication: the verified success is still
+                // known in this client, while other clients cannot retire its JSON.
+                std::fs::remove_file(journal_path(directory, "poll").with_extension("completed"))
+                    .unwrap();
+            }
+            drop(guard);
+            drop(sibling.claim_pending_send("unrelated").unwrap());
+            assert!(!directory.join(LONG_POLL_MAINTENANCE).exists());
+            assert_eq!(journal_path(directory, "poll").exists(), !marker_persisted);
+            let scans = MAINTENANCE_SCANS.get();
+            drop(sender.claim_pending_send("poll").unwrap());
+            assert!(sender.pending_operation("poll").is_none());
+            assert!(!journal_path(directory, "poll").exists());
+            assert_eq!(MAINTENANCE_SCANS.get(), scans);
+        }
+    }
+
+    fn pending(client: &Client, key: &str) -> PendingWrite {
+        PendingWrite {
+            code: "outcome_unknown".into(),
+            cause_code: "outcome_unknown".into(),
+            cause_status: None,
+            protocol: NegotiatedProtocol::candidate(2),
+            method: "POST".into(),
+            path: "/api/v1/presence".into(),
+            request_path: "/api/v1/presence".into(),
+            body: Some("{}".into()),
+            key: key.into(),
+            repository: None,
+            session: "fixture".into(),
+            origin: client.base_url.clone(),
+            credential_scope: crate::credential_fingerprint(&client.token),
+            request_digest: None,
+            first_sent_unix_secs: None,
+            pre_execution_rejected: false,
+            encryption_context: None,
+            result_expires_at: None,
+            result_retry_at: None,
+        }
+    }
+
+    #[test]
+    fn bad_completion_markers_preserve_pending_and_do_not_block_other_keys_or_clients() {
+        for fault in [
+            "json",
+            "key",
+            "path",
+            "digest",
+            "mismatch",
+            "changed_record",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let root = root.path().canonicalize().unwrap();
+            let new_client = || {
+                Client::new("http://127.0.0.1:1", "fixture".into())
+                    .unwrap()
+                    .with_pending_journal(&root)
+                    .unwrap()
+            };
+            let client = new_client();
+            let bad = pending(&client, "bad");
+            let good = pending(&client, "good");
+            client.retain_pending(bad.clone()).unwrap();
+            client.retain_pending(good.clone()).unwrap();
+            client.complete_pending_later(&bad);
+            client.complete_pending_later(&good);
+            let directory = client.pending_journal.as_ref().unwrap();
+            let path = journal_path(directory, "bad").with_extension("completed");
+            let mut marker: Value = read_private_json(&path).unwrap();
+            match fault {
+                "json" => {}
+                "key" => marker["key"] = Value::Null,
+                "path" => marker["key"] = json!("another-key"),
+                "digest" => marker["digest"] = json!("wrong-digest"),
+                "mismatch" => marker["digest"] = json!("a".repeat(64)),
+                "changed_record" => {
+                    let mut changed = bad.clone();
+                    changed.body = Some("{\"new\":true}".into());
+                    lockyard_core::fsio::replace(
+                        &journal_path(directory, "bad"),
+                        &serde_json::to_vec(&changed).unwrap(),
+                        0o600,
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let bytes = if fault == "json" {
+                b"broken-json".to_vec()
+            } else {
+                serde_json::to_vec(&marker).unwrap()
+            };
+            lockyard_core::fsio::replace(&path, &bytes, 0o600).unwrap();
+            let original = std::fs::read(journal_path(directory, "bad")).unwrap();
+            // Fresh clients have no in-memory completion hints. The same durable
+            // files must permit progress after the original process has exited.
+            let next = new_client();
+            drop(next.claim_pending_send("unrelated").unwrap());
+            assert!(!path.exists(), "{fault}");
+            assert_eq!(
+                std::fs::read(journal_path(directory, "bad")).unwrap(),
+                original
+            );
+            assert!(!journal_path(directory, "good").exists(), "{fault}");
+            let quarantines: Vec<_> = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.to_string_lossy().contains(".completed.bad-"))
+                .collect();
+            assert_eq!(quarantines.len(), 1, "{fault}");
+            assert_eq!(std::fs::read(&quarantines[0]).unwrap(), bytes, "{fault}");
+            assert!(!directory.join(LONG_POLL_MAINTENANCE).exists());
+            let scans = MAINTENANCE_SCANS.get();
+            let restored = new_client();
+            drop(restored.claim_pending_send("another-unrelated").unwrap());
+            assert_eq!(MAINTENANCE_SCANS.get(), scans);
+            assert!(restored.pending_operation("bad").is_some(), "{fault}");
+            assert!(restored.pending_operation("good").is_none(), "{fault}");
+        }
+    }
+
+    #[test]
+    fn dropping_send_guard_cleans_operation_lock_and_releases_both_owners() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let client = Client::new("http://127.0.0.1:1", "fixture".into())
+            .unwrap()
+            .with_pending_journal(root)
+            .unwrap();
+        let directory = client.pending_journal.as_ref().unwrap();
+        let path = journal_path(directory, "key").with_extension("inflight");
+        let mut guard = client.claim_pending_send("key").unwrap();
+        assert!(journal_busy(
+            &PendingSendGuard::lock_journal(directory).unwrap_err()
+        ));
+        assert!(!path.exists(), "short sends own only the shared journal");
+        guard.release_journal().unwrap();
+        drop(PendingSendGuard::lock_journal(directory).unwrap());
+        assert!(journal_busy(
+            &PendingSendGuard::lock_operation(&path).unwrap_err()
+        ));
+        guard.reacquire_journal(Duration::ZERO, |_| Ok(())).unwrap();
+        drop(guard);
+        assert!(!path.exists());
+        drop(client.claim_pending_send("key").unwrap());
+        assert!(!path.exists());
+
+        let mut guard = client.claim_pending_send("key").unwrap();
+        guard.release_journal().unwrap();
+        drop(guard);
+        assert!(
+            path.exists(),
+            "cleanup without the shared journal is deferred"
+        );
+        drop(client.claim_pending_send("other-key").unwrap());
+        assert!(
+            !path.exists(),
+            "next owner cleans the closed operation inode"
+        );
+        assert!(!directory.join(LONG_POLL_MAINTENANCE).exists());
+        let scans = MAINTENANCE_SCANS.get();
+        drop(client.claim_pending_send("short").unwrap());
+        assert_eq!(MAINTENANCE_SCANS.get(), scans);
+    }
+}
+
+#[cfg(test)]
 mod status_protocol_cache_tests {
     use super::*;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1980,6 +2646,39 @@ mod status_protocol_cache_tests {
     use std::net::TcpListener;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn survey_r5_soft_zones_ping_knowledge_is_fresh_and_never_discovers() {
+        use crate::Transport;
+        let client = Client::new("http://127.0.0.1:1", "fixture".into()).unwrap();
+        assert!(!client.cached_soft_zones_v1());
+        let mut protocol = NegotiatedProtocol::candidate(2);
+        protocol.capabilities.insert(crate::SOFT_ZONES_V1.into());
+        {
+            let mut state = client.protocol_state.lock().unwrap();
+            state.cached = Some(CachedProtocol {
+                value: protocol,
+                obtained: Instant::now(),
+            });
+            assert!(
+                !client.cached_soft_zones_v1(),
+                "contended Ping must not block"
+            );
+        }
+        assert!(client.cached_soft_zones_v1());
+        client
+            .protocol_state
+            .lock()
+            .unwrap()
+            .cached
+            .as_mut()
+            .unwrap()
+            .obtained = Instant::now() - CACHE_TTL;
+        assert!(
+            !client.cached_soft_zones_v1(),
+            "expired negotiation is not proof"
+        );
+    }
 
     #[test]
     fn status_registry_capability_cache_contention_preserves_support_deadline_and_cancellation() {

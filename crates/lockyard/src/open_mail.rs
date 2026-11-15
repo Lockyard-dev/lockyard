@@ -242,6 +242,7 @@ mod tests {
 
     fn ask(id: i64, from: &str, to: &str, body: &str, created: i64) -> Message {
         Message {
+            replied_at: None,
             id,
             thread_id: None,
             reply_to: None,

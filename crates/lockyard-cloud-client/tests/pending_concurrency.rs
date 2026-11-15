@@ -11,6 +11,154 @@ use std::time::{Duration, Instant};
 
 const WAIT: Duration = Duration::from_secs(5);
 
+fn survey_wait_call(deadline: u64) -> Call {
+    let mut call = Call::write(
+        "me",
+        "POST",
+        "/api/v1/zones/claims".into(),
+        json!({"paths":["src"]}),
+    );
+    call.key = Some("survey-wait-key".into());
+    call.long_poll = true;
+    call.deadline_ms = Some(deadline);
+    call
+}
+
+fn survey_prime(server: &Server, journal: &Journal) {
+    let mut call = Call::write("me", "POST", "/api/v1/presence".into(), json!({}));
+    call.deadline_ms = Some(500);
+    assert_eq!(
+        server.client(journal).call(&call).unwrap_err().code(),
+        Some("rate_limited")
+    );
+}
+
+#[test]
+fn survey_r3_same_key_in_process_waits_until_deadline_without_resending() {
+    let server = Server::start();
+    let journal = Journal::new();
+    survey_prime(&server, &journal);
+    let client = Arc::new(server.client(&journal));
+    let done = start_call(Arc::clone(&client), survey_wait_call(5_000));
+    let first = server.requests.recv_timeout(WAIT).unwrap();
+    let original = client.pending_operation("survey-wait-key").unwrap();
+    let started = Instant::now();
+    let error = client.call(&survey_wait_call(450)).unwrap_err();
+    assert_eq!(error.code(), Some("journal_busy"));
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    assert!(server.requests.try_recv().is_err());
+    assert_eq!(
+        client.pending_operation("survey-wait-key").unwrap(),
+        original
+    );
+    first.reply(200, None);
+    assert!(done.recv_timeout(WAIT).unwrap().is_ok());
+    assert!(client.pending_operation("survey-wait-key").is_none());
+    server.finish();
+}
+
+#[test]
+fn survey_r2_same_key_process_waits_during_unlocked_long_poll() {
+    let server = Server::start();
+    let journal = Journal::new();
+    survey_prime(&server, &journal);
+    let client = Arc::new(server.client(&journal));
+    let done = start_call(Arc::clone(&client), survey_wait_call(5_000));
+    let first = server.requests.recv_timeout(WAIT).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "survey_r2_same_key_child", "--nocapture"])
+        .env("LY_R2_URL", &server.url)
+        .env("LY_R2_JOURNAL", &journal.0)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "same key returned before its journal deadline"
+    );
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        server.requests.try_recv().is_err(),
+        "same key was transmitted concurrently"
+    );
+    first.reply(200, None);
+    assert!(done.recv_timeout(WAIT).unwrap().is_ok());
+    let restored = server.client(&journal);
+    assert!(restored.pending_operation("survey-wait-key").is_none());
+    server.finish();
+}
+
+#[test]
+fn survey_r2_same_key_child() {
+    let Ok(url) = std::env::var("LY_R2_URL") else {
+        return;
+    };
+    let journal = PathBuf::from(std::env::var_os("LY_R2_JOURNAL").unwrap());
+    let client = Client::new(&url, "fixture-token".into())
+        .unwrap()
+        .with_pending_journal(journal)
+        .unwrap()
+        .with_content_encryption(
+            "fixture-workspace",
+            Some(WorkspaceKey::from_entropy([73; 32])),
+            true,
+        );
+    let started = Instant::now();
+    let error = client.call(&survey_wait_call(450)).unwrap_err();
+    assert_eq!(error.code(), Some("journal_busy"));
+    assert!(started.elapsed() >= Duration::from_millis(400));
+}
+
+#[test]
+fn survey_r2_success_survives_failed_journal_reacquisition_and_later_cleans_up() {
+    let server = Server::start();
+    let journal = Journal::new();
+    survey_prime(&server, &journal);
+    let waiter = Arc::new(server.client(&journal));
+    let done = start_call(Arc::clone(&waiter), survey_wait_call(700));
+    let first = server.requests.recv_timeout(WAIT).unwrap();
+    let mut hold = Call::write("me", "POST", "/api/v1/presence".into(), json!({}));
+    // Distinct keys must never serialize merely because a short lock hash collides.
+    let prefix = &lockyard_cloud_client::credential_fingerprint("survey-wait-key")[..2];
+    hold.key = (0..10_000)
+        .map(|id| format!("unrelated-holder-{id}"))
+        .find(|key| lockyard_cloud_client::credential_fingerprint(key).starts_with(prefix));
+    assert!(hold.key.is_some());
+    hold.deadline_ms = Some(5_000);
+    let holder = start_call(Arc::new(server.client(&journal)), hold);
+    let held = server.requests.recv_timeout(WAIT).unwrap();
+    first.reply(200, None);
+    let success = done.recv_timeout(WAIT).unwrap();
+    // Release the other write even if this assertion is about to fail.
+    held.reply(200, None);
+    assert!(holder.recv_timeout(WAIT).unwrap().is_ok());
+    assert!(
+        success.is_ok(),
+        "a verified successful response was lost: {success:?}"
+    );
+    drop(waiter);
+    // A fresh process/client's next journal acquisition must retire the completed record.
+    let next = Arc::new(server.client(&journal));
+    let call = Call::write("me", "POST", "/api/v1/presence".into(), json!({}));
+    let done = start_call(Arc::clone(&next), call);
+    server.requests.recv_timeout(WAIT).unwrap().reply(200, None);
+    assert!(done.recv_timeout(WAIT).unwrap().is_ok());
+    assert!(
+        server
+            .client(&journal)
+            .pending_operation("survey-wait-key")
+            .is_none()
+    );
+    server.finish();
+}
+
 struct Journal(PathBuf);
 
 impl Journal {
@@ -445,4 +593,109 @@ fn write_waits_out_a_busy_pending_journal_within_the_deadline() {
             .as_str(),
         "pending journal is busy"
     ));
+}
+
+/// LY-0010: a long-poll claim (zone wait) must not hold the pending-journal flock while the
+/// server keeps the HTTP response open — otherwise a sibling process cannot release/finish.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn long_poll_releases_the_pending_journal_while_waiting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (ready_tx, ready_rx) = mpsc::channel::<TcpStream>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = Arc::clone(&stop);
+    let worker = std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        while !stopping.load(Ordering::Acquire) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            let (path, _body, _key) = read_request(&mut stream);
+            if path == "/api/v1/protocol" {
+                write_reply(
+                    &mut stream,
+                    200,
+                    json!({
+                        "selected_protocol":2,"min_protocol":1,"max_protocol":2,"capabilities":[]
+                    }),
+                );
+            } else {
+                let _ = ready_tx.send(stream);
+            }
+        }
+    });
+
+    let journal = Journal::new();
+    let waiter = Client::new(&url, "fixture-token".into())
+        .unwrap()
+        .with_pending_journal(&journal.0)
+        .unwrap();
+
+    let wait = std::thread::spawn(move || {
+        let mut call = Call::write(
+            "me",
+            "POST",
+            "/api/v1/zones/claims".into(),
+            json!({"paths":["src"],"note":"","ttl_minutes":30}),
+        );
+        call.key = Some("wait-key".into());
+        call.long_poll = true;
+        call.deadline_ms = Some(8_000);
+        waiter.call(&call)
+    });
+    let held = ready_rx
+        .recv_timeout(WAIT)
+        .expect("long-poll claim reached the server");
+
+    let started = Instant::now();
+    let mut release = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "long_poll_sibling_process", "--nocapture"])
+        .env("LY_SURVEY_URL", &url)
+        .env("LY_SURVEY_JOURNAL", &journal.0)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let release_stream = ready_rx
+        .recv_timeout(WAIT)
+        .expect("sibling release must reach the server while wait still holds its HTTP response");
+    assert!(
+        started.elapsed() < Duration::from_millis(1_500),
+        "sibling was blocked on the journal flock for {:?}",
+        started.elapsed()
+    );
+    write_reply(&mut { release_stream }, 200, json!({"released": 1}));
+    assert!(release.wait().unwrap().success());
+
+    write_reply(
+        &mut { held },
+        200,
+        json!({"claim":{"id":1,"session":"me","paths":["src"],"fence":1,"expires_at":999999},
+               "created":true}),
+    );
+    assert!(wait.join().unwrap().is_ok());
+    stop.store(true, Ordering::Release);
+    let _ = worker.join();
+}
+
+#[test]
+fn long_poll_sibling_process() {
+    let Ok(url) = std::env::var("LY_SURVEY_URL") else {
+        return;
+    };
+    let journal = std::env::var_os("LY_SURVEY_JOURNAL").unwrap();
+    let client = Client::new(&url, "fixture-token".into())
+        .unwrap()
+        .with_pending_journal(PathBuf::from(journal))
+        .unwrap();
+    let mut call = Call::write("me", "DELETE", "/api/v1/zones/claims/9".into(), json!({}));
+    call.key = Some("release-key".into());
+    call.deadline_ms = Some(2_000);
+    client.call(&call).unwrap();
 }

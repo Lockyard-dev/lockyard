@@ -54,6 +54,10 @@ pub struct Conflict {
     pub note: String,
     #[serde(default)]
     pub expires_at: Stamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<crate::proto::ClaimMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty: Option<bool>,
 }
 
 impl fmt::Display for Conflict {
@@ -213,6 +217,8 @@ fn find_conflicts(
         for (claim, holder, note, expires_at, held_path) in &held {
             if path.overlaps(&ZonePath::stored(held_path.clone())) {
                 conflicts.push(Conflict {
+                    mode: Some(crate::proto::ClaimMode::Exclusive),
+                    dirty: None,
                     path: path.as_str().to_string(),
                     held_path: held_path.clone(),
                     claim: *claim,
@@ -238,7 +244,7 @@ fn lease_ms(ttl_minutes: i64) -> Result<i64> {
 fn require_one(changed: usize, id: Option<i64>) -> Result<usize> {
     match id {
         Some(id) if changed == 0 => Err(Error::NotFound(format!(
-            "Z-{id} is not an active claim of this agent"
+            "claim Z-{id} is gone: expired or released (истекла или снята); check status --lost"
         ))),
         _ => Ok(changed),
     }

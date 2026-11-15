@@ -123,6 +123,8 @@ fn check_item(item: Value) -> std::result::Result<PathCheck, ClientError> {
             agent: session.clone(),
             note: String::new(),
             expires_at: Default::default(),
+            mode: None,
+            dirty: None,
         }),
         Some(object) => {
             let mut conflict: Conflict = serde_json::from_value(object.clone())
@@ -148,6 +150,12 @@ fn check_item(item: Value) -> std::result::Result<PathCheck, ClientError> {
         path,
         status,
         holder,
+        mode: serde_json::from_value(item.get("mode").cloned().unwrap_or(Value::Null))
+            .map_err(|error| ClientError::Decode(error.to_string()))?,
+        auto_grantable: serde_json::from_value(
+            item.get("auto_grantable").cloned().unwrap_or(Value::Null),
+        )
+        .map_err(|error| ClientError::Decode(error.to_string()))?,
     })
 }
 
@@ -191,6 +199,81 @@ impl<T: Transport> CloudBackend<T> {
 
     fn post(&self, session: &str, path: String, body: &impl Serialize) -> Result<Value> {
         self.write(session, "POST", path, body)
+    }
+
+    fn zone_request_body(&self, agent: &str, request: &impl Serialize) -> Result<Value> {
+        let mut body =
+            serde_json::to_value(request).map_err(|error| Error::Invalid(error.to_string()))?;
+        // An unknown capability (ping/protocol failure) is not a confirmed server default.
+        if body.get("mode").is_none() && !self.transport.soft_zones_v1(agent).unwrap_or(false) {
+            // Safe before Request::Call crosses even a 0.3.12 agent socket.
+            body["mode"] = json!("exclusive");
+        }
+        Ok(body)
+    }
+
+    fn claim_error(&self, agent: &str, id: i64, error: Error) -> Error {
+        if error.kind() != "not_found"
+            && !matches!(
+                &error,
+                Error::Cloud {
+                    status: Some(404),
+                    ..
+                }
+            )
+        {
+            return error;
+        }
+        let tail = query(&[("session", Some(agent.to_string()))]);
+        let lost = self
+            .get_with_timeout(
+                agent,
+                format!("/api/v1/zones/lost{tail}"),
+                Some(std::time::Duration::from_millis(500)),
+            )
+            .ok()
+            .and_then(|value| list::<LostClaim>(value, &["lost", "claims", "items"]).ok())
+            .and_then(|items| {
+                items.into_iter().find(|claim| {
+                    claim.claim_id == id && (claim.session.is_empty() || claim.session == agent)
+                })
+            });
+        let detail = match lost {
+            Some(claim) => format!(
+                "{}{}",
+                claim.reason.as_deref().unwrap_or("expired or released"),
+                claim
+                    .lost_at
+                    .map(|at| format!(" at {at}"))
+                    .unwrap_or_default()
+            ),
+            None => match &error {
+                Error::Cloud { details, .. } if details.get("reason").is_some() => format!(
+                    "{}{}",
+                    details["reason"].as_str().unwrap_or("expired or released"),
+                    details
+                        .get("lost_at")
+                        .map(|at| format!(" at {at}"))
+                        .unwrap_or_default()
+                ),
+                _ => "expired or released (истекла или снята)".into(),
+            },
+        };
+        let message = format!("claim Z-{id} is gone: {detail}; check status --lost");
+        match error {
+            Error::Cloud {
+                code,
+                status,
+                details,
+                ..
+            } => Error::Cloud {
+                code,
+                status,
+                details,
+                message,
+            },
+            _ => Error::NotFound(message),
+        }
     }
 
     fn item(&self, session: &str, id: &str) -> Result<Value> {
@@ -295,7 +378,21 @@ impl<T: Transport> CloudBackend<T> {
         if let Some(key) = &self.write_idempotency_key {
             call.key = Some(key.clone());
         }
-        Ok(self.transport.call(&call).map_err(|mut error| {
+        let result = self.transport.call(&call);
+        let result = match result {
+            Err(ClientError::OutcomeUnknown(_))
+                if call.method == "POST"
+                    && call.path == ITEMS
+                    && call
+                        .body
+                        .as_ref()
+                        .is_some_and(|body| body["client_key"].is_string()) =>
+            {
+                self.transport.call(&call)
+            }
+            result => result,
+        };
+        Ok(result.map_err(|mut error| {
             error.explain_task_create_refusal(&call);
             error
         })?)
@@ -378,6 +475,7 @@ fn receipt_from(value: &Value) -> bus::Receipt {
 fn message(value: Value) -> Result<Message> {
     if value.get("queued").and_then(Value::as_bool) == Some(true) && value.get("id").is_none() {
         return Ok(Message {
+            replied_at: None,
             id: 0,
             thread_id: None,
             reply_to: None,
@@ -761,14 +859,17 @@ impl<T: Transport> Backend for CloudBackend<T> {
             .map(|(claim, _)| claim)
     }
 
+    fn soft_zones_v1(&self) -> Result<bool> {
+        Ok(self.transport.soft_zones_v1(&self.session)?)
+    }
+
     fn claim_with_creation_status(
         &mut self,
         agent: &str,
         request: &ClaimRequest,
         _now: i64,
     ) -> Result<(Claim, Option<bool>)> {
-        let body =
-            serde_json::to_value(request).map_err(|error| Error::Invalid(error.to_string()))?;
+        let body = self.zone_request_body(agent, request)?;
         let mut call = Call::write(agent, "POST", "/api/v1/zones/claims".into(), body);
         if let Some(key) = &self.write_idempotency_key {
             call.key = Some(key.clone());
@@ -791,21 +892,46 @@ impl<T: Transport> Backend for CloudBackend<T> {
         request: &RenewRequest,
         now: i64,
     ) -> Result<usize> {
-        let ids = match id {
-            Some(id) => vec![id],
-            None => {
-                let own = ClaimQuery {
+        if !(1..=240).contains(&request.ttl_minutes) {
+            return Err(Error::Invalid("ttl must be 1 to 240 minutes".into()));
+        }
+        let owned = if request.fence.is_none() || id.is_none() {
+            self.claims(
+                &ClaimQuery {
                     session: Some(agent.to_string()),
                     path: None,
-                };
-                self.claims(&own, now)?
-                    .into_iter()
-                    .map(|claim| claim.id)
-                    .collect()
-            }
+                },
+                now,
+            )?
+            .into_iter()
+            .filter(|claim| claim.session == agent)
+            .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let ids = match id {
+            Some(id) => vec![id],
+            None => owned.iter().map(|claim| claim.id).collect(),
         };
         for id in &ids {
-            self.post(agent, format!("/api/v1/zones/claims/{id}/renew"), request)?;
+            let mut request = request.clone();
+            if request.fence.is_none() {
+                request.fence = Some(
+                    owned
+                        .iter()
+                        .find(|claim| claim.id == *id)
+                        .map(|claim| claim.fence)
+                        .ok_or_else(|| {
+                            self.claim_error(
+                                agent,
+                                *id,
+                                Error::NotFound("claim is not yours or no longer active".into()),
+                            )
+                        })?,
+                );
+            }
+            self.post(agent, format!("/api/v1/zones/claims/{id}/renew"), &request)
+                .map_err(|error| self.claim_error(agent, *id, error))?;
         }
         Ok(ids.len())
     }
@@ -819,13 +945,15 @@ impl<T: Transport> Backend for CloudBackend<T> {
     ) -> Result<usize> {
         match id {
             Some(id) => {
-                self.write(
-                    agent,
-                    "DELETE",
-                    format!("/api/v1/zones/claims/{id}"),
-                    request,
-                )?;
-                Ok(1)
+                let value = self
+                    .write(
+                        agent,
+                        "DELETE",
+                        format!("/api/v1/zones/claims/{id}"),
+                        request,
+                    )
+                    .map_err(|error| self.claim_error(agent, id, error))?;
+                Ok(count(&value, &["released", "count"], 1))
             }
             None => {
                 if request.fence.is_some() {
@@ -887,7 +1015,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
     }
 
     fn queue_add(&mut self, agent: &str, request: &QueueRequest) -> Result<QueueEntry> {
-        let value = self.post(agent, "/api/v1/zones/queue".into(), request)?;
+        let body = self.zone_request_body(agent, request)?;
+        let value = self.post(agent, "/api/v1/zones/queue".into(), &body)?;
         Ok(one(value, "entry")?)
     }
 
@@ -1089,9 +1218,66 @@ impl<T: Transport> Backend for CloudBackend<T> {
         )?)
     }
 
+    fn reply_with_client(
+        &mut self,
+        agent: &str,
+        id: i64,
+        body: &str,
+        client: &str,
+        _now: i64,
+    ) -> Result<Message> {
+        message(self.post(
+            agent,
+            format!("/api/v1/bus/messages/{id}/reply"),
+            &json!({"body":body,"from_client":client}),
+        )?)
+    }
+
     fn ack(&mut self, agent: &str, id: i64) -> Result<()> {
         self.post(agent, format!("/api/v1/bus/messages/{id}/ack"), &json!({}))?;
         Ok(())
+    }
+
+    fn validate_handled(&self, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() || ids.iter().any(|id| *id <= 0) {
+            return Err(Error::Invalid(
+                "handled message ids must be positive integers".into(),
+            ));
+        }
+        let protocol = self.cloud_protocol()?;
+        if !protocol["capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|cap| cap == "mail_handled_v1"))
+        {
+            return Err(Error::Invalid("marking mail handled requires server capability mail_handled_v1; no read receipts were changed".into()));
+        }
+        Ok(())
+    }
+
+    fn mark_handled(&mut self, agent: &str, ids: &[i64]) -> Result<usize> {
+        self.validate_handled(ids)?;
+        let reply = self.post(
+            agent,
+            "/api/v1/bus/inbox/handled".into(),
+            &json!({"ids": ids}),
+        )?;
+        Ok(count(&reply, &["handled", "count"], 0))
+    }
+
+    fn task_by_client_key(&self, key: &str) -> Result<Option<tasks::Task>> {
+        let reply = self.get(
+            &self.session,
+            format!("{ITEMS}{}", query(&[("client_key", Some(key.to_owned()))])),
+        )?;
+        let items: Vec<Value> = list(reply, &["items", "tasks"])?;
+        let matching: Vec<_> = items
+            .iter()
+            .filter(|item| item["client_key"].as_str() == Some(key))
+            .collect();
+        match matching.as_slice() {
+            [item] => task_from(item).map(Some),
+            _ => Ok(None),
+        }
     }
 
     fn inbox(&mut self, agent: &str, filter: InboxQuery, now: i64) -> Result<InboxPage> {
@@ -1394,7 +1580,31 @@ impl<T: Transport> Backend for CloudBackend<T> {
                 spec.pad
             )?);
         }
-        task_from(&self.post(author, ITEMS.into(), &body)?)
+        let reply = self.post(author, ITEMS.into(), &body).map_err(|error| {
+            if let Error::Cloud {
+                code,
+                status,
+                mut details,
+                message,
+            } = error
+            {
+                if code == "outcome_unknown" {
+                    if !details.is_object() {
+                        details = json!({});
+                    }
+                    details["client_key"] = body["client_key"].clone();
+                }
+                Error::Cloud {
+                    code,
+                    status,
+                    details,
+                    message,
+                }
+            } else {
+                error
+            }
+        })?;
+        task_from(&reply)
     }
 
     fn plan_task(&mut self, agent: &str, id: &str, plan: &tasks::TaskPlan) -> Result<tasks::Task> {
@@ -1875,6 +2085,26 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn survey_r4_check_and_granted_request_preserve_server_modes() {
+        let checks = checks(
+            json!([{"path":"src/a.rs","status":"held","mode":"shared","auto_grantable":false,
+            "holder":{"session":"other","path":"src/a.rs","mode":"exclusive","dirty":true}}]),
+        )
+        .unwrap();
+        let output = serde_json::to_value(checks).unwrap();
+        assert_eq!(output[0]["mode"], "shared");
+        assert_eq!(output[0]["auto_grantable"], false);
+        assert_eq!(output[0]["holder"]["mode"], "exclusive");
+        assert_eq!(output[0]["holder"]["dirty"], true);
+        let record: AccessRecord = one(json!({"id":4,"granted":true,"claim":{"id":7,"session":"me","mode":"shared","held":false,
+            "foreign_dirty_paths":[{"path":"src/a.rs","task_id":12}]}}), "request").unwrap();
+        let output = serde_json::to_value(record).unwrap();
+        assert_eq!(output["claim"]["mode"], "shared");
+        assert_eq!(output["granted"], true);
+        assert_eq!(output["claim"]["foreign_dirty_paths"][0]["task_id"], "D-12");
+    }
+
+    #[test]
     fn legacy_nested_and_bare_task_fields_are_normalized_once() {
         for wire in [
             json!([{"path":"a","task_id":12}]),
@@ -2128,7 +2358,7 @@ mod tests {
             paths: vec!["src".into()],
             note: "n".into(),
             ttl_minutes: 30,
-            mode: ClaimMode::Shared,
+            mode: Some(ClaimMode::Shared),
             purpose: Purpose::Deploy,
             lazy: true,
             zone: Some("api".into()),

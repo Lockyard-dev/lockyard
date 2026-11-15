@@ -544,7 +544,7 @@ fn mcp_auto_area_tasks_show_and_list_preserve_server_paths_and_legacy_output() {
                 let task = if key == "task" {
                     &answer["structuredContent"]["task"]
                 } else {
-                    &answer["structuredContent"][0]
+                    &answer["structuredContent"]["tasks"][0]
                 };
                 match &paths {
                     Some(paths) => assert_eq!(task["paths"], json!(paths), "{answer}"),

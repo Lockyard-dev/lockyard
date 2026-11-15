@@ -41,6 +41,7 @@
             let limit = match tool["name"].as_str() {
                 Some("start_work") => 200, // Includes the required idle-release warning.
                 Some("finish_work") => 160, // Explains the explicit bulk-release opt-in.
+                Some("task_add") => 180, // Required P0 category list and area fallback.
                 _ => 110,
             };
             assert!(description.len() <= limit && !description.contains('\n'), "{description}");
@@ -71,7 +72,10 @@
         let added = call(&dir, "lead", "task_add", json!({"title": "legacy"}));
         assert_eq!(added["isError"], false);
         let listed = call(&dir, "lead", "task_list", json!({}));
-        assert_eq!(listed["structuredContent"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            listed["structuredContent"]["tasks"].as_array().unwrap().len(),
+            1
+        );
     }
 
     fn compact_call(dir: &tempfile::TempDir, agent: &str, name: &str, arguments: Value) -> Value {
@@ -93,7 +97,7 @@
         assert_eq!(added["isError"], false, "{}", text(&added));
         assert_eq!(added["structuredContent"]["id"], "D-1");
         let listed = call(&dir, "lead", "task_list", json!({}));
-        let tasks = listed["structuredContent"].as_array().unwrap();
+        let tasks = listed["structuredContent"]["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0]["id"], "D-1");
         assert_eq!(tasks[0]["title"], "local task");
@@ -319,7 +323,13 @@
             let refused = compact_call(&dir, "worker", "finish_work", arguments);
             assert_eq!(refused["isError"], true, "{refused}");
             let tasks = call(&dir, "worker", "task_list", json!({}));
-            assert_eq!(tasks["structuredContent"][0]["status"], "claimed");
+            let listed = &tasks["structuredContent"]["tasks"];
+            assert!(
+                listed.as_array().unwrap().iter().any(|task| {
+                    task["id"] == "D-1" && task["status"] == "claimed"
+                }),
+                "{tasks}"
+            );
             let status = compact_call(&dir, "worker", "status", json!({}));
             assert_eq!(status["structuredContent"]["claims"].as_array().unwrap().len(), 2);
         }
@@ -585,7 +595,8 @@
         let dir = project();
         call(&dir, "a", "zone_claim", json!({"paths": ["src"]}));
         let failed_finish = call(&dir, "a", "finish_work", json!({"id": 999}));
-        assert_eq!(failed_finish["isError"], true);
+        assert_eq!(failed_finish["isError"], false);
+        assert_eq!(failed_finish["structuredContent"]["already_gone"], json!([999]));
         let result = call(&dir, "a", "check", json!({"path": "src/file.rs"}));
         assert_eq!(result["isError"], false);
         let answer: Value = serde_json::from_str(text(&result)).unwrap();
@@ -785,6 +796,72 @@
     }
 
     #[test]
+    fn task_list_structured_content_is_an_object() {
+        let wrapped = wrap_task_list_structured(json!([{"id":"D-1"}]));
+        assert!(wrapped.is_object(), "{wrapped}");
+        assert_eq!(wrapped["tasks"][0]["id"], "D-1");
+    }
+
+    #[test]
+    fn update_accepts_reply_to_without_to_body_pair() {
+        let dir = project();
+        call(&dir, "b", "zone_claim", json!({"paths":["docs"]}));
+        let sent = call(
+            &dir,
+            "a",
+            "msg_send",
+            json!({"to": "b", "body": "ping"}),
+        );
+        assert_eq!(sent["isError"], false, "{}", text(&sent));
+        let id = sent["structuredContent"]["id"].as_i64().unwrap();
+        let replied = call(
+            &dir,
+            "b",
+            "update",
+            json!({"reply_to": id, "body": "pong"}),
+        );
+        assert_eq!(replied["isError"], false, "{}", text(&replied));
+    }
+
+    #[test]
+    fn task_add_rejects_unknown_p0_category_with_allowed_list() {
+        let dir = project();
+        let refused = call(
+            &dir,
+            "lead",
+            "task_add",
+            json!({"title": "money", "priority": "P0", "p0_category": "money", "area": "general"}),
+        );
+        assert_eq!(refused["isError"], true);
+        let message = text(&refused);
+        assert!(message.contains("player_money"), "{message}");
+        assert!(message.contains("security_breach"), "{message}");
+    }
+
+    #[test]
+    fn session_label_merge_is_ready_for_cloud_claim_meta() {
+        let merged = crate::session_label::merge_session_meta(Some(json!({"custom": true}))).unwrap();
+        assert_eq!(merged["custom"], true);
+        assert!(merged["pid"].as_u64().is_some());
+        assert!(merged.get("parent_pid").is_some());
+    }
+
+    #[test]
+    fn finish_work_lists_already_gone_claims() {
+        let dir = project();
+        let started = call(&dir, "a", "start_work", json!({"paths": ["src/one.rs"]}));
+        assert_eq!(started["isError"], false, "{}", text(&started));
+        let id = started["structuredContent"]["claim"]["id"].as_i64().unwrap();
+        let released = call(&dir, "a", "zone_release", json!({"id": id}));
+        assert_eq!(released["isError"], false, "{}", text(&released));
+        let finished = call(&dir, "a", "finish_work", json!({"id": id}));
+        assert_eq!(finished["isError"], false, "{}", text(&finished));
+        let content = &finished["structuredContent"];
+        assert_eq!(content["already_gone"], json!([id]), "{finished}");
+        assert_eq!(content["released"], 0);
+    }
+
+    #[test]
     fn task_add_with_only_area_on_auto_area_server_hints_reconnect() {
         let error = validate_task_add_area(
             Surface::Compact,
@@ -805,4 +882,13 @@
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn queued_update_explains_delivery_without_inventing_a_deadline() {
+        let mut queued = json!({"queued":true,"id":0});
+        composite::annotate_queued_delivery(&mut queued);
+        let hint = queued["delivery"].as_str().unwrap();
+        assert!(hint.contains("retries automatically") && hint.contains("write journal is free"), "{queued}");
+        assert!(hint.contains("msg_sent"), "{queued}");
     }

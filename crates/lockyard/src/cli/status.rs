@@ -293,6 +293,14 @@ fn render_status(
     read.tasks.truncate(20);
     lines.push(join(&read.tasks, task_line, "no tasks"));
     data["tasks"] = json!(read.tasks);
+    if let Some(tasks) = data["tasks"].as_array_mut() {
+        for task in tasks {
+            if let Some(object) = task.as_object_mut() {
+                object.remove("body");
+                object.remove("acceptance");
+            }
+        }
+    }
     if let Some(snap) = open_mail {
         data["open_mail"] = json!(snap.items);
         if snap.truncated {
