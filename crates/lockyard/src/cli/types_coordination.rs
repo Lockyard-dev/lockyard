@@ -306,6 +306,8 @@ pub(super) enum MsgCommand {
 
 #[derive(Subcommand)]
 #[command(defer = true)]
+// Parsed once per process; boxing clap variants would only obscure the CLI shape.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum TaskCommand {
     /// Cloud registry items that are actionable, with raw states and dependency links.
     Ready {

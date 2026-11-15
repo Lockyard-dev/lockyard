@@ -36,7 +36,7 @@ allow = [
 # Scope approval to the locked data crates; other crates/versions still fail closed.
 exceptions = [
     { crate = "webpki-roots@0.26.11", allow = ["CDLA-Permissive-2.0"] },
-    { crate = "webpki-roots@1.0.11", allow = ["CDLA-Permissive-2.0"] },
+    { crate = "webpki-roots@1.0.12", allow = ["CDLA-Permissive-2.0"] },
 ]
 
 [bans]

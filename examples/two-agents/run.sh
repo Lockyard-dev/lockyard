@@ -86,7 +86,8 @@ expect 0 alice msg send bob "about 10 minutes, I will release src/api when the r
 expect 0 alice zone release Z-1
 
 say "Bob reads the answer"
-expect 0 bob msg inbox
+# Outside a terminal, inbox marks mail read only when asked.
+expect 0 bob msg inbox --mark-read
 contains "10 minutes"
 
 say "Alice can see her message arrived and was read"

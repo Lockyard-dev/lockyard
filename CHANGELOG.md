@@ -14,6 +14,11 @@ All notable changes to Lockyard are recorded here. The format follows
   owner holds the journal, the load still succeeds and the hint is restored by a later
   open. Hint cleanup also requires the shared flock; `zone wait`
   continues to release it throughout the HTTP long poll (LY-0010).
+- Release pending-journal and operation flocks explicitly when their guard drops (LY-0020).
+  A child process forked meanwhile shares the open file description, so closing alone left
+  the journal "busy" until that child exec'd or exited.
+- Unit tests of the cloud client no longer race on the process-wide key directory, and the
+  fake server closes its listener and workers and reuses connections (LY-0020).
 
 ### Added
 

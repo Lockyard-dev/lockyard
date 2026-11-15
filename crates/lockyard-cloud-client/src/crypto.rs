@@ -1843,6 +1843,7 @@ impl WorkspaceKey {
     }
     /// Location of the current workspace key; no key bytes or recovery words are returned.
     pub fn storage_path(workspace: &str) -> Result<std::path::PathBuf, String> {
+        #[cfg(not(test))]
         use std::path::PathBuf;
         if workspace.is_empty()
             || !workspace
@@ -1851,6 +1852,10 @@ impl WorkspaceKey {
         {
             return Err("invalid workspace id for local key storage".into());
         }
+        // Unit tests exercise real key files without changing process-wide environment.
+        #[cfg(test)]
+        let base = crate::test_support::key_config_home();
+        #[cfg(not(test))]
         let base = match std::env::var_os("XDG_CONFIG_HOME") {
             Some(p) if !p.is_empty() => PathBuf::from(p),
             _ => PathBuf::from(lockyard_core::paths::home_dir().ok_or("HOME is not set")?)

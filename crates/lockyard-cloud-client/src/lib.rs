@@ -17,6 +17,8 @@ mod repository;
 pub mod revocations;
 mod signed_results;
 mod status;
+#[cfg(test)]
+mod test_support;
 
 pub use backend::CloudBackend;
 pub use crypto::{CONTENT_FIELDS, FieldRule, WorkspaceKey, route_matches, transform_fields};
@@ -2307,32 +2309,7 @@ mod tests {
         }
     }
 
-    struct KeyEnv {
-        previous: Option<std::ffi::OsString>,
-        path: std::path::PathBuf,
-    }
-    impl KeyEnv {
-        fn new() -> Self {
-            let previous = std::env::var_os("XDG_CONFIG_HOME");
-            // Key storage rejects symlinked parents; macOS commonly spells its temp root via /var.
-            let path = std::env::temp_dir()
-                .canonicalize()
-                .unwrap()
-                .join(format!("lockyard-test-{}", ulid()));
-            unsafe { std::env::set_var("XDG_CONFIG_HOME", &path) };
-            Self { previous, path }
-        }
-    }
-    impl Drop for KeyEnv {
-        fn drop(&mut self) {
-            if let Some(value) = self.previous.take() {
-                unsafe { std::env::set_var("XDG_CONFIG_HOME", value) };
-            } else {
-                unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-            }
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
+    use crate::test_support::KeyEnv;
 
     fn setting(mode: &str, key_id: Option<&str>) -> Reply {
         Reply::json(
@@ -2343,7 +2320,9 @@ mod tests {
 
     #[test]
     fn setting_off_leaves_content_clear() {
-        let _lock = KEY_ENV.lock().unwrap();
+        let _lock = KEY_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = KeyEnv::new();
         let server = FakeServer::start(vec![
             setting("off", None),
@@ -2377,7 +2356,9 @@ mod tests {
 
     #[test]
     fn node_context_encrypts_even_when_legacy_setting_is_off() {
-        let _lock = KEY_ENV.lock().unwrap();
+        let _lock = KEY_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = KeyEnv::new();
         let key = WorkspaceKey::from_entropy([83; 32]);
         key.store_for_workspace(NODE_WORKSPACE).unwrap();
@@ -2415,7 +2396,9 @@ mod tests {
 
     #[test]
     fn node_context_refuses_missing_policy_key_or_wrong_workspace() {
-        let _lock = KEY_ENV.lock().unwrap();
+        let _lock = KEY_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = KeyEnv::new();
         for reply in [
             Reply::json(
@@ -3165,7 +3148,9 @@ mod tests {
 
     #[test]
     fn required_setting_encrypts_requests_and_decrypts_replies() {
-        let _lock = KEY_ENV.lock().unwrap();
+        let _lock = KEY_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = KeyEnv::new();
         let (key, _) = WorkspaceKey::generate().unwrap();
         key.store_for_workspace("123e4567-e89b-12d3-a456-426614174000")
@@ -3209,7 +3194,9 @@ mod tests {
 
     #[test]
     fn required_setting_without_key_refuses_content_write() {
-        let _lock = KEY_ENV.lock().unwrap();
+        let _lock = KEY_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = KeyEnv::new();
         let server = FakeServer::start(vec![
             setting("required", Some("expected")),
@@ -3241,7 +3228,9 @@ mod tests {
 
     #[test]
     fn required_setting_rejects_a_mismatched_local_key_id() {
-        let _lock = KEY_ENV.lock().unwrap();
+        let _lock = KEY_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = KeyEnv::new();
         let (key, _) = WorkspaceKey::generate().unwrap();
         key.store_for_workspace("123e4567-e89b-12d3-a456-426614174000")
@@ -3404,12 +3393,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolved_content_key_reloads_from_disk_when_memory_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_home = dir.path().canonicalize().unwrap();
-        let previous = std::env::var_os("XDG_CONFIG_HOME");
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        }
+        // Keep the existing key-storage test guard poison tolerant, including after a panic.
+        let _lock = KEY_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = KeyEnv::new();
         let key = WorkspaceKey::from_entropy([42; 32]);
         key.store_for_workspace("wave2reload").unwrap();
         let empty = Client::new("http://127.0.0.1:9", "fixture".into())
@@ -3446,12 +3434,6 @@ mod tests {
             pinned.resolved_content_key().unwrap().unwrap().key_id(),
             newer.key_id()
         );
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
     }
 
     #[test]
