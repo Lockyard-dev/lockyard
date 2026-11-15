@@ -2680,8 +2680,8 @@ mod tests {
             let hang_here = hang > 0
                 && (!self.hang_inbox_only.load(Ordering::SeqCst) || route == "/api/v1/bus/inbox");
             if hang_here {
-                // Honour attempt_timeout_ms the way ureq does for a real Client: sleep at most
-                // the attempt budget, then fail instead of blocking the caller's renew window.
+                // attempt_timeout_ms is serialized on Call (LY-0008): honour it like ureq's
+                // request timeout so a hung route frees the agent thread within the budget.
                 let sleep_ms = call
                     .attempt_timeout_ms
                     .map(|limit| hang.min(usize::try_from(limit).unwrap_or(usize::MAX)))
@@ -6063,6 +6063,33 @@ mod tests {
         );
         // Hung inbox → omit count; the renew caller still finishes inside the budget.
         assert!(count.is_none());
+    }
+
+    #[test]
+    fn attempt_timeout_crosses_the_agent_wire_and_frees_a_hung_forward() {
+        // LY-0008: serialize Call through the envelope the socket uses; the daemon FakeServer
+        // (standing in for ureq) must see attempt_timeout_ms and return before hang_ms.
+        let rig = start_with(timing(), |_| {});
+        rig.server.hang_ms.store(2_000, Ordering::SeqCst);
+        let mut call = Call::get("alice", "/api/v1/bus/inbox".into());
+        call.attempt_timeout_ms = Some(80);
+        let wire = serde_json::to_value(&Request::Call { call: call.clone() }).unwrap();
+        let restored: Request = serde_json::from_value(wire).unwrap();
+        let Request::Call { call: on_wire } = restored else {
+            panic!("expected Call");
+        };
+        assert_eq!(on_wire.attempt_timeout_ms, Some(80));
+        let started = Instant::now();
+        let reply = rig.daemon.handle(Request::Call { call: on_wire });
+        let elapsed = started.elapsed();
+        assert!(
+            reply.error.is_some(),
+            "hung route must fail once the attempt budget elapses"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "agent thread stayed blocked for {elapsed:?}; attempt_timeout_ms was ignored"
+        );
     }
 
     /// Proof: a real Client over lockyard-cloud-client::fake observes mail_open_v1 on Ping

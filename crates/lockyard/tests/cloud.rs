@@ -1641,6 +1641,11 @@ fn cloud_status_hung_agent_falls_back_within_the_probe_budget() {
     let server = Server::start();
     let dir = cloud_project(&server);
     let runtime = tempfile::tempdir().unwrap();
+    // Warm the binary so cold-start is not charged to the hung-socket budget.
+    json_of(&cli(dir.path(), runtime.path(), &["--json", "about"]));
+    let baseline = Instant::now();
+    json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    let direct_ms = baseline.elapsed();
     std::fs::create_dir_all(socket(runtime.path()).parent().unwrap()).unwrap();
     std::fs::set_permissions(
         socket(runtime.path()).parent().unwrap(),
@@ -1659,12 +1664,21 @@ fn cloud_status_hung_agent_falls_back_within_the_probe_budget() {
             });
         }
     });
+    server.state.lock().unwrap().seen.clear();
     let started = Instant::now();
     json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
+    let hung = started.elapsed();
+    // Absolute cap: probe ≤100 ms; must not spend the 1500 ms aggregate budget.
     assert!(
-        started.elapsed() < Duration::from_millis(900),
-        "hung agent consumed the status budget: {:?}",
-        started.elapsed()
+        hung < Duration::from_millis(900),
+        "hung agent consumed the status budget: {hung:?} (direct baseline {direct_ms:?})"
+    );
+    // Relative: hung path may add the probe, not the aggregate timeout.
+    assert!(
+        hung < direct_ms + Duration::from_millis(400),
+        "hung overhead {:?} exceeds probe budget over direct {:?}",
+        hung.saturating_sub(direct_ms),
+        direct_ms
     );
     assert!(
         accepted.load(Ordering::Relaxed),
@@ -1842,6 +1856,88 @@ fn cloud_status_running_agent_preserves_tokenless_cli_support() {
     assert_eq!(status["freshness"]["via"], "agent");
     assert_eq!(status["claims"], json!([]));
     assert_eq!(status["tasks"], json!([]));
+}
+
+#[test]
+fn cloud_status_without_token_or_agent_exits_with_no_cloud_access() {
+    // META-0033: exit 5 only when the token is missing and the agent path is unavailable.
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let output = binary(dir.path(), runtime.path())
+        .args(["--json", "status"])
+        .env("LOCKYARD_AGENT", "alice")
+        .env_remove("LOCKYARD_TOKEN")
+        .env_remove("LOCKYARD_TOKEN_FILE")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5));
+    let body = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    let text = format!("{body}{err}");
+    assert!(
+        text.contains("LOCKYARD_TOKEN_FILE") || text.contains("no_cloud_access"),
+        "stdout={body} stderr={err}"
+    );
+}
+
+#[test]
+fn agent_service_opens_socket_when_project_root_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    write_agent_service_config(dir.path(), runtime.path());
+    let project = dir.path().canonicalize().unwrap();
+    // cwd stays on the safe runtime; --root names the unreadable project (LY-0007).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let url = server.url.clone();
+    let mut command = Command::new(
+        std::env::var_os("LOCKYARD_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_lockyard").into()),
+    );
+    command
+        .current_dir(runtime.path())
+        .args(["agent", "--root"])
+        .arg(&project)
+        .env("LOCKYARD_URL", &url)
+        .env("LOCKYARD_TOKEN", "test-token")
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_STATE_HOME", runtime.path().join("state"))
+        .env("XDG_CONFIG_HOME", runtime.path().join("config"))
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("LOCKYARD_TOKEN_FILE");
+    std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let restore = || {
+        let _ = std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o755));
+    };
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            restore();
+            panic!("failed to spawn agent: {error}");
+        }
+    };
+    let agent = Agent(child);
+    let end = Instant::now() + Duration::from_secs(10);
+    let mut ready = false;
+    while Instant::now() < end {
+        if socket(runtime.path()).exists() {
+            ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    restore();
+    assert!(
+        ready,
+        "agent never opened its socket with an unreadable --root"
+    );
+    drop(agent);
 }
 
 #[test]
@@ -3318,7 +3414,34 @@ fn start_agent(dir: &Path, runtime: &Path) -> Agent {
     start_agent_until(dir, runtime, true)
 }
 
+/// Service mode reads only `agent-config.toml` under XDG state (LY-0007).
+fn write_agent_service_config(dir: &Path, runtime: &Path) {
+    let config = std::fs::read_to_string(dir.join(".lockyard/config.toml")).unwrap();
+    let url = config
+        .lines()
+        .find_map(|line| line.strip_prefix("url = '")?.strip_suffix("'"))
+        .unwrap_or_default();
+    let workspace = config
+        .lines()
+        .find_map(|line| line.strip_prefix("workspace = '")?.strip_suffix("'"))
+        .unwrap_or("team");
+    let state = runtime.join("state/lockyard");
+    std::fs::create_dir_all(&state).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let text = format!(
+        "url = '{url}'\nworkspace = '{workspace}'\nproject_root = '{}'\n",
+        root.display()
+    );
+    std::fs::write(state.join("agent-config.toml"), text).unwrap();
+}
+
 fn start_agent_until(dir: &Path, runtime: &Path, wait_for_view: bool) -> Agent {
+    write_agent_service_config(dir, runtime);
     let child = binary(dir, runtime)
         .arg("agent")
         .env("LOCKYARD_TOKEN", "test-token")

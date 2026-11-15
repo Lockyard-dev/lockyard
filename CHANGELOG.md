@@ -5,6 +5,39 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.12] - 2026-11-15
+
+### Fixed
+
+- Status keeps the caller's own claims when the server marks `holder_available: false`
+  (stale presence). Those claims stay visible in text and JSON with a keepalive hint;
+  other sessions' unavailable claims still stop blocking (LC-0011).
+- `lockyard agent install` writes `~/.local/state/lockyard/agent-config.toml` (url,
+  workspace, repository) and sets WorkingDirectory to the state root (or `$HOME`). The
+  running service reads only that copy — it does not open the project tree before the
+  socket — so launchd no longer hangs in `getcwd` on a Desktop workspace waiting for
+  macOS Full Disk Access (LY-0007). **Existing units are not rewritten automatically:
+  run `lockyard agent install` again after upgrading.** `agent status` warns when the
+  process is alive but the socket file is missing, and when the copied config is older
+  than the project's `.lockyard/config.toml`.
+- Optional agent reads serialize `attempt_timeout_ms` on `Call` so the daemon applies it as
+  the ureq HTTP request timeout; a hung server frees the agent thread within that budget
+  (LY-0008).
+- Exit code `5` (no cloud access) fires only when there is no token *and* the agent path
+  failed; a running agent still serves tokenless `status` / mail / path-request CLI.
+- Path-request peeks on `status` / `zone renew` / `zone activity` use `get_with_timeout`
+  (≤300 ms). A failed or skipped peek sets `incoming_requests_unknown` and never writes
+  an empty `incoming_requests` array.
+
+### Added
+
+- Status, `zone renew`, and `zone activity` surface unanswered path requests aimed at the
+  caller's claims (`incoming_requests` in JSON; a `lockyard zone answer` hint in text)
+  via `GET /api/v1/zones/requests` (META-0032).
+- Without a cloud token and without a usable agent, `status`, `msg inbox`/`open`, and
+  `zone requests` print a clear no-access message and exit with code `5` (META-0033).
+- Advance synchronized Rust, npm, PyPI and MCP registry versions to `0.3.12`.
+
 ## [0.3.11] - 2026-11-14
 
 ### Fixed

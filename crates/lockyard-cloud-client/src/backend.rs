@@ -912,7 +912,15 @@ impl<T: Transport> Backend for CloudBackend<T> {
     }
 
     fn zone_requests(&self, agent: &str) -> Result<Vec<AccessRecord>> {
-        let value = self.get(agent, "/api/v1/zones/requests".into())?;
+        self.zone_requests_within(agent, std::time::Duration::from_secs(40))
+    }
+
+    fn zone_requests_within(
+        &self,
+        agent: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<AccessRecord>> {
+        let value = self.get_with_timeout(agent, "/api/v1/zones/requests".into(), Some(timeout))?;
         Ok(list(value, &["requests", "items"])?)
     }
 

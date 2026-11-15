@@ -39,6 +39,9 @@ pub(super) fn claim_line(claim: &Claim, clock: Option<i64>) -> String {
         claim.session,
         claim.paths.join(" ")
     );
+    if claim.holder_available == Some(false) {
+        line.push_str("  держатель недоступен — продли или `lockyard keepalive`");
+    }
     if !claim.note.is_empty() {
         line.push_str("  ");
         line.push_str(&claim.note);
