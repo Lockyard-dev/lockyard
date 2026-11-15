@@ -975,8 +975,18 @@ impl Client {
                 ));
             }
         }
-        if maintenance {
-            private_directory(&directory.join(LONG_POLL_MAINTENANCE))?;
+        let hint = directory.join(LONG_POLL_MAINTENANCE);
+        if maintenance && !hint.try_exists().unwrap_or(false) {
+            // Even this disposable hint mutates the shared journal. Take its flock
+            // briefly for legacy-sidecar restoration, never for the HTTP long poll.
+            // Current clients normally publish the hint with their sidecars, so this
+            // mostly runs for journals written by older clients. A busy owner never fails the
+            // load: the hint stays unpublished and the next open retries it.
+            match PendingSendGuard::lock_journal(&directory) {
+                Ok(_journal) => private_directory(&hint)?,
+                Err(error) if journal_busy(&error) => {}
+                Err(error) => return Err(error),
+            }
         }
         self.protocol_state
             .lock()
@@ -2409,6 +2419,65 @@ mod pending_completion_tests {
             assert!(journal_files(directory).is_empty());
         }
         assert_eq!(MAINTENANCE_SCANS.get(), scans);
+    }
+
+    #[test]
+    fn ly0019_legacy_long_poll_hint_creation_and_cleanup_require_journal_lock() {
+        for extension in ["inflight", "completed"] {
+            let root = tempfile::tempdir().unwrap();
+            let root = root.path().canonicalize().unwrap();
+            let new_client = || {
+                Client::new("http://127.0.0.1:1", "fixture".into())
+                    .unwrap()
+                    .with_pending_journal(&root)
+            };
+            let sender = new_client().unwrap();
+            let directory = sender.pending_journal.as_ref().unwrap();
+            let hint = directory.join(LONG_POLL_MAINTENANCE);
+            let sidecar = journal_path(directory, "poll").with_extension(extension);
+            let holder = PendingSendGuard::lock_journal(directory).unwrap();
+            let record = pending(&sender, "poll");
+            sender.retain_pending(record.clone()).unwrap();
+            // Model an older journal with sidecars but no maintenance hint.
+            if extension == "inflight" {
+                drop(PendingSendGuard::lock_operation(&sidecar).unwrap());
+            } else {
+                sender.complete_pending_later(&record);
+            }
+            assert!(sidecar.exists());
+            assert!(!hint.exists());
+            // A busy journal never fails the load; the hint waits for the flock.
+            drop(new_client().expect("a busy journal must not fail the load"));
+            assert!(!hint.exists(), "{extension}: creation bypassed the flock");
+            drop(holder);
+
+            let restored = new_client().unwrap();
+            assert!(
+                hint.exists(),
+                "{extension}: restoration must publish the hint"
+            );
+            // Restoration releases the flock immediately; another owner can take it.
+            let holder = PendingSendGuard::lock_journal(directory).unwrap();
+            let error = restored.claim_pending_send("unrelated").err().unwrap();
+            assert!(journal_busy(&error), "{extension}: {error}");
+            assert!(hint.exists(), "{extension}: removal bypassed the flock");
+            assert!(sidecar.exists());
+            drop(holder);
+
+            // A published hint means loads skip the flock even while it is busy.
+            let holder = PendingSendGuard::lock_journal(directory).unwrap();
+            drop(new_client().expect("an existing hint must not need the flock"));
+            assert!(hint.exists());
+            drop(holder);
+
+            drop(restored.claim_pending_send("unrelated").unwrap());
+            assert!(!hint.exists(), "{extension}: cleanup must remove the hint");
+            assert!(!sidecar.exists());
+            assert_eq!(
+                restored.pending_operation("poll").is_some(),
+                extension == "inflight"
+            );
+        }
     }
 
     #[test]

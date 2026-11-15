@@ -1,6 +1,43 @@
 <!-- Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0. -->
 # Compatibility boundaries
 
+LC-0019 soft zones use an optional request `mode` in claims, short waits and the long
+queue. CLI `--shared` sends `shared`; `--exclusive` sends `exclusive` (mutually exclusive).
+MCP `shared:true` / `shared:false` select those modes; omission preserves server choice.
+Shared folder claims may overlap; only dirty files are exclusively held. Reserve paths
+exclusively for migrations, contracts and hosts with `--exclusive` or `shared:false`.
+Local SQLite still supports exclusive claims only, including its unchanged default.
+
+Server contract: advertise `soft_zones_v1` in the negotiated `/api/v1/protocol`
+capabilities only when both POST `/api/v1/zones/claims` (including `queue_wait_seconds`)
+and POST `/api/v1/zones/queue` accept omitted `mode`, selecting shared for file paths
+and exclusive for host paths. Explicit modes must be honored; responses report the
+selected `mode`. HEAD `579d557` requires a nonempty mode in `ModeAndPurpose`, so the
+CloudBackend supplies `exclusive` before forwarding a claim/queue request unless its
+transport confirms this capability. A direct HTTP client negotiates its own protocol;
+an agent socket requires the new Ping `soft_zones_v1` flag, which promises both that
+the agent negotiates the write and that its fresh negotiated server supports omission.
+An older agent omitting this flag always receives explicit `exclusive`, even if a
+forwarded protocol GET would advertise a newer server. Ping only reads cached support;
+a cache miss, expiry or contention conservatively keeps the exclusive default.
+The HTTP transport also supplies this fallback for raw calls. This happens before
+encryption/journaling; replay retains the
+original wire bytes and idempotency key. No probe mutation or failed-write fallback
+is needed. Wave-4 server code must add this capability before implicit soft defaults
+activate with this client. The cloud tree is not modified by the client change.
+
+Claim reuse and acquisition receipt validation use the same capability-dependent
+default: without confirmed support, an omitted mode requires an exclusive claim.
+With support, an omitted mode accepts the server's selected mode. Explicit modes
+always require an exact match; local SQLite retains the exclusive default.
+
+Wave-4 response metadata is classified per DTO: claims/receipts `held` (boolean),
+`idle_release_at` (timestamp); check `mode` and `auto_grantable` (boolean); conflict
+holder `dirty` (boolean); requests `granted` (boolean) and `claim` (fully classified,
+decrypted claim receipt); mail `replied_at` (timestamp). These optional fields survive
+JSON output. Status text includes `mode=shared` or `mode=exclusive`. Unknown response
+fields remain refused by required E2EE policy, including inside nested claims/holders.
+
 EP-12 compatibility belongs exclusively to `lockyard-compat/src/legacy_v1.rs`.
 `lockyard-core` and `lockyard-node` cannot depend on that crate. CLI, MCP, SDK,
 and persisted-workflow adapters validate canonical `TaskId` and `BusTaskId`
