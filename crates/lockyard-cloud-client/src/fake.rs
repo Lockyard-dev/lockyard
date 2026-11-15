@@ -67,6 +67,7 @@ struct ServeMode {
     default_headers: Vec<(String, String)>,
     /// When the script is empty, answer with path-shaped empty JSON instead of `{}`.
     routed: bool,
+    capabilities: Vec<String>,
 }
 
 pub struct FakeServer {
@@ -77,7 +78,7 @@ pub struct FakeServer {
 impl FakeServer {
     /// Serves `script` in order. Requests past the end get `{}`.
     pub fn start(script: Vec<Reply>) -> Self {
-        Self::start_with(script, Vec::new(), false)
+        Self::start_with(script, Vec::new(), false, &[])
     }
 
     /// Path-shaped empty JSON for agent refresh traffic, with sticky response headers.
@@ -86,13 +87,19 @@ impl FakeServer {
     /// concurrent refresh, and every response must keep announcing capabilities such as
     /// `mail_open_v1`.
     pub fn start_routed(default_headers: Vec<(String, String)>) -> Self {
-        Self::start_with(Vec::new(), default_headers, true)
+        Self::start_with(Vec::new(), default_headers, true, &[])
+    }
+
+    /// Routed agent fixture with additional capabilities in the discovery response body.
+    pub fn start_routed_with_capabilities(capabilities: &[&str]) -> Self {
+        Self::start_with(Vec::new(), Vec::new(), true, capabilities)
     }
 
     fn start_with(
         script: Vec<Reply>,
         default_headers: Vec<(String, String)>,
         routed: bool,
+        capabilities: &[&str],
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -102,6 +109,10 @@ impl FakeServer {
         let mode = Arc::new(ServeMode {
             default_headers,
             routed,
+            capabilities: capabilities
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
         });
         thread::spawn(move || {
             for stream in listener.incoming() {
@@ -204,7 +215,11 @@ fn answer(
         // Existing tests describe business traffic. EP-10 negotiation is exercised by the
         // dedicated raw HTTP fixtures; upgrade this helper without changing those assertions.
         let selected: u16 = protocol.as_deref().unwrap_or("2").parse().unwrap();
-        let reply_body = serde_json::json!({"selected_protocol":selected,"min_protocol":1,"max_protocol":2,"capabilities":["revocations_v1","zone_catalog_v1","drain_v1"]}).to_string();
+        let capabilities: Vec<&str> = ["revocations_v1", "zone_catalog_v1", "drain_v1"]
+            .into_iter()
+            .chain(mode.capabilities.iter().map(String::as_str))
+            .collect();
+        let reply_body = serde_json::json!({"selected_protocol":selected,"min_protocol":1,"max_protocol":2,"capabilities":capabilities}).to_string();
         let mut reply = Reply::text(200, &reply_body)
             .header("Content-Type", "application/json")
             .header("Lockyard-Protocol", &selected.to_string());

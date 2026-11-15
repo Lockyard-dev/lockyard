@@ -114,11 +114,13 @@ pub(super) enum ZoneCommand {
         #[arg(long)]
         fence: Option<i64>,
     },
-    /// Add one path to a claim.
+    /// Add one or more paths to a claim (workspace-root relative).
     AddPath {
         #[arg(value_parser = parse_id)]
         id: i64,
-        path: String,
+        /// Path relative to the workspace root. Pass several to add them in one command.
+        #[arg(required = true)]
+        paths: Vec<String>,
         #[arg(long)]
         fence: Option<i64>,
     },

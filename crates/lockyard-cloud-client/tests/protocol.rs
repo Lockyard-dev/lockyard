@@ -3,6 +3,152 @@
 //! EP-10 HTTP fixtures record discovery separately from the eventual operation.
 use lockyard_cloud_client::{Call, Client, ClientError, Transport};
 use serde_json::{Value, json};
+
+#[test]
+fn survey_r5_reuse_and_receipt_respect_the_negotiated_default_mode() {
+    use lockyard_cloud_client::CloudBackend;
+    use lockyard_core::{
+        claim_or_reuse_with_status,
+        proto::{ClaimMode, ClaimRequest},
+    };
+
+    for soft in [false, true] {
+        for mode in [None, Some(ClaimMode::Shared), Some(ClaimMode::Exclusive)] {
+            let shared = json!({"id":7,"session":"me","paths":["src"],"mode":"shared"});
+            let mut granted = shared.clone();
+            granted["id"] = json!(8);
+            granted["mode"] = json!("exclusive");
+            let server = Server::start(vec![
+                discovery(2, 1, 2, if soft { &["soft_zones_v1"] } else { &[] }),
+                Reply::json(200, json!([shared]), Some("2")),
+                Reply::json(200, granted, Some("2")),
+            ]);
+            let mut backend = CloudBackend::new(server.client(), "me");
+            let request = ClaimRequest {
+                paths: vec!["src/file".into()],
+                mode,
+                ..Default::default()
+            };
+            let (claim, submitted) =
+                claim_or_reuse_with_status(&mut backend, "me", &request, 0).unwrap();
+            let should_submit = mode == Some(ClaimMode::Exclusive) || (mode.is_none() && !soft);
+            assert_eq!(submitted, should_submit, "soft={soft}, mode={mode:?}");
+            assert_eq!(claim.id, if should_submit { 8 } else { 7 });
+        }
+        // The same default must validate the POST receipt when no claim was reusable.
+        let server = Server::start(vec![
+            discovery(2, 1, 2, if soft { &["soft_zones_v1"] } else { &[] }),
+            Reply::json(200, json!([]), Some("2")),
+            Reply::json(
+                200,
+                json!({"id":9,"session":"me","paths":["src"],"mode":"shared"}),
+                Some("2"),
+            ),
+        ]);
+        let mut backend = CloudBackend::new(server.client(), "me");
+        let result = claim_or_reuse_with_status(
+            &mut backend,
+            "me",
+            &ClaimRequest {
+                paths: vec!["src".into()],
+                ..Default::default()
+            },
+            0,
+        );
+        assert_eq!(
+            result.is_ok(),
+            soft,
+            "shared receipt, soft={soft}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn survey_r4_mode_default_is_capability_gated_on_the_http_wire() {
+    for caps in [&[][..], &["soft_zones_v1"][..]] {
+        for route in ["/api/v1/zones/claims", "/api/v1/zones/queue"] {
+            for mode in [None, Some("shared"), Some("exclusive")] {
+                let server = Server::start(vec![
+                    discovery(2, 1, 2, caps),
+                    Reply::json(200, json!({"id":7,"mode":"shared"}), Some("2")),
+                ]);
+                let client = server.client();
+                let mut body = json!({"paths":["src"],"note":"work","purpose":"work","lazy":false,"ttl_minutes":30,"queue_wait_seconds":1});
+                if let Some(mode) = mode {
+                    body["mode"] = json!(mode);
+                }
+                client
+                    .call(&Call::write("me", "POST", route.into(), body))
+                    .unwrap();
+                let requests = server.requests();
+                let wire: Value = serde_json::from_str(&requests[1].body).unwrap();
+                assert_eq!(
+                    wire.get("mode").and_then(Value::as_str),
+                    mode.or(if caps.is_empty() {
+                        Some("exclusive")
+                    } else {
+                        None
+                    }),
+                    "{wire}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn survey_r2_registry_create_replays_exact_client_key_and_retires_journal() {
+    let server = Server::start(vec![
+        discovery(2, 1, 2, &[]),
+        problem(500, "internal_error", json!({}), Some("2")),
+        Reply::json(
+            200,
+            json!({"id":"FE-77","client_key":"stable-create-key","title":"private"}),
+            Some("2"),
+        ),
+    ]);
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path().canonicalize().unwrap();
+    let client = server
+        .client()
+        .with_pending_journal(&directory)
+        .unwrap()
+        .with_content_encryption(
+            "fixture-workspace",
+            Some(lockyard_cloud_client::WorkspaceKey::from_entropy([31; 32])),
+            true,
+        );
+    let call = Call::write(
+        "me",
+        "POST",
+        "/api/v1/registry/items".into(),
+        json!({"title":"private","client_key":"stable-create-key"}),
+    );
+    assert!(client.call(&call).is_err());
+    assert!(
+        client
+            .pending_operation(call.key.as_deref().unwrap())
+            .is_some()
+    );
+    let result = client.call(&call).unwrap();
+    assert_eq!(result["id"], "FE-77");
+    assert!(client.pending_operations().is_empty());
+    assert!(
+        server
+            .client()
+            .with_pending_journal(&directory)
+            .unwrap()
+            .pending_operations()
+            .is_empty()
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].body, requests[2].body);
+    assert_eq!(
+        requests[1].header("idempotency-key"),
+        requests[2].header("idempotency-key")
+    );
+}
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -970,7 +1116,18 @@ fn post_send_journal_cleanup_failure_keeps_original_pending_operation() {
             if request.method == "POST" {
                 // The request has been received and its pre-send file is already durable.
                 let scope = writer_journal.lock().unwrap().clone().unwrap();
-                assert_eq!(std::fs::read_dir(&scope).unwrap().count(), 1);
+                assert_eq!(
+                    std::fs::read_dir(&scope)
+                        .unwrap()
+                        .filter(|entry| entry
+                            .as_ref()
+                            .unwrap()
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "json"))
+                        .count(),
+                    1
+                );
                 std::fs::set_permissions(scope, std::fs::Permissions::from_mode(0o500)).unwrap();
             }
         },

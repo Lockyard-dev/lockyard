@@ -55,14 +55,20 @@ pub(super) fn run_msg(
                 re,
                 key,
                 ttl_minutes: ttl,
-                from_client: None,
+                from_client: Some(crate::session_label::mail_label()),
             };
             let message = backend.send(&agent, &request, now)?;
             let text = sent_line(&message);
             output(&safe_message(message), text)
         }
         MsgCommand::Reply { id, body } => {
-            let message = backend.reply(&agent, id, &body, now)?;
+            let message = backend.reply_with_client(
+                &agent,
+                id,
+                &body,
+                &crate::session_label::mail_label(),
+                now,
+            )?;
             let text = sent_line(&message);
             output(&safe_message(message), text)
         }

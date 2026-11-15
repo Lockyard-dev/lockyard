@@ -89,6 +89,11 @@ pub trait Backend {
     fn agents(&self) -> Result<Vec<AgentSeen>>;
 
     fn claim(&mut self, agent: &str, request: &ClaimRequest, now: i64) -> Result<Claim>;
+    /// Whether an omitted claim mode delegates to the server's supported default.
+    /// Local and legacy backends must require exclusive claims for an omitted mode.
+    fn soft_zones_v1(&self) -> Result<bool> {
+        Ok(false)
+    }
     /// Creation is an outcome of this write, never a property of a stored claim.
     /// Legacy cloud backends cannot distinguish creation from server-side reuse.
     fn claim_with_creation_status(
@@ -230,8 +235,32 @@ pub trait Backend {
 
     fn send(&mut self, agent: &str, request: &SendRequest, now: i64) -> Result<Message>;
     fn reply(&mut self, agent: &str, id: i64, body: &str, now: i64) -> Result<Message>;
+    fn reply_with_client(
+        &mut self,
+        agent: &str,
+        id: i64,
+        body: &str,
+        _client: &str,
+        now: i64,
+    ) -> Result<Message> {
+        self.reply(agent, id, body, now)
+    }
     fn ack(&mut self, _agent: &str, _id: i64) -> Result<()> {
         cloud("msg ack")
+    }
+    /// Close mail for this reader, independently from its read receipt.
+    fn validate_handled(&self, _ids: &[i64]) -> Result<()> {
+        Err(Error::Invalid("marking mail handled requires server capability mail_handled_v1; reading mail does not mark it handled".into()))
+    }
+
+    /// Close mail for this reader, independently from its read receipt.
+    fn mark_handled(&mut self, _agent: &str, _ids: &[i64]) -> Result<usize> {
+        Err(Error::Invalid("marking mail handled requires server capability mail_handled_v1; reading mail does not mark it handled".into()))
+    }
+
+    /// Exact creation identity lookup; a matching title is not creation evidence.
+    fn task_by_client_key(&self, _key: &str) -> Result<Option<tasks::Task>> {
+        Ok(None)
     }
     /// Reads mail and marks nothing: the caller shows it first, then calls [`Backend::inbox_seen`].
     fn inbox(&mut self, agent: &str, query: InboxQuery, now: i64) -> Result<InboxPage>;
@@ -725,6 +754,13 @@ fn acquire_claim(
     request: &ClaimRequest,
     now: i64,
 ) -> Result<(Claim, bool, Option<bool>)> {
+    let mut effective = request.clone();
+    // An unknown capability (ping or protocol failure) means the server default is not
+    // confirmed, so the claim stays explicitly exclusive instead of failing.
+    if effective.mode.is_none() && !backend.soft_zones_v1().unwrap_or(false) {
+        effective.mode = Some(ClaimMode::Exclusive);
+    }
+    let request = &effective;
     if !request.paths.is_empty() {
         let existing = backend.claims(
             &ClaimQuery {
@@ -752,7 +788,7 @@ fn acquire_claim(
 fn claim_covers_request(claim: &Claim, agent: &str, request: &ClaimRequest) -> bool {
     let fold_case = claim.case_insensitive_paths.unwrap_or(true);
     claim.session == agent
-        && claim.mode == request.mode
+        && request.mode.is_none_or(|mode| claim.mode == mode)
         && request.paths.iter().all(|requested| {
             let requested = crate::paths::ZonePath::stored(requested.clone());
             claim.paths.iter().any(|held| {
@@ -782,6 +818,7 @@ fn claim_record(claim: zones::Claim) -> Claim {
         expires_at: Stamp::Millis(claim.expires_at),
         hold_until: None,
         idle_release_at: None,
+        held: None,
         hold_reason: None,
         hold_until_ref: None,
         return_to: None,
@@ -812,6 +849,7 @@ fn message_record(message: bus::Message) -> Message {
         key: None,
         expires_at: None,
         created_at: Stamp::Millis(message.created_at),
+        replied_at: None,
         deduplicated: false,
         queued: false,
     }
@@ -856,7 +894,7 @@ impl Backend for Store {
     fn claim(&mut self, agent: &str, request: &ClaimRequest, now: i64) -> Result<Claim> {
         let refused = [
             (request.lazy, "a lazy claim"),
-            (request.mode != ClaimMode::Exclusive, "a shared claim"),
+            (request.mode == Some(ClaimMode::Shared), "a shared claim"),
             (request.purpose != Purpose::Work, "a deploy claim"),
             (request.queue_wait_seconds.is_some(), "zone wait"),
             (request.meta.is_some(), "claim meta"),
@@ -951,6 +989,8 @@ impl Backend for Store {
             .map(|path| {
                 let holder = Store::check(self, agent, path, now)?;
                 Ok(PathCheck {
+                    mode: Some(ClaimMode::Exclusive),
+                    auto_grantable: None,
                     path: path.as_str().to_string(),
                     status: if holder.is_some() {
                         CheckStatus::Held
@@ -1522,7 +1562,7 @@ mod tests {
         let (_dir, mut store) = test_store();
         let backend: &mut dyn Backend = &mut store;
         let shared = ClaimRequest {
-            mode: ClaimMode::Shared,
+            mode: Some(ClaimMode::Shared),
             ..request(&["src"])
         };
         assert!(matches!(

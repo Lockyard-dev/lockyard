@@ -284,6 +284,8 @@ impl View {
                         .any(|held| !held.is_ascii()))
         }) {
             return PathCheck {
+                mode: None,
+                auto_grantable: None,
                 path: raw.to_string(),
                 status: CheckStatus::Unknown,
                 holder: None,
@@ -307,9 +309,13 @@ impl View {
             .find(|claim| !(shares && claim.mode == ClaimMode::Shared));
         match holder {
             Some(claim) => PathCheck {
+                mode: None,
+                auto_grantable: None,
                 path: raw.to_string(),
                 status: CheckStatus::Held,
                 holder: Some(Conflict {
+                    mode: Some(claim.mode),
+                    dirty: None,
                     path: raw.to_string(),
                     held_path: claim
                         .paths
@@ -331,6 +337,8 @@ impl View {
                 }),
             },
             None => PathCheck {
+                mode: None,
+                auto_grantable: None,
                 path: raw.to_string(),
                 status: if mine.is_empty() {
                     CheckStatus::Free
@@ -746,6 +754,8 @@ impl<T: Transport + 'static> Shared<T> {
                 let checks = paths
                     .into_iter()
                     .map(|path| PathCheck {
+                        mode: None,
+                        auto_grantable: None,
                         path,
                         status: CheckStatus::Unknown,
                         holder: None,
@@ -1687,6 +1697,7 @@ impl<T: Transport + 'static> Shared<T> {
             workspace: self.config.workspace.clone(),
             token_id: self.config.token_id.clone(),
             catalog_expansion_v1: true,
+            soft_zones_v1: self.transport.cached_soft_zones_v1(),
             mail_open_v1: self
                 .transport
                 .mail_open_v1_within(&self.session, std::time::Duration::ZERO)
@@ -2519,6 +2530,82 @@ mod tests {
     use super::super::socket::AgentSocket;
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[cfg(unix)]
+    #[test]
+    fn survey_r5_new_agent_omits_mode_only_for_a_confirmed_soft_server() {
+        use lockyard_cloud_client::{RepositoryTransport, fake::FakeServer as HttpFake};
+        use lockyard_core::{
+            Backend,
+            proto::{ClaimRequest, QueueRequest},
+        };
+
+        for soft in [false, true] {
+            let server = HttpFake::start_routed_with_capabilities(if soft {
+                &["soft_zones_v1"]
+            } else {
+                &[]
+            });
+            let url = server.url();
+            let dir = tempfile::tempdir().unwrap();
+            let client =
+                Arc::new(lockyard_cloud_client::Client::new(&url, "fixture-token".into()).unwrap());
+            client.negotiated_protocol("probe").unwrap();
+            let mut cfg = config(dir.path(), timing());
+            cfg.url = url.clone();
+            let _daemon = Daemon::start(cfg, client).unwrap();
+            let socket = AgentSocket::connect(
+                &dir.path().join("run/agent.sock"),
+                &url,
+                "team",
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            let status = socket.ask(&Request::Ping).unwrap().status.unwrap();
+            assert_eq!(status.soft_zones_v1, soft);
+            // Exercise the same Arc + repository wrapper used by real CLI/MCP backends.
+            let mut backend = CloudBackend::new(
+                RepositoryTransport::new(Arc::new(socket), None).unwrap(),
+                "alice",
+            );
+            // The routed fixture returns empty snapshots, not acquisition DTOs. Only the
+            // outgoing HTTP bytes matter here; receipt validation has a separate regression.
+            let _ = backend.claim(
+                "alice",
+                &ClaimRequest {
+                    paths: vec!["src".into()],
+                    ..Default::default()
+                },
+                0,
+            );
+            let _ = backend.queue_add(
+                "alice",
+                &QueueRequest {
+                    paths: vec!["src".into()],
+                    ..Default::default()
+                },
+            );
+            let writes: Vec<_> = server
+                .requests()
+                .into_iter()
+                .filter(|request| {
+                    request.method == "POST"
+                        && matches!(
+                            request.path.as_str(),
+                            "/api/v1/zones/claims" | "/api/v1/zones/queue"
+                        )
+                })
+                .collect();
+            assert_eq!(writes.len(), 2);
+            for request in writes {
+                assert_eq!(
+                    request.body.get("mode"),
+                    (!soft).then_some(&json!("exclusive")),
+                    "soft={soft}: {request:?}"
+                );
+            }
+        }
+    }
 
     #[cfg(windows)]
     include!("windows_tests.rs");

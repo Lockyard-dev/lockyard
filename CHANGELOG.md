@@ -5,6 +5,62 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.13] - 2026-11-15
+
+### Fixed
+
+- Supply the exclusive default before forwarding claim/queue calls through old agents.
+  Only a new agent Ping confirming negotiated `soft_zones_v1` permits omission. Claim
+  reuse and acquisition receipts apply the same capability-dependent default.
+- Claim/wait/queue mode is optional: `--shared` / `--exclusive` and MCP `shared:true|false`
+  select a mode explicitly. Servers advertising `soft_zones_v1` choose the omitted default;
+  older servers receive `exclusive` for compatibility with 579d557. Status shows mode,
+  and wave-4 metadata is accepted by the strict E2EE response classifier (LC-0019/0020).
+
+- `zone wait` / long-poll claims release the local pending-write journal flock while the
+  HTTP response is open, so sibling `zone release` / `finish_work` / `start_work` / `task add`
+  are not blocked (LY-0010).
+- MCP `update` accepts `reply_to` + `body`, `handled:[ids]`, returns new mail by default
+  (`all:true` for the whole mailbox), and annotates `queued:true` with a delivery hint
+  (LY-0011). Status omits task bodies by default and keeps claim `fence` for renew.
+- `zone_renew` / CLI `zone renew` fill `fence` from the caller's own claim in status; foreign
+  claims still need an explicit fence (LY-0012).
+- MCP `tasks`/`task_list`/`area_list` `structuredContent` is always an object; CLI
+  `task list --json` escapes control characters in titles/bodies (LY-0013).
+- MCP `task_add` documents and validates `p0_category` enum values; uncertain writes confirm
+  creation by retrying the exact POST with the same `client_key`, retiring its pending journal
+  record after confirmation; an unconfirmed retry still reports unknown (LY-0014).
+- `zone add-path` accepts multiple paths; claim/narrow/add-path paths are workspace-root
+  relative; absolute paths are accepted. A path found only relative to a subrepository cwd
+  produces a workspace-root hint. Unknown catalog zones explain how to use paths; TTL errors
+  name minutes (LY-0015).
+- Lost-claim errors use server reasons/times and point to the new `status --lost`; `finish_work`
+  lists `released_ids`, `already_gone`, and per-claim `failed` without stopping on one failure
+  (LY-0016).
+- Unencrypted claims carry a sanitized session label (up to 64 ASCII characters) and process
+  IDs in `meta`; unencrypted outgoing mail carries the label in `from_client` (LY-0017).
+  Encrypted workspaces omit this identity metadata. Strict E2EE accepts bounded identity
+  metadata on other clients' claims. Server 579d557 does not persist a reply sender label.
+- `update` validates `handled` IDs and `mail_handled_v1` before sending. A handling failure
+  after sending returns `sent` and `handled_error` without marking the send as failed.
+- Long polls retain per-key ownership while releasing the shared journal. A verified success
+  survives a journal reacquisition failure; a durable completion marker retires the pending
+  record on the next journal acquisition.
+- Short writes keep the original journal path without per-key sidecar files or extra flushes.
+  Per-key locks are created only when a long poll releases the journal. A lazy `.long-poll`
+  directory flags maintenance across processes; acquisitions skip sidecar scans while it is
+  absent, and cleanup removes the hint once no active locks or completion markers remain.
+- Build identity watches HEAD, local branch refs and packed refs; changes to loose remote
+  refs no longer force a full rebuild of dependents between identical test invocations.
+- Concurrent writes with the same key, including calls in the same process, wait for journal
+  ownership within their call deadline and report `journal_busy` if it expires.
+- Invalid pending completion markers move to `.completed.bad-<timestamp>` quarantine with a
+  warning; unrelated writes continue and the original pending record remains recoverable.
+
+### Added
+
+- Advance synchronized Rust, npm, PyPI and MCP registry versions to `0.3.13`.
+
 ## [0.3.12] - 2026-11-15
 
 ### Fixed

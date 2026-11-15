@@ -152,6 +152,14 @@ impl<T> RepositoryTransport<T> {
 }
 
 impl<T: Transport> Transport for RepositoryTransport<T> {
+    fn soft_zones_v1(&self, session: &str) -> Result<bool, ClientError> {
+        self.inner.soft_zones_v1(session)
+    }
+
+    fn cached_soft_zones_v1(&self) -> bool {
+        self.inner.cached_soft_zones_v1()
+    }
+
     fn registry_auto_area(&self, session: &str) -> Result<bool, ClientError> {
         self.inner.registry_auto_area(session)
     }

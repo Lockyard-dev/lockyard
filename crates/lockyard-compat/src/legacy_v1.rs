@@ -185,6 +185,16 @@ impl LegacyCompatibilityV1 {
             return Ok(value);
         };
         match schema {
+            "lockyard_core::proto::AccessRecord" => {
+                if let Some(claim) = object.get_mut("claim").filter(|claim| !claim.is_null()) {
+                    *claim = Self::wire_schema(
+                        claim.clone(),
+                        "lockyard_core::proto::Claim",
+                        source,
+                        protocol,
+                    )?;
+                }
+            }
             "lockyard_core::proto::Claim"
             | "lockyard_core::proto::QueueEntry"
             | "lockyard_core::proto::Presence" => {

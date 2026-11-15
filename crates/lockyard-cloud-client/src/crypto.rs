@@ -174,7 +174,19 @@ fn parsed() -> Result<&'static (FieldMap, Value), String> {
     PARSED
         .get_or_init(|| {
             let map: FieldMap = serde_json::from_str(FIELDS).map_err(|e| e.to_string())?;
-            let api: Value = serde_json::from_str(OPENAPI).map_err(|e| e.to_string())?;
+            let mut api: Value = serde_json::from_str(OPENAPI).map_err(|e| e.to_string())?;
+            // LC-0019/0020 additive response contract. Keep the published fixture intact;
+            // classify each new field on its specific DTO, including nested claim content.
+            let schemas = &mut api["components"]["schemas"];
+            for schema in ["CoordinationClaim", "CoordinationClaimReceipt"] {
+                schemas[schema]["properties"]["held"] = serde_json::json!({"type":["boolean","null"]});
+                schemas[schema]["properties"]["idle_release_at"] = serde_json::json!({"type":["string","integer","null"]});
+            }
+            schemas["CoordinationCheckResult"]["properties"]["mode"] = serde_json::json!({"type":["string","null"],"enum":["shared","exclusive",null]});
+            schemas["CoordinationCheckResult"]["properties"]["auto_grantable"] = serde_json::json!({"type":["boolean","null"]});
+            schemas["CoordinationRequest"]["properties"]["granted"] = serde_json::json!({"type":["boolean","null"]});
+            schemas["CoordinationRequest"]["properties"]["claim"] = serde_json::json!({"anyOf":[{"type":"null"},{"$ref":"#/components/schemas/CoordinationClaimReceipt"}]});
+            schemas["CoordinationMessage"]["properties"]["replied_at"] = serde_json::json!({"type":["string","integer","null"]});
             for field in map.fields.iter().filter(|field| !field.when.is_empty()) {
                 let properties = api["components"]["schemas"][&field.schema]["properties"]
                     .as_object()
@@ -336,6 +348,24 @@ pub(crate) fn transform_fields_policy(
         for definition in inline_schemas {
             validate_inline_metadata_request(value, definition, &api["components"]["schemas"])?;
         }
+    }
+    // Identity is classified for compatibility with other clients' claims, but this
+    // client must not publish a chat label or process IDs in an encrypted workspace.
+    if encrypt
+        && matches!(normalized, "/api/v1/zones/claims" | "/api/v1/zones/queue")
+        && let Some(meta) = value.get_mut("meta").and_then(Value::as_object_mut)
+    {
+        for name in ["session_label", "parent_pid", "pid"] {
+            meta.remove(name);
+        }
+        if meta.is_empty() {
+            value.as_object_mut().expect("claim object").remove("meta");
+        }
+    }
+    if encrypt && normalized.starts_with("/api/v1/bus/messages") {
+        value
+            .as_object_mut()
+            .map(|object| object.remove("from_client"));
     }
     let mut touched = Vec::new();
     for schema in schemas {
@@ -584,10 +614,6 @@ fn visit(
             for (property, value) in obj.iter() {
                 if !props.contains_key(property)
                     && !(event_payload && event_payload_alias(schema, property, value))
-                    // New servers add this public timestamp to claims. Keep compatibility with
-                    // the published schema while accepting the same wire types as proto::Stamp.
-                    && !(schema == "CoordinationClaim" && property == "idle_release_at"
-                        && (value.is_null() || value.is_string() || value.as_i64().is_some()))
                 {
                     return Err("required node response contains an unsupported field".into());
                 }
@@ -955,6 +981,7 @@ fn transform_conflict_entry(
     if required {
         for (name, slot) in object.iter() {
             let valid = match name.as_str() {
+                "dirty" => slot.is_null() || slot.is_boolean(),
                 "note" => slot.is_null() || slot.is_string(),
                 "paths" => {
                     slot.is_null()
@@ -1629,21 +1656,31 @@ fn safe_timestamp(value: &Value) -> bool {
         })
 }
 
-/// A composite claim attempt's random correlation marker is structural metadata.
-/// No other claim metadata is classified by this exception.
+/// Bounded process identity and a composite attempt's random correlation marker.
 fn safe_start_work_meta(value: &Value) -> bool {
     value.as_object().is_some_and(|object| {
-        object.len() == 1
-            && object
-                .get("lockyard_start_work_nonce")
-                .and_then(Value::as_str)
-                .is_some_and(|nonce| {
+        !object.is_empty()
+            && object.iter().all(|(name, value)| match name.as_str() {
+                "session_label" => {
+                    value.is_null()
+                        || value.as_str().is_some_and(|label| {
+                            !label.is_empty()
+                                && label.len() <= 64
+                                && label.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric() || b" _-.:@/".contains(&byte)
+                                })
+                        })
+                }
+                "parent_pid" | "pid" => value.as_u64().is_some_and(|pid| pid <= u32::MAX as u64),
+                "lockyard_start_work_nonce" => value.as_str().is_some_and(|nonce| {
                     nonce.len() == 26
                         && nonce.as_bytes()[0] <= b'7'
                         && nonce
                             .bytes()
                             .all(|byte| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&byte))
-                })
+                }),
+                _ => false,
+            })
     })
 }
 
@@ -2736,6 +2773,63 @@ mod tests {
     }
 
     #[test]
+    fn survey_r2_classified_session_meta_accepts_foreign_claims_and_hides_outgoing_identity() {
+        let key = WorkspaceKey::from_entropy([9; 32]);
+        let meta = serde_json::json!({"session_label":"review-session", "parent_pid":123, "pid":456,
+            "lockyard_start_work_nonce":"01K00000000000000000000000"});
+        let mut request = serde_json::json!({"paths":["src"], "note":"work", "meta":meta});
+        transform_fields_policy(
+            &mut request,
+            "POST",
+            "/api/v1/zones/claims",
+            "w",
+            Some(&key),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            request["meta"],
+            serde_json::json!({"lockyard_start_work_nonce":"01K00000000000000000000000"})
+        );
+        let mut response =
+            serde_json::json!([{"id":7,"session":"other","paths":["src"],"meta":meta}]);
+        transform_fields_policy(
+            &mut response,
+            "GET",
+            "/api/v1/zones/claims",
+            "w",
+            Some(&key),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(response[0]["meta"], meta);
+        for bad in [
+            serde_json::json!({"session_label":"x".repeat(65)}),
+            serde_json::json!({"session_label":"x\n"}),
+            serde_json::json!({"pid":"123"}),
+            serde_json::json!({"parent_pid":-1}),
+            serde_json::json!({"pid":4294967296_u64}),
+        ] {
+            let mut response = serde_json::json!([{"id":7,"meta":bad}]);
+            assert!(
+                transform_fields_policy(
+                    &mut response,
+                    "GET",
+                    "/api/v1/zones/claims",
+                    "w",
+                    Some(&key),
+                    false,
+                    true
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn start_work_nonce_is_classified_only_on_required_claim_requests() {
         let key = WorkspaceKey::from_entropy([9; 32]);
         let meta = serde_json::json!({"lockyard_start_work_nonce":"01K00000000000000000000000"});
@@ -2758,6 +2852,141 @@ mod tests {
             key.decrypt("w", "note", request["note"].as_str().unwrap())
                 .unwrap(),
             "private work"
+        );
+    }
+
+    #[test]
+    fn survey_r4_soft_zone_response_fields_are_classified_without_opening_unknown_fields() {
+        let key = WorkspaceKey::from_entropy([9; 32]);
+        let claim = serde_json::json!({"id":7,"mode":"shared","held":false,
+            "idle_release_at":"2099-01-01T00:00:00Z",
+            "note":key.encrypt("w", "note", "private claim").unwrap()});
+        let cases = [
+            (
+                "GET",
+                "/api/v1/zones/claims",
+                serde_json::json!([claim.clone()]),
+                "/0/note",
+            ),
+            ("POST", "/api/v1/zones/claims", claim.clone(), "/note"),
+            (
+                "POST",
+                "/api/v1/zones/check",
+                serde_json::json!([{"path":"src/a.rs","status":"held","mode":"shared","auto_grantable":false,
+                "holder":{"session":"other","path":"src/a.rs","mode":"exclusive","dirty":true}}]),
+                "",
+            ),
+            (
+                "POST",
+                "/api/v1/zones/requests",
+                serde_json::json!({"id":4,"granted":true,"claim":claim,
+                "text":key.encrypt("w", "text", "private request").unwrap()}),
+                "/claim/note",
+            ),
+            (
+                "GET",
+                "/api/v1/bus/inbox",
+                serde_json::json!({"messages":[{"id":1,"replied_at":1234,
+                "body":key.encrypt("w", "body", "private message").unwrap()}]}),
+                "/messages/0/body",
+            ),
+        ];
+        for (method, route, wire, content) in cases {
+            for required in [false, true] {
+                let mut reply = wire.clone();
+                transform_fields_policy(
+                    &mut reply,
+                    method,
+                    route,
+                    "w",
+                    Some(&key),
+                    false,
+                    required,
+                )
+                .unwrap();
+                if !content.is_empty() {
+                    assert!(
+                        reply
+                            .pointer(content)
+                            .unwrap()
+                            .as_str()
+                            .unwrap()
+                            .starts_with("private"),
+                        "{reply}"
+                    );
+                }
+            }
+            // Every top-level DTO still refuses unrelated extensions.
+            let mut unknown = wire;
+            let object = if unknown.is_array() {
+                &mut unknown[0]
+            } else {
+                &mut unknown
+            };
+            object["unclassified"] = serde_json::json!("private");
+            assert!(
+                transform_fields_policy(&mut unknown, method, route, "w", Some(&key), false, true)
+                    .is_err()
+            );
+        }
+        for (route, wire) in [
+            (
+                "/api/v1/zones/claims",
+                serde_json::json!({"id":7,"held":"private"}),
+            ),
+            (
+                "/api/v1/zones/check",
+                serde_json::json!([{"path":"src","mode":"unexpected"}]),
+            ),
+            (
+                "/api/v1/zones/check",
+                serde_json::json!([{"path":"src","auto_grantable":"private"}]),
+            ),
+            (
+                "/api/v1/zones/check",
+                serde_json::json!([{"path":"src","holder":{"dirty":"private"}}]),
+            ),
+            (
+                "/api/v1/zones/check",
+                serde_json::json!([{"path":"src","holder":{"dirty":true,"unknown":"private"}}]),
+            ),
+            (
+                "/api/v1/zones/requests",
+                serde_json::json!({"id":4,"granted":"private"}),
+            ),
+            (
+                "/api/v1/zones/requests",
+                serde_json::json!({"id":4,"claim":{"id":7,"note":"plaintext"}}),
+            ),
+            (
+                "/api/v1/zones/requests",
+                serde_json::json!({"id":4,"claim":{"id":7,"unknown":"private"}}),
+            ),
+            (
+                "/api/v1/zones/requests",
+                serde_json::json!({"id":4,"claim":{"id":7,"held":"private"}}),
+            ),
+        ] {
+            let mut reply = wire;
+            assert!(
+                transform_fields_policy(&mut reply, "POST", route, "w", Some(&key), false, true)
+                    .is_err(),
+                "{reply}"
+            );
+        }
+        let mut invalid_stamp =
+            serde_json::json!({"messages":[{"id":1,"replied_at":{"private":"text"}}]});
+        assert!(
+            transform_fields_policy(
+                &mut invalid_stamp,
+                "GET",
+                "/api/v1/bus/inbox",
+                "w",
+                Some(&key),
+                false,
+                true
+            )
+            .is_err()
         );
     }
 

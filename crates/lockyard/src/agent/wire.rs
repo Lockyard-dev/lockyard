@@ -93,6 +93,10 @@ pub struct AgentStatus {
     pub token_id: String,
     #[serde(default)]
     pub catalog_expansion_v1: bool,
+    /// This agent negotiates claim modes itself and its server confirmed `soft_zones_v1`.
+    /// Absence on old agents requires an explicit exclusive default in forwarded requests.
+    #[serde(default)]
+    pub soft_zones_v1: bool,
     /// Server announced `mail_open_v1` in this agent's negotiated / observed capabilities.
     #[serde(default)]
     pub mail_open_v1: bool,

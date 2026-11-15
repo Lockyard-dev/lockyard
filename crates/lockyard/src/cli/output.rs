@@ -34,11 +34,21 @@ pub(super) fn claim_line(claim: &Claim, clock: Option<i64>) -> String {
         (stamp, _) => format!("until {stamp}"),
     };
     let mut line = format!(
-        "Z-{}  {}  {}  {left}",
+        "Z-{}  {}  {}  {left}  fence={}  mode={}",
         claim.id,
         claim.session,
-        claim.paths.join(" ")
+        claim.paths.join(" "),
+        claim.fence,
+        claim.mode
     );
+    if let Some(meta) = &claim.meta {
+        if let Some(label) = meta["session_label"].as_str() {
+            line.push_str(&format!("  session={}", escape_controls(label)));
+        }
+        if let Some(pid) = meta["parent_pid"].as_u64() {
+            line.push_str(&format!("  parent_pid={pid}"));
+        }
+    }
     if claim.holder_available == Some(false) {
         line.push_str("  держатель недоступен — продли или `lockyard keepalive`");
     }
@@ -117,7 +127,10 @@ pub(super) fn safe_receipts(
 
 pub(super) fn sent_line(message: &Message) -> String {
     match (message.queued, message.deduplicated) {
-        (true, _) => "queued: the server is out of reach, the agent will send it".to_string(),
+        (true, _) => {
+            "queued locally: the running agent retries automatically when the write journal is free and the server accepts delivery; delivery time is not confirmed. Check msg sent or status for a receipt."
+                .to_string()
+        }
         (_, true) => format!("already sent as M-{}", message.id),
         _ => format!("sent M-{}", message.id),
     }
@@ -130,7 +143,7 @@ pub(super) fn task_line(task: &Task) -> String {
         task.id,
         task.raw_status.as_deref().unwrap_or(task.status.as_str()),
         assignee,
-        task.title
+        escape_controls(&task.title)
     )
 }
 

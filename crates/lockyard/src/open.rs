@@ -19,6 +19,28 @@ pub struct Opened {
 }
 
 impl Opened {
+    /// Workspace-relative paths; catch a common accidental subrepository-relative argument.
+    pub fn workspace_zone_path(&self, cwd: &Path, raw: &str) -> Result<String> {
+        if !Path::new(raw).is_absolute()
+            && !self.root.join(raw).exists()
+            && cwd.join(raw).exists()
+            && let Ok(relative) = cwd.join(raw).strip_prefix(&self.root)
+        {
+            return Err(Error::Invalid(format!(
+                "paths are relative to the workspace root {}; {raw:?} exists only from cwd; use {:?} or an absolute path",
+                self.root.display(),
+                relative.to_string_lossy()
+            )));
+        }
+        self.zone_path(&self.root, raw)
+    }
+
+    pub fn workspace_zone_paths(&self, cwd: &Path, raw: &[String]) -> Result<Vec<String>> {
+        raw.iter()
+            .map(|path| self.workspace_zone_path(cwd, path))
+            .collect()
+    }
+
     /// Reads a raw path as a project path.
     pub fn zone_path(&self, cwd: &Path, raw: &str) -> Result<String> {
         let path = ZonePath::resolve(&self.root, cwd, raw)?

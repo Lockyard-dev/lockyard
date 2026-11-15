@@ -12,6 +12,7 @@ mod onboarding;
 mod open;
 mod open_mail;
 mod revoke_access;
+mod session_label;
 mod setup;
 mod shutdown;
 mod workflow;
@@ -331,11 +332,15 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             let text = join(&agents, line, "no agents yet");
             output(&agents, text)
         }
-        Command::Status => {
+        Command::Status { lost } => {
             if let Some(out) = no_cloud_access_output(cwd)? {
                 return Ok(out);
             }
-            run_status_command(cwd, agent.as_ref())
+            if lost {
+                run_zone(open()?, ZoneCommand::Lost, agent.as_ref(), cwd)
+            } else {
+                run_status_command(cwd, agent.as_ref())
+            }
         }
         Command::Zone(command) => {
             if matches!(command, ZoneCommand::Requests)
@@ -541,7 +546,10 @@ fn deliver(out: &Output, json: bool) -> std::io::Result<()> {
     let mut stdout = std::io::stdout().lock();
     if json {
         if !out.json.is_null() {
-            writeln!(stdout, "{}", out.json)?;
+            // serde_json::to_string escapes all controls; Display is the same, but keep one path.
+            let encoded = serde_json::to_string(&out.json)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            writeln!(stdout, "{encoded}")?;
         }
     } else if !out.text.is_empty() {
         writeln!(stdout, "{}", out.text)?;
