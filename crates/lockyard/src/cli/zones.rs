@@ -299,10 +299,19 @@ pub(super) fn run_zone(
                 paths,
                 fence,
             };
-            opened
+            let agent = resolve_agent(agent)?;
+            opened.backend.activity(&agent, id, &request)?;
+            let incoming = match opened
                 .backend
-                .activity(&resolve_agent(agent)?, id, &request)?;
-            output(&json!({"reported": id}), format!("reported Z-{id}"))
+                .zone_requests_within(&agent, Duration::from_millis(300))
+            {
+                Ok(records) => IncomingFetch::Known(incoming_path_requests(records, &agent)),
+                Err(_) => IncomingFetch::Unknown,
+            };
+            let mut lines = vec![format!("reported Z-{id}")];
+            let mut data = json!({ "reported": id });
+            attach_incoming(&mut data, &mut lines, incoming);
+            output(&data, lines.join("\n"))
         }
         ZoneCommand::Lost => {
             let lost = opened.backend.lost(&resolve_agent(agent)?)?;
@@ -343,7 +352,16 @@ pub(super) fn run_zone(
                 fence,
             };
             let renewed = opened.backend.renew(&agent, id, &request, now)?;
+            let incoming = match opened
+                .backend
+                .zone_requests_within(&agent, Duration::from_millis(300))
+            {
+                Ok(records) => IncomingFetch::Known(incoming_path_requests(records, &agent)),
+                Err(_) => IncomingFetch::Unknown,
+            };
             let mut data = json!({ "renewed": renewed });
+            let mut lines = vec![format!("renewed {renewed}")];
+            attach_incoming(&mut data, &mut lines, incoming);
             if let Some(count) = crate::open_mail::open_mail_count_within(
                 opened.backend.as_ref(),
                 &agent,
@@ -352,7 +370,7 @@ pub(super) fn run_zone(
             ) {
                 data["open_mail_count"] = json!(count);
             }
-            output(&data, format!("renewed {renewed}"))
+            output(&data, lines.join("\n"))
         }
         ZoneCommand::Release {
             id,

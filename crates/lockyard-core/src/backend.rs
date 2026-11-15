@@ -139,6 +139,10 @@ pub trait Backend {
     fn zone_requests(&self, _agent: &str) -> Result<Vec<AccessRecord>> {
         cloud("zone requests")
     }
+    /// Same as [`Self::zone_requests`], with a per-attempt HTTP budget for hot paths.
+    fn zone_requests_within(&self, agent: &str, _timeout: Duration) -> Result<Vec<AccessRecord>> {
+        self.zone_requests(agent)
+    }
     fn zone_answer(
         &mut self,
         _agent: &str,

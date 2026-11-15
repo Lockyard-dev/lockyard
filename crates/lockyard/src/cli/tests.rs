@@ -811,11 +811,37 @@ fn cli_status_json_keeps_its_fields_and_does_not_request_lost_claims() {
         if cloud {
             assert_eq!(out.json["offers"], json!([]));
             assert_eq!(out.json["work"], json!([]));
-            expected.extend(["offers", "work", "freshness"]);
+            // Scripted cloud has no zone_requests → unknown, never an empty array.
+            assert!(out.json.get("incoming_requests").is_none(), "{}", out.json);
+            assert_eq!(out.json["incoming_requests_unknown"], true);
+            expected.extend(["offers", "work", "freshness", "incoming_requests_unknown"]);
             expected.sort_unstable();
+        } else {
+            assert!(out.json.get("incoming_requests").is_none(), "{}", out.json);
+            assert!(
+                out.json.get("incoming_requests_unknown").is_none(),
+                "{}",
+                out.json
+            );
         }
         assert_eq!(keys, expected);
     }
+}
+
+#[test]
+fn incoming_fetch_unknown_omits_empty_array() {
+    let mut data = json!({"renewed": 1});
+    let mut lines = vec!["renewed 1".into()];
+    attach_incoming(&mut data, &mut lines, IncomingFetch::Unknown);
+    assert!(data.get("incoming_requests").is_none(), "{data}");
+    assert_eq!(data["incoming_requests_unknown"], true);
+    assert_eq!(lines, vec!["renewed 1"]);
+
+    let mut known = json!({"renewed": 1});
+    let mut known_lines = vec!["renewed 1".into()];
+    attach_incoming(&mut known, &mut known_lines, IncomingFetch::Known(vec![]));
+    assert_eq!(known["incoming_requests"], json!([]));
+    assert!(known.get("incoming_requests_unknown").is_none());
 }
 
 #[test]
@@ -925,4 +951,86 @@ fn body_and_paths_files_refuse_nul_symlinks_and_oversize() {
                 .contains("regular file")
         );
     }
+}
+
+#[test]
+fn claim_line_marks_unavailable_holder_with_keepalive_hint() {
+    let mut claim = serde_json::from_value(json!({
+        "id": 853,
+        "session": "me",
+        "paths": ["meta"],
+        "expires_at": 9_999_999_999_i64,
+        "holder_available": false
+    }))
+    .unwrap();
+    let line = claim_line(&claim, None);
+    assert!(line.contains("держатель недоступен"), "{line}");
+    assert!(line.contains("keepalive"), "{line}");
+    claim.holder_available = Some(true);
+    assert!(!claim_line(&claim, None).contains("держатель недоступен"));
+}
+
+#[test]
+fn incoming_path_requests_keep_unanswered_foreign_asks() {
+    let records = vec![
+        serde_json::from_value(json!({
+            "id": 1, "from": "other", "paths": ["a"], "text": "please"
+        }))
+        .unwrap(),
+        serde_json::from_value(json!({
+            "id": 2, "from": "other", "paths": ["b"], "text": "x", "reply": "later"
+        }))
+        .unwrap(),
+        serde_json::from_value(json!({
+            "id": 3, "from": "me", "paths": ["c"], "text": "mine"
+        }))
+        .unwrap(),
+    ];
+    let incoming = incoming_path_requests(records, "me");
+    assert_eq!(incoming.len(), 1);
+    assert_eq!(incoming[0].id, 1);
+    let lines = incoming_request_lines(&incoming);
+    assert!(lines[0].contains("R-1"), "{lines:?}");
+    assert!(lines[0].contains("lockyard zone answer"), "{lines:?}");
+    let json = incoming_requests_json(&incoming);
+    assert_eq!(json[0]["id"], 1);
+    assert_eq!(json[0]["from"], "other");
+}
+
+#[test]
+fn no_cloud_access_exits_with_dedicated_code_and_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".lockyard")).unwrap();
+    std::fs::write(
+        root.join(".lockyard/config.toml"),
+        r#"mode = "cloud"
+url = "https://example.test"
+workspace = "team"
+"#,
+    )
+    .unwrap();
+    let out = no_cloud_access_output(root)
+        .unwrap()
+        .expect("cloud without token");
+    assert_eq!(out.exit, EXIT_NO_CLOUD_ACCESS);
+    assert!(out.text.contains("LOCKYARD_TOKEN_FILE"), "{}", out.text);
+    assert!(
+        out.text.contains("почта и запросы путей недоступны"),
+        "{}",
+        out.text
+    );
+}
+
+#[test]
+fn agent_accepts_root_flag_for_safe_service_cwd() {
+    let cli = Cli::try_parse_from(["lockyard", "agent", "--root", "/tmp/project"]).unwrap();
+    let Command::Agent(args) = cli.command else {
+        panic!("expected agent");
+    };
+    assert_eq!(
+        args.root.as_deref(),
+        Some(std::path::Path::new("/tmp/project"))
+    );
+    assert!(args.command.is_none());
 }

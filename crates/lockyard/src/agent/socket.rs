@@ -423,9 +423,8 @@ impl Transport for AgentSocket {
             .unwrap_or(false))
     }
     fn call(&self, call: &Call) -> Result<Value, ClientError> {
-        // attempt_timeout_ms is #[serde(skip)] on Call — it never crosses the agent wire.
-        // Bound the local socket wait to the caller's attempt budget so renew/status cannot
-        // sit on CLI_TIMEOUT (40s) while FakeServer/ureq would have cut the attempt short.
+        // attempt_timeout_ms also crosses the wire (serialized on Call) so the daemon can bound
+        // ureq. Still cap the local socket wait so a stalled agent cannot sit on CLI_TIMEOUT.
         let budget = call
             .attempt_timeout_ms
             .map(Duration::from_millis)

@@ -333,8 +333,9 @@ pub struct Call {
     /// Keep frozen bytes until the caller has durably completed its outbox entry.
     #[serde(default)]
     pub defer_pending_ack: bool,
-    /// Per-request timeout for internal transports such as the agent outbox.
-    #[serde(skip)]
+    /// Per-attempt HTTP timeout (milliseconds). Crosses the agent wire so the daemon can bound
+    /// the ureq request itself, not only the caller's socket wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_timeout_ms: Option<u64>,
     /// Process-local cancellation shared by the live members of one status generation. This is
     /// deliberately absent from RPC/HTTP serialization, including with older agents and CLIs.

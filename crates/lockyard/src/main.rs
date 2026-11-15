@@ -41,6 +41,10 @@ const EXIT_CONFLICT: u8 = 3;
 const EXIT_FAILURE: u8 = 1;
 /// A check could not learn the state of a path in time.
 const EXIT_UNKNOWN: u8 = 4;
+/// Cloud mail / path-request commands without a usable token (META-0033).
+const EXIT_NO_CLOUD_ACCESS: u8 = 5;
+const NO_CLOUD_ACCESS_TEXT: &str =
+    "почта и запросы путей недоступны: нет доступа к облаку (LOCKYARD_TOKEN_FILE …)";
 /// Messages `lockyard msg inbox` prints at most.
 const INBOX_LIMIT: usize = 200;
 /// The server keeps a place in line for this long.
@@ -161,6 +165,114 @@ fn resolve_agent(flag: Option<&String>) -> Result<String> {
     })
 }
 
+/// When cloud mode has no token and the agent path is unavailable, mail and path-request
+/// surfaces exit with a dedicated code. A running agent still serves tokenless CLI callers
+/// (`status_read` / `cloud()`).
+fn no_cloud_access_output(cwd: &Path) -> Result<Option<Output>> {
+    use lockyard_core::config::{Config, Mode};
+    use std::time::Duration;
+    let Some(root) = lockyard_core::paths::find_root(cwd) else {
+        return Ok(None);
+    };
+    let config = Config::load(&root)?;
+    if config.mode != Mode::Cloud {
+        return Ok(None);
+    }
+    let Ok((url, workspace)) = open::endpoint(&config) else {
+        return Ok(None);
+    };
+    if Config::token_for(&url).is_ok() {
+        return Ok(None);
+    }
+    let socket = crate::agent::socket_path_for(&url, &workspace);
+    let probe = Duration::from_millis(100);
+    // Tokenless callers keep the existing daemon-only route (connect_status / cloud).
+    if crate::agent::socket::AgentSocket::connect_status(&socket, &url, &workspace, None, probe)
+        .is_some()
+        || crate::agent::socket::AgentSocket::connect(&socket, &url, &workspace, probe).is_some()
+    {
+        return Ok(None);
+    }
+    let mut out = output(
+        &json!({"error": "no_cloud_access", "exit": EXIT_NO_CLOUD_ACCESS}),
+        NO_CLOUD_ACCESS_TEXT,
+    )?;
+    out.exit = EXIT_NO_CLOUD_ACCESS;
+    Ok(Some(out))
+}
+
+/// Outcome of an optional path-request peek on a hot path.
+#[derive(Debug, Clone)]
+enum IncomingFetch {
+    /// Local mode / not a cloud surface — omit the field entirely.
+    NotApplicable,
+    /// Cloud path where requests were not read or the read failed — never an empty array.
+    Unknown,
+    /// Successful read (possibly empty).
+    Known(Vec<lockyard_core::proto::AccessRecord>),
+}
+
+fn attach_incoming(data: &mut Value, lines: &mut Vec<String>, fetch: IncomingFetch) {
+    match fetch {
+        IncomingFetch::Known(records) => {
+            data["incoming_requests"] = incoming_requests_json(&records);
+            lines.extend(incoming_request_lines(&records));
+        }
+        IncomingFetch::Unknown => {
+            data["incoming_requests_unknown"] = json!(true);
+        }
+        IncomingFetch::NotApplicable => {}
+    }
+}
+
+/// Unanswered path requests aimed at this session's claims (META-0032).
+fn incoming_path_requests(
+    records: Vec<lockyard_core::proto::AccessRecord>,
+    session: &str,
+) -> Vec<lockyard_core::proto::AccessRecord> {
+    records
+        .into_iter()
+        .filter(|record| {
+            record.reply.is_none()
+                && record.from != session
+                && record
+                    .holder
+                    .as_deref()
+                    .is_none_or(|holder| holder == session)
+        })
+        .collect()
+}
+
+fn incoming_request_lines(records: &[lockyard_core::proto::AccessRecord]) -> Vec<String> {
+    records
+        .iter()
+        .map(|record| {
+            format!(
+                "запрос пути R-{} от {} на {} — ответь `lockyard zone answer`",
+                record.id,
+                record.from,
+                record.paths.join(" ")
+            )
+        })
+        .collect()
+}
+
+fn incoming_requests_json(records: &[lockyard_core::proto::AccessRecord]) -> Value {
+    json!(
+        records
+            .iter()
+            .map(|record| {
+                json!({
+                    "id": record.id,
+                    "from": record.from,
+                    "paths": record.paths,
+                    "at": record.created_at,
+                })
+            })
+            .collect::<Vec<_>>()
+    )
+}
+
 /// Work to do once a command's output is out, such as marking printed mail.
 pub(crate) type After = Box<dyn FnOnce() -> Result<()>>;
 
@@ -219,9 +331,28 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             let text = join(&agents, line, "no agents yet");
             output(&agents, text)
         }
-        Command::Status => run_status_command(cwd, agent.as_ref()),
-        Command::Zone(command) => run_zone(open()?, command, agent.as_ref(), cwd),
-        Command::Msg(command) => run_msg(open()?, command, agent.as_ref()),
+        Command::Status => {
+            if let Some(out) = no_cloud_access_output(cwd)? {
+                return Ok(out);
+            }
+            run_status_command(cwd, agent.as_ref())
+        }
+        Command::Zone(command) => {
+            if matches!(command, ZoneCommand::Requests)
+                && let Some(out) = no_cloud_access_output(cwd)?
+            {
+                return Ok(out);
+            }
+            run_zone(open()?, command, agent.as_ref(), cwd)
+        }
+        Command::Msg(command) => {
+            if matches!(command, MsgCommand::Inbox { .. } | MsgCommand::Open)
+                && let Some(out) = no_cloud_access_output(cwd)?
+            {
+                return Ok(out);
+            }
+            run_msg(open()?, command, agent.as_ref())
+        }
         Command::Task(command) => run_task(open()?, command, agent.as_ref()),
         Command::Work(command) => run_work(open()?, command, agent.as_ref()),
         Command::Board(command) => run_board(open()?, command, agent.as_ref()),

@@ -66,6 +66,10 @@ pub(super) enum PresenceCommand {
 
 #[derive(Args)]
 pub(super) struct AgentArgs {
+    /// Project root with `.lockyard/` for `agent install` / status helpers. The long-running
+    /// service ignores this and reads `agent-config.toml` instead (LY-0007).
+    #[arg(long)]
+    pub(super) root: Option<PathBuf>,
     /// Private credential reference used by the native Windows scheduled task.
     #[cfg(windows)]
     #[arg(long, hide = true)]

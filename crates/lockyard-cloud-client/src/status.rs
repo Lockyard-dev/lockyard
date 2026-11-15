@@ -369,7 +369,7 @@ pub(crate) fn read<T: Transport>(
         ))
     };
     let mut claims = claims.value.map_err(|error| required("claims", error))?;
-    expire_claims(&mut claims, upper)?;
+    expire_claims(&mut claims, upper, session)?;
     let mut tasks = active
         .value
         .map_err(|error| required("assigned tasks", error))?
@@ -392,7 +392,11 @@ pub(crate) fn read<T: Transport>(
 
 /// Expiry and idle release are checked for every answer, after all independent reads finish.
 /// An opaque lease timestamp cannot prove ownership and therefore fails closed.
-fn expire_claims(claims: &mut Vec<Claim>, upper: i64) -> Result<()> {
+///
+/// `holder_available: false` hides *other* sessions' claims (they no longer block). Own claims of
+/// the requesting session stay visible: presence expiry must not make status report "no active
+/// claims" while the lease is still live (LC-0011).
+fn expire_claims(claims: &mut Vec<Claim>, upper: i64, session: &str) -> Result<()> {
     fn millis(stamp: &Stamp) -> Option<i64> {
         match stamp {
             Stamp::Millis(value) => Some(*value),
@@ -413,7 +417,8 @@ fn expire_claims(claims: &mut Vec<Claim>, upper: i64) -> Result<()> {
         }
     }
     claims.retain(|claim| {
-        claim.holder_available != Some(false)
+        let holder_ok = claim.holder_available != Some(false) || claim.session == session;
+        holder_ok
             && millis(&claim.expires_at).is_some_and(|expiry| expiry > upper)
             && claim
                 .idle_release_at
@@ -1117,13 +1122,13 @@ mod tests {
         let mut unavailable = claim(10000);
         unavailable.holder_available = Some(false);
         *cloud.transport.claims.lock().unwrap() = vec![claim(5000), idle, unavailable];
-        assert!(
-            cloud
-                .status_read("me", 0, Duration::from_secs(1))
-                .unwrap()
-                .claims
-                .is_empty()
-        );
+        let kept = cloud
+            .status_read("me", 0, Duration::from_secs(1))
+            .unwrap()
+            .claims;
+        // Expired and idle-released drop; own holder_available:false stays (LC-0011).
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].holder_available, Some(false));
         let read = cloud.status_read("me", 0, Duration::from_secs(1)).unwrap();
         assert_eq!(read.freshness["claims_cached"], false);
         assert_eq!(read.freshness["claims_clock_source"], "http_date");
@@ -1131,11 +1136,26 @@ mod tests {
     }
 
     #[test]
+    fn status_keeps_own_unavailable_claim_and_drops_foreign_unavailable() {
+        let mut own = claim(10000);
+        own.holder_available = Some(false);
+        let mut foreign = claim(10000);
+        foreign.id = 2;
+        foreign.session = "other".into();
+        foreign.holder_available = Some(false);
+        let mut claims = vec![own.clone(), foreign];
+        expire_claims(&mut claims, 1000, "me").unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].session, "me");
+        assert_eq!(claims[0].holder_available, Some(false));
+    }
+
+    #[test]
     fn status_opaque_claim_expiry_fails_closed() {
         let mut invalid = claim(10000);
         invalid.expires_at = Stamp::Text("opaque".into());
         let mut claims = vec![invalid];
-        assert!(expire_claims(&mut claims, 1000).is_err());
+        assert!(expire_claims(&mut claims, 1000, "me").is_err());
     }
 
     #[test]

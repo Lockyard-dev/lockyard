@@ -47,9 +47,34 @@ pub(super) fn run_status_command(cwd: &Path, agent: Option<&String>) -> Result<O
         .name("status".into())
         .spawn(move || {
             let session = agent.as_deref().unwrap_or("lockyard-cli");
-            let result = open::status_read(&cwd, session, started + read_limit)
+            let deadline = started + read_limit;
+            let result = open::status_read(&cwd, session, deadline)
                 .and_then(|(root, cloud, read, open_mail)| {
-                    render_status(&root, cloud, agent.as_deref(), read, started, open_mail)
+                    // Only reuse a warm agent: open()/fresh Client hang or re-negotiate protocol.
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    let incoming = if !cloud {
+                        IncomingFetch::NotApplicable
+                    } else if read.freshness.get("via") == Some(&json!("agent"))
+                        && left > Duration::from_millis(80)
+                    {
+                        // Cap at 300 ms; never spend more than the status remainder.
+                        agent_incoming_requests(
+                            &root,
+                            session,
+                            left.min(Duration::from_millis(300)),
+                        )
+                    } else {
+                        IncomingFetch::Unknown
+                    };
+                    render_status(
+                        &root,
+                        cloud,
+                        agent.as_deref(),
+                        read,
+                        started,
+                        open_mail,
+                        incoming,
+                    )
                 })
                 // Output's post-delivery closure is intentionally not Send. Status has no such action.
                 .map(|out| (out.json, out.text));
@@ -63,6 +88,32 @@ pub(super) fn run_status_command(cwd: &Path, agent: Option<&String>) -> Result<O
             "status deadline exceeded ({} ms); claims and assigned tasks could not be confirmed",
             limit.as_millis()
         ))),
+    }
+}
+
+fn agent_incoming_requests(root: &Path, session: &str, budget: Duration) -> IncomingFetch {
+    use lockyard_cloud_client::CloudBackend;
+    use lockyard_core::config::Config;
+    let Ok(config) = Config::load(root) else {
+        return IncomingFetch::Unknown;
+    };
+    let Ok((url, workspace)) = open::endpoint(&config) else {
+        return IncomingFetch::Unknown;
+    };
+    let token = Config::token_for(&url).ok();
+    let expected = token.as_deref().map(lockyard_cloud_client::token_id);
+    let Some(socket) = crate::agent::socket::AgentSocket::connect_status(
+        &crate::agent::socket_path_for(&url, &workspace),
+        &url,
+        &workspace,
+        expected.as_deref(),
+        budget.min(Duration::from_millis(100)),
+    ) else {
+        return IncomingFetch::Unknown;
+    };
+    match CloudBackend::new(socket, session).zone_requests_within(session, budget) {
+        Ok(records) => IncomingFetch::Known(incoming_path_requests(records, session)),
+        Err(_) => IncomingFetch::Unknown,
     }
 }
 
@@ -82,6 +133,17 @@ pub(super) fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Outp
             crate::open_mail::SENT_BUDGET,
         )
     });
+    let incoming = if opened.backend.is_cloud() {
+        match opened
+            .backend
+            .zone_requests_within(session, Duration::from_millis(300))
+        {
+            Ok(records) => IncomingFetch::Known(incoming_path_requests(records, session)),
+            Err(_) => IncomingFetch::Unknown,
+        }
+    } else {
+        IncomingFetch::NotApplicable
+    };
     render_status(
         &opened.root,
         opened.backend.is_cloud(),
@@ -89,6 +151,7 @@ pub(super) fn run_status(opened: &Opened, agent: Option<&String>) -> Result<Outp
         read,
         started,
         open_mail,
+        incoming,
     )
 }
 
@@ -99,6 +162,7 @@ fn render_status(
     mut read: StatusRead,
     started: Instant,
     open_mail: Option<crate::open_mail::OpenMailSnapshot>,
+    incoming_fetch: IncomingFetch,
 ) -> Result<Output> {
     let _span = lockyard_core::perf::Span::new("status.render");
     let session = agent.unwrap_or("lockyard-cli");
@@ -200,7 +264,7 @@ fn render_status(
             }
         }
     }
-    let (claims, incoming): (Vec<_>, Vec<_>) = read
+    let (claims, offered): (Vec<_>, Vec<_>) = read
         .claims
         .into_iter()
         .partition(|claim| claim.session == session);
@@ -210,7 +274,7 @@ fn render_status(
         |claim| claim_line(claim, lease),
         "no active claims",
     ));
-    let offers: Vec<_> = incoming
+    let offers: Vec<_> = offered
         .iter()
         .map(|claim| {
             lines.push(format!(
@@ -223,10 +287,12 @@ fn render_status(
             json!({"id": claim.id, "from": claim.session, "paths": claim.paths, "note": claim.note})
         })
         .collect();
+    let mut data = json!({"unread": unread, "claims": claims,
+        "machine_level": machine_level, "unannounced": unannounced});
+    attach_incoming(&mut data, &mut lines, incoming_fetch);
     read.tasks.truncate(20);
     lines.push(join(&read.tasks, task_line, "no tasks"));
-    let mut data = json!({"unread": unread, "claims": claims, "tasks": read.tasks,
-        "machine_level": machine_level, "unannounced": unannounced});
+    data["tasks"] = json!(read.tasks);
     if let Some(snap) = open_mail {
         data["open_mail"] = json!(snap.items);
         if snap.truncated {

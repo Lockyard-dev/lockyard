@@ -334,6 +334,13 @@ pub struct AccessRecord {
     pub reply: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eta: Option<Stamp>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "created_at",
+        alias = "at"
+    )]
+    pub created_at: Option<Stamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<Stamp>,
 }
