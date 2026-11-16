@@ -10,6 +10,7 @@ pub mod catalog;
 mod catalog_client;
 mod crypto;
 pub mod device;
+pub mod sse;
 
 pub mod protocol;
 mod registry;
@@ -20,7 +21,7 @@ mod status;
 #[cfg(test)]
 mod test_support;
 
-pub use backend::CloudBackend;
+pub use backend::{CloudBackend, checks as decode_checks};
 pub use crypto::{CONTENT_FIELDS, FieldRule, WorkspaceKey, route_matches, transform_fields};
 pub use protocol::{NegotiatedProtocol, PendingWrite, Problem, ProtocolRange};
 pub use repository::RepositoryTransport;
@@ -445,6 +446,51 @@ pub(crate) const SOFT_ZONES_V1: &str = "soft_zones_v1";
 
 /// How requests reach the server.
 pub trait Transport: Send + Sync {
+    /// Explicit discovery on background / send paths only, never on status or renew.
+    fn mail_push_v1(&self, _session: &str) -> Result<bool, ClientError> {
+        Ok(false)
+    }
+    fn renegotiate_mail_push(&self, session: &str) -> Result<bool, ClientError> {
+        self.mail_push_v1(session)
+    }
+    /// A connected daemon owns the subscription even if it predates zone wait RPC.
+    fn owns_event_stream(&self) -> bool {
+        false
+    }
+    /// Recover an exact registry create from the pending journal, if still retained.
+    fn prepare_task_create(&self, call: &Call, _explicit_key: bool) -> Result<Call, ClientError> {
+        Ok(call.clone())
+    }
+    /// A daemon can wait on its existing SSE stream without opening a competing subscription.
+    fn wait_zone_free(
+        &self,
+        _session: &str,
+        _path: &str,
+        _timeout: Duration,
+    ) -> Option<Result<bool, ClientError>> {
+        None
+    }
+    fn event_stream_sessions(
+        &self,
+        session: &str,
+        _sessions: &[String],
+        after: i64,
+        _interrupt: Arc<AtomicBool>,
+    ) -> Result<sse::EventStream, ClientError> {
+        self.event_stream(session, after)
+    }
+    fn event_stream(&self, _session: &str, _after: i64) -> Result<sse::EventStream, ClientError> {
+        Err(ClientError::Transport("mail_push_v1 is unsupported".into()))
+    }
+    /// Decode errors mean structurally skippable events. Key/authentication failures
+    /// must use another error variant so consumers retry without advancing a cursor.
+    fn decode_stream_event(
+        &self,
+        _event: &mut lockyard_core::proto::Event,
+    ) -> Result<(), ClientError> {
+        Ok(())
+    }
+
     fn call(&self, call: &Call) -> Result<Value, ClientError>;
 
     /// Confirm that an omitted claim/queue mode is accepted and defaulted by the server.
@@ -562,6 +608,45 @@ pub trait Transport: Send + Sync {
 }
 
 impl<T: Transport + ?Sized> Transport for Arc<T> {
+    fn mail_push_v1(&self, session: &str) -> Result<bool, ClientError> {
+        (**self).mail_push_v1(session)
+    }
+    fn renegotiate_mail_push(&self, session: &str) -> Result<bool, ClientError> {
+        (**self).renegotiate_mail_push(session)
+    }
+    fn owns_event_stream(&self) -> bool {
+        (**self).owns_event_stream()
+    }
+    fn prepare_task_create(&self, call: &Call, explicit_key: bool) -> Result<Call, ClientError> {
+        (**self).prepare_task_create(call, explicit_key)
+    }
+    fn wait_zone_free(
+        &self,
+        session: &str,
+        path: &str,
+        timeout: Duration,
+    ) -> Option<Result<bool, ClientError>> {
+        (**self).wait_zone_free(session, path, timeout)
+    }
+    fn event_stream_sessions(
+        &self,
+        session: &str,
+        sessions: &[String],
+        after: i64,
+        interrupt: Arc<AtomicBool>,
+    ) -> Result<sse::EventStream, ClientError> {
+        (**self).event_stream_sessions(session, sessions, after, interrupt)
+    }
+    fn event_stream(&self, session: &str, after: i64) -> Result<sse::EventStream, ClientError> {
+        (**self).event_stream(session, after)
+    }
+    fn decode_stream_event(
+        &self,
+        event: &mut lockyard_core::proto::Event,
+    ) -> Result<(), ClientError> {
+        (**self).decode_stream_event(event)
+    }
+
     fn soft_zones_v1(&self, session: &str) -> Result<bool, ClientError> {
         (**self).soft_zones_v1(session)
     }
@@ -1131,6 +1216,7 @@ impl Client {
         request = request
             .set("Authorization", &format!("Bearer {}", self.token))
             .set("X-Lockyard-Session", &session)
+            .set("X-Lockyard-Capabilities", "mail_push_v1")
             .set(
                 "User-Agent",
                 concat!("lockyard/", env!("CARGO_PKG_VERSION")),
@@ -1418,6 +1504,40 @@ fn task_create_missing_legacy_area(call: &Call, error: &ApiError) -> bool {
 }
 
 impl Transport for Client {
+    fn prepare_task_create(&self, call: &Call, explicit_key: bool) -> Result<Call, ClientError> {
+        self.pending_task_create(call, explicit_key)
+    }
+    fn mail_push_v1(&self, session: &str) -> Result<bool, ClientError> {
+        Ok(self
+            .negotiated_protocol(session)?
+            .capabilities
+            .contains("mail_push_v1"))
+    }
+    fn renegotiate_mail_push(&self, session: &str) -> Result<bool, ClientError> {
+        Ok(self
+            .refresh_protocol(session)?
+            .capabilities
+            .contains("mail_push_v1"))
+    }
+    fn event_stream_sessions(
+        &self,
+        session: &str,
+        sessions: &[String],
+        after: i64,
+        interrupt: Arc<AtomicBool>,
+    ) -> Result<sse::EventStream, ClientError> {
+        self.open_event_stream_sessions(session, sessions, after, interrupt)
+    }
+    fn event_stream(&self, session: &str, after: i64) -> Result<sse::EventStream, ClientError> {
+        self.open_event_stream(session, after)
+    }
+    fn decode_stream_event(
+        &self,
+        event: &mut lockyard_core::proto::Event,
+    ) -> Result<(), ClientError> {
+        self.decode_stream_event(event)
+    }
+
     fn soft_zones_v1(&self, session: &str) -> Result<bool, ClientError> {
         Ok(self
             .negotiated_protocol(session)?
@@ -1883,10 +2003,17 @@ mod tests {
             Reply::json(200, json!({})).delay(Duration::from_millis(2000)),
             Reply::json(200, json!({})).delay(Duration::from_millis(2000)),
             Reply::json(200, json!({})).delay(Duration::from_millis(2000)),
-            // Hold reserved slots long enough to observe write+poll flags; deadline below is 1000 ms.
-            Reply::json(200, json!({})).delay(Duration::from_millis(200)),
-            Reply::json(200, json!({})).delay(Duration::from_millis(200)),
         ]);
+        // Reserved calls race each other, so route their protocol-shaped replies by path.
+        // Hold both slots long enough to observe write+poll flags (deadline: 1000 ms).
+        server.enqueue(
+            "/api/v1/events",
+            Reply::json(200, json!([])).delay(Duration::from_millis(200)),
+        );
+        server.enqueue(
+            "/api/v1/presence",
+            Reply::json(200, json!({})).delay(Duration::from_millis(200)),
+        );
         let mut client = Client::new(&server.url(), "fixture".into()).unwrap();
         client.set_http_worker_limit(8);
         client.negotiated_protocol("me").unwrap();
@@ -2273,12 +2400,14 @@ mod tests {
                     .require_e2ee_for(workspace)
                     .unwrap()
                     .with_content_encryption(workspace, Some(key.clone()), true);
-                assert_eq!(
-                    client
-                        .call(&Call::get("session", "/api/v1/events".into()))
-                        .is_ok(),
-                    allowed
-                );
+                let result = client
+                    .call(&Call::get("session", "/api/v1/events".into()))
+                    .unwrap();
+                if allowed {
+                    assert_eq!(result[0]["payload"]["repository"], repository);
+                } else {
+                    assert_eq!(result[0], json!({"seq":1,"type":"","payload":null}));
+                }
             }
         }
     }
@@ -2486,22 +2615,24 @@ mod tests {
                 ("/api/v1/zones/queue", json!([{"meta":meta}])),
                 (
                     "/api/v1/events",
-                    json!([{"type":"zone.claimed","payload":{"meta":meta}}]),
+                    json!([{"seq":1,"type":"zone.claimed","payload":{"meta":meta}}]),
                 ),
                 (
                     "/api/v1/events",
-                    json!([{"type":"zone.queued","payload":{"meta":meta}}]),
+                    json!([{"seq":1,"type":"zone.queued","payload":{"meta":meta}}]),
                 ),
             ] {
                 let server = FakeServer::start(vec![Reply::json(200, body)]);
                 let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
-                assert!(
-                    matches!(
-                        client.call(&Call::get("node-job", path.into())),
-                        Err(ClientError::Invalid(_))
-                    ),
-                    "{path}"
-                );
+                let result = client.call(&Call::get("node-job", path.into()));
+                if path == "/api/v1/events" {
+                    assert_eq!(
+                        result.unwrap()[0],
+                        json!({"seq":1,"type":"","payload":null})
+                    );
+                } else {
+                    assert!(matches!(result, Err(ClientError::Invalid(_))), "{path}");
+                }
                 assert_eq!(server.requests().len(), 1);
             }
         }
@@ -2538,11 +2669,19 @@ mod tests {
             ),
             (
                 "/api/v1/events",
-                json!([{"type":"bus.unread","payload":{"to":"member","future_content":"private"}}]),
+                json!([{"seq":1,"type":"bus.unread","payload":{"to":"member","future_content":"private"}}]),
             ),
             (
                 "/api/v1/events",
-                json!([{"type":"zone.claimed","payload":{"claim_id":{"code":"private"}}}]),
+                json!([{"seq":1,"type":"zone.claimed","payload":{"claim_id":{"code":"private"}}}]),
+            ),
+            (
+                "/api/v1/events",
+                json!([{"seq":1,"type":"bus.seen","session":"member","payload":{"seen":["17"]}}]),
+            ),
+            (
+                "/api/v1/events",
+                json!([{"seq":1,"type":"bus.handled","session":"member","payload":{"handled":["17"]}}]),
             ),
             (
                 "/api/v1/zones/catalog",
@@ -2564,14 +2703,22 @@ mod tests {
                 assert_eq!(server.requests().len(), 1);
                 continue;
             }
-            assert!(matches!(result, Err(ClientError::Invalid(_))), "{path}");
+            if path == "/api/v1/events" {
+                assert_eq!(
+                    result.unwrap()[0],
+                    json!({"seq":1,"type":"","payload":null})
+                );
+            } else {
+                assert!(matches!(result, Err(ClientError::Invalid(_))), "{path}");
+            }
             assert_eq!(server.requests().len(), 1);
         }
         for event in [
-            json!({"type":"bus.unread","payload":{"to":"member"}}),
-            json!({"type":"bus.seen","payload":{"seen":[17,"message-id"]}}),
-            json!({"type":"presence.heartbeat","payload":{"session":"member","state":"working","last_seen":"2026-11-07T07:00:00.1234567+00:00"}}),
-            json!({"type":"zone.claimed","payload":{"claim_id":17,"session":"member","paths":["src"],"note":"","reason":"claimed","fence":1}}),
+            json!({"seq":1,"type":"bus.unread","payload":{"to":"member"}}),
+            json!({"seq":1,"type":"bus.seen","session":"member","payload":{"seen":[17,5000000000i64]}}),
+            json!({"seq":1,"type":"bus.handled","session":"member","payload":{"handled":[17,5000000000i64]}}),
+            json!({"seq":1,"type":"presence.heartbeat","payload":{"session":"member","state":"working","last_seen":"2026-11-07T07:00:00.1234567+00:00"}}),
+            json!({"seq":1,"type":"zone.claimed","payload":{"claim_id":17,"session":"member","paths":["src"],"note":"","reason":"claimed","fence":1}}),
         ] {
             let server = FakeServer::start(vec![Reply::json(200, json!([event]))]);
             let client = forced_client(&server, WorkspaceKey::from_entropy([85; 32]));
@@ -3003,15 +3150,15 @@ mod tests {
             ),
             Reply::json(
                 200,
-                json!([{"type":"task.offered","payload":{"title":title}}]),
+                json!([{"seq":1,"type":"task.offered","payload":{"title":title}}]),
             ),
             Reply::json(
                 200,
-                json!([{"type":"board.changed","payload":{"value":value}}]),
+                json!([{"seq":1,"type":"board.changed","payload":{"value":value}}]),
             ),
             Reply::json(
                 200,
-                json!([{"type":"zone.requested","payload":{"text":text,"note":text}}]),
+                json!([{"seq":1,"type":"zone.requested","payload":{"text":text,"note":text}}]),
             ),
             Reply::json(200, json!([{"value":value}])),
             Reply::json(200, json!([{"op":"owner_closed","reason":value}])),
@@ -3058,15 +3205,15 @@ mod tests {
             ),
             (
                 "/api/v1/events",
-                json!([{"type":"task.offered","payload":{"title":"private plaintext"}}]),
+                json!([{"seq":1,"type":"task.offered","payload":{"title":"private plaintext"}}]),
             ),
             (
                 "/api/v1/events",
-                json!([{"type":"new.content","payload":{"new_field":"private plaintext"}}]),
+                json!([{"seq":1,"type":"new.content","payload":{"new_field":"private plaintext"}}]),
             ),
             (
                 "/api/v1/events",
-                json!([{"type":"presence.heartbeat","payload":{"title":"private plaintext"}}]),
+                json!([{"seq":1,"type":"presence.heartbeat","payload":{"title":"private plaintext"}}]),
             ),
             (
                 "/api/v1/bus/board/history",
@@ -3077,13 +3224,21 @@ mod tests {
                 json!([{"value":"lyenc1.tampered.envelope"}]),
             ),
         ] {
+            // Every plaintext event becomes a cursor-bearing tombstone (content never surfaced);
+            // non-event content responses still fail closed.
+            let skippable_event = path == "/api/v1/events";
             let server = FakeServer::start(vec![Reply::json(200, body)]);
-            assert!(
-                forced_client(&server, key.clone())
-                    .call(&Call::get("node-job", path.into()))
-                    .is_err(),
-                "{path}"
-            );
+            let result =
+                forced_client(&server, key.clone()).call(&Call::get("node-job", path.into()));
+            if skippable_event {
+                assert_eq!(
+                    result.unwrap()[0],
+                    json!({"seq":1,"type":"","payload":null})
+                );
+            } else {
+                // Plaintext or tampered non-event content fails the whole response.
+                assert!(result.is_err(), "{path}");
+            }
         }
     }
 
@@ -3096,15 +3251,15 @@ mod tests {
         let server = FakeServer::start(vec![
             Reply::json(
                 200,
-                json!([{"type":"zone.takeover","payload":{"reason":reason}}]),
+                json!([{"seq":1,"type":"zone.takeover","payload":{"reason":reason}}]),
             ),
             Reply::json(
                 200,
-                json!([{"type":"zone.lost","payload":{"reason":"taken"}}]),
+                json!([{"seq":1,"type":"zone.lost","payload":{"reason":"taken"}}]),
             ),
             Reply::json(
                 200,
-                json!([{"type":"zone.takeover","payload":{"reason":"private plaintext"}}]),
+                json!([{"seq":1,"type":"zone.takeover","payload":{"reason":"private plaintext"}}]),
             ),
             Reply::json(200, json!({})),
         ]);
@@ -3119,10 +3274,13 @@ mod tests {
                 .unwrap()[0]["payload"]["reason"],
             "taken"
         );
-        assert!(
+        // Plaintext required content is dropped as a tombstone: it is never shown and it
+        // cannot wedge the cursor (retrying would never fix it).
+        assert_eq!(
             client
                 .call(&Call::get("node-job", "/api/v1/events".into()))
-                .is_err()
+                .unwrap()[0],
+            json!({"seq":1,"type":"","payload":null})
         );
         for timestamp in [
             "private prompt",

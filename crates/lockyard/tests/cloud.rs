@@ -34,6 +34,7 @@ struct State {
     survey_soft_zones: bool,
     survey_uncertain_create: bool,
     survey_echo_client_key: bool,
+    survey_lose_create_replies: bool,
     survey_lost: Vec<Value>,
     seen: Vec<Seen>,
     claims: Vec<Value>,
@@ -525,6 +526,7 @@ fn route_reply(
                 }
                 return refusal;
             }
+            let client_key = query_value(path, "client_key");
             let status = query_value(path, "status");
             let assignee = state
                 .registry_assignee_session
@@ -542,6 +544,11 @@ fn route_reply(
             let items = state
                 .registry_items
                 .iter()
+                .filter(|item| {
+                    client_key
+                        .as_deref()
+                        .is_none_or(|key| item["client_key"].as_str() == Some(key))
+                })
                 .filter(|item| {
                     status
                         .as_deref()
@@ -589,7 +596,11 @@ fn route_reply(
                     .iter()
                     .find(|task| task["client_key"] == body["client_key"])
             {
-                return (200, task.clone());
+                return if state.survey_lose_create_replies {
+                    (200, json!("response lost after commit"))
+                } else {
+                    (200, task.clone())
+                };
             }
             let mut task =
                 json!({"id":"FE-77","title":body["title"],"status":"ready","author":"alice"});
@@ -3648,14 +3659,11 @@ fn through_the_agent_a_hook_denies_a_held_path_from_memory() {
 }
 
 #[test]
-fn through_the_agent_a_hook_delivers_mail_in_two_phases() {
+fn mail_through_agent_hook_reminds_without_reading_until_explicit_inbox() {
     let server = Server::start();
-    server
-        .state
-        .lock()
-        .unwrap()
-        .inbox
-        .push(json!({"id": 7, "from_session": "bob", "to": "me", "body": "look at src"}));
+    server.state.lock().unwrap().inbox.push(
+        json!({"id": 7, "from_session": "bob", "to": "me", "body": "look at src", "needs":"reply"}),
+    );
     let dir = cloud_project(&server);
     let runtime = tempfile::tempdir().unwrap();
     let _agent = start_agent(dir.path(), runtime.path());
@@ -3677,15 +3685,27 @@ fn through_the_agent_a_hook_delivers_mail_in_two_phases() {
     }
     let claimed = server.seen("POST", "/api/v1/bus/inbox/claim");
     assert_eq!(claimed[0].body, json!({"ids": [7], "lease_seconds": 60}));
+    assert!(server.seen("POST", "/api/v1/bus/inbox/seen").is_empty());
+    assert!(
+        !String::from_utf8_lossy(&hook(dir.path(), runtime.path(), &event).stdout)
+            .contains("look at src")
+    );
+    let read = binary(dir.path(), runtime.path())
+        .args(["msg", "inbox", "--mark-read"])
+        .env("LOCKYARD_AGENT", "me")
+        .env("LOCKYARD_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(read.status.success());
     let end = Instant::now() + Duration::from_secs(5);
     while server.seen("POST", "/api/v1/bus/inbox/seen").is_empty() {
-        assert!(Instant::now() < end, "seen never arrived");
+        assert!(Instant::now() < end, "explicit inbox read was not marked");
         thread::sleep(Duration::from_millis(10));
     }
-    let seen = server.seen("POST", "/api/v1/bus/inbox/seen");
-    assert_eq!(seen[0].body, json!({"ids": [7]}));
-    assert!(seen[0].key.is_some());
-    assert_eq!(seen[0].session.as_deref(), Some("me"));
+    assert_eq!(
+        server.seen("POST", "/api/v1/bus/inbox/seen")[0].body,
+        json!({"ids":[7]})
+    );
 }
 
 #[test]
@@ -4235,3 +4255,60 @@ fn open_mail_escapes_controls_in_status() {
 include!("survey_client/mod.rs");
 include!("survey_client/r2.rs");
 include!("survey_client/r4.rs");
+
+#[test]
+fn task_add_cli_and_mcp_reconcile_two_lost_create_responses_without_duplicates() {
+    for (use_mcp, use_agent) in [(false, false), (true, false), (false, true), (true, true)] {
+        let server = Server::start();
+        {
+            let mut state = server.state.lock().unwrap();
+            state.registry_areas = vec![json!({"id":"area","key":"engine","prefix":"FE"})];
+            state.registry_items = (1..=250)
+                .map(|id| json!({"id":format!("FE-{id}"),"title":"same title","status":"ready"}))
+                .collect();
+            state.registry_page_size = Some(20);
+            state.survey_uncertain_create = true;
+            state.survey_echo_client_key = true;
+            state.survey_lose_create_replies = true;
+        }
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        let _agent = use_agent.then(|| start_agent(dir.path(), runtime.path()));
+        if use_mcp {
+            let answers = mcp_calls(
+                dir.path(),
+                runtime.path(),
+                "compact",
+                &[("task_add", json!({"title":"same title","area":"engine"}))],
+            );
+            assert_eq!(answers[0]["isError"], false, "{answers:?}");
+            assert_eq!(answers[0]["structuredContent"]["id"], "FE-77");
+            assert_eq!(answers[0]["structuredContent"]["created"], true);
+        } else {
+            let result = cli(
+                dir.path(),
+                runtime.path(),
+                &["--json", "task", "add", "same title", "--area", "engine"],
+            );
+            assert_eq!(json_of(&result)["id"], "FE-77");
+        }
+        let writes = server.seen("POST", "/api/v1/registry/items");
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].body, writes[1].body);
+        assert_eq!(writes[0].key, writes[1].key);
+        let lookups = server.seen("GET", "/api/v1/registry/items");
+        assert_eq!(lookups.len(), 1);
+        assert!(lookups[0].path.contains("client_key="));
+        assert_eq!(server.state.lock().unwrap().registry_items.len(), 251);
+        let journal = runtime
+            .path()
+            .join("state/lockyard/pending-writes")
+            .canonicalize()
+            .unwrap();
+        let client = lockyard_cloud_client::Client::new(&server.url, "test-token".into())
+            .unwrap()
+            .with_pending_journal(journal)
+            .unwrap();
+        assert!(client.pending_operations().is_empty());
+    }
+}

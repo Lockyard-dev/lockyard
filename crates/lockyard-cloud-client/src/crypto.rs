@@ -186,6 +186,16 @@ fn parsed() -> Result<&'static (FieldMap, Value), String> {
             schemas["CoordinationCheckResult"]["properties"]["auto_grantable"] = serde_json::json!({"type":["boolean","null"]});
             schemas["CoordinationRequest"]["properties"]["granted"] = serde_json::json!({"type":["boolean","null"]});
             schemas["CoordinationRequest"]["properties"]["claim"] = serde_json::json!({"anyOf":[{"type":"null"},{"$ref":"#/components/schemas/CoordinationClaimReceipt"}]});
+            for schema in ["CoordinationMessage", "CoordinationMessageWrite"] {
+                schemas[schema]["properties"]["urgent"] = serde_json::json!({"type":"boolean"});
+            }
+            for field in ["address", "role", "from_alias"] {
+                schemas["CoordinationMessage"]["properties"][field] = serde_json::json!({"type":["string","null"]});
+            }
+            schemas["CoordinationMessage"]["properties"]["recipients"] = serde_json::json!({"type":["array","null"],"items":{"type":"string"}});
+            schemas["CoordinationMessage"]["properties"]["reply_to"] = serde_json::json!({"type":["integer","null"]});
+            // mail_push_v1 uses `from` as an alias of the sender session metadata.
+            schemas["CoordinationMessage"]["properties"]["from"] = serde_json::json!({"type":"string"});
             schemas["CoordinationMessage"]["properties"]["replied_at"] = serde_json::json!({"type":["string","integer","null"]});
             for field in map.fields.iter().filter(|field| !field.when.is_empty()) {
                 let properties = api["components"]["schemas"][&field.schema]["properties"]
@@ -643,7 +653,7 @@ fn visit(
                             key,
                             false,
                             true,
-                            false,
+                            event_payload,
                             touched,
                         )?;
                     }
@@ -741,7 +751,13 @@ fn visit(
                             )?);
                         } else if !enc && s.starts_with(PREFIX) {
                             *slot = Value::String(match key {
+                                None if event_payload => {
+                                    return Err("event content key is unavailable".into());
+                                }
                                 None => "[locked]".into(),
+                                Some(k) if event_payload => {
+                                    decrypt_compatible(k, workspace, content_name, alternate, s)?
+                                }
                                 Some(k) => {
                                     decrypt_compatible(k, workspace, content_name, alternate, s)
                                         .unwrap_or_else(|_| "[cannot decrypt]".into())
@@ -797,6 +813,7 @@ fn visit(
                     key,
                     enc,
                     require_encrypted,
+                    event_payload,
                     touched,
                 )?;
             }
@@ -834,6 +851,7 @@ fn visit_shape(
     key: Option<&WorkspaceKey>,
     enc: bool,
     required: bool,
+    event_payload: bool,
     touched: &mut Vec<String>,
 ) -> Result<(), String> {
     if value.is_null() {
@@ -852,11 +870,29 @@ fn visit_shape(
             .ok_or("required node response schema is unavailable")?;
         return if definition.get("properties").is_some_and(Value::is_object) {
             visit(
-                value, name, schemas, fields, workspace, key, enc, required, false, touched,
+                value,
+                name,
+                schemas,
+                fields,
+                workspace,
+                key,
+                enc,
+                required,
+                event_payload,
+                touched,
             )
         } else {
             visit_shape(
-                value, definition, schemas, fields, workspace, key, enc, required, touched,
+                value,
+                definition,
+                schemas,
+                fields,
+                workspace,
+                key,
+                enc,
+                required,
+                event_payload,
+                touched,
             )
         };
     }
@@ -868,7 +904,7 @@ fn visit_shape(
         for variant in variants {
             let mut candidate = value.clone();
             let mut changed = Vec::new();
-            if visit_shape(
+            match visit_shape(
                 &mut candidate,
                 variant,
                 schemas,
@@ -877,13 +913,16 @@ fn visit_shape(
                 key,
                 enc,
                 required,
+                event_payload,
                 &mut changed,
-            )
-            .is_ok()
-            {
-                *value = candidate;
-                touched.extend(changed);
-                return Ok(());
+            ) {
+                Ok(()) => {
+                    *value = candidate;
+                    touched.extend(changed);
+                    return Ok(());
+                }
+                Err(error) if is_content_failure(&error) => return Err(error),
+                Err(_) => {}
             }
         }
         return Err("required node response has an unsupported field type".into());
@@ -892,7 +931,16 @@ fn visit_shape(
         if let Some(values) = value.as_array_mut() {
             for item in values {
                 visit_shape(
-                    item, items, schemas, fields, workspace, key, enc, required, touched,
+                    item,
+                    items,
+                    schemas,
+                    fields,
+                    workspace,
+                    key,
+                    enc,
+                    required,
+                    event_payload,
+                    touched,
                 )?;
             }
             return Ok(());
@@ -1146,6 +1194,7 @@ fn visit_event(
                     workspace,
                     key,
                     required,
+                    true,
                 )?;
             }
         }
@@ -1159,7 +1208,7 @@ fn visit_event(
                 key,
                 false,
                 required,
-                false,
+                true,
                 touched,
             )?;
         }
@@ -1178,6 +1227,7 @@ fn visit_event(
         "bus.message" | "bus.ack" => Some("CoordinationMessage"),
         "bus.unread"
         | "bus.seen"
+        | "bus.handled"
         | "bus.delivery_claimed"
         | "bus.imported"
         | "presence.activity"
@@ -1211,7 +1261,7 @@ fn visit_event(
             if matches!(kind.as_str(), "zone.requested" | "zone.answered")
                 && let Some(note) = payload.get_mut("note")
             {
-                decrypt_event_field(note, "text", workspace, key, required)?;
+                decrypt_stream_field(note, "text", workspace, key, required)?;
             }
             if kind.starts_with("zone.")
                 && let Some(reason) = payload.get_mut("reason")
@@ -1237,7 +1287,7 @@ fn visit_event(
                         | ("zone.answered", "answered")
                 );
                 if !is_system {
-                    decrypt_event_field(reason, "reason", workspace, key, required)?;
+                    decrypt_stream_field(reason, "reason", workspace, key, required)?;
                 }
             }
         } else if required {
@@ -1248,12 +1298,33 @@ fn visit_event(
 }
 
 fn validate_metadata_event(kind: &str, value: &Value) -> Result<(), String> {
+    // Service notifications contain no user content and are deliberately opaque.
+    if matches!(kind, "bus.delivery_claimed" | "bus.imported") {
+        return Ok(());
+    }
     let object = value
         .as_object()
         .ok_or("required node metadata event must be an object")?;
+    if kind == "bus.unread" {
+        for (name, item) in object {
+            let valid = match name.as_str() {
+                "id" | "thread_id" => item.as_i64().is_some(),
+                "reply_to" => item.is_null() || item.as_i64().is_some(),
+                "urgent" => item.is_boolean(),
+                "from" | "from_alias" | "to" | "address" | "kind" | "needs" | "created_at"
+                | "role" => item.is_null() || item.is_string(),
+                _ => false,
+            };
+            if !valid {
+                return Err("required node bus.unread contains invalid metadata".into());
+            }
+        }
+        return Ok(());
+    }
     let fields: &[&str] = match kind {
         "bus.unread" => &["to"],
         "bus.seen" => &["seen"],
+        "bus.handled" => &["handled"],
         "bus.delivery_claimed" => &["ids"],
         "bus.imported" => &["threads", "board", "tasks"],
         "presence.activity" => &["session", "claim_id", "last_seen"],
@@ -1329,7 +1400,10 @@ fn validate_metadata_event(kind: &str, value: &Value) -> Result<(), String> {
                         .bytes()
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             }),
-            "seen" | "ids" => item.as_array().is_some_and(|a| a.iter().all(id)),
+            "seen" | "handled" => item
+                .as_array()
+                .is_some_and(|a| a.iter().all(|v| v.as_i64().is_some())),
+            "ids" => item.as_array().is_some_and(|a| a.iter().all(id)),
             "claim_id" => id(item),
             "session" | "to" => session(item),
             "item_id" => item
@@ -1425,7 +1499,17 @@ fn decrypt_event_field(
     key: Option<&WorkspaceKey>,
     required: bool,
 ) -> Result<(), String> {
-    decrypt_event_field_alias(value, name, None, workspace, key, required)
+    decrypt_event_field_alias(value, name, None, workspace, key, required, false)
+}
+
+fn decrypt_stream_field(
+    value: &mut Value,
+    name: &str,
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    required: bool,
+) -> Result<(), String> {
+    decrypt_event_field_alias(value, name, None, workspace, key, required, true)
 }
 
 fn decrypt_compatible(
@@ -1460,6 +1544,23 @@ fn decrypt_owner_compatible(
     .map_err(|_| "content_authentication_failed".into())
 }
 
+/// Content failures are retryable at an event cursor, unlike schema/type failures.
+/// Keep this classification beside the crypto errors, shared by JSON and SSE.
+pub(crate) fn is_content_failure(error: &str) -> bool {
+    matches!(
+        error,
+        "content_authentication_failed"
+            | "required node response key is unavailable"
+            | "required node content response failed authentication"
+            | "required node content response contains plaintext"
+            | "required node event content failed authentication"
+            | "required node event key is unavailable"
+            | "required node event content contains plaintext"
+            | "event content key is unavailable"
+            | "event content failed authentication"
+    )
+}
+
 fn decrypt_event_field_alias(
     value: &mut Value,
     name: &str,
@@ -1467,6 +1568,7 @@ fn decrypt_event_field_alias(
     workspace: &str,
     key: Option<&WorkspaceKey>,
     required: bool,
+    retry_content: bool,
 ) -> Result<(), String> {
     if value.is_null() || value.as_str() == Some("") {
         return Ok(());
@@ -1487,10 +1589,12 @@ fn decrypt_event_field_alias(
                 Err(_) if required => {
                     return Err("required node event content failed authentication".into());
                 }
+                Err(_) if retry_content => return Err("event content failed authentication".into()),
                 Err(_) => "[cannot decrypt]".into(),
             },
             None if owner_context => return Err("content_authentication_failed".into()),
             None if required => return Err("required node event key is unavailable".into()),
+            None if retry_content => return Err("event content key is unavailable".into()),
             None => "[locked]".into(),
         });
     } else if required {
@@ -2154,6 +2258,126 @@ use std::fs::OpenOptions as StateOpenOptions;
 #[cfg(test)]
 mod w4_owner_contract_tests {
     use super::*;
+
+    #[test]
+    fn mail_push_required_full_unread_and_opaque_service_events() {
+        let key = WorkspaceKey::from_entropy([31; 32]);
+        let payload = serde_json::json!({"id":5000000000i64,"thread_id":5000000000i64,
+            "reply_to":null,"from":"bob","from_alias":null,"to":"alice","address":null,
+            "urgent":false,"kind":"ask","needs":"reply","created_at":"2026-11-16T01:02:03Z","role":"recipient"});
+        let check = |payload: Value, kind: &str| {
+            let mut page =
+                serde_json::json!([{"seq":1,"type":kind,"session":"alice","payload":payload}]);
+            transform_fields_policy(
+                &mut page,
+                "GET",
+                "/api/v1/events",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+        };
+        check(payload.clone(), "bus.unread").unwrap();
+        check(serde_json::json!({"to":"alice"}), "bus.unread").unwrap();
+        for name in ["id", "thread_id", "reply_to"] {
+            let mut invalid = payload.clone();
+            invalid[name] = "42".into();
+            assert!(
+                check(invalid, "bus.unread").is_err(),
+                "numeric field {name}"
+            );
+        }
+        for name in [
+            "from",
+            "from_alias",
+            "to",
+            "address",
+            "kind",
+            "needs",
+            "created_at",
+            "role",
+        ] {
+            let mut nullable = payload.clone();
+            nullable[name] = Value::Null;
+            check(nullable, "bus.unread").unwrap();
+            let mut invalid = payload.clone();
+            invalid[name] = 42.into();
+            assert!(
+                check(invalid, "bus.unread").is_err(),
+                "metadata field {name}"
+            );
+        }
+        for (kind, payload) in [
+            ("bus.delivery_claimed", serde_json::json!({"ids":[42]})),
+            (
+                "bus.imported",
+                serde_json::json!({"threads":1,"board":0,"tasks":2}),
+            ),
+        ] {
+            check(payload, kind).unwrap();
+            check(serde_json::json!({"future":"opaque metadata"}), kind).unwrap();
+        }
+    }
+
+    #[test]
+    fn mail_push_required_event_metadata_and_handled_contract() {
+        let key = WorkspaceKey::from_entropy([31; 32]);
+        let body = key.encrypt("w", "body", "private").unwrap();
+        let payload = serde_json::json!({"id":5000000000i64,"thread_id":5000000000i64,"reply_to":42,
+            "from":"bob","from_alias":"Reviewer","to":"*","address":"@zone:client","recipients":["alice"],
+            "urgent":true,"role":"recipient","body":body});
+        for kind in ["bus.message", "bus.ack"] {
+            let mut event =
+                serde_json::json!([{"seq":1,"type":kind,"session":"alice","payload":payload}]);
+            transform_fields_policy(
+                &mut event,
+                "GET",
+                "/api/v1/events",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(event[0]["payload"]["body"], "private");
+            assert_eq!(event[0]["payload"]["address"], "@zone:client");
+            assert_eq!(event[0]["payload"]["from_alias"], "Reviewer");
+        }
+        for (kind, payload) in [
+            (
+                "bus.handled",
+                serde_json::json!({"handled":[5000000000i64]}),
+            ),
+            ("bus.seen", serde_json::json!({"seen":[5000000000i64]})),
+        ] {
+            let mut event =
+                serde_json::json!([{"seq":2,"type":kind,"session":"alice","payload":payload}]);
+            transform_fields_policy(
+                &mut event,
+                "GET",
+                "/api/v1/events",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+            .unwrap();
+            event[0]["payload"]["unclassified"] = true.into();
+            assert!(
+                transform_fields_policy(
+                    &mut event,
+                    "GET",
+                    "/api/v1/events",
+                    "w",
+                    Some(&key),
+                    false,
+                    true
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn owner_close_canonical_aad_round_trips_across_rust_and_web() {

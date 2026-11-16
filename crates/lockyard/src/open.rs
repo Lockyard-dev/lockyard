@@ -167,6 +167,45 @@ pub fn open(cwd: &Path, agent: Option<&str>) -> Result<Opened> {
     Ok(Opened { backend, root })
 }
 
+/// Older daemons own their SSE stream but cannot service WaitZoneFree. Use direct
+/// authoritative checks without subscribing, so the daemon's mail stream survives.
+pub fn open_zone_wait(cwd: &Path, agent: Option<&str>) -> Result<Opened> {
+    let root = find_root(cwd).ok_or(Error::NoProject)?;
+    let config = Config::load(&root)?;
+    if config.mode != Mode::Cloud {
+        return open(cwd, agent);
+    }
+    let (url, workspace) = endpoint(&config)?;
+    let status = crate::agent::socket::AgentSocket::status(
+        &crate::agent::socket_path_for(&url, &workspace),
+        std::time::Duration::from_millis(500),
+    )
+    .ok();
+    let daemon = status.filter(|status| {
+        status.url.trim_end_matches('/') == url.trim_end_matches('/')
+            && status.workspace == workspace
+    });
+    let forced_direct = std::env::var_os("LOCKYARD_REQUIRE_E2EE").is_some()
+        || std::env::var_os("LOCKYARD_E2EE_WORKSPACE_ID").is_some();
+    if let Some(status) = daemon {
+        if status.wait_zone_free_v1 && !forced_direct {
+            return open(cwd, agent);
+        }
+        let session = agent.unwrap_or(ANONYMOUS);
+        let client = direct_client(&url)?.configure_content_encryption(session)?;
+        let backend = CloudBackend::new(
+            RepositoryTransport::new(client, config.repository.as_deref())?,
+            session,
+        )
+        .with_zone_stream_allowed(false);
+        return Ok(Opened {
+            root,
+            backend: Box::new(backend),
+        });
+    }
+    open(cwd, agent)
+}
+
 /// A status-specific open: probing an old or unresponsive daemon must not consume the command's
 /// deadline. Reads use its existing authenticated connection pool when the aggregate is supported.
 ///

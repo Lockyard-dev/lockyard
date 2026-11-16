@@ -1034,3 +1034,199 @@ fn agent_accepts_root_flag_for_safe_service_cwd() {
     );
     assert!(args.command.is_none());
 }
+
+#[test]
+fn mail_push_cli_addresses_urgent_and_wait_defaults() {
+    use lockyard_cloud_client::{
+        Client, CloudBackend,
+        fake::{FakeServer, Reply},
+    };
+    for push in [true, false] {
+        let server =
+            FakeServer::start_routed_with_capabilities(if push { &["mail_push_v1"] } else { &[] });
+        for to in [
+            "*",
+            "all",
+            "все",
+            "everyone",
+            "@claude",
+            "@cursor",
+            "@codex",
+            "@zone:client",
+            "@path:src/lib.rs",
+        ] {
+            let mut args = vec!["lockyard", "msg", "send", to, "test"];
+            if push {
+                args.push("--urgent");
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Msg(command) = cli.command else {
+                panic!("msg command")
+            };
+            server.enqueue(
+                "/api/v1/bus/messages",
+                Reply::json(200, json!({"id":42,"to":to,"body":"test","from":"alice"})),
+            );
+            let opened = Opened {
+                backend: Box::new(CloudBackend::new(
+                    Client::new(&server.url(), "test-token".into()).unwrap(),
+                    "alice",
+                )),
+                root: PathBuf::from("/unused"),
+            };
+            let result = run_msg(opened, command, Some(&"alice".to_string()));
+            if push || matches!(to, "*" | "all" | "все" | "everyone") {
+                assert!(result.is_ok(), "{to}");
+            } else {
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("сервер не поддерживает")
+                );
+            }
+        }
+        let sent: Vec<_> = server
+            .requests()
+            .into_iter()
+            .filter(|r| r.path == "/api/v1/bus/messages")
+            .collect();
+        assert_eq!(sent.len(), if push { 9 } else { 4 });
+        for (i, request) in sent.iter().enumerate() {
+            assert_eq!(
+                request.body["to"],
+                if push {
+                    [
+                        "*",
+                        "all",
+                        "все",
+                        "everyone",
+                        "@claude",
+                        "@cursor",
+                        "@codex",
+                        "@zone:client",
+                        "@path:src/lib.rs",
+                    ][i]
+                } else {
+                    "*"
+                }
+            );
+            assert_eq!(request.body.get("urgent"), push.then_some(&json!(true)));
+        }
+    }
+    let cli = Cli::try_parse_from(["lockyard", "mail", "wait"]).unwrap();
+    let Command::Mail(MailCommand::Wait { session, timeout }) = cli.command else {
+        panic!("wait command")
+    };
+    assert!(session.is_none());
+    assert_eq!(timeout, 21600);
+    let cli = Cli::try_parse_from([
+        "lockyard",
+        "mail",
+        "wait",
+        "--session",
+        "a",
+        "--timeout",
+        "0",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Mail(MailCommand::Wait {
+            session: Some(_),
+            timeout: 0
+        })
+    ));
+}
+
+#[test]
+fn mail_wait_environment_order_matches_other_commands() {
+    assert_eq!(
+        env_agent_from(|name| Some(
+            if name == "LOCKYARD_AGENT" {
+                "lockyard-session"
+            } else {
+                "claude-session"
+            }
+            .into()
+        ))
+        .as_deref(),
+        Some("lockyard-session")
+    );
+    assert_eq!(
+        env_agent_from(|name| Some(
+            if name == "LOCKYARD_AGENT" {
+                ""
+            } else {
+                "claude-session"
+            }
+            .into()
+        ))
+        .as_deref(),
+        Some("claude-session")
+    );
+    assert_eq!(env_agent_from(|_| None), None);
+}
+
+#[test]
+fn mail_events_cli_hides_json_tombstones() {
+    use lockyard_cloud_client::{
+        Client, CloudBackend,
+        fake::{FakeServer, Reply},
+    };
+    let server = FakeServer::start(vec![Reply::json(
+        200,
+        json!({"events":[
+            {"seq":1,"type":42,"session":"alice"},
+            {"seq":2,"type":"zone.claimed","payload":{"id":7}}
+        ]}),
+    )]);
+    let opened = Opened {
+        root: PathBuf::from("/unused"),
+        backend: Box::new(CloudBackend::new(
+            Client::new(&server.url(), "fixture".into()).unwrap(),
+            "alice",
+        )),
+    };
+    let cli = Cli::try_parse_from(["lockyard", "events"]).unwrap();
+    let Command::Events(args) = cli.command else {
+        panic!("events command")
+    };
+    let result = run_events(&opened, args, Some(&"alice".to_string())).unwrap();
+    assert_eq!(result.json.as_array().unwrap().len(), 1);
+    assert_eq!(result.json[0]["seq"], 2);
+    assert_eq!(result.text, "2  zone.claimed");
+}
+
+#[test]
+fn zone_wait_free_cli_parses_timeout_without_taking_a_claim() {
+    let cli = Cli::try_parse_from([
+        "lockyard",
+        "zone",
+        "wait-free",
+        "src/lib.rs",
+        "--timeout",
+        "7",
+    ])
+    .unwrap();
+    assert!(
+        matches!(cli.command, Command::Zone(ZoneCommand::WaitFree { path, timeout:7 }) if path == "src/lib.rs")
+    );
+}
+
+#[test]
+fn task_add_accepts_explicit_client_key() {
+    let cli = Cli::try_parse_from([
+        "lockyard",
+        "task",
+        "add",
+        "title",
+        "--client-key",
+        "retry-key",
+    ])
+    .unwrap();
+    assert!(
+        matches!(cli.command, Command::Task(TaskCommand::Add { client_key:Some(key), .. }) if key == "retry-key")
+    );
+}

@@ -12,6 +12,8 @@
 //! edit. The mirror accelerates path checks (target p95 ≤ 10 ms when fresh); it must never allow a
 //! write the server would refuse. The written guarantee is `docs/cloud-mirror.md`.
 
+#[path = "mail_push.rs"]
+mod mail_push;
 use super::outbox::Outbox;
 use super::private_dir;
 use super::wire::{AgentStatus, Envelope, Phase, Reply, Request, Source};
@@ -25,6 +27,7 @@ use lockyard_core::proto::{
 };
 use lockyard_core::zones::Conflict;
 use lockyard_core::{Backend, Error, ZonePath};
+use mail_push::PushState;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
@@ -36,6 +39,8 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
@@ -368,6 +373,7 @@ fn covers(claim: &Claim, path: &ZonePath) -> bool {
 
 #[derive(Default)]
 struct SessionTrack {
+    push_bound: bool,
     /// Outstanding refreshes retain this identity across removal and re-registration.
     incarnation: Arc<()>,
     heard: Option<Instant>,
@@ -387,6 +393,7 @@ struct ClaimActivity {
 #[derive(Default)]
 struct SessionEvents {
     after: i64,
+    poll_after: i64,
     last_poll: Option<Instant>,
     events: VecDeque<lockyard_core::proto::Event>,
 }
@@ -431,6 +438,15 @@ fn write_class(call: &Call) -> WriteClass {
 
 struct Shared<T: Transport + 'static> {
     transport: Arc<T>,
+    #[cfg(test)]
+    upkeep_cycles: AtomicU64,
+    push_enabled: AtomicBool,
+    push_ready: AtomicBool,
+    push_fallback: AtomicBool,
+    mail_protocol: AtomicI64,
+    stream_interrupt: Mutex<Option<Arc<AtomicBool>>>,
+    push: Mutex<PushState>,
+    mail_ready: Condvar,
     config: AgentConfig,
     session: String,
     state_dir: PathBuf,
@@ -666,7 +682,9 @@ impl<T: Transport + 'static> Shared<T> {
 
     fn stop(&self) {
         self.signal().stop = true;
+        self.interrupt_push();
         self.wake.notify_all();
+        self.mail_ready.notify_all();
     }
 
     /// Wakes the upkeep thread for work that should not wait for its next round.
@@ -1032,7 +1050,8 @@ impl<T: Transport + 'static> Shared<T> {
         let registered_session = {
             let mut sessions = self.sessions();
             let registered = !sessions.contains_key(session);
-            sessions.entry(session.to_string()).or_default().heard = Some(Instant::now());
+            let track = sessions.entry(session.to_string()).or_default();
+            track.heard = Some(Instant::now());
             registered
         };
         let (cached_unread, unread_generation, registered) = {
@@ -1100,10 +1119,18 @@ impl<T: Transport + 'static> Shared<T> {
                 let mail_budget = leftover
                     .saturating_sub(reply_reserve)
                     .min(crate::open_mail::SENT_BUDGET);
-                if !mail_budget.is_zero()
-                    && let Some(snap) =
-                        crate::open_mail::open_mail_within(&backend, session, now_ms(), mail_budget)
-                {
+                if let Some(snap) = self.push_open_snapshot(session).or_else(|| {
+                    (!mail_budget.is_zero())
+                        .then(|| {
+                            crate::open_mail::open_mail_within(
+                                &backend,
+                                session,
+                                now_ms(),
+                                mail_budget,
+                            )
+                        })
+                        .flatten()
+                }) {
                     if snap.truncated {
                         status.freshness["open_mail_truncated"] = json!(true);
                     }
@@ -1320,6 +1347,9 @@ impl<T: Transport + 'static> Shared<T> {
                 .collect()
         };
         for session in active {
+            if self.push_ready.load(Ordering::Acquire) && !self.poll_push_session(&session) {
+                continue;
+            }
             let acked = {
                 let cursor_name = format!(
                     "cursor-session-{}",
@@ -1349,6 +1379,7 @@ impl<T: Transport + 'static> Shared<T> {
                 cache.after = cache.after.max(acked);
                 cache
                     .after
+                    .max(cache.poll_after)
                     .max(cache.events.back().map_or(0, |event| event.seq))
             };
             let query = EventQuery {
@@ -1358,13 +1389,28 @@ impl<T: Transport + 'static> Shared<T> {
                 session: Some(session.clone()),
                 types: Vec::new(),
             };
-            if let Ok(page) = self.backend(&session).events(&query) {
+            let page = match self.backend(&session).events(&query) {
+                Ok(page) => page,
+                Err(error) => {
+                    if matches!(error, Error::Invalid(_) | Error::Protocol(_)) {
+                        self.invalidate_event_views();
+                    }
+                    continue;
+                }
+            };
+            {
+                self.apply_events(&page);
                 let mut caches = self
                     .session_events
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 let cache = caches.entry(session).or_default();
+                cache.poll_after = cache.poll_after.max(page.last_seq(after));
                 for event in page.events {
+                    if event.kind.is_empty() {
+                        // Poll progress is separate from acknowledgement of real events.
+                        continue;
+                    }
                     if event.seq > cache.after
                         && !cache
                             .events
@@ -1384,12 +1430,24 @@ impl<T: Transport + 'static> Shared<T> {
     }
 
     fn hear(&self, session: &str) {
+        let before = self.active_push_sessions();
+        let bound = self
+            .push
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .bound_sessions
+            .contains(session);
         let registered = {
             let mut sessions = self.sessions();
             let registered = !sessions.contains_key(session);
-            sessions.entry(session.to_string()).or_default().heard = Some(Instant::now());
+            let track = sessions.entry(session.to_string()).or_default();
+            track.heard = Some(Instant::now());
+            track.push_bound |= bound;
             registered
         };
+        if self.active_push_sessions() != before {
+            self.interrupt_push();
+        }
         if registered {
             self.nudge();
         }
@@ -1588,6 +1646,9 @@ impl<T: Transport + 'static> Shared<T> {
                 };
             }
         }
+        if let Some(reply) = self.push_read(&call) {
+            return reply;
+        }
         let class = if call.is_write() {
             write_class(&call)
         } else {
@@ -1597,6 +1658,7 @@ impl<T: Transport + 'static> Shared<T> {
             let writes = call.is_write() && call.path.starts_with("/api/v1/zones/");
             return match self.transport.call(&call) {
                 Ok(value) => {
+                    self.confirm_session_binding(&call);
                     if repository_probe {
                         self.repository_capabilities
                             .lock()
@@ -1634,10 +1696,12 @@ impl<T: Transport + 'static> Shared<T> {
         let queued = json!({"queued": true, "key": key});
         let session = call.session.clone();
         let seen = call.path.starts_with("/api/v1/bus/inbox/seen");
+        let seen_ids = call.body.as_ref().and_then(|body| body.get("ids")).cloned();
         if class == WriteClass::Background {
             return match self.outbox.append(call) {
                 Ok(_) => {
                     if seen {
+                        self.push_seen(&session, seen_ids.as_ref());
                         self.mark_unread_dirty(&session);
                     }
                     Reply {
@@ -1696,6 +1760,16 @@ impl<T: Transport + 'static> Shared<T> {
             url: self.config.url.clone(),
             workspace: self.config.workspace.clone(),
             token_id: self.config.token_id.clone(),
+            mail_push_v1: self.mail_protocol.load(Ordering::Acquire) == 1,
+            mail_protocol: match self.mail_protocol.load(Ordering::Acquire) {
+                -1 => None,
+                value => Some(value == 1),
+            },
+            wait_mail_v1: true,
+            peek_mail_v1: true,
+            hook_mail_state_dir: Some(self.state_dir.clone()),
+            prepare_task_create_v1: true,
+            wait_zone_free_v1: true,
             catalog_expansion_v1: true,
             soft_zones_v1: self.transport.cached_soft_zones_v1(),
             mail_open_v1: self
@@ -1730,8 +1804,32 @@ impl<T: Transport + 'static> Shared<T> {
                 status: Some(self.status()),
                 ..Reply::default()
             },
+            Request::PrepareTaskCreate { call, explicit_key } => {
+                match self.transport.prepare_task_create(&call, explicit_key) {
+                    Ok(call) => Reply {
+                        value: serde_json::to_value(call).ok(),
+                        ..Reply::default()
+                    },
+                    Err(error) => Reply::failed(error),
+                }
+            }
+            Request::PeekMail { session } => self.peek_hook_mail(&session),
+            Request::WaitZoneFree {
+                session,
+                path,
+                timeout_ms,
+            } => self.wait_zone_free(&session, &path, timeout_ms, &mut || false),
             Request::Check { session, paths } => self.check(&session, paths),
             Request::Unread { session } => self.unread(&session),
+            Request::WaitMail {
+                session,
+                since,
+                timeout_ms,
+            } => {
+                let reply = self.wait_mail(&session, since, timeout_ms, &mut || false);
+                self.confirm_mail_wake(&session, &reply, true);
+                reply
+            }
             Request::ZoneSnapshot { session } => self.zone_snapshot(&session),
             Request::StatusRead {
                 session,
@@ -1769,16 +1867,33 @@ impl<T: Transport + 'static> Shared<T> {
                     Err(error) => Reply::failed(error),
                 }
             }
+            Request::AcknowledgeWrite { call } => match self.transport.acknowledge_write(&call) {
+                Ok(()) => Reply::default(),
+                Err(error) => Reply::failed(error),
+            },
             Request::Call { call } => self.forward(call),
         }
+    }
+
+    /// A skipped event may hide any coordination mutation. No poll may bless it.
+    fn invalidate_event_views(&self) {
+        let mut view = self.write_view();
+        view.zones_generation += 1;
+        view.board_generation += 1;
+        for marks in view.lost.values_mut() {
+            marks.generation += 1;
+        }
+        drop(view);
+        self.nudge();
     }
 
     fn apply_events(&self, page: &EventPage) {
         let mut touched = false;
         let mut view = self.write_view();
         for event in &page.events {
-            if event.kind.starts_with("zone.") {
+            if !mail_push::known_event(&event.kind) || event.kind.starts_with("zone.") {
                 view.zones_generation += 1;
+                view.board_generation += 1;
                 for marks in view.lost.values_mut() {
                     marks.generation += 1;
                 }
@@ -1806,12 +1921,23 @@ impl<T: Transport + 'static> Shared<T> {
         }
         view.confirm(Instant::now());
         drop(view);
+        if page.events.iter().any(|e| e.kind.starts_with("zone.")) {
+            self.push
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .zone_version += 1;
+            self.mail_ready.notify_all();
+        }
         if touched {
             self.nudge();
         }
     }
 
     fn poll_stream(&self, stream: Stream, name: &str, seq: &AtomicI64) {
+        if stream == Stream::Coordination {
+            self.coordination_loop();
+            return;
+        }
         let mut pause = self.timing().retry_min;
         let session = (stream == Stream::Coordination).then(|| self.session.clone());
         let backend = self.backend(&self.session);
@@ -1837,17 +1963,7 @@ impl<T: Transport + 'static> Shared<T> {
                     }
                     if last != query.after {
                         seq.store(last, Ordering::Relaxed);
-                        #[cfg(unix)]
-                        let _ = fs::write(
-                            self.state_dir.join(format!("cursor-{name}")),
-                            last.to_string(),
-                        );
-                        #[cfg(windows)]
-                        let _ = lockyard_core::fsio::replace(
-                            &self.state_dir.join(format!("cursor-{name}")),
-                            last.to_string().as_bytes(),
-                            0o600,
-                        );
+                        let _ = save_seq(&self.state_dir, name, last);
                     }
                 }
                 Err(error) => {
@@ -2087,6 +2203,8 @@ impl<T: Transport + 'static> Shared<T> {
     /// One thread keeps the view current, so a slow server delays nothing a hook waits for.
     fn upkeep(&self) {
         while !self.stopped() {
+            #[cfg(test)]
+            self.upkeep_cycles.fetch_add(1, Ordering::Relaxed);
             let half = self.timing().fresh / 2;
             let (zones, board) = {
                 let view = self.read_view();
@@ -2102,23 +2220,31 @@ impl<T: Transport + 'static> Shared<T> {
             if board {
                 self.refresh_board();
             }
-            self.refresh_unread();
-            let retry_mail = self.refresh_mail();
+            if self.mail_cache_ready() {
+                self.seed_active_push_mail();
+            } else {
+                self.refresh_unread();
+            }
+            let retry_mail = if self.mail_cache_ready() {
+                self.refresh_push_mail()
+            } else {
+                self.refresh_mail()
+            };
             self.refresh_lost();
             self.refresh_session_events();
             self.flush_activity();
+            let upkeep_delay = if retry_mail {
+                self.timing().upkeep.min(self.timing().retry_min)
+            } else if self.mail_cache_ready() && self.polling_mail_waiters() {
+                self.timing().upkeep.min(Duration::from_secs(1))
+            } else {
+                self.timing().upkeep
+            };
             let mut signal = self.signal();
             if !signal.nudged && !signal.stop {
                 signal = self
                     .wake
-                    .wait_timeout(
-                        signal,
-                        if retry_mail {
-                            self.timing().upkeep.min(self.timing().retry_min)
-                        } else {
-                            self.timing().upkeep
-                        },
-                    )
+                    .wait_timeout(signal, upkeep_delay)
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
             }
@@ -2168,6 +2294,9 @@ impl<T: Transport + 'static> Shared<T> {
                 outcome => {
                     pause = self.timing().retry_min;
                     let succeeded = outcome.is_ok();
+                    if succeeded {
+                        self.confirm_session_binding(&call);
+                    }
                     if let Err(error) = self.outbox.finish(entry.n, outcome) {
                         eprintln!("lockyard agent: cannot update the outbox: {error}");
                     } else if succeeded && let Err(error) = self.transport.acknowledge_write(&call)
@@ -2207,6 +2336,58 @@ fn answer<T: Transport + 'static>(shared: &Arc<Shared<T>>, stream: UnixStream) -
             return Ok(());
         }
         let reply = match serde_json::from_str::<Envelope>(&line) {
+            Ok(Envelope {
+                workspace,
+                request:
+                    Request::WaitZoneFree {
+                        session,
+                        path,
+                        timeout_ms,
+                    },
+            }) if workspace == shared.config.workspace => {
+                reader.get_ref().set_read_timeout(Some(STATUS_PEER_READ))?;
+                let reply = shared.wait_zone_free(&session, &path, timeout_ms, &mut || {
+                    let mut byte = [0u8; 1];
+                    match reader.read_exact(&mut byte) {
+                        Ok(()) => true,
+                        Err(e) => !matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::Interrupted
+                        ),
+                    }
+                });
+                write_reply(&mut writer, &reply)?;
+                return Ok(());
+            }
+            Ok(Envelope {
+                workspace,
+                request:
+                    Request::WaitMail {
+                        session,
+                        since,
+                        timeout_ms,
+                    },
+            }) if workspace == shared.config.workspace => {
+                reader.get_ref().set_read_timeout(Some(STATUS_PEER_READ))?;
+                let reply = shared.wait_mail(&session, since, timeout_ms, &mut || {
+                    let mut byte = [0u8; 1];
+                    match reader.read_exact(&mut byte) {
+                        Ok(()) => true,
+                        Err(e) => !matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::Interrupted
+                        ),
+                    }
+                });
+                let sent = write_reply(&mut writer, &reply);
+                shared.confirm_mail_wake(&session, &reply, sent.is_ok());
+                sent?;
+                return Ok(());
+            }
             Ok(Envelope {
                 workspace,
                 request:
@@ -2277,6 +2458,20 @@ fn load_seq(dir: &Path, name: &str) -> i64 {
                 .and_then(|text| text.trim().parse().ok())
         })
         .unwrap_or(0)
+}
+
+fn save_seq(dir: &Path, name: &str, seq: i64) -> io::Result<()> {
+    let path = dir.join(format!("cursor-{name}"));
+    #[cfg(unix)]
+    {
+        let temp = dir.join(format!("cursor-{name}.tmp"));
+        fs::write(&temp, seq.to_string())?;
+        lockyard_core::fsio::rename(&temp, &path)
+    }
+    #[cfg(windows)]
+    {
+        lockyard_core::fsio::replace(&path, seq.to_string().as_bytes(), 0o600)
+    }
 }
 
 fn state_folder(config: &AgentConfig) -> String {
@@ -2354,6 +2549,15 @@ impl<T: Transport + 'static> Daemon<T> {
         let outbox = Outbox::open(&state_dir)?;
         let shared = Arc::new(Shared {
             transport: Arc::new(transport),
+            #[cfg(test)]
+            upkeep_cycles: AtomicU64::new(0),
+            push_enabled: AtomicBool::new(false),
+            push_ready: AtomicBool::new(false),
+            push_fallback: AtomicBool::new(false),
+            mail_protocol: AtomicI64::new(-1),
+            stream_interrupt: Mutex::new(None),
+            push: Mutex::new(PushState::default()),
+            mail_ready: Condvar::new(),
             // One name per token, not per machine: another key on this machine must not find it taken (D-3178).
             // Same rule as Client::service_session (first 8 hex of the token id).
             session: format!(
@@ -2563,6 +2767,13 @@ mod tests {
             .unwrap();
             let status = socket.ask(&Request::Ping).unwrap().status.unwrap();
             assert_eq!(status.soft_zones_v1, soft);
+            assert!(
+                status.peek_mail_v1 && status.wait_zone_free_v1 && status.prepare_task_create_v1
+            );
+            assert_eq!(
+                status.hook_mail_state_dir,
+                Some(_daemon.shared.state_dir.clone())
+            );
             // Exercise the same Arc + repository wrapper used by real CLI/MCP backends.
             let mut backend = CloudBackend::new(
                 RepositoryTransport::new(Arc::new(socket), None).unwrap(),
@@ -3588,6 +3799,12 @@ mod tests {
         session: &str,
         deadline_ms: u64,
     ) -> (UnixStream, JoinHandle<()>) {
+        let (mut stream, worker) = status_peer_connection(rig, name);
+        send_status_peer(&mut stream, session, deadline_ms);
+        (stream, worker)
+    }
+
+    fn status_peer_connection(rig: &Rig, name: &str) -> (UnixStream, JoinHandle<()>) {
         let path = rig.dir.path().join(name);
         let listener = UnixListener::bind(&path).unwrap();
         let shared = Arc::clone(&rig.daemon.shared);
@@ -3595,10 +3812,14 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let _ = answer(&shared, stream);
         });
-        let mut stream = UnixStream::connect(path).unwrap();
+        let stream = UnixStream::connect(path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(4)))
             .unwrap();
+        (stream, worker)
+    }
+
+    fn send_status_peer(stream: &mut UnixStream, session: &str, deadline_ms: u64) {
         writeln!(
             stream,
             "{}",
@@ -3609,7 +3830,6 @@ mod tests {
             .unwrap()
         )
         .unwrap();
-        (stream, worker)
     }
 
     fn status_peer_reply(stream: &mut UnixStream) -> Reply {
@@ -3717,7 +3937,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         windows,
-        ignore = "timing flake on windows-latest runners (LY-0021); enforced on Linux and macOS"
+        ignore = "LY-0021: fixture fixes need windows-latest --ignored verification before removing ignore"
     )]
     fn status_read_twenty_soft_peer_disconnects_at_850ms_do_not_delay_next_hard() {
         let mut rig = start_with(timing(), |_| {});
@@ -3752,8 +3972,11 @@ mod tests {
         rig.daemon.shared.status_reads.lock().unwrap().running = 0;
         rig.daemon.shared.status_ready.notify_all();
         rig.server.hang_ms.store(20, Ordering::SeqCst);
+        // Pipe creation, security-descriptor checks and spawning the fixture peer are
+        // setup costs, outside the status request's latency budget.
+        let (mut hard, worker) = status_peer_connection(&rig, "h");
         let started = Instant::now();
-        let (mut hard, worker) = status_peer(&rig, "h", "hard", 2600);
+        send_status_peer(&mut hard, "hard", 2600);
         assert!(status_peer_reply(&mut hard).error.is_none());
         assert!(
             started.elapsed() < Duration::from_millis(250),
@@ -6105,7 +6328,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         windows,
-        ignore = "timing flake on windows-latest runners (LY-0021); enforced on Linux and macOS"
+        ignore = "LY-0021: fixture fixes need windows-latest --ignored verification before removing ignore"
     )]
     fn renew_open_mail_via_agent_skips_protocol_and_fits_renew_budget_when_server_hangs() {
         let rig = start_with(timing(), |_| {});
@@ -6114,13 +6337,25 @@ mod tests {
         rig.server.hang_inbox_only.store(true, Ordering::SeqCst);
         rig.server.hang_ms.store(2_000, Ordering::SeqCst);
         // Production CLI agent socket timeout (open.rs CLI_TIMEOUT), not a short test cheat.
+        let path = rig.dir.path().join("run/agent.sock");
+        #[cfg(unix)]
         let socket = AgentSocket::connect(
-            &rig.dir.path().join("run/agent.sock"),
+            &path,
             "https://example.test",
             "team",
             Duration::from_secs(40),
-        )
-        .expect("agent socket");
+        );
+        // Named-pipe trust validates the fixture state directory's ACL, not the user's
+        // installed daemon state. Using connect() here tested unrelated machine state.
+        #[cfg(windows)]
+        let socket = AgentSocket::connect_in_state(
+            &path,
+            "https://example.test",
+            "team",
+            Duration::from_secs(40),
+            &rig.dir.path().join("state"),
+        );
+        let socket = socket.expect("agent socket");
         let before = rig.server.calls_to("/api/v1/protocol");
         let started = Instant::now();
         let count = crate::open_mail::open_mail_count_within(

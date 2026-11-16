@@ -5,6 +5,7 @@ mod context;
 mod guard;
 mod hook;
 mod keepalive;
+mod mail_wait;
 mod mcp;
 mod monitor;
 mod node_cli;
@@ -153,9 +154,13 @@ pub(crate) fn now_ms() -> i64 {
 }
 
 pub(crate) fn env_agent() -> Option<String> {
+    env_agent_from(|name| std::env::var(name).ok())
+}
+
+fn env_agent_from(mut lookup: impl FnMut(&str) -> Option<String>) -> Option<String> {
     ["LOCKYARD_AGENT", "CLAUDE_CODE_SESSION_ID"]
         .iter()
-        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+        .find_map(|name| lookup(name).filter(|value| !value.is_empty()))
 }
 
 fn resolve_agent(flag: Option<&String>) -> Result<String> {
@@ -348,8 +353,14 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             {
                 return Ok(out);
             }
-            run_zone(open()?, command, agent.as_ref(), cwd)
+            let opened = if matches!(command, ZoneCommand::WaitFree { .. }) {
+                open::open_zone_wait(cwd, name.as_deref())?
+            } else {
+                open()?
+            };
+            run_zone(opened, command, agent.as_ref(), cwd)
         }
+        Command::Mail(_) => unreachable!("mail wait is handled before opening a backend"),
         Command::Msg(command) => {
             if matches!(command, MsgCommand::Inbox { .. } | MsgCommand::Open)
                 && let Some(out) = no_cloud_access_output(cwd)?
@@ -582,6 +593,21 @@ fn main() -> ExitCode {
     let parsing = lockyard_core::perf::Span::new("process.parse");
     let cli = Cli::parse();
     drop(parsing);
+    if let Command::Mail(MailCommand::Wait { session, timeout }) = &cli.command {
+        let session = session
+            .clone()
+            .or_else(env_agent)
+            .or_else(mail_wait::hook_session);
+        return ExitCode::from(
+            session
+                .and_then(|session| {
+                    current_dir()
+                        .ok()
+                        .map(|cwd| mail_wait::run(&cwd, &session, Duration::from_secs(*timeout)))
+                })
+                .unwrap_or(0),
+        );
+    }
     let json = cli.json;
     if let Command::Mcp(args) = &cli.command {
         let surface = match mcp::Surface::choose(args.tools.as_deref()) {
@@ -604,6 +630,7 @@ fn main() -> ExitCode {
             }
         };
     }
+    let is_zone_wait = matches!(&cli.command, Command::Zone(ZoneCommand::WaitFree { .. }));
     let is_hook = matches!(&cli.command, Command::Hook(_));
     match current_dir().and_then(|cwd| run(cli, &cwd)) {
         Ok(_) if is_hook => ExitCode::SUCCESS,
@@ -622,6 +649,10 @@ fn main() -> ExitCode {
                 return ExitCode::from(EXIT_FAILURE);
             }
             ExitCode::from(out.exit)
+        }
+        Err(error) if is_zone_wait => {
+            report(&error, json);
+            ExitCode::from(2)
         }
         Err(
             error @ (Error::Conflict(_)

@@ -124,7 +124,11 @@ pub(super) fn run_tool(
         return node_tool(name, args);
     }
     let now = crate::now_ms();
-    let mut opened = open(cwd, agent)?;
+    let mut opened = if name == "zone_wait_free" {
+        crate::open::open_zone_wait(cwd, agent)?
+    } else {
+        open(cwd, agent)?
+    };
     let me = || {
         agent.ok_or_else(|| {
             Error::Invalid(
@@ -326,6 +330,18 @@ pub(super) fn run_tool(
             let claim =
                 lockyard_core::claim_or_reuse(opened.backend.as_mut(), me()?, &request, now)?;
             encode(&claim)
+        }
+        "zone_wait_free" => {
+            let path = opened.workspace_zone_path(cwd, args.text("path")?)?;
+            let seconds = args.some_int("timeout")?.unwrap_or(3600);
+            let seconds = u64::try_from(seconds)
+                .map_err(|_| Error::Invalid("timeout must be nonnegative seconds".into()))?;
+            let free = opened.backend.wait_zone_free(
+                me()?,
+                &path,
+                std::time::Duration::from_secs(seconds),
+            )?;
+            Ok(json!({"path":path,"free":free,"timed_out":!free}))
         }
         "zone_wait" => {
             let request = claim_request(&opened, args, cwd)?;
@@ -593,27 +609,9 @@ pub(super) fn run_tool(
                 _ => Ok(json!({"free": true})),
             }
         }
-        "msg_send" => {
-            let to = resolve_target(cwd, agent, args.text("to")?)?;
-            if me()? == to {
-                return Err(Error::Invalid("cannot send a message to yourself".into()));
-            }
-            let from_client = Some(crate::session_label::mail_label_for_client(client));
-            let request = SendRequest {
-                to,
-                body: args.text("body")?.to_string(),
-                from_client,
-                kind: args.some_text("kind")?,
-                needs: args.some_text("needs")?,
-                zone: args.some_text("zone")?,
-                re: args.some_text("re")?,
-                key: args.some_text("key")?,
-                ttl_minutes: args.some_int("ttl")?,
-            };
-            let mut message = opened.backend.send(me()?, &request, now)?;
-            message.body = escape_bidi_controls(&message.body);
-            encode(&message)
-        }
+        "msg_send" => send_mail(opened.backend.as_mut(), me()?, args, client, &|target| {
+            resolve_target(cwd, agent, target)
+        }),
         "msg_reply" => {
             let mut message = opened.backend.reply_with_client(
                 me()?,
@@ -674,6 +672,7 @@ pub(super) fn run_tool(
             let p0_category = args.some_text("p0_category")?;
             validate_p0_category(priority.as_deref(), p0_category.as_deref())?;
             let spec = TaskSpec {
+                client_key: args.some_text("client_key")?,
                 title: args.text("title")?.to_string(),
                 body: args.optional_text("body")?.to_string(),
                 acceptance: args.some_text("acceptance")?,
@@ -704,28 +703,6 @@ pub(super) fn run_tool(
                         answer["warning"] = json!(TASK_PATHS_WARNING);
                     }
                     Ok(answer)
-                }
-                Err(error) if is_reconciliation(&error) => {
-                    let message = format!(
-                        "{error}; created=unknown: the idempotent retry with the original client_key could not confirm creation; do not resubmit with a fresh key (it could create a duplicate)"
-                    );
-                    match error {
-                        Error::Cloud {
-                            code,
-                            status,
-                            mut details,
-                            ..
-                        } => {
-                            details["created"] = Value::Null;
-                            Err(Error::Cloud {
-                                code,
-                                status,
-                                details,
-                                message,
-                            })
-                        }
-                        _ => Err(Error::Invalid(message)),
-                    }
                 }
                 Err(error) => Err(error),
             }
@@ -891,7 +868,9 @@ pub(super) fn run_tool(
                 session: agent.map(str::to_string),
                 types: args.strings("types")?,
             };
-            encode(&opened.backend.events(&query)?.events)
+            let mut page = opened.backend.events(&query)?;
+            page.events.retain(|event| !event.kind.is_empty());
+            encode(&page.events)
         }
         "presence" => {
             let within = args
@@ -939,3 +918,42 @@ pub(super) fn run_tool(
 #[cfg(test)]
 #[path = "tests/status_lost.rs"]
 mod status_lost_tests;
+
+pub(super) fn send_mail(
+    backend: &mut dyn lockyard_core::Backend,
+    agent: &str,
+    args: Args<'_>,
+    client: Option<&str>,
+    resolve: &dyn Fn(&str) -> Result<String>,
+) -> Result<Value> {
+    let target = args.text("to")?;
+    let to = if lockyard_core::proto::is_mail_address(target) {
+        target.to_string()
+    } else {
+        resolve(target)?
+    };
+    let to = if backend.is_cloud() {
+        to
+    } else {
+        lockyard_core::proto::mail_address(&to, false)?
+    };
+    if agent == to {
+        return Err(Error::Invalid("cannot send a message to yourself".into()));
+    }
+    let from_client = Some(crate::session_label::mail_label_for_client(client));
+    let request = SendRequest {
+        urgent: args.flag("urgent")?,
+        to,
+        body: args.text("body")?.to_string(),
+        from_client,
+        kind: args.some_text("kind")?,
+        needs: args.some_text("needs")?,
+        zone: args.some_text("zone")?,
+        re: args.some_text("re")?,
+        key: args.some_text("key")?,
+        ttl_minutes: args.some_int("ttl")?,
+    };
+    let mut message = backend.send(agent, &request, crate::now_ms())?;
+    message.body = escape_bidi_controls(&message.body);
+    encode(&message)
+}

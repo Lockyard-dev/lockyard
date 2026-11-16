@@ -5,6 +5,12 @@ use super::*;
 #[derive(Subcommand)]
 #[command(defer = true)]
 pub(super) enum ZoneCommand {
+    /// Wait until no other session holds this path; does not acquire it. Timeout in seconds.
+    WaitFree {
+        path: String,
+        #[arg(long, default_value_t = 3600)]
+        timeout: u64,
+    },
     /// Claim paths, all of them or none.
     Claim {
         paths: Vec<String>,
@@ -232,10 +238,13 @@ pub(super) enum DirtyCommand {
 #[derive(Subcommand)]
 #[command(defer = true)]
 pub(super) enum MsgCommand {
-    /// Send to an agent, or to `*` for everyone.
+    /// Send to a session, *, all, все, everyone, @client, @zone:key or @path:path.
     Send {
         to: String,
         body: String,
+        /// Wake a waiting session even for informational mail.
+        #[arg(long)]
+        urgent: bool,
         /// ask, notice or event.
         #[arg(long)]
         kind: Option<String>,
@@ -365,6 +374,9 @@ pub(super) enum TaskCommand {
     /// Add an open task about files or directories; the server determines its area.
     Add {
         title: String,
+        /// Reuse this creation key when retrying an unconfirmed task.
+        #[arg(long)]
+        client_key: Option<String>,
         /// File or directory relative to the workspace root. Repeat for each path.
         /// Required when the server supports automatic areas.
         #[arg(long = "path", value_name = "PATH")]
@@ -633,5 +645,17 @@ pub(super) enum BoardCommand {
     List {
         #[arg(long)]
         zone: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(super) enum MailCommand {
+    /// Wait silently for actionable mail; exit 2 with a reminder, or 0 on timeout/unavailable.
+    Wait {
+        #[arg(long)]
+        session: Option<String>,
+        /// Maximum wait in seconds (default six hours).
+        #[arg(long, default_value_t = 21600)]
+        timeout: u64,
     },
 }

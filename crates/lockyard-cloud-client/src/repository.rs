@@ -152,6 +152,57 @@ impl<T> RepositoryTransport<T> {
 }
 
 impl<T: Transport> Transport for RepositoryTransport<T> {
+    fn mail_push_v1(&self, session: &str) -> Result<bool, ClientError> {
+        self.inner.mail_push_v1(session)
+    }
+
+    fn renegotiate_mail_push(&self, session: &str) -> Result<bool, ClientError> {
+        self.inner.renegotiate_mail_push(session)
+    }
+    fn owns_event_stream(&self) -> bool {
+        self.inner.owns_event_stream()
+    }
+    fn prepare_task_create(&self, call: &Call, explicit_key: bool) -> Result<Call, ClientError> {
+        self.inner
+            .prepare_task_create(&self.qualified_call(call)?, explicit_key)
+    }
+    fn wait_zone_free(
+        &self,
+        session: &str,
+        path: &str,
+        timeout: std::time::Duration,
+    ) -> Option<Result<bool, ClientError>> {
+        let path = match self.path(path) {
+            Ok(path) => path,
+            Err(error) => return Some(Err(error)),
+        };
+        // Namespace support must be verified before asking the daemon about a qualified path.
+        if self.repository.is_some() && !self.verified.load(Ordering::Acquire) {
+            let mut probe = Call::get(session, "/api/v1/zones/claims".into());
+            probe.deadline_ms = Some(timeout.as_millis().max(1).min(u64::MAX as u128) as u64);
+            if let Err(error) = self.call(&probe) {
+                return Some(Err(error));
+            }
+        }
+        self.inner.wait_zone_free(session, &path, timeout)
+    }
+    fn event_stream_sessions(
+        &self,
+        session: &str,
+        sessions: &[String],
+        after: i64,
+        interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::sse::EventStream, ClientError> {
+        self.inner
+            .event_stream_sessions(session, sessions, after, interrupt)
+    }
+    fn decode_stream_event(
+        &self,
+        event: &mut lockyard_core::proto::Event,
+    ) -> Result<(), ClientError> {
+        self.inner.decode_stream_event(event)
+    }
+
     fn soft_zones_v1(&self, session: &str) -> Result<bool, ClientError> {
         self.inner.soft_zones_v1(session)
     }

@@ -85,7 +85,7 @@ fn reply(mut stream: TcpStream, shared: &Mutex<State>, capability: &str) {
                 200,
                 json!({
                     "selected_protocol":2,"min_protocol":1,"max_protocol":2,
-                    "capabilities":if capability == "body" {vec!["registry_auto_area_v1"]} else {vec![]}
+                    "capabilities":if capability == "body" {vec!["registry_auto_area_v1"]} else if capability == "push" {vec!["mail_push_v1"]} else {vec![]}
                 }),
             ),
             ("GET", "/api/v1/workspace/encryption") => (
@@ -101,6 +101,9 @@ fn reply(mut stream: TcpStream, shared: &Mutex<State>, capability: &str) {
                     {"id":"engine-id","key":"engine","prefix":"FE"}
                 ]}),
             ),
+            ("POST", "/api/v1/zones/check") => {
+                (200, json!({"paths":[{"path":"src","status":"free"}]}))
+            }
             ("POST", "/api/v1/registry/items") => state.refusal.clone().unwrap_or((200, task)),
             ("GET", "/api/v1/registry/ready") => (200, json!({"items":[task]})),
             ("GET", "/api/v1/registry/items/FE-0001") => (200, task),
@@ -387,7 +390,7 @@ fn mcp_auto_area_adds_normalized_workspace_paths_without_area_and_preserves_an_o
             let absolute = project.root.path().join("engine/src/main.rs");
             let answers = project.rpc(&server, &nested, surface, vec![
                 call("task_add", json!({"title":"paths","paths":["engine\\src\\lib.rs", absolute]})),
-                call("task_add", json!({"title":"override","paths":["engine/src"],"area":"Case Sensitive Override"}))
+                call("task_add", json!({"title":"override","paths":["engine/src"],"area":"Case Sensitive Override","client_key":"retry-this-task"}))
             ]);
             for answer in answers {
                 assert_eq!(answer["isError"], false, "{answer}");
@@ -401,6 +404,7 @@ fn mcp_auto_area_adds_normalized_workspace_paths_without_area_and_preserves_an_o
             assert!(last[0].get("area").is_none());
             assert!(last[0].get("area_id").is_none());
             assert_eq!(last[1]["area"], "Case Sensitive Override");
+            assert_eq!(last[1]["client_key"], "retry-this-task");
         }
     }
 }
@@ -614,4 +618,68 @@ fn mcp_auto_area_server_errors_explain_recovery_and_preserve_problem_details() {
         assert_eq!(answer["structuredContent"]["code"], code);
         assert_eq!(answer["structuredContent"]["details"], details);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn old_daemon_zone_wait_free_uses_direct_checks_without_sse() {
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    let server = Server::start("push");
+    let project = Project::new(&server);
+    let runtime = project.runtime.path().join("lockyard");
+    std::fs::create_dir(&runtime).unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(runtime.join("agent.sock")).unwrap();
+    let url = server.url.clone();
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["op"], "ping");
+        // Frozen old Ping: no capability flags, so WaitZoneFree must never be sent here.
+        let reply = json!({"status":{"url":url,"workspace":"team","pid":1,"view_fresh":false,"view_age_ms":null,"claims":0,"board":0,"sessions":0,"outbox":0,"coordination_seq":0,"registry_seq":0}});
+        serde_json::to_writer(&mut stream, &reply).unwrap();
+        stream.write_all(b"\n").unwrap();
+    });
+    let out = Command::new(
+        std::env::var_os("LOCKYARD_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_lockyard").into()),
+    )
+    .args(["--json", "zone", "wait-free", "src", "--timeout", "1"])
+    .current_dir(project.root.path())
+    .env_clear()
+    .env("XDG_RUNTIME_DIR", project.runtime.path())
+    .env("XDG_STATE_HOME", project.runtime.path().join("state"))
+    .env("XDG_CONFIG_HOME", project.runtime.path().join("config"))
+    .env("LOCKYARD_URL", &server.url)
+    .env("LOCKYARD_TOKEN", "synthetic-test-token")
+    .env("LOCKYARD_AGENT", "test-worker")
+    .output()
+    .unwrap();
+    peer.join().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["free"],
+        true
+    );
+    let state = server.state.lock().unwrap();
+    assert!(
+        state
+            .seen
+            .iter()
+            .any(|(_, path, _)| path == "/api/v1/zones/check")
+    );
+    assert!(
+        !state
+            .seen
+            .iter()
+            .any(|(_, path, _)| path == "/api/v1/events")
+    );
 }

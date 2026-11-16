@@ -171,6 +171,20 @@ pub(super) fn run_zone(
     let now = now_ms();
     let lease = clock(&opened);
     match command {
+        ZoneCommand::WaitFree { path, timeout } => {
+            let path = opened.workspace_zone_path(cwd, &path)?;
+            let free = opened.backend.wait_zone_free(
+                &resolve_agent(agent)?,
+                &path,
+                Duration::from_secs(timeout),
+            )?;
+            let mut answer = output(
+                &json!({"path":path,"free":free,"timed_out":!free}),
+                if free { "free" } else { "timed out" },
+            )?;
+            answer.exit = if free { 0 } else { 1 };
+            Ok(answer)
+        }
         ZoneCommand::Claim {
             paths,
             paths_file,

@@ -110,13 +110,15 @@ fn survey_0014_reconcile_exact_creation_identity_or_report_unknown() {
             assert_eq!(answer["structuredContent"]["id"], "FE-77");
         } else {
             assert_eq!(answer["isError"], true, "{answer}");
-            assert!(answer["content"][0]["text"].as_str().unwrap().contains("created=unknown"), "{answer}");
+            assert!(answer["content"][0]["text"].as_str().unwrap().contains("task creation could not be confirmed"), "{answer}");
         }
         let requests = server.seen("POST", "/api/v1/registry/items");
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].key, requests[1].key);
         assert_eq!(requests[0].body, requests[1].body);
-        assert!(server.seen("GET", "/api/v1/registry/items").is_empty());
+        let lookups = server.seen("GET", "/api/v1/registry/items");
+        assert_eq!(lookups.len(), usize::from(!exact));
+        if !exact { assert!(lookups[0].path.contains("client_key=")); }
     }
 }
 

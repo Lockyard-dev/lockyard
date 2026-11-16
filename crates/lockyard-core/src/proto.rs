@@ -406,6 +406,8 @@ pub struct ActivityRequest {
 /// One message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub urgent: bool,
     #[serde(default)]
     pub id: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -418,6 +420,12 @@ pub struct Message {
     pub from: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_client: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     #[serde(default)]
     pub to: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -447,6 +455,8 @@ pub struct Message {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct SendRequest {
+    #[serde(skip_serializing_if = "is_false")]
+    pub urgent: bool,
     pub to: String,
     pub body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -823,6 +833,31 @@ pub fn expand_zones(catalog: &Value, names: &[String]) -> Result<Vec<String>> {
 
 fn pointer(section: &str, name: &str) -> String {
     format!("/{section}/{}", name.replace('~', "~0").replace('/', "~1"))
+}
+
+/// Recipient syntax that must be resolved by the workspace server, not presence aliases.
+pub fn is_mail_address(to: &str) -> bool {
+    matches!(
+        to,
+        "*" | "all" | "все" | "everyone" | "@claude" | "@cursor" | "@codex"
+    ) || to.starts_with("@zone:")
+        || to.starts_with("@path:")
+}
+
+pub fn mail_address(to: &str, push: bool) -> crate::Result<String> {
+    if push {
+        return Ok(to.to_string());
+    }
+    match to {
+        "all" | "все" | "everyone" => Ok("*".into()),
+        "@claude" | "@cursor" | "@codex" => Err(crate::Error::Invalid(
+            "сервер не поддерживает этот адрес: требуется mail_push_v1".into(),
+        )),
+        value if value.starts_with("@zone:") || value.starts_with("@path:") => Err(
+            crate::Error::Invalid("сервер не поддерживает группы: требуется mail_push_v1".into()),
+        ),
+        _ => Ok(to.to_string()),
+    }
 }
 
 #[cfg(test)]
