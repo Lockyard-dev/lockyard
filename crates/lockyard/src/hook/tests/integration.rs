@@ -394,3 +394,52 @@
         assert_eq!(store.unread("me").unwrap(), 0);
     }
 
+
+    #[cfg(unix)]
+    #[test]
+    fn old_daemon_hook_uses_take_mail_and_zone_wait_uses_checks_without_new_requests() {
+        use crate::agent::{socket::AgentSocket, wire::{AgentStatus, Envelope, Reply, Request}};
+        use lockyard_cloud_client::CloudBackend;
+        use std::{io::{BufRead, BufReader}, os::unix::net::UnixListener, time::Duration};
+        let dir = tempfile::tempdir().unwrap();
+        crate::agent::private_dir(dir.path()).unwrap();
+        let path = dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut delivered = false;
+            let mut seen = false;
+            for _ in 0..8 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let envelope: Envelope = serde_json::from_str(&line).unwrap();
+                let reply = match envelope.request {
+                    Request::Ping => Reply { status: Some(AgentStatus { url:"http://fixture".into(), workspace:"team".into(), ..Default::default() }), ..Default::default() },
+                    Request::Unread { .. } => Reply { unread:Some(1), ..Default::default() },
+                    Request::TakeEvents { .. } => Reply { events:Some(vec![]), ..Default::default() },
+                    Request::TakeMail { limit, lease_seconds, .. } => {
+                        assert_eq!(limit, 5); assert_eq!(lease_seconds, 60); delivered = true;
+                        Reply { messages:Some(vec![letter()]), ..Default::default() }
+                    },
+                    Request::Call { call } if call.path == "/api/v1/bus/inbox/seen" => {
+                        assert!(delivered); assert_eq!(call.body.unwrap()["ids"], json!([4])); seen = true;
+                        Reply::default()
+                    },
+                    Request::Call { call } if call.path == "/api/v1/zones/check" => {
+                        assert!(seen);
+                        Reply { value:Some(json!({"paths":[{"path":"src","status":"free"}]})), ..Default::default() }
+                    },
+                    other => panic!("old daemon does not know {other:?}"),
+                };
+                serde_json::to_writer(&mut stream, &reply).unwrap(); stream.write_all(b"\n").unwrap();
+            }
+        });
+        let socket = AgentSocket::connect(&path, "http://fixture", "team", Duration::from_secs(1)).unwrap();
+        let mut port = cloud::AgentPort { socket, root:dir.path().into(), tool:Tool::Codex, repository:None, repository_confirmed:false };
+        let mut out = Vec::new();
+        deliver_mail(&mut port, "SessionStart", "me", 1, &mut out).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("hi"));
+        let backend = CloudBackend::new(port.socket, "me");
+        assert!(backend.wait_zone_free("me", "src", Duration::from_secs(1)).unwrap());
+        peer.join().unwrap();
+    }

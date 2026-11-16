@@ -1766,6 +1766,10 @@ impl<T: Transport + 'static> Shared<T> {
                 value => Some(value == 1),
             },
             wait_mail_v1: true,
+            peek_mail_v1: true,
+            hook_mail_state_dir: Some(self.state_dir.clone()),
+            prepare_task_create_v1: true,
+            wait_zone_free_v1: true,
             catalog_expansion_v1: true,
             soft_zones_v1: self.transport.cached_soft_zones_v1(),
             mail_open_v1: self
@@ -1800,6 +1804,21 @@ impl<T: Transport + 'static> Shared<T> {
                 status: Some(self.status()),
                 ..Reply::default()
             },
+            Request::PrepareTaskCreate { call, explicit_key } => {
+                match self.transport.prepare_task_create(&call, explicit_key) {
+                    Ok(call) => Reply {
+                        value: serde_json::to_value(call).ok(),
+                        ..Reply::default()
+                    },
+                    Err(error) => Reply::failed(error),
+                }
+            }
+            Request::PeekMail { session } => self.peek_hook_mail(&session),
+            Request::WaitZoneFree {
+                session,
+                path,
+                timeout_ms,
+            } => self.wait_zone_free(&session, &path, timeout_ms, &mut || false),
             Request::Check { session, paths } => self.check(&session, paths),
             Request::Unread { session } => self.unread(&session),
             Request::WaitMail {
@@ -1848,6 +1867,10 @@ impl<T: Transport + 'static> Shared<T> {
                     Err(error) => Reply::failed(error),
                 }
             }
+            Request::AcknowledgeWrite { call } => match self.transport.acknowledge_write(&call) {
+                Ok(()) => Reply::default(),
+                Err(error) => Reply::failed(error),
+            },
             Request::Call { call } => self.forward(call),
         }
     }
@@ -1898,6 +1921,13 @@ impl<T: Transport + 'static> Shared<T> {
         }
         view.confirm(Instant::now());
         drop(view);
+        if page.events.iter().any(|e| e.kind.starts_with("zone.")) {
+            self.push
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .zone_version += 1;
+            self.mail_ready.notify_all();
+        }
         if touched {
             self.nudge();
         }
@@ -2309,6 +2339,31 @@ fn answer<T: Transport + 'static>(shared: &Arc<Shared<T>>, stream: UnixStream) -
             Ok(Envelope {
                 workspace,
                 request:
+                    Request::WaitZoneFree {
+                        session,
+                        path,
+                        timeout_ms,
+                    },
+            }) if workspace == shared.config.workspace => {
+                reader.get_ref().set_read_timeout(Some(STATUS_PEER_READ))?;
+                let reply = shared.wait_zone_free(&session, &path, timeout_ms, &mut || {
+                    let mut byte = [0u8; 1];
+                    match reader.read_exact(&mut byte) {
+                        Ok(()) => true,
+                        Err(e) => !matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::Interrupted
+                        ),
+                    }
+                });
+                write_reply(&mut writer, &reply)?;
+                return Ok(());
+            }
+            Ok(Envelope {
+                workspace,
+                request:
                     Request::WaitMail {
                         session,
                         since,
@@ -2712,6 +2767,13 @@ mod tests {
             .unwrap();
             let status = socket.ask(&Request::Ping).unwrap().status.unwrap();
             assert_eq!(status.soft_zones_v1, soft);
+            assert!(
+                status.peek_mail_v1 && status.wait_zone_free_v1 && status.prepare_task_create_v1
+            );
+            assert_eq!(
+                status.hook_mail_state_dir,
+                Some(_daemon.shared.state_dir.clone())
+            );
             // Exercise the same Arc + repository wrapper used by real CLI/MCP backends.
             let mut backend = CloudBackend::new(
                 RepositoryTransport::new(Arc::new(socket), None).unwrap(),
@@ -3737,6 +3799,12 @@ mod tests {
         session: &str,
         deadline_ms: u64,
     ) -> (UnixStream, JoinHandle<()>) {
+        let (mut stream, worker) = status_peer_connection(rig, name);
+        send_status_peer(&mut stream, session, deadline_ms);
+        (stream, worker)
+    }
+
+    fn status_peer_connection(rig: &Rig, name: &str) -> (UnixStream, JoinHandle<()>) {
         let path = rig.dir.path().join(name);
         let listener = UnixListener::bind(&path).unwrap();
         let shared = Arc::clone(&rig.daemon.shared);
@@ -3744,10 +3812,14 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let _ = answer(&shared, stream);
         });
-        let mut stream = UnixStream::connect(path).unwrap();
+        let stream = UnixStream::connect(path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(4)))
             .unwrap();
+        (stream, worker)
+    }
+
+    fn send_status_peer(stream: &mut UnixStream, session: &str, deadline_ms: u64) {
         writeln!(
             stream,
             "{}",
@@ -3758,7 +3830,6 @@ mod tests {
             .unwrap()
         )
         .unwrap();
-        (stream, worker)
     }
 
     fn status_peer_reply(stream: &mut UnixStream) -> Reply {
@@ -3866,7 +3937,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         windows,
-        ignore = "timing flake on windows-latest runners (LY-0021); enforced on Linux and macOS"
+        ignore = "LY-0021: fixture fixes need windows-latest --ignored verification before removing ignore"
     )]
     fn status_read_twenty_soft_peer_disconnects_at_850ms_do_not_delay_next_hard() {
         let mut rig = start_with(timing(), |_| {});
@@ -3901,8 +3972,11 @@ mod tests {
         rig.daemon.shared.status_reads.lock().unwrap().running = 0;
         rig.daemon.shared.status_ready.notify_all();
         rig.server.hang_ms.store(20, Ordering::SeqCst);
+        // Pipe creation, security-descriptor checks and spawning the fixture peer are
+        // setup costs, outside the status request's latency budget.
+        let (mut hard, worker) = status_peer_connection(&rig, "h");
         let started = Instant::now();
-        let (mut hard, worker) = status_peer(&rig, "h", "hard", 2600);
+        send_status_peer(&mut hard, "hard", 2600);
         assert!(status_peer_reply(&mut hard).error.is_none());
         assert!(
             started.elapsed() < Duration::from_millis(250),
@@ -6254,7 +6328,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         windows,
-        ignore = "timing flake on windows-latest runners (LY-0021); enforced on Linux and macOS"
+        ignore = "LY-0021: fixture fixes need windows-latest --ignored verification before removing ignore"
     )]
     fn renew_open_mail_via_agent_skips_protocol_and_fits_renew_budget_when_server_hangs() {
         let rig = start_with(timing(), |_| {});
@@ -6263,13 +6337,25 @@ mod tests {
         rig.server.hang_inbox_only.store(true, Ordering::SeqCst);
         rig.server.hang_ms.store(2_000, Ordering::SeqCst);
         // Production CLI agent socket timeout (open.rs CLI_TIMEOUT), not a short test cheat.
+        let path = rig.dir.path().join("run/agent.sock");
+        #[cfg(unix)]
         let socket = AgentSocket::connect(
-            &rig.dir.path().join("run/agent.sock"),
+            &path,
             "https://example.test",
             "team",
             Duration::from_secs(40),
-        )
-        .expect("agent socket");
+        );
+        // Named-pipe trust validates the fixture state directory's ACL, not the user's
+        // installed daemon state. Using connect() here tested unrelated machine state.
+        #[cfg(windows)]
+        let socket = AgentSocket::connect_in_state(
+            &path,
+            "https://example.test",
+            "team",
+            Duration::from_secs(40),
+            &rig.dir.path().join("state"),
+        );
+        let socket = socket.expect("agent socket");
         let before = rig.server.calls_to("/api/v1/protocol");
         let started = Instant::now();
         let count = crate::open_mail::open_mail_count_within(

@@ -353,7 +353,12 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             {
                 return Ok(out);
             }
-            run_zone(open()?, command, agent.as_ref(), cwd)
+            let opened = if matches!(command, ZoneCommand::WaitFree { .. }) {
+                open::open_zone_wait(cwd, name.as_deref())?
+            } else {
+                open()?
+            };
+            run_zone(opened, command, agent.as_ref(), cwd)
         }
         Command::Mail(_) => unreachable!("mail wait is handled before opening a backend"),
         Command::Msg(command) => {
@@ -625,6 +630,7 @@ fn main() -> ExitCode {
             }
         };
     }
+    let is_zone_wait = matches!(&cli.command, Command::Zone(ZoneCommand::WaitFree { .. }));
     let is_hook = matches!(&cli.command, Command::Hook(_));
     match current_dir().and_then(|cwd| run(cli, &cwd)) {
         Ok(_) if is_hook => ExitCode::SUCCESS,
@@ -643,6 +649,10 @@ fn main() -> ExitCode {
                 return ExitCode::from(EXIT_FAILURE);
             }
             ExitCode::from(out.exit)
+        }
+        Err(error) if is_zone_wait => {
+            report(&error, json);
+            ExitCode::from(2)
         }
         Err(
             error @ (Error::Conflict(_)

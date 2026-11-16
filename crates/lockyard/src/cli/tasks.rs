@@ -178,6 +178,7 @@ pub(super) fn run_task(
         }
         TaskCommand::Add {
             title,
+            client_key,
             paths,
             body,
             acceptance,
@@ -195,6 +196,7 @@ pub(super) fn run_task(
         } => store.add_task(
             &resolve_agent(agent)?,
             &TaskSpec {
+                client_key,
                 title,
                 paths,
                 body,

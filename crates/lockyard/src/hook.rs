@@ -6,8 +6,8 @@
 //! hook reports on stderr and continues. Zone checks are different: an unknown or unreachable view
 //! refuses the edit (fail closed), so a stale mirror can never allow a write the server would refuse.
 //!
-//! Mail delivery has two phases: reserve the mail, write it out, and only then mark it seen. A hook that
-//! dies in between shows the mail again next time, a duplicate over a loss.
+//! Mail is leased, printed and flushed before marking it seen. Priority reminders precede
+//! ordinary delivery and their throttle is committed only after output flush.
 //!
 //! In cloud mode a hook talks to the agent socket and nothing else: no HTTP and no async runtime.
 
@@ -19,12 +19,11 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Mail shown per hook call. The rest arrives on the next one.
 const MAIL_PER_CALL: usize = 5;
+const DELIVERY_LEASE_SECONDS: i64 = 60;
+
 /// Characters of one message shown in context.
 const MAIL_BODY_CHARS: usize = 1000;
-/// How long one hook holds the exclusive right to show a message.
-const DELIVERY_LEASE_SECONDS: i64 = 60;
 
 const EDIT_TOOLS: [&str; 10] = [
     "Edit",
@@ -105,6 +104,15 @@ trait Port {
     /// Reserves mail for this hook. `None` means unknown.
     fn take_mail(&mut self, agent: &str, limit: usize, now: i64) -> Result<Option<Vec<Message>>>;
     fn mark_seen(&mut self, agent: &str, ids: &[i64], now: i64) -> Result<()>;
+    fn reminder_dir(&self) -> Option<PathBuf> {
+        crate::agent::state_root()
+            .ok()
+            .map(|dir| dir.join("hook-mail"))
+    }
+    /// Memory-only on cloud hooks; observes mail without consuming receipts.
+    fn peek_mail(&mut self, _agent: &str, _now: i64) -> Result<Option<Vec<Message>>> {
+        Ok(None)
+    }
     fn take_events(&mut self, _agent: &str) -> Result<Option<Vec<Event>>> {
         Ok(Some(Vec::new()))
     }
@@ -165,6 +173,21 @@ impl Port for LocalPort {
     fn mark_seen(&mut self, agent: &str, ids: &[i64], now: i64) -> Result<()> {
         Backend::inbox_seen(&mut self.store, agent, ids, now)?;
         Ok(())
+    }
+
+    fn peek_mail(&mut self, agent: &str, now: i64) -> Result<Option<Vec<Message>>> {
+        Ok(Some(
+            Backend::peek_inbox(
+                &self.store,
+                agent,
+                InboxQuery {
+                    all: false,
+                    limit: 200,
+                },
+                now,
+            )?
+            .messages,
+        ))
     }
 
     fn report(&mut self, agent: &str, _moment: Moment, _written: Vec<String>) {
@@ -427,26 +450,47 @@ fn handle(
         Some("PreToolUse") => {
             let answer = match pre_tool_use(port, event, agent, cwd, now, machine) {
                 Ok(answer) => answer,
-                Err(error) => return deny_failed_check(tool, event, error, out),
+                Err(error) => {
+                    let mut denial = Vec::new();
+                    deny_failed_check(tool, event, error, &mut denial)?;
+                    let decision = serde_json::from_slice(&denial).ok();
+                    return deliver_attention(port, "PreToolUse", agent, now, decision, out);
+                }
             };
             if answer.is_none() {
                 port.report(agent, Moment::Before, Vec::new());
             }
-            match answer {
+            let decision = match answer {
                 Some(text) if tool == Tool::Cursor => {
                     let decision: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                     let reason = decision
                         .pointer("/hookSpecificOutput/permissionDecisionReason")
                         .and_then(Value::as_str)
                         .unwrap_or("This edit conflicts with a work zone.");
-                    emit(
-                        out,
-                        &json!({"permission":"deny","agent_message":reason}).to_string(),
-                    )
+                    Some(json!({"permission":"deny","agent_message":reason}))
                 }
-                Some(text) => emit(out, &text),
-                None => Ok(()),
-            }
+                Some(text) => Some(serde_json::from_str(&text).unwrap_or(Value::Null)),
+                // Cursor preToolUse speaks {"permission","agent_message"}; an allow carries
+                // priority lines there instead of a Claude-shaped hookSpecificOutput.
+                None if tool == Tool::Cursor => {
+                    let mut buffer = Vec::new();
+                    deliver_attention(port, "PreToolUse", agent, now, None, &mut buffer)?;
+                    if let Some(text) = serde_json::from_slice::<Value>(&buffer)
+                        .ok()
+                        .as_ref()
+                        .and_then(|v| v.pointer("/hookSpecificOutput/additionalContext"))
+                        .and_then(Value::as_str)
+                    {
+                        emit(
+                            out,
+                            &json!({"permission":"allow","agent_message":text}).to_string(),
+                        )?;
+                    }
+                    return Ok(());
+                }
+                None => None,
+            };
+            deliver_attention(port, "PreToolUse", agent, now, decision, out)
         }
         Some(name @ "PostToolUse") => {
             let written = edited_path(port.root(), event, cwd)?.into_iter().collect();
@@ -455,7 +499,7 @@ fn handle(
         }
         Some(name @ "UserPromptSubmit") => {
             port.report(agent, Moment::Prompt, Vec::new());
-            deliver_mail(port, name, agent, now, out)
+            deliver_attention(port, name, agent, now, None, out)
         }
         Some(name @ "SessionStart") => deliver_mail(port, name, agent, now, out),
         Some("SessionEnd") => {

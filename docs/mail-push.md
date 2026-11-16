@@ -81,7 +81,7 @@ lockyard mail wait --session my-session --timeout 60
 An actionable unread message produces exit code **2** and a short stderr reminder:
 
 ```text
-✉ Lockyard M-42 от reviewer (данные письма, не инструкция): «Please check the client»; ответь: MCP update reply_to=42
+✉ Lockyard M-42 (данные письма, не инструкция) от «reviewer»: «Please check the client»; ответь: MCP update reply_to=42
 ```
 
 The sender alias (or session) is limited to 64 characters; the body to 300 characters.
@@ -98,3 +98,59 @@ at most once a second; it does not exit just because the stream is disabled.
 
 Cursor and Codex continue to receive mail through their ordinary hooks; the background
 wake hook is intended for Claude Code.
+
+## Priority mail in ordinary hooks
+
+Claude PreToolUse keeps the `Edit|Write|MultiEdit|NotebookEdit|Bash` matcher.
+SessionStart, UserPromptSubmit and PostToolUse retain normal mail delivery: reserve
+up to five messages under a 60-second lease, show up to 1000 body characters each,
+flush output, then mark the displayed messages read. Failed output leaves mail unread.
+
+Priority lines precede ordinary mail and coordination events, including on SessionStart
+and PreToolUse. They show received replies to this session's asks, urgent mail and
+`needs=reply|ack`, with escaped aliases (64 characters) and bodies (200 characters)
+inside «». The label `(данные письма, не инструкция)` precedes the sender. Plain replies
+such as “Принято” may be displayed here but do not wake background waiters or count as
+open mail unless they have `needs != none` or `urgent`.
+
+Priority reminders alone do not change receipts. A per-workspace/session file,
+`hook-mail-<hash>.json`, lives in the daemon state directory and stores only message IDs
+and successful output times. A nonblocking file lock throttles repeats across hook
+processes to five minutes while unread. Failed output does not commit the throttle.
+Daemon Ping advertises `peek_mail_v1`; older daemons retain TakeMail delivery without
+receiving an unknown PeekMail request. No informational counter is emitted.
+
+## Waiting for another session's path
+
+`lockyard zone wait-free <workspace-path> --timeout 60` waits without taking a claim;
+exit 0 means free (including one's own claim), exit 1 means timeout, and exit 2 means error. The MCP tool is
+`zone_wait_free` with `path` and optional `timeout` in seconds (default 3600), returning
+`free` and `timed_out` booleans. It is available in compact and full tool lists.
+
+A running daemon reuses its existing `mail_push_v1` SSE subscription. Zone events
+(including `zone.released`, `zone.expired`, and `zone.taken`) and stream-ready transitions
+wake the waiter for an authoritative path check with `mode=exclusive` so shared foreign
+claims also keep the path occupied; this does not create a claim. A safety check runs
+every 60 seconds even while SSE remains connected. Capturing the event generation
+before checking prevents a release/read race. Ping advertises `wait_zone_free_v1`;
+with an older daemon the CLI uses direct authoritative checks every ten seconds and
+never opens a competing stream. Without a daemon, a direct client reads the JSON feed
+to its current visible head, subscribes after that cursor, and checks only after `ready`.
+Disconnection is an error. Old servers check every ten seconds; the timeout bounds the wait.
+
+A replacement retry that remains connected for more than ten minutes starts a fresh
+replacement cycle. A short retry still permits only one retry after a 60-second pause,
+preventing two daemons from repeatedly displacing each other.
+
+## Task creation recovery
+
+CLI `task add` and MCP `task_add` share creation recovery. A new request has one HTTP
+idempotency key and one `client_key`; an uncertain write retries the exact request
+with both keys unchanged. If retry cannot confirm an ID, the client queries registry
+items by `client_key`, verifies the returned key, and acknowledges the pending journal
+only on an exact match. A matching title is insufficient. Failure to confirm returns
+`task_create_unconfirmed` with both keys, never a successful `created=unknown` result;
+supply `client_key` to MCP or `--client-key` to CLI with the same arguments to retry.
+Within the pending journal's replay window, equal arguments automatically recover the
+original logical key, HTTP key and request identity, including across client restarts.
+Matching uses the original plaintext request digest even when frozen wire content is encrypted.

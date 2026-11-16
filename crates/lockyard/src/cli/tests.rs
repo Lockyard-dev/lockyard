@@ -1198,3 +1198,35 @@ fn mail_events_cli_hides_json_tombstones() {
     assert_eq!(result.json[0]["seq"], 2);
     assert_eq!(result.text, "2  zone.claimed");
 }
+
+#[test]
+fn zone_wait_free_cli_parses_timeout_without_taking_a_claim() {
+    let cli = Cli::try_parse_from([
+        "lockyard",
+        "zone",
+        "wait-free",
+        "src/lib.rs",
+        "--timeout",
+        "7",
+    ])
+    .unwrap();
+    assert!(
+        matches!(cli.command, Command::Zone(ZoneCommand::WaitFree { path, timeout:7 }) if path == "src/lib.rs")
+    );
+}
+
+#[test]
+fn task_add_accepts_explicit_client_key() {
+    let cli = Cli::try_parse_from([
+        "lockyard",
+        "task",
+        "add",
+        "title",
+        "--client-key",
+        "retry-key",
+    ])
+    .unwrap();
+    assert!(
+        matches!(cli.command, Command::Task(TaskCommand::Add { client_key:Some(key), .. }) if key == "retry-key")
+    );
+}

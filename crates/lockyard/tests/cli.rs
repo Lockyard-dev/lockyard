@@ -1212,7 +1212,8 @@ fn mcp_stdio_initializes_lists_claims_and_reports_conflicts_and_parse_errors() {
             "cloud_protocol",
             "task_add",
             "zone_renew",
-            "keepalive"
+            "keepalive",
+            "zone_wait_free"
         ],
         "the default surface is the short one"
     );
@@ -1262,7 +1263,7 @@ fn the_full_tool_surface_is_a_flag_or_an_environment_variable_away() {
         list,
     ));
     assert_eq!(
-        compact, 17,
+        compact, 18,
         "the compact surface includes task creation, claim renewal, and keepalive"
     );
     assert!(by_flag > 50, "the full surface keeps every tool: {by_flag}");
@@ -1482,4 +1483,67 @@ fn survey_0015_claims_are_workspace_relative_and_ttl_uses_minutes() {
     let refused = lockyard(&nested, "a", &["zone", "renew", &id, "--ttl", "1800"]);
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("minutes"));
+}
+
+#[test]
+fn zone_wait_free_returns_zero_for_free_and_one_for_timeout_without_claiming() {
+    let dir = project();
+    let free = lockyard(
+        dir.path(),
+        "alice",
+        &["--json", "zone", "wait-free", "src", "--timeout", "0"],
+    );
+    assert!(
+        free.status.success(),
+        "{}",
+        String::from_utf8_lossy(&free.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&free.stdout).unwrap()["free"],
+        true
+    );
+    ok(dir.path(), "bob", &["zone", "claim", "src"]);
+    let held = lockyard(
+        dir.path(),
+        "alice",
+        &["--json", "zone", "wait-free", "src", "--timeout", "0"],
+    );
+    assert_eq!(held.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&held.stdout).unwrap()["timed_out"],
+        true
+    );
+    let claims = lockyard(dir.path(), "alice", &["--json", "zone", "list"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&claims.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn zone_wait_free_errors_exit_two_before_and_after_open() {
+    let empty = tempfile::tempdir().unwrap();
+    let no_project = lockyard(
+        empty.path(),
+        "alice",
+        &["zone", "wait-free", "src", "--timeout", "0"],
+    );
+    assert_eq!(no_project.status.code(), Some(2));
+    let dir = project();
+    let outside = lockyard(
+        dir.path(),
+        "alice",
+        &[
+            "zone",
+            "wait-free",
+            empty.path().to_str().unwrap(),
+            "--timeout",
+            "0",
+        ],
+    );
+    assert_eq!(outside.status.code(), Some(2));
 }

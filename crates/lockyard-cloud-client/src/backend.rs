@@ -161,6 +161,7 @@ fn check_item(item: Value) -> std::result::Result<PathCheck, ClientError> {
 
 /// [`Backend`] on a [`Transport`]. The `agent` of each call is its session.
 pub struct CloudBackend<T: Transport> {
+    zone_stream_allowed: bool,
     pub(crate) transport: T,
     pub(crate) session: String,
     write_idempotency_key: Option<String>,
@@ -173,7 +174,229 @@ impl<T: Transport> CloudBackend<T> {
             transport,
             session: session.to_string(),
             write_idempotency_key: None,
+            zone_stream_allowed: true,
         }
+    }
+
+    pub fn with_zone_stream_allowed(mut self, allowed: bool) -> Self {
+        self.zone_stream_allowed = allowed;
+        self
+    }
+
+    fn zone_is_free(&self, agent: &str, path: &str, budget: std::time::Duration) -> Result<bool> {
+        let mut call = Call::write(
+            agent,
+            "POST",
+            "/api/v1/zones/check".into(),
+            json!({"paths":[path],"mode":"exclusive"}),
+        );
+        call.key = None; // check is a read, despite its POST verb.
+        let ms = budget.as_millis().max(1).min(u64::MAX as u128) as u64;
+        call.deadline_ms = Some(ms);
+        call.attempt_timeout_ms = Some(ms);
+        let rows = checks(self.transport.call(&call)?)?;
+        match rows.as_slice() {
+            [row] => match row.status {
+                CheckStatus::Free | CheckStatus::Own => Ok(true),
+                CheckStatus::Held => Ok(false),
+                CheckStatus::Unknown => Err(Error::Unavailable("zone state is unknown".into())),
+            },
+            _ => Err(Error::Unavailable(
+                "zone check returned no unique answer".into(),
+            )),
+        }
+    }
+
+    fn wait_zone_stream(
+        &self,
+        agent: &str,
+        path: &str,
+        timeout: std::time::Duration,
+    ) -> Result<bool> {
+        self.wait_zone_stream_with_recheck(agent, path, timeout, std::time::Duration::from_secs(60))
+    }
+
+    fn wait_zone_stream_with_recheck(
+        &self,
+        agent: &str,
+        path: &str,
+        timeout: std::time::Duration,
+        recheck_every: std::time::Duration,
+    ) -> Result<bool> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::Invalid("zone wait timeout is too large".into()))?;
+        if timeout.is_zero() {
+            return self.zone_is_free(agent, path, timeout);
+        }
+        if !self.zone_stream_allowed
+            || self.transport.owns_event_stream()
+            || !self.transport.mail_push_v1(agent)?
+        {
+            if self.zone_is_free(
+                agent,
+                path,
+                deadline.saturating_duration_since(Instant::now()),
+            )? {
+                return Ok(true);
+            }
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Ok(false);
+                }
+                std::thread::sleep(left.min(Duration::from_secs(10)));
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Ok(false);
+                }
+                if self.zone_is_free(agent, path, left)? {
+                    return Ok(true);
+                }
+            }
+        }
+        // Walk the JSON feed to its current visible head before subscribing. JSON reads do
+        // not replace an existing stream; replay preceding this head is irrelevant to a wait.
+        let mut after = 0;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(false);
+            }
+            let mut call = Call::get(
+                agent,
+                format!("/api/v1/events?after={after}&session={}", encode(agent)),
+            );
+            call.deadline_ms = Some(left.as_millis().max(1).min(u64::MAX as u128) as u64);
+            let value = self.transport.call(&call)?;
+            let events: Vec<lockyard_core::proto::Event> = list(value, &["events", "items"])?;
+            let head = events.iter().map(|event| event.seq).max().unwrap_or(after);
+            if head <= after {
+                break;
+            }
+            after = head;
+        }
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let (done, completion) = mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let stop = interrupt.clone();
+            scope.spawn(move || {
+                if completion
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .is_err()
+                {
+                    stop.store(true, Ordering::Release);
+                }
+            });
+            let result = (|| {
+                let mut stream = self.transport.event_stream_sessions(
+                    agent,
+                    &[agent.to_string()],
+                    after,
+                    interrupt.clone(),
+                )?;
+                let stream_stop = stream.interrupt_handle();
+                let (frames, receive) = mpsc::sync_channel(1);
+                let stop = interrupt.clone();
+                scope.spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        let next = stream.next_frame();
+                        let ended = !matches!(next, Ok(Some(_)));
+                        if frames.send(next).is_err() || ended {
+                            break;
+                        }
+                    }
+                });
+                let result = (|| {
+                    let mut ready = false;
+                    let mut recheck = Instant::now() + recheck_every;
+                    loop {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Ok(false);
+                        }
+                        if ready && now >= recheck {
+                            if self.zone_is_free(
+                                agent,
+                                path,
+                                deadline.saturating_duration_since(now),
+                            )? {
+                                return Ok(true);
+                            }
+                            recheck = Instant::now() + recheck_every;
+                        }
+                        let until = if ready {
+                            deadline.min(recheck)
+                        } else {
+                            deadline
+                        };
+                        let next = match receive
+                            .recv_timeout(until.saturating_duration_since(Instant::now()))
+                        {
+                            Ok(next) => next,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(_) => {
+                                return Err(Error::Unavailable("zone event reader stopped".into()));
+                            }
+                        };
+                        let frame = match next {
+                            Ok(Some(frame)) => frame,
+                            Ok(None) => {
+                                return Err(Error::Unavailable(
+                                    "zone event stream disconnected".into(),
+                                ));
+                            }
+                            Err(error) => {
+                                return Err(Error::Unavailable(format!(
+                                    "zone event stream: {error}"
+                                )));
+                            }
+                        };
+                        if frame.event == "replaced" {
+                            return Err(Error::Unavailable(
+                                "zone event stream was replaced; use the local daemon".into(),
+                            ));
+                        }
+                        if frame.event == "ready" {
+                            ready = true;
+                        } else if !ready {
+                            continue;
+                        }
+                        let changed = frame.event == "ready"
+                            || frame.event.starts_with("zone.")
+                            || frame
+                                .decode()?
+                                .is_some_and(|event| event.kind.starts_with("zone."));
+                        if changed {
+                            if self.zone_is_free(
+                                agent,
+                                path,
+                                deadline.saturating_duration_since(Instant::now()),
+                            )? {
+                                return Ok(true);
+                            }
+                            recheck = Instant::now() + recheck_every;
+                        }
+                    }
+                })();
+                interrupt.store(true, Ordering::Release);
+                stream_stop.store(true, Ordering::Release);
+                drop(receive);
+                result
+            })();
+            let _ = done.send(());
+            if result.is_err() && Instant::now() >= deadline {
+                Ok(false)
+            } else {
+                result
+            }
+        })
     }
 
     fn get(&self, session: &str, path: String) -> Result<Value> {
@@ -1277,6 +1500,21 @@ impl<T: Transport> Backend for CloudBackend<T> {
         Ok(count(&reply, &["handled", "count"], 0))
     }
 
+    fn wait_zone_free(
+        &self,
+        agent: &str,
+        path: &str,
+        timeout: std::time::Duration,
+    ) -> Result<bool> {
+        if std::time::Instant::now().checked_add(timeout).is_none() {
+            return Err(Error::Invalid("zone wait timeout is too large".into()));
+        }
+        if let Some(result) = self.transport.wait_zone_free(agent, path, timeout) {
+            return Ok(result?);
+        }
+        self.wait_zone_stream(agent, path, timeout)
+    }
+
     fn task_by_client_key(&self, key: &str) -> Result<Option<tasks::Task>> {
         let reply = self.get(
             &self.session,
@@ -1566,7 +1804,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
             ));
         }
         let mut body = json!({
-            "client_key": ulid(),
+            "client_key": spec.client_key.clone().unwrap_or_else(ulid),
             "title": spec.title,
             "body": spec.body,
             "acceptance": spec.acceptance.as_deref().unwrap_or(&spec.title),
@@ -1593,31 +1831,63 @@ impl<T: Transport> Backend for CloudBackend<T> {
                 spec.pad
             )?);
         }
-        let reply = self.post(author, ITEMS.into(), &body).map_err(|error| {
-            if let Error::Cloud {
-                code,
-                status,
-                mut details,
-                message,
-            } = error
-            {
-                if code == "outcome_unknown" {
-                    if !details.is_object() {
-                        details = json!({});
+        if let Some(key) = &spec.client_key
+            && (key.is_empty() || key.len() > 256 || !key.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            return Err(Error::Invalid(
+                "client_key must be 1 to 256 visible ASCII bytes".into(),
+            ));
+        }
+        // Keep the exact HTTP key as well as the logical creation key for reconciliation.
+        let mut call = Call::write(author, "POST", ITEMS.into(), body.clone());
+        if let Some(key) = &self.write_idempotency_key {
+            call.key = Some(key.clone());
+        }
+        let call = self
+            .transport
+            .prepare_task_create(&call, spec.client_key.is_some())?;
+        body = call.body.clone().expect("task creation body");
+        let attempt = || {
+            self.transport.call(&call).and_then(|reply| {
+                task_from(&reply).map_err(|error| ClientError::Decode(error.to_string()))
+            })
+        };
+        let mut result = attempt();
+        // A lost daemon reply is a Transport error rather than OutcomeUnknown; a
+        // malformed success response can also follow a committed registry write.
+        let uncertain = matches!(
+            result,
+            Err(ClientError::OutcomeUnknown(_)
+                | ClientError::Transport(_)
+                | ClientError::Decode(_))
+        );
+        if uncertain {
+            result = attempt();
+        }
+        match result {
+            Ok(task) => Ok(task),
+            Err(error) => {
+                if uncertain {
+                    let key = body["client_key"].as_str().expect("creation key");
+                    if let Ok(Some(task)) = self.task_by_client_key(key) {
+                        // A key match proves this pending write completed; a title never does.
+                        self.transport.acknowledge_write(&call)?;
+                        return Ok(task);
                     }
-                    details["client_key"] = body["client_key"].clone();
+                    return Err(Error::Cloud {
+                        code: "task_create_unconfirmed".into(),
+                        status: None,
+                        details: json!({"client_key":key,"idempotency_key":call.key}),
+                        message: format!(
+                            "task creation could not be confirmed after retry and lookup; client_key={key}; repeat task_add with client_key={key} or CLI task add --client-key {key} and the same arguments: {error}"
+                        ),
+                    });
                 }
-                Error::Cloud {
-                    code,
-                    status,
-                    details,
-                    message,
-                }
-            } else {
-                error
+                let mut error = error;
+                error.explain_task_create_refusal(&call);
+                Err(error.into())
             }
-        })?;
-        task_from(&reply)
+        }
     }
 
     fn plan_task(&mut self, agent: &str, id: &str, plan: &tasks::TaskPlan) -> Result<tasks::Task> {
@@ -3846,6 +4116,300 @@ mod tests {
             ],
         );
         assert_eq!(seen[1].body["role"], "agent");
+    }
+
+    #[derive(Default)]
+    struct CreationFaults {
+        calls: std::sync::Mutex<Vec<Call>>,
+        found: bool,
+        retry_succeeds: bool,
+        socket_loss: bool,
+        acknowledged: std::sync::atomic::AtomicBool,
+    }
+    impl Transport for CreationFaults {
+        fn call(&self, call: &Call) -> std::result::Result<Value, ClientError> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(call.clone());
+            if call.path == AREAS {
+                return Ok(json!([{"id":"area","key":"web"}]));
+            }
+            let creates: Vec<_> = calls.iter().filter(|c| c.method == "POST").collect();
+            if call.path == ITEMS {
+                if self.retry_succeeds && creates.len() == 2 {
+                    return Ok(item("ready", 1));
+                }
+                if self.socket_loss {
+                    return Err(ClientError::Transport("agent socket reply lost".into()));
+                }
+                let pending = serde_json::from_value(json!({
+                    "code":"outcome_unknown","cause_code":"connection_lost_after_commit",
+                    "cause_status":null,"protocol":{"selected":2,"capabilities":[]},
+                    "method":call.method,"path":call.path,"request_path":call.path,
+                    "body":call.body.as_ref().map(Value::to_string),"key":call.key,
+                    "repository":null,"session":call.session,"origin":"http://fixture",
+                    "credential_scope":"fixture"
+                }))
+                .unwrap();
+                return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+            }
+            let key = creates[0].body.as_ref().unwrap()["client_key"].clone();
+            assert_eq!(
+                call.path,
+                format!("{ITEMS}?client_key={}", key.as_str().unwrap())
+            );
+            let mut row = item("ready", 1);
+            row["client_key"] = if self.found {
+                key
+            } else {
+                json!("unrelated-key")
+            };
+            Ok(json!({"items":[row]}))
+        }
+        fn acknowledge_write(&self, call: &Call) -> std::result::Result<(), ClientError> {
+            assert_eq!(
+                call.key,
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c.method == "POST")
+                    .unwrap()
+                    .key
+            );
+            self.acknowledged
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn task_creation_retries_exact_request_then_reconciles_by_client_key() {
+        for (found, retry_succeeds, socket_loss) in [
+            (true, false, false),
+            (false, false, false),
+            (false, true, false),
+            (true, false, true),
+        ] {
+            let transport = std::sync::Arc::new(CreationFaults {
+                found,
+                retry_succeeds,
+                socket_loss,
+                ..Default::default()
+            });
+            let mut cloud = CloudBackend::new(transport.clone(), "alice");
+            let result = cloud.add_task(
+                "alice",
+                &tasks::TaskSpec {
+                    title: "same title".into(),
+                    area: Some("web".into()),
+                    ..Default::default()
+                },
+                0,
+            );
+            if found || retry_succeeds {
+                assert_eq!(result.unwrap().id.as_str(), "G-SG-0012");
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), "task_create_unconfirmed");
+                assert!(!error.to_string().contains("created=unknown"));
+                assert!(error.to_string().contains("client_key="));
+            }
+            let calls = transport.calls.lock().unwrap();
+            let posts: Vec<_> = calls.iter().filter(|c| c.method == "POST").collect();
+            assert_eq!(posts.len(), 2);
+            assert_eq!(posts[0], posts[1]);
+            assert!(posts[0].key.is_some());
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|c| c.path.contains("?client_key="))
+                    .count(),
+                usize::from(!retry_succeeds)
+            );
+            assert_eq!(
+                transport
+                    .acknowledged
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                found
+            );
+        }
+    }
+
+    struct ZoneEvents {
+        push: bool,
+        states: std::sync::Mutex<std::collections::VecDeque<&'static str>>,
+        calls: std::sync::Mutex<Vec<Call>>,
+    }
+    impl Transport for ZoneEvents {
+        fn mail_push_v1(&self, _: &str) -> std::result::Result<bool, ClientError> {
+            Ok(self.push)
+        }
+        fn call(&self, call: &Call) -> std::result::Result<Value, ClientError> {
+            if call.path.starts_with("/api/v1/events?") {
+                self.calls.lock().unwrap().push(call.clone());
+                return if call.path.contains("after=0&") {
+                    Ok(json!({"events":[{"seq":42,"type":"zone.taken","payload":{}}]}))
+                } else {
+                    Ok(json!({"events":[]}))
+                };
+            }
+            assert_eq!(call.path, "/api/v1/zones/check");
+            assert_eq!(
+                call.body.as_ref().unwrap()["mode"],
+                "exclusive",
+                "shared checks can permit a foreign holder"
+            );
+            self.calls.lock().unwrap().push(call.clone());
+            let state = self.states.lock().unwrap().pop_front().unwrap_or("held");
+            Ok(json!({"paths":[{"path":"src","status":state}]}))
+        }
+        fn event_stream_sessions(
+            &self,
+            _: &str,
+            _: &[String],
+            after: i64,
+            _: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> std::result::Result<crate::sse::EventStream, ClientError> {
+            assert!(self.push);
+            assert_eq!(after, 42);
+            assert_eq!(self.calls.lock().unwrap().len(), 2, "no check before ready");
+            let bytes =
+                b"id: 42\nevent: ready\ndata: {\"head\":42}\n\nid: 1\nevent: zone.taken\ndata: {}\n\nid: 2\nevent: zone.released\ndata: {}\n\n"
+                    .to_vec();
+            Ok(crate::sse::EventStream::new(Box::new(
+                std::io::Cursor::new(bytes),
+            )))
+        }
+    }
+    #[test]
+    fn zone_wait_free_uses_events_and_old_server_does_not_poll_before_ten_seconds() {
+        use std::time::Duration;
+        let cloud = CloudBackend::new(
+            ZoneEvents {
+                push: true,
+                states: std::sync::Mutex::new(["held", "held", "free"].into()),
+                calls: Default::default(),
+            },
+            "alice",
+        );
+        assert!(
+            cloud
+                .wait_zone_free("alice", "src", Duration::from_secs(1))
+                .unwrap()
+        );
+        assert_eq!(cloud.transport.calls.lock().unwrap().len(), 5);
+        let cloud = CloudBackend::new(
+            ZoneEvents {
+                push: false,
+                states: Default::default(),
+                calls: Default::default(),
+            },
+            "alice",
+        );
+        assert!(
+            !cloud
+                .wait_zone_free("alice", "src", Duration::from_millis(20))
+                .unwrap()
+        );
+        assert_eq!(cloud.transport.calls.lock().unwrap().len(), 1);
+        let cloud = CloudBackend::new(
+            ZoneEvents {
+                push: true,
+                states: std::sync::Mutex::new(["own"].into()),
+                calls: Default::default(),
+            },
+            "alice",
+        );
+        assert!(
+            cloud
+                .wait_zone_free("alice", "src", Duration::ZERO)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn zone_wait_free_rechecks_a_quiet_sse_and_stops_the_reader() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+        struct Quiet {
+            stopped: Arc<AtomicBool>,
+            ready: std::io::Cursor<Vec<u8>>,
+        }
+        impl std::io::Read for Quiet {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let count = std::io::Read::read(&mut self.ready, out)?;
+                if count > 0 {
+                    return Ok(count);
+                }
+                while !self.stopped.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "stopped",
+                ))
+            }
+        }
+        struct QuietZone {
+            checks: AtomicUsize,
+            stopped: Arc<AtomicBool>,
+        }
+        impl Transport for QuietZone {
+            fn mail_push_v1(&self, _: &str) -> std::result::Result<bool, ClientError> {
+                Ok(true)
+            }
+            fn call(&self, call: &Call) -> std::result::Result<Value, ClientError> {
+                if call.path.starts_with("/api/v1/events?") {
+                    return Ok(json!({"events":[]}));
+                }
+                let state = if self.checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                    "held"
+                } else {
+                    "free"
+                };
+                Ok(json!({"paths":[{"path":"src","status":state}]}))
+            }
+            fn event_stream_sessions(
+                &self,
+                _: &str,
+                _: &[String],
+                _: i64,
+                interrupt: Arc<AtomicBool>,
+            ) -> std::result::Result<crate::sse::EventStream, ClientError> {
+                // The test reader observes the same cancellation token as a real network reader.
+                self.stopped.store(false, Ordering::Release);
+                Ok(crate::sse::EventStream::new(Box::new(Quiet {
+                    stopped: interrupt,
+                    ready: std::io::Cursor::new(
+                        b"id: 0\nevent: ready\ndata: {\"head\":0}\n\n".to_vec(),
+                    ),
+                })))
+            }
+        }
+        let cloud = CloudBackend::new(
+            QuietZone {
+                checks: AtomicUsize::new(0),
+                stopped: Arc::new(AtomicBool::new(false)),
+            },
+            "alice",
+        );
+        let start = std::time::Instant::now();
+        assert!(
+            cloud
+                .wait_zone_stream_with_recheck(
+                    "alice",
+                    "src",
+                    Duration::from_secs(1),
+                    Duration::from_millis(25)
+                )
+                .unwrap()
+        );
+        assert_eq!(cloud.transport.checks.load(Ordering::SeqCst), 2);
+        assert!(start.elapsed() >= Duration::from_millis(25));
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     /// Keeps the calls it is given, for what HTTP does not show.

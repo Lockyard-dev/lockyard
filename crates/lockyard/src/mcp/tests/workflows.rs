@@ -23,7 +23,8 @@
                 "cloud_protocol",
                 "task_add",
                 "zone_renew",
-                "keepalive"
+                "keepalive",
+                "zone_wait_free"
             ]
         );
         let full = listed(Surface::Full, &dir);

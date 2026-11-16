@@ -1018,6 +1018,68 @@ impl Client {
         Ok(self)
     }
 
+    /// Match only creates of this session/repository and within the journal replay window.
+    pub fn pending_task_create(
+        &self,
+        call: &Call,
+        explicit_key: bool,
+    ) -> Result<Call, ClientError> {
+        if call.method != "POST"
+            || call.path != "/api/v1/registry/items"
+            || !call.body.as_ref().is_some_and(Value::is_object)
+        {
+            return Err(ClientError::Invalid(
+                "expected a registry task create".into(),
+            ));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| ClientError::Invalid(e.to_string()))?
+            .as_secs();
+        for pending in self.pending_operations() {
+            if pending.method != call.method
+                || pending.request_path != call.path
+                || pending.session != call.session
+                || pending.repository != call.repository
+                || !pending
+                    .first_sent_unix_secs
+                    .and_then(|first| now.checked_sub(first))
+                    .is_some_and(|age| age < 30 * 24 * 60 * 60 - 60)
+            {
+                continue;
+            }
+            let Some(body) = pending
+                .body
+                .as_deref()
+                .and_then(|bytes| serde_json::from_str::<Value>(bytes).ok())
+            else {
+                continue;
+            };
+            let mut recovered = call.clone();
+            let candidate = recovered.body.as_mut().expect("task create has a body");
+            if !explicit_key {
+                candidate["client_key"] = body["client_key"].clone();
+            }
+            if let (Some(current), Some(original)) = (
+                candidate["evidence"].as_array_mut(),
+                body["evidence"].as_array(),
+            ) {
+                for (current, original) in current.iter_mut().zip(original) {
+                    current["observed_at"] = original["observed_at"].clone();
+                }
+            }
+            // The digest binds caller plaintext before encryption; never compare ciphertext
+            // or put encrypted journal bytes back into a new plaintext request.
+            if pending.request_digest.as_deref()
+                == Some(crate::request_identity(&recovered).as_str())
+            {
+                recovered.key = Some(pending.key);
+                return Ok(recovered);
+            }
+        }
+        Ok(call.clone())
+    }
+
     /// Retrieve exact bytes for receipt reconciliation; do not log this value.
     pub fn pending_operation(&self, key: &str) -> Option<PendingWrite> {
         self.protocol_state
@@ -2424,6 +2486,88 @@ mod pending_completion_tests {
             // Windows already used this global journal lock in 0.3.12.
             .filter(|path| path.file_name().unwrap() != ".journal.lock")
             .collect()
+    }
+
+    #[test]
+    fn task_pending_create_reuses_keys_after_restart_only_for_same_arguments_in_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let client = Client::new("http://127.0.0.1:1", "fixture".into())
+            .unwrap()
+            .with_pending_journal(&root)
+            .unwrap();
+        let original = Call::write(
+            "alice",
+            "POST",
+            "/api/v1/registry/items".into(),
+            json!({"client_key":"original-logical-key", "title":"same title", "body":"same body", "paths":["src"], "evidence":[{"value":"commit", "observed_at":"old timestamp"}]}),
+        );
+        let mut operation = pending(&client, original.key.as_deref().unwrap());
+        operation.method = original.method.clone();
+        operation.path = original.path.clone();
+        operation.request_path = original.path.clone();
+        operation.session = original.session.clone();
+        operation.body = original.body.as_ref().map(Value::to_string);
+        operation.request_digest = Some(crate::request_identity(&original));
+        operation.first_sent_unix_secs = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+        client.retain_pending(operation.clone()).unwrap();
+        drop(client);
+        let client = Client::new("http://127.0.0.1:1", "fixture".into())
+            .unwrap()
+            .with_pending_journal(&root)
+            .unwrap();
+        let mut repeat = original.clone();
+        repeat.key = Some("fresh-http-key".into());
+        repeat.body.as_mut().unwrap()["client_key"] = json!("fresh-logical-key");
+        repeat.body.as_mut().unwrap()["evidence"][0]["observed_at"] = json!("new timestamp");
+        assert_eq!(
+            client.pending_task_create(&repeat, false).unwrap(),
+            original
+        );
+        assert_eq!(client.pending_task_create(&repeat, true).unwrap(), repeat);
+        let mut changed = repeat.clone();
+        changed.body.as_mut().unwrap()["body"] = json!("different body");
+        assert_eq!(
+            client.pending_task_create(&changed, false).unwrap(),
+            changed
+        );
+        changed = repeat.clone();
+        changed.session = "bob".into();
+        assert_eq!(
+            client.pending_task_create(&changed, false).unwrap(),
+            changed
+        );
+        // Simulate encrypted content in the journal: identity is still caller plaintext.
+        operation.body = Some(json!({"client_key":"original-logical-key", "title":{"ciphertext":"opaque"}, "evidence":[{"observed_at":"old timestamp"}]}).to_string());
+        client
+            .protocol_state
+            .lock()
+            .unwrap()
+            .pending
+            .insert(operation.key.clone(), operation.clone());
+        assert_eq!(
+            client.pending_task_create(&repeat, false).unwrap(),
+            original
+        );
+        operation.first_sent_unix_secs = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_sub(30 * 24 * 60 * 60),
+        );
+        client
+            .protocol_state
+            .lock()
+            .unwrap()
+            .pending
+            .insert(operation.key.clone(), operation);
+        assert_eq!(client.pending_task_create(&repeat, false).unwrap(), repeat);
     }
 
     #[cfg(unix)]

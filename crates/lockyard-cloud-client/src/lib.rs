@@ -21,7 +21,7 @@ mod status;
 #[cfg(test)]
 mod test_support;
 
-pub use backend::CloudBackend;
+pub use backend::{CloudBackend, checks as decode_checks};
 pub use crypto::{CONTENT_FIELDS, FieldRule, WorkspaceKey, route_matches, transform_fields};
 pub use protocol::{NegotiatedProtocol, PendingWrite, Problem, ProtocolRange};
 pub use repository::RepositoryTransport;
@@ -453,6 +453,23 @@ pub trait Transport: Send + Sync {
     fn renegotiate_mail_push(&self, session: &str) -> Result<bool, ClientError> {
         self.mail_push_v1(session)
     }
+    /// A connected daemon owns the subscription even if it predates zone wait RPC.
+    fn owns_event_stream(&self) -> bool {
+        false
+    }
+    /// Recover an exact registry create from the pending journal, if still retained.
+    fn prepare_task_create(&self, call: &Call, _explicit_key: bool) -> Result<Call, ClientError> {
+        Ok(call.clone())
+    }
+    /// A daemon can wait on its existing SSE stream without opening a competing subscription.
+    fn wait_zone_free(
+        &self,
+        _session: &str,
+        _path: &str,
+        _timeout: Duration,
+    ) -> Option<Result<bool, ClientError>> {
+        None
+    }
     fn event_stream_sessions(
         &self,
         session: &str,
@@ -596,6 +613,20 @@ impl<T: Transport + ?Sized> Transport for Arc<T> {
     }
     fn renegotiate_mail_push(&self, session: &str) -> Result<bool, ClientError> {
         (**self).renegotiate_mail_push(session)
+    }
+    fn owns_event_stream(&self) -> bool {
+        (**self).owns_event_stream()
+    }
+    fn prepare_task_create(&self, call: &Call, explicit_key: bool) -> Result<Call, ClientError> {
+        (**self).prepare_task_create(call, explicit_key)
+    }
+    fn wait_zone_free(
+        &self,
+        session: &str,
+        path: &str,
+        timeout: Duration,
+    ) -> Option<Result<bool, ClientError>> {
+        (**self).wait_zone_free(session, path, timeout)
     }
     fn event_stream_sessions(
         &self,
@@ -1473,6 +1504,9 @@ fn task_create_missing_legacy_area(call: &Call, error: &ApiError) -> bool {
 }
 
 impl Transport for Client {
+    fn prepare_task_create(&self, call: &Call, explicit_key: bool) -> Result<Call, ClientError> {
+        self.pending_task_create(call, explicit_key)
+    }
     fn mail_push_v1(&self, session: &str) -> Result<bool, ClientError> {
         Ok(self
             .negotiated_protocol(session)?

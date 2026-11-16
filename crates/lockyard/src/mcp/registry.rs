@@ -86,8 +86,8 @@ impl ToolRegistry {
             ),
             tool_def(
                 "update",
-                "Read mail; send: to+body, urgent wakes. To: session, *, all, все, everyone, @claude/@cursor/@codex, @zone:key, @path:path. reply_to+body replies; handled closes.",
-                json!({"to": text, "body": text, "urgent": flag, "reply_to": {"type":"integer","description":"Reply in this thread; exclusive with to. Server 579d557 does not persist the reply sender label."}, "handled": {"type":"array","items":{"type":"integer","minimum":1},"description":"Close messages for this reader; requires server capability mail_handled_v1, checked before sending; independent of read receipts"}, "peek": flag, "all": flag}),
+                "Read mail; to+body sends, reply_to+body replies; urgent wakes; handled closes. Group addresses supported.",
+                json!({"to": {"type":"string","description":"Session, *, all, все, everyone, @claude/@cursor/@codex, @zone:key, or @path:path."}, "body": text, "urgent": flag, "reply_to": {"type":"integer","description":"Reply in this thread; exclusive with to. Server 579d557 does not persist the reply sender label."}, "handled": {"type":"array","items":{"type":"integer","minimum":1},"description":"Close messages for this reader; requires server capability mail_handled_v1, checked before sending; independent of read receipts"}, "peek": flag, "all": flag}),
                 &[],
             ),
             tool_def(
@@ -207,6 +207,7 @@ fn compact_visibility(name: &str) -> Option<usize> {
         "task_add" => 14,
         "zone_renew" => 15,
         "keepalive" => 16,
+        "zone_wait_free" => 17,
         _ => return None,
     })
 }
@@ -445,6 +446,12 @@ fn primitive_definitions() -> Vec<Value> {
             &[],
         ),
         tool_def(
+            "zone_wait_free",
+            "Wait for a free path; no claim. timeout: seconds, default 3600. SSE; old servers poll every 10s.",
+            json!({"path":text,"timeout":{"type":"integer","minimum":0}}),
+            &["path"],
+        ),
+        tool_def(
             "zone_wait",
             "Claim paths with server-selected mode unless shared is set. seconds: wait time (up to 120); ttl: lease minutes (1-240).",
             json!({"paths": names, "note": text, "ttl": int, "seconds": int, "shared": flag, "deploy": flag, "zones": names}),
@@ -597,7 +604,7 @@ fn primitive_definitions() -> Vec<Value> {
                 "p0_category": {"type":"string","enum":["player_money","security_breach","prod_outage","cert_slip"],
                     "description":"Required with priority P0: player_money, security_breach, prod_outage, or cert_slip."},
                 "type": text, "target": text, "verification": text, "area": text, "prefix": text,
-                "pad": int, "due": text, "evidence": text,
+                "pad": int, "due": text, "evidence": text, "client_key": text,
                 "paths": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64,
                     "description":"Files or directories the task concerns, relative to the workspace root. Required with registry_auto_area_v1: the server determines the area from these paths. On other servers paths are not sent; supply area."}
             }),

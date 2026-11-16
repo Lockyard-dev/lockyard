@@ -28,6 +28,7 @@ pub struct AgentSocket {
     path: PathBuf,
     workspace: String,
     timeout: Duration,
+    prepare_task_create_v1: bool,
     #[cfg(windows)]
     state_root: PathBuf,
 }
@@ -39,6 +40,7 @@ impl AgentSocket {
             path: path.to_path_buf(),
             workspace: workspace.to_string(),
             timeout,
+            prepare_task_create_v1: false,
             #[cfg(windows)]
             state_root: super::state_root().ok()?,
         };
@@ -59,6 +61,7 @@ impl AgentSocket {
             path: path.to_path_buf(),
             workspace: workspace.to_string(),
             timeout,
+            prepare_task_create_v1: false,
             #[cfg(windows)]
             state_root: super::state_root().ok()?,
         };
@@ -98,8 +101,9 @@ impl AgentSocket {
         })
     }
 
-    fn match_target(self, url: &str, workspace: &str) -> Option<Self> {
+    fn match_target(mut self, url: &str, workspace: &str) -> Option<Self> {
         let status = self.ping().ok()?;
+        self.prepare_task_create_v1 = status.prepare_task_create_v1;
         (status.url.trim_end_matches('/') == url.trim_end_matches('/')
             && status.workspace == workspace)
             .then_some(self)
@@ -117,6 +121,7 @@ impl AgentSocket {
             path: path.to_path_buf(),
             workspace: workspace.to_string(),
             timeout,
+            prepare_task_create_v1: false,
             state_root: state_root.to_path_buf(),
         }
         .match_target(url, workspace)
@@ -127,12 +132,23 @@ impl AgentSocket {
         self.ping().map(|status| status.token_id)
     }
 
+    pub fn supports_peek_mail(&self) -> bool {
+        self.ping().is_ok_and(|status| status.peek_mail_v1)
+    }
+
+    pub fn hook_mail_dir(&self) -> io::Result<PathBuf> {
+        self.ping()?
+            .hook_mail_state_dir
+            .ok_or_else(|| io::Error::other("agent omitted hook mail state directory"))
+    }
+
     /// Asks the process at `path` how it is, whichever workspace it serves.
     pub fn status(path: &Path, timeout: Duration) -> io::Result<AgentStatus> {
         Self {
             path: path.to_path_buf(),
             workspace: String::new(),
             timeout,
+            prepare_task_create_v1: false,
             #[cfg(windows)]
             state_root: super::state_root()?,
         }
@@ -517,6 +533,56 @@ impl Transport for AgentSocket {
         )
     }
 
+    fn owns_event_stream(&self) -> bool {
+        true
+    }
+    fn prepare_task_create(&self, call: &Call, explicit_key: bool) -> Result<Call, ClientError> {
+        if !self.prepare_task_create_v1 {
+            return Ok(call.clone());
+        }
+        let reply = self.ask_for(&Request::PrepareTaskCreate {
+            call: call.clone(),
+            explicit_key,
+        })?;
+        serde_json::from_value(reply.value.unwrap_or(Value::Null))
+            .map_err(|e| ClientError::Decode(e.to_string()))
+    }
+    fn wait_zone_free(
+        &self,
+        session: &str,
+        path: &str,
+        timeout: Duration,
+    ) -> Option<Result<bool, ClientError>> {
+        match self.ping() {
+            Ok(status) if status.wait_zone_free_v1 => {}
+            Ok(_) => return None,
+            Err(error) => return Some(Err(ClientError::Transport(error.to_string()))),
+        }
+        let request = Request::WaitZoneFree {
+            session: session.into(),
+            path: path.into(),
+            timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
+        };
+        Some(
+            self.ask_with_timeout(&request, timeout.saturating_add(Duration::from_secs(1)))
+                .map_err(|e| ClientError::Transport(e.to_string()))
+                .and_then(|reply| {
+                    if let Some(error) = reply.error {
+                        return Err(error);
+                    }
+                    reply
+                        .value
+                        .and_then(|v| v["free"].as_bool())
+                        .ok_or_else(|| ClientError::Decode("agent omitted zone wait result".into()))
+                }),
+        )
+    }
+
+    fn acknowledge_write(&self, call: &Call) -> Result<(), ClientError> {
+        self.ask_for(&Request::AcknowledgeWrite { call: call.clone() })
+            .map(|_| ())
+    }
+
     fn fast_unread(&self, session: &str) -> Option<Result<Option<i64>, ClientError>> {
         let request = Request::Unread {
             session: session.to_string(),
@@ -586,6 +652,7 @@ mod tests {
                     path,
                     workspace: "team".into(),
                     timeout: Duration::from_secs(2),
+                    prepare_task_create_v1: false,
                 };
                 let mut backend = CloudBackend::new(socket, "me");
                 backend
@@ -673,6 +740,7 @@ mod tests {
             path,
             workspace: "test".into(),
             timeout: Duration::from_secs(2),
+            prepare_task_create_v1: false,
         }
         .call(&call);
         peer.join().unwrap();
@@ -873,6 +941,7 @@ mod tests {
             path,
             workspace: "team".into(),
             timeout: Duration::from_secs(1),
+            prepare_task_create_v1: false,
         };
         let started = Instant::now();
         let error = socket

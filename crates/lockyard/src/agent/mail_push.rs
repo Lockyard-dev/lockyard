@@ -12,6 +12,7 @@ pub(super) struct PushState {
     clock_now: Option<Instant>,
     subscribed: HashSet<String>,
     pub(super) bound_sessions: HashSet<String>,
+    pub(super) zone_version: u64,
     next_waiter: u64,
     waiters: HashMap<String, u64>,
     mailboxes: HashMap<String, Mailbox>,
@@ -81,6 +82,7 @@ pub(super) fn known_event(kind: &str) -> bool {
             | "zone.answered"
             | "zone.queued"
             | "zone.dequeued"
+            | "zone.taken"
             | "zone.claimed"
             | "zone.released"
             | "zone.expired"
@@ -117,7 +119,7 @@ impl<T: Transport + 'static> Drop for SeedGuard<'_, T> {
 }
 
 fn wakes(message: &Message) -> bool {
-    message.urgent || matches!(message.needs.as_deref(), Some("reply" | "ack"))
+    crate::mail_wait::actionable(message)
 }
 
 fn is_open(mail: &Message) -> bool {
@@ -138,6 +140,122 @@ fn addressed(event: &Event, session: &str) -> bool {
 }
 
 impl<T: Transport + 'static> Shared<T> {
+    pub(super) fn peek_hook_mail(&self, session: &str) -> Reply {
+        self.hear(session);
+        let push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(mailbox) = push.mailboxes.get(session).filter(|m| m.seeded) {
+            return Reply {
+                messages: Some(
+                    mailbox
+                        .unread
+                        .values()
+                        .filter(|m| !mailbox.handled_ids.contains(&m.id))
+                        .cloned()
+                        .collect(),
+                ),
+                ..Reply::default()
+            };
+        }
+        drop(push);
+        Reply {
+            messages: self
+                .read_view()
+                .mail
+                .get(session)
+                .map(|b| b.messages.iter().cloned().collect()),
+            ..Reply::default()
+        }
+    }
+
+    pub(super) fn wait_zone_free(
+        &self,
+        session: &str,
+        path: &str,
+        timeout_ms: u64,
+        disconnected: &mut dyn FnMut() -> bool,
+    ) -> Reply {
+        let result = (|| -> lockyard_core::Result<bool> {
+            let deadline = Instant::now()
+                .checked_add(Duration::from_millis(timeout_ms))
+                .ok_or_else(|| Error::Invalid("zone wait timeout is too large".into()))?;
+            self.hear(session);
+            let push_server = self.transport.mail_push_v1(session)?;
+            loop {
+                // Capture before the authoritative read so an event racing the read is observed.
+                let version = self
+                    .push
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .zone_version;
+                let mut call = Call::write(
+                    session,
+                    "POST",
+                    "/api/v1/zones/check".into(),
+                    json!({"paths":[path],"mode":"exclusive"}),
+                );
+                call.key = None;
+                let left = deadline.saturating_duration_since(Instant::now());
+                let ms = left.as_millis().max(1).min(u64::MAX as u128) as u64;
+                call.deadline_ms = Some(ms);
+                call.attempt_timeout_ms = Some(ms);
+                let answer = match self.transport.call(&call) {
+                    Ok(answer) => answer,
+                    Err(_) if Instant::now() >= deadline && timeout_ms > 0 => return Ok(false),
+                    Err(error) => return Err(error.into()),
+                };
+                self.confirm_session_binding(&call);
+                let rows = lockyard_cloud_client::decode_checks(answer)?;
+                match rows.as_slice() {
+                    [row] if matches!(row.status, CheckStatus::Free | CheckStatus::Own) => {
+                        return Ok(true);
+                    }
+                    [row] if row.status == CheckStatus::Held => {}
+                    _ => {
+                        return Err(Error::Unavailable(
+                            "zone check returned unknown state".into(),
+                        ));
+                    }
+                }
+                if Instant::now() >= deadline || self.stopped() {
+                    return Ok(false);
+                }
+                let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+                let next = if push_server {
+                    deadline.min(Instant::now() + Duration::from_secs(60))
+                } else {
+                    deadline.min(Instant::now() + Duration::from_secs(10))
+                };
+                while push.zone_version == version && Instant::now() < next && !self.stopped() {
+                    if disconnected() {
+                        return Ok(false);
+                    }
+                    let wait = next
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(100));
+                    push = self
+                        .mail_ready
+                        .wait_timeout(push, wait)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                    // Refresh session liveness without making any HTTP requests.
+                    drop(push);
+                    self.hear(session);
+                    push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+                }
+                if Instant::now() >= deadline || self.stopped() {
+                    return Ok(false);
+                }
+            }
+        })();
+        match result {
+            Ok(free) => Reply {
+                value: Some(json!({"free":free,"timed_out":!free})),
+                ..Reply::default()
+            },
+            Err(error) => Reply::failed(ClientError::Invalid(error.to_string())),
+        }
+    }
+
     pub(super) fn mail_cache_ready(&self) -> bool {
         self.push_ready.load(Ordering::Acquire)
             || (self.push_fallback.load(Ordering::Acquire)
@@ -935,13 +1053,14 @@ impl<T: Transport + 'static> Shared<T> {
             .is_none_or(|r| !r.retried && now >= r.retry_at)
     }
 
-    fn stream_replaced(&self, sessions: Vec<String>) {
+    fn stream_replaced(&self, sessions: Vec<String>, started: Instant) {
         let now = self.replacement_now();
         let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
         let retried = push
             .replacement
             .as_ref()
-            .is_some_and(|r| r.sessions == sessions);
+            .is_some_and(|r| r.sessions == sessions)
+            && now.saturating_duration_since(started) <= Duration::from_secs(10 * 60);
         push.replacement = Some(Replacement {
             sessions,
             retry_at: now + Duration::from_secs(60),
@@ -1002,6 +1121,7 @@ impl<T: Transport + 'static> Shared<T> {
                     if self.stopped() || self.active_push_sessions() != sessions {
                         interrupt.store(true, Ordering::Release);
                     }
+                    let started = self.replacement_now();
                     let mut ready = false;
                     let mut replaced = false;
                     while !self.stopped() && !interrupt.load(Ordering::Acquire) {
@@ -1034,6 +1154,8 @@ impl<T: Transport + 'static> Shared<T> {
                                 let mut push =
                                     self.push.lock().unwrap_or_else(PoisonError::into_inner);
                                 push.subscribed = sessions.iter().cloned().collect();
+                                // Recheck waiting paths after ready closes the subscription race.
+                                push.zone_version += 1;
                                 self.push_ready.store(true, Ordering::Release);
                                 drop(push);
                                 ready = true;
@@ -1103,7 +1225,7 @@ impl<T: Transport + 'static> Shared<T> {
                         continue;
                     }
                     if replaced {
-                        self.stream_replaced(sessions);
+                        self.stream_replaced(sessions, started);
                         exit = PushExit::Replaced;
                         // Return to coordination JSON long-poll during cooldown and
                         // indefinitely after a second displacement of this session set.
@@ -1314,6 +1436,23 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
     }
+    #[test]
+    fn mail_reply_without_needs_is_closed_and_does_not_wake() {
+        let mut mail: Message = serde_json::from_value(
+            json!({"id":1,"from":"bob","to":"alice","reply_to":9,"needs":"none","body":"Принято"}),
+        )
+        .unwrap();
+        assert!(!wakes(&mail));
+        assert!(!is_open(&mail));
+        mail.needs = Some("ack".into());
+        assert!(wakes(&mail));
+        assert!(is_open(&mail));
+        mail.needs = None;
+        mail.urgent = true;
+        assert!(wakes(&mail));
+        assert!(is_open(&mail));
+    }
+
     fn rig(push: bool, pending: Option<Value>) -> Rig {
         rig_with(push, pending, |_, _| {})
     }
@@ -2918,6 +3057,135 @@ mod tests {
                 .is_none()
         );
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn mail_push_replacement_history_resets_only_after_ten_minutes_of_stream() {
+        let rig = rig(false, None);
+        let shared = &rig.daemon.shared;
+        let start = Instant::now();
+        let sessions = vec!["alice".to_string()];
+        let set_now = |now| shared.push.lock().unwrap().clock_now = Some(now);
+        set_now(start);
+        shared.stream_replaced(sessions.clone(), start);
+        set_now(start + Duration::from_secs(61));
+        assert!(shared.replacement_allows_stream(&sessions));
+        let retry = start + Duration::from_secs(61);
+        set_now(retry + Duration::from_secs(600));
+        shared.stream_replaced(sessions.clone(), retry);
+        assert!(
+            shared
+                .push
+                .lock()
+                .unwrap()
+                .replacement
+                .as_ref()
+                .unwrap()
+                .retried
+        );
+        set_now(retry + Duration::from_secs(3600));
+        assert!(!shared.replacement_allows_stream(&sessions));
+        // A healthy retry gets a fresh single retry allowance after a later displacement.
+        set_now(retry + Duration::from_secs(601));
+        shared.stream_replaced(sessions.clone(), retry);
+        assert!(
+            !shared
+                .push
+                .lock()
+                .unwrap()
+                .replacement
+                .as_ref()
+                .unwrap()
+                .retried
+        );
+        assert!(!shared.replacement_allows_stream(&sessions));
+        set_now(retry + Duration::from_secs(662));
+        assert!(shared.replacement_allows_stream(&sessions));
+    }
+
+    #[test]
+    fn zone_wait_free_reuses_daemon_sse_and_checks_only_after_zone_event() {
+        let rig = rig(true, None);
+        rig.daemon.shared.hear("alice");
+        seeded(&rig, "alice");
+        let streams = stream_count(&rig.server);
+        let checks = || {
+            rig.server
+                .requests()
+                .iter()
+                .filter(|r| r.path == "/api/v1/zones/check")
+                .count()
+        };
+        let before = checks();
+        rig.server.enqueue(
+            "/api/v1/zones/check",
+            HttpReply::json(200, json!({"paths":[{"path":"src","status":"held"}]})),
+        );
+        let socket = socket(&rig);
+        let worker = thread::spawn(move || {
+            socket
+                .wait_zone_free("alice", "src", Duration::from_secs(3))
+                .unwrap()
+                .unwrap()
+        });
+        eventually(|| checks() == before + 1);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(checks(), before + 1, "push wait must not poll the path");
+        rig.server.enqueue("/api/v1/events", HttpReply::sse("id: 10\nevent: zone.released\ndata: {\"seq\":10,\"type\":\"zone.released\",\"payload\":{\"paths\":[\"src\"]}}\n\n"));
+        assert!(worker.join().unwrap());
+        assert_eq!(checks(), before + 2);
+        for request in rig
+            .server
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/api/v1/zones/check")
+        {
+            assert_eq!(request.body["mode"], "exclusive");
+        }
+        assert_eq!(
+            stream_count(&rig.server),
+            streams,
+            "waiter opened a competing SSE stream"
+        );
+    }
+
+    #[test]
+    fn mail_push_reply_to_needs_none_is_hook_only_without_wake_or_read_receipt() {
+        let rig = rig(true, None);
+        let (received, worker) = waiting(&rig, "alice", Duration::from_secs(3));
+        seeded(&rig, "alice");
+        let mut reply = mail(30, "alice", false, "none");
+        reply["reply_to"] = json!(12);
+        publish(&rig, 1, reply);
+        assert!(received.recv_timeout(Duration::from_millis(150)).is_err());
+        assert!(
+            !rig.daemon
+                .shared
+                .push_open_snapshot("alice")
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| item.id == 30)
+        );
+        let mut urgent = mail(31, "alice", true, "none");
+        urgent["reply_to"] = json!(12);
+        publish(&rig, 2, urgent);
+        let answer = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(answer.messages.unwrap()[0].id, 31);
+        let peek = rig.daemon.shared.peek_hook_mail("alice");
+        assert!(
+            peek.messages
+                .unwrap()
+                .iter()
+                .any(|message| message.id == 30)
+        );
+        assert!(
+            !rig.server
+                .requests()
+                .iter()
+                .any(|r| r.path.ends_with("/seen"))
+        );
     }
 
     #[test]

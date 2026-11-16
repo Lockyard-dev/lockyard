@@ -124,7 +124,11 @@ pub(super) fn run_tool(
         return node_tool(name, args);
     }
     let now = crate::now_ms();
-    let mut opened = open(cwd, agent)?;
+    let mut opened = if name == "zone_wait_free" {
+        crate::open::open_zone_wait(cwd, agent)?
+    } else {
+        open(cwd, agent)?
+    };
     let me = || {
         agent.ok_or_else(|| {
             Error::Invalid(
@@ -326,6 +330,18 @@ pub(super) fn run_tool(
             let claim =
                 lockyard_core::claim_or_reuse(opened.backend.as_mut(), me()?, &request, now)?;
             encode(&claim)
+        }
+        "zone_wait_free" => {
+            let path = opened.workspace_zone_path(cwd, args.text("path")?)?;
+            let seconds = args.some_int("timeout")?.unwrap_or(3600);
+            let seconds = u64::try_from(seconds)
+                .map_err(|_| Error::Invalid("timeout must be nonnegative seconds".into()))?;
+            let free = opened.backend.wait_zone_free(
+                me()?,
+                &path,
+                std::time::Duration::from_secs(seconds),
+            )?;
+            Ok(json!({"path":path,"free":free,"timed_out":!free}))
         }
         "zone_wait" => {
             let request = claim_request(&opened, args, cwd)?;
@@ -656,6 +672,7 @@ pub(super) fn run_tool(
             let p0_category = args.some_text("p0_category")?;
             validate_p0_category(priority.as_deref(), p0_category.as_deref())?;
             let spec = TaskSpec {
+                client_key: args.some_text("client_key")?,
                 title: args.text("title")?.to_string(),
                 body: args.optional_text("body")?.to_string(),
                 acceptance: args.some_text("acceptance")?,
@@ -686,28 +703,6 @@ pub(super) fn run_tool(
                         answer["warning"] = json!(TASK_PATHS_WARNING);
                     }
                     Ok(answer)
-                }
-                Err(error) if is_reconciliation(&error) => {
-                    let message = format!(
-                        "{error}; created=unknown: the idempotent retry with the original client_key could not confirm creation; do not resubmit with a fresh key (it could create a duplicate)"
-                    );
-                    match error {
-                        Error::Cloud {
-                            code,
-                            status,
-                            mut details,
-                            ..
-                        } => {
-                            details["created"] = Value::Null;
-                            Err(Error::Cloud {
-                                code,
-                                status,
-                                details,
-                                message,
-                            })
-                        }
-                        _ => Err(Error::Invalid(message)),
-                    }
                 }
                 Err(error) => Err(error),
             }

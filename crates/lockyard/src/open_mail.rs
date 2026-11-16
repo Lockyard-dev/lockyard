@@ -169,11 +169,11 @@ fn is_open(message: &Message, me: &str, now: i64, replied: &HashSet<i64>) -> boo
     }
     // A stored reply is kind=ask, needs=none, in_reply_to set — not an outstanding ask.
     let needs = message.needs.as_deref().unwrap_or("none");
-    if message.reply_to.is_some() && needs == "none" {
+    if message.reply_to.is_some() && needs == "none" && !message.urgent {
         return false;
     }
     let kind = message.kind.as_deref().unwrap_or("ask");
-    if kind != "ask" && needs == "none" {
+    if kind != "ask" && needs == "none" && !message.urgent {
         return false;
     }
     let created = stamp_ms(&message.created_at);

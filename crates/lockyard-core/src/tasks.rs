@@ -100,6 +100,7 @@ pub struct Task {
 /// to the cloud backlog, where the agent that writes an item also sets its urgency.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskSpec {
+    pub client_key: Option<String>,
     pub title: String,
     pub body: String,
     pub paths: Vec<String>,
@@ -120,6 +121,7 @@ impl TaskSpec {
     /// True when local mode would have to drop part of this request.
     pub fn uses_registry_fields(&self) -> bool {
         [
+            &self.client_key,
             &self.acceptance,
             &self.priority,
             &self.p0_category,

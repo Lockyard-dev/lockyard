@@ -479,13 +479,6 @@ fn validate_p0_category(priority: Option<&str>, category: Option<&str>) -> Resul
     }
 }
 
-fn is_reconciliation(error: &Error) -> bool {
-    let text = error.to_string();
-    text.contains("mutation outcome requires reconciliation")
-        || text.contains("outcome_unknown")
-        || error.kind() == "outcome_unknown"
-}
-
 fn validate_task_add_area(
     surface: Surface,
     args: Args<'_>,

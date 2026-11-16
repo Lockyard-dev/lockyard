@@ -109,3 +109,47 @@ fn mail_push_mcp_update_addresses_urgent_and_legacy_server() {
         "boolean"
     );
 }
+
+#[test]
+fn zone_wait_free_mcp_reports_free_timeout_and_validates_timeout() {
+    let dir = project();
+    let free = call(
+        &dir,
+        "alice",
+        "zone_wait_free",
+        json!({"path":"src","timeout":0}),
+    );
+    assert_eq!(free["isError"], false, "{free}");
+    assert_eq!(free["structuredContent"]["free"], true);
+    call(&dir, "bob", "zone_claim", json!({"paths":["src"]}));
+    let held = call(
+        &dir,
+        "alice",
+        "zone_wait_free",
+        json!({"path":"src","timeout":0}),
+    );
+    assert_eq!(held["structuredContent"]["timed_out"], true, "{held}");
+    let invalid = call(
+        &dir,
+        "alice",
+        "zone_wait_free",
+        json!({"path":"src","timeout":-1}),
+    );
+    assert_eq!(invalid["isError"], true);
+    for surface in [Surface::Compact, Surface::Full] {
+        assert!(tools(surface).iter().any(|t| t["name"] == "zone_wait_free"));
+    }
+}
+
+#[test]
+fn task_add_schema_accepts_client_key() {
+    let registry = tools(Surface::Full);
+    let add = registry
+        .iter()
+        .find(|tool| tool["name"] == "task_add")
+        .unwrap();
+    assert_eq!(
+        add["inputSchema"]["properties"]["client_key"]["type"],
+        "string"
+    );
+}

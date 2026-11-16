@@ -35,12 +35,29 @@ pub enum Request {
         #[serde(default = "wait_mail_timeout")]
         timeout_ms: u64,
     },
+    /// Wait on the daemon's existing event stream; never acquire a claim.
+    WaitZoneFree {
+        session: String,
+        path: String,
+        timeout_ms: u64,
+    },
+    /// Unread mail snapshot for non-consuming hook reminders.
+    PeekMail {
+        session: String,
+    },
     /// May this session touch these paths?
-    Check { session: String, paths: Vec<String> },
+    Check {
+        session: String,
+        paths: Vec<String>,
+    },
     /// How much mail is waiting?
-    Unread { session: String },
+    Unread {
+        session: String,
+    },
     /// A memory-only snapshot of coordination state for one session.
-    ZoneSnapshot { session: String },
+    ZoneSnapshot {
+        session: String,
+    },
     /// A bounded authoritative status read using the daemon's warm HTTP transport.
     StatusRead {
         session: String,
@@ -54,9 +71,14 @@ pub enum Request {
         lease_seconds: i64,
     },
     /// Read coordination events addressed to this session without advancing its cursor.
-    TakeEvents { session: String },
+    TakeEvents {
+        session: String,
+    },
     /// Acknowledge events after they have been written to the hook output.
-    AckEvents { session: String, through: i64 },
+    AckEvents {
+        session: String,
+        through: i64,
+    },
     /// Tool activity of a session.
     Touch {
         session: String,
@@ -65,9 +87,22 @@ pub enum Request {
         write_paths: Vec<String>,
     },
     /// Expand names inside the authenticated client, retaining its verified catalog type.
-    ExpandCatalog { call: Call, names: Vec<String> },
+    ExpandCatalog {
+        call: Call,
+        names: Vec<String>,
+    },
+    PrepareTaskCreate {
+        call: Call,
+        explicit_key: bool,
+    },
+    /// Retire an exactly reconciled pending write through the owning transport.
+    AcknowledgeWrite {
+        call: Call,
+    },
     /// Any protocol request.
-    Call { call: Call },
+    Call {
+        call: Call,
+    },
 }
 
 /// A request and the workspace its sender believes it belongs to.
@@ -99,6 +134,15 @@ pub struct AgentStatus {
     pub mail_protocol: Option<bool>,
     #[serde(default)]
     pub wait_mail_v1: bool,
+    #[serde(default)]
+    pub peek_mail_v1: bool,
+    /// Exact state location selected by the daemon, including custom state roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_mail_state_dir: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub prepare_task_create_v1: bool,
+    #[serde(default)]
+    pub wait_zone_free_v1: bool,
     pub url: String,
     pub workspace: String,
     /// Which token the process runs under. See `lockyard_cloud_client::token_id`.

@@ -49,6 +49,10 @@ impl Port for AgentPort {
         &self.root
     }
 
+    fn reminder_dir(&self) -> Option<PathBuf> {
+        self.socket.hook_mail_dir().ok()
+    }
+
     fn check(&mut self, agent: &str, path: &str, _now: i64) -> Result<Verdict> {
         if let Some(repository) = self
             .repository
@@ -169,6 +173,22 @@ impl Port for AgentPort {
         match reply.error {
             Some(error) => Err(error.into()),
             None => Ok(()),
+        }
+    }
+
+    fn peek_mail(&mut self, agent: &str, _now: i64) -> Result<Option<Vec<Message>>> {
+        if !self.socket.supports_peek_mail() {
+            return Ok(None);
+        }
+        let reply = self
+            .socket
+            .ask(&Request::PeekMail {
+                session: agent.into(),
+            })
+            .map_err(failed)?;
+        match reply.error {
+            Some(error) => Err(error.into()),
+            None => Ok(reply.messages),
         }
     }
 

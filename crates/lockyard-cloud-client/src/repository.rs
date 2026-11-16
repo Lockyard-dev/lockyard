@@ -159,6 +159,33 @@ impl<T: Transport> Transport for RepositoryTransport<T> {
     fn renegotiate_mail_push(&self, session: &str) -> Result<bool, ClientError> {
         self.inner.renegotiate_mail_push(session)
     }
+    fn owns_event_stream(&self) -> bool {
+        self.inner.owns_event_stream()
+    }
+    fn prepare_task_create(&self, call: &Call, explicit_key: bool) -> Result<Call, ClientError> {
+        self.inner
+            .prepare_task_create(&self.qualified_call(call)?, explicit_key)
+    }
+    fn wait_zone_free(
+        &self,
+        session: &str,
+        path: &str,
+        timeout: std::time::Duration,
+    ) -> Option<Result<bool, ClientError>> {
+        let path = match self.path(path) {
+            Ok(path) => path,
+            Err(error) => return Some(Err(error)),
+        };
+        // Namespace support must be verified before asking the daemon about a qualified path.
+        if self.repository.is_some() && !self.verified.load(Ordering::Acquire) {
+            let mut probe = Call::get(session, "/api/v1/zones/claims".into());
+            probe.deadline_ms = Some(timeout.as_millis().max(1).min(u64::MAX as u128) as u64);
+            if let Err(error) = self.call(&probe) {
+                return Some(Err(error));
+            }
+        }
+        self.inner.wait_zone_free(session, &path, timeout)
+    }
     fn event_stream_sessions(
         &self,
         session: &str,
