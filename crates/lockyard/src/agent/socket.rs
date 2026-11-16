@@ -188,6 +188,20 @@ impl AgentSocket {
         Ok(stream)
     }
 
+    pub fn wait_mail(&self, session: &str, since: i64, timeout: Duration) -> io::Result<Reply> {
+        if timeout.is_zero() || !self.ping()?.wait_mail_v1 {
+            return Ok(Reply::default());
+        }
+        self.ask_with_timeout(
+            &Request::WaitMail {
+                session: session.into(),
+                since,
+                timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
+            },
+            timeout.saturating_add(Duration::from_millis(250)),
+        )
+    }
+
     /// Sends one request and reads its answer.
     pub fn ask(&self, request: &Request) -> io::Result<Reply> {
         self.ask_with_timeout(request, self.timeout)
@@ -395,6 +409,16 @@ fn connect_bounded(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
 }
 
 impl Transport for AgentSocket {
+    fn mail_push_v1(&self, session: &str) -> Result<bool, ClientError> {
+        // Sending groups/urgent depends on server negotiation, including during SSE fallback.
+        // Forward discovery with a bounded budget instead of testing daemon stream health.
+        let mut call = Call::get(session, "/api/v1/protocol".into());
+        call.deadline_ms = Some(2000);
+        let value = self.call(&call)?;
+        Ok(value["capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|cap| cap == "mail_push_v1")))
+    }
     fn soft_zones_v1(&self, _session: &str) -> Result<bool, ClientError> {
         // A protocol GET forwarded by an old daemon is not proof that the daemon
         // implements default-mode negotiation. Only the new Ping flag is proof.

@@ -60,7 +60,8 @@ pub(super) fn run_events(
         session: agent.cloned().or_else(env_agent),
         types: args.types,
     };
-    let page = opened.backend.events(&query)?;
+    let mut page = opened.backend.events(&query)?;
+    page.events.retain(|event| !event.kind.is_empty());
     let line = |event: &lockyard_core::proto::Event| format!("{}  {}", event.seq, event.kind);
     let text = join(&page.events, line, "no events");
     output(&page.events, text)

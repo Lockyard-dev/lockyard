@@ -183,7 +183,7 @@ fn is_open(message: &Message, me: &str, now: i64, replied: &HashSet<i64>) -> boo
     true
 }
 
-fn to_open(message: &Message) -> OpenMail {
+pub(crate) fn to_open(message: &Message) -> OpenMail {
     let subject = message.body.lines().next().unwrap_or(message.body.as_str());
     OpenMail {
         id: message.id,
@@ -242,12 +242,16 @@ mod tests {
 
     fn ask(id: i64, from: &str, to: &str, body: &str, created: i64) -> Message {
         Message {
+            urgent: false,
             replied_at: None,
             id,
             thread_id: None,
             reply_to: None,
             kind: Some("ask".into()),
             from: from.into(),
+            from_alias: None,
+            address: None,
+            role: None,
             from_client: None,
             to: to.into(),
             zone: None,

@@ -36,6 +36,7 @@ pub(super) fn run_msg(
         MsgCommand::Send {
             to,
             body,
+            urgent,
             kind,
             needs,
             zone,
@@ -43,10 +44,21 @@ pub(super) fn run_msg(
             key,
             ttl,
         } => {
+            let to = if backend.is_cloud() {
+                to
+            } else {
+                lockyard_core::proto::mail_address(&to, false)?
+            };
+            if urgent && !backend.is_cloud() {
+                return Err(Error::Invalid(
+                    "сервер не поддерживает urgent: требуется mail_push_v1".into(),
+                ));
+            }
             if to == agent {
                 return Err(Error::Invalid("cannot send a message to yourself".into()));
             }
             let request = SendRequest {
+                urgent,
                 to,
                 body,
                 kind,

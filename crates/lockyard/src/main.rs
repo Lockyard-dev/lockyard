@@ -5,6 +5,7 @@ mod context;
 mod guard;
 mod hook;
 mod keepalive;
+mod mail_wait;
 mod mcp;
 mod monitor;
 mod node_cli;
@@ -153,9 +154,13 @@ pub(crate) fn now_ms() -> i64 {
 }
 
 pub(crate) fn env_agent() -> Option<String> {
+    env_agent_from(|name| std::env::var(name).ok())
+}
+
+fn env_agent_from(mut lookup: impl FnMut(&str) -> Option<String>) -> Option<String> {
     ["LOCKYARD_AGENT", "CLAUDE_CODE_SESSION_ID"]
         .iter()
-        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+        .find_map(|name| lookup(name).filter(|value| !value.is_empty()))
 }
 
 fn resolve_agent(flag: Option<&String>) -> Result<String> {
@@ -350,6 +355,7 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             }
             run_zone(open()?, command, agent.as_ref(), cwd)
         }
+        Command::Mail(_) => unreachable!("mail wait is handled before opening a backend"),
         Command::Msg(command) => {
             if matches!(command, MsgCommand::Inbox { .. } | MsgCommand::Open)
                 && let Some(out) = no_cloud_access_output(cwd)?
@@ -582,6 +588,21 @@ fn main() -> ExitCode {
     let parsing = lockyard_core::perf::Span::new("process.parse");
     let cli = Cli::parse();
     drop(parsing);
+    if let Command::Mail(MailCommand::Wait { session, timeout }) = &cli.command {
+        let session = session
+            .clone()
+            .or_else(env_agent)
+            .or_else(mail_wait::hook_session);
+        return ExitCode::from(
+            session
+                .and_then(|session| {
+                    current_dir()
+                        .ok()
+                        .map(|cwd| mail_wait::run(&cwd, &session, Duration::from_secs(*timeout)))
+                })
+                .unwrap_or(0),
+        );
+    }
     let json = cli.json;
     if let Command::Mcp(args) = &cli.command {
         let surface = match mcp::Surface::choose(args.tools.as_deref()) {

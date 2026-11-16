@@ -43,6 +43,9 @@ pub(super) enum Command {
     /// Talk to other agents.
     #[command(subcommand)]
     Msg(MsgCommand),
+    /// Background mail notifications for asyncRewake hooks.
+    #[command(subcommand)]
+    Mail(MailCommand),
     /// Work that outlives a session.
     #[command(subcommand)]
     Task(TaskCommand),

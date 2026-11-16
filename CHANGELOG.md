@@ -5,6 +5,17 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.15] - Unreleased
+
+### Added
+
+- Workspace SSE mail delivery when the server advertises `mail_push_v1`, with resumable
+  cursors, heartbeat read timeout and reconnect backoff. Older servers retain long-poll.
+- `lockyard mail wait` and daemon socket subscriptions for Claude Code `asyncRewake`:
+  urgent/reply/ack mail wakes the session; timeout and unavailable services stay silent.
+- Broadcast aliases and client/zone/path groups in MCP `update` and CLI `msg send`, plus
+  MCP `urgent` and CLI `--urgent`. See [mail push and hook setup](docs/mail-push.md).
+
 ## [0.3.14] - 2026-11-16
 
 ### Fixed

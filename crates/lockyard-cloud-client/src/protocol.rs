@@ -1797,7 +1797,13 @@ impl Client {
                                 .is_ok()
                         });
                     // Authenticate/decrypt the response before releasing its recovery record.
-                    if let Some(workspace) = self.workspace.as_deref()
+                    let event_page = call.method == "GET"
+                        && call.path.split('?').next() == Some("/api/v1/events");
+                    if event_page {
+                        self.decode_json_events(&mut value)?;
+                    }
+                    if !event_page
+                        && let Some(workspace) = self.workspace.as_deref()
                         && let Err(message) = crate::crypto::transform_fields_policy(
                             &mut value,
                             &call.method,

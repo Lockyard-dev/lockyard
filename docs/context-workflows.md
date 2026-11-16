@@ -101,3 +101,6 @@ local directory private. No bearer token is stored: a credential fingerprint bin
 retries to the same credential. Remote write steps reuse their saved idempotency
 keys, while local uncertain writes require reconciliation. There is no arbitrary
 shell-execution step, background launcher, automatic merge or implicit publication.
+
+See [broadcast mail, urgent messages and background mail wait](mail-push.md) for
+workspace groups and the Claude Code `asyncRewake` Stop hook.

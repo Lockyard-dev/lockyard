@@ -152,6 +152,30 @@ impl<T> RepositoryTransport<T> {
 }
 
 impl<T: Transport> Transport for RepositoryTransport<T> {
+    fn mail_push_v1(&self, session: &str) -> Result<bool, ClientError> {
+        self.inner.mail_push_v1(session)
+    }
+
+    fn renegotiate_mail_push(&self, session: &str) -> Result<bool, ClientError> {
+        self.inner.renegotiate_mail_push(session)
+    }
+    fn event_stream_sessions(
+        &self,
+        session: &str,
+        sessions: &[String],
+        after: i64,
+        interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::sse::EventStream, ClientError> {
+        self.inner
+            .event_stream_sessions(session, sessions, after, interrupt)
+    }
+    fn decode_stream_event(
+        &self,
+        event: &mut lockyard_core::proto::Event,
+    ) -> Result<(), ClientError> {
+        self.inner.decode_stream_event(event)
+    }
+
     fn soft_zones_v1(&self, session: &str) -> Result<bool, ClientError> {
         self.inner.soft_zones_v1(session)
     }

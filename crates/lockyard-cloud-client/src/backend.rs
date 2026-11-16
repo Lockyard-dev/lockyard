@@ -475,12 +475,16 @@ fn receipt_from(value: &Value) -> bus::Receipt {
 fn message(value: Value) -> Result<Message> {
     if value.get("queued").and_then(Value::as_bool) == Some(true) && value.get("id").is_none() {
         return Ok(Message {
+            urgent: false,
             replied_at: None,
             id: 0,
             thread_id: None,
             reply_to: None,
             kind: None,
             from: String::new(),
+            from_alias: None,
+            address: None,
+            role: None,
             from_client: None,
             to: String::new(),
             zone: None,
@@ -1206,6 +1210,15 @@ impl<T: Transport> Backend for CloudBackend<T> {
 
     fn send(&mut self, agent: &str, request: &SendRequest, _now: i64) -> Result<Message> {
         let mut request = request.clone();
+        if lockyard_core::proto::is_mail_address(&request.to) || request.urgent {
+            let push = self.transport.mail_push_v1(agent)?;
+            request.to = lockyard_core::proto::mail_address(&request.to, push)?;
+            if request.urgent && !push {
+                return Err(Error::Invalid(
+                    "сервер не поддерживает urgent: требуется mail_push_v1".into(),
+                ));
+            }
+        }
         request.kind.get_or_insert_with(|| DEFAULT_KIND.to_string());
         message(self.post(agent, "/api/v1/bus/messages".into(), &request)?)
     }
@@ -2701,6 +2714,7 @@ mod tests {
             json!({}),
         ]);
         let send = SendRequest {
+            urgent: false,
             to: "bob".into(),
             body: "x".into(),
             kind: Some("ask".into()),
@@ -3889,6 +3903,7 @@ mod tests {
         let (server, mut cloud) =
             backend(vec![json!({"id": 1}), json!({"key": "k", "value": "v"})]);
         let send = SendRequest {
+            urgent: false,
             to: "bob".into(),
             body: "x".into(),
             ..SendRequest::default()

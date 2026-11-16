@@ -284,6 +284,7 @@ fn inspect(
         writeln!(out, "{line}")?;
         if ports.store.should_tell(record.id, now)? && claim.session != settings.agent {
             let request = SendRequest {
+                urgent: false,
                 to: claim.session.clone(),
                 body: format!(
                     "Lockyard noticed a write outside the hook: {text}. \

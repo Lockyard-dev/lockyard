@@ -28,6 +28,13 @@ pub enum Phase {
 pub enum Request {
     /// Who are you, and how fresh is your view?
     Ping,
+    /// Hold this connection until actionable unread mail arrives. A new waiter replaces the old.
+    WaitMail {
+        session: String,
+        since: i64,
+        #[serde(default = "wait_mail_timeout")]
+        timeout_ms: u64,
+    },
     /// May this session touch these paths?
     Check { session: String, paths: Vec<String> },
     /// How much mail is waiting?
@@ -86,6 +93,12 @@ pub enum Source {
 /// State of the process, for `lockyard agent status`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AgentStatus {
+    #[serde(default)]
+    pub mail_push_v1: bool,
+    #[serde(default)]
+    pub mail_protocol: Option<bool>,
+    #[serde(default)]
+    pub wait_mail_v1: bool,
     pub url: String,
     pub workspace: String,
     /// Which token the process runs under. See `lockyard_cloud_client::token_id`.
@@ -165,6 +178,10 @@ impl Reply {
             ..Self::default()
         }
     }
+}
+
+fn wait_mail_timeout() -> u64 {
+    6 * 60 * 60 * 1000
 }
 
 #[cfg(test)]

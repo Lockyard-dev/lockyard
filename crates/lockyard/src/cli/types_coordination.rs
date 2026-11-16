@@ -232,10 +232,13 @@ pub(super) enum DirtyCommand {
 #[derive(Subcommand)]
 #[command(defer = true)]
 pub(super) enum MsgCommand {
-    /// Send to an agent, or to `*` for everyone.
+    /// Send to a session, *, all, все, everyone, @client, @zone:key or @path:path.
     Send {
         to: String,
         body: String,
+        /// Wake a waiting session even for informational mail.
+        #[arg(long)]
+        urgent: bool,
         /// ask, notice or event.
         #[arg(long)]
         kind: Option<String>,
@@ -633,5 +636,17 @@ pub(super) enum BoardCommand {
     List {
         #[arg(long)]
         zone: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(super) enum MailCommand {
+    /// Wait silently for actionable mail; exit 2 with a reminder, or 0 on timeout/unavailable.
+    Wait {
+        #[arg(long)]
+        session: Option<String>,
+        /// Maximum wait in seconds (default six hours).
+        #[arg(long, default_value_t = 21600)]
+        timeout: u64,
     },
 }

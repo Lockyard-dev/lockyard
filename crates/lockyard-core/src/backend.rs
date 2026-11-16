@@ -834,11 +834,15 @@ fn claim_record(claim: zones::Claim) -> Claim {
 
 fn message_record(message: bus::Message) -> Message {
     Message {
+        urgent: false,
         id: message.id,
         thread_id: None,
         reply_to: message.reply_to,
         kind: None,
         from: message.from,
+        from_alias: None,
+        address: None,
+        role: None,
         from_client: None,
         to: message.to,
         zone: None,
@@ -1004,14 +1008,15 @@ impl Backend for Store {
     }
 
     fn send(&mut self, agent: &str, request: &SendRequest, now: i64) -> Result<Message> {
-        let extras = request.kind.is_some()
+        let extras = request.urgent
+            || request.kind.is_some()
             || request.needs.is_some()
             || request.zone.is_some()
             || request.re.is_some()
             || request.key.is_some()
             || request.ttl_minutes.is_some();
         if extras {
-            return cloud("message kind, needs, zone, re, key and ttl");
+            return cloud("message urgent, kind, needs, zone, re, key and ttl");
         }
         Ok(message_record(Store::send(
             self,
@@ -1587,6 +1592,7 @@ mod tests {
             Err(Error::NeedsCloud(_))
         ));
         let needs = SendRequest {
+            urgent: false,
             to: "*".into(),
             body: "x".into(),
             needs: Some("ack".into()),
@@ -1628,6 +1634,7 @@ mod tests {
         assert_eq!(backend.claims(&by_path, 1).unwrap().len(), 1);
         backend.touch_agent("b", 0).unwrap();
         let send = SendRequest {
+            urgent: false,
             to: "b".into(),
             body: "hi".into(),
             ..SendRequest::default()

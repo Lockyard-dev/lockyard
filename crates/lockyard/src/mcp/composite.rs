@@ -26,6 +26,17 @@ pub(super) fn run_composite(
             after,
         )
     };
+    run_composite_steps(name, args, agent, cwd, after, step)
+}
+
+pub(super) fn run_composite_steps(
+    name: &str,
+    args: Args<'_>,
+    agent: Option<&str>,
+    cwd: &Path,
+    after: &mut Option<After>,
+    step: impl Fn(&str, Value, &mut Option<After>) -> Result<Value>,
+) -> Result<Value> {
     match name {
         "start_work" => {
             let paths = args.strings("paths")?;
@@ -139,8 +150,11 @@ pub(super) fn run_composite(
                 true
             } else if let (Some(to), Some(body)) = (args.some_text("to")?, args.some_text("body")?)
             {
-                let to = resolve_target(cwd, agent, &to)?;
-                let mut sent = step("msg_send", json!({"to": to, "body": body}), after)?;
+                let mut sent = step(
+                    "msg_send",
+                    json!({"to": to, "body": body, "urgent": args.flag("urgent")?}),
+                    after,
+                )?;
                 annotate_queued_delivery(&mut sent);
                 answer["sent"] = sent;
                 true

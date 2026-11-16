@@ -86,8 +86,8 @@ impl ToolRegistry {
             ),
             tool_def(
                 "update",
-                "New mail (all:true for all). Send: to+body; reply: reply_to+body. handled:[ids] closes mail. Sends peek.",
-                json!({"to": text, "body": text, "reply_to": {"type":"integer","description":"Reply in this thread; exclusive with to. Server 579d557 does not persist the reply sender label."}, "handled": {"type":"array","items":{"type":"integer","minimum":1},"description":"Close messages for this reader; requires server capability mail_handled_v1, checked before sending; independent of read receipts"}, "peek": flag, "all": flag}),
+                "Read mail; send: to+body, urgent wakes. To: session, *, all, все, everyone, @claude/@cursor/@codex, @zone:key, @path:path. reply_to+body replies; handled closes.",
+                json!({"to": text, "body": text, "urgent": flag, "reply_to": {"type":"integer","description":"Reply in this thread; exclusive with to. Server 579d557 does not persist the reply sender label."}, "handled": {"type":"array","items":{"type":"integer","minimum":1},"description":"Close messages for this reader; requires server capability mail_handled_v1, checked before sending; independent of read receipts"}, "peek": flag, "all": flag}),
                 &[],
             ),
             tool_def(
@@ -552,8 +552,8 @@ fn primitive_definitions() -> Vec<Value> {
         ),
         tool_def(
             "msg_send",
-            "Send a message to an agent, or to * for everyone",
-            json!({"to": text, "body": text, "kind": text, "needs": text, "zone": text, "re": text, "key": text, "ttl": int}),
+            "Send mail to a session, broadcast alias or @client/@zone:key/@path:path; urgent wakes.",
+            json!({"to": text, "body": text, "urgent": flag, "kind": text, "needs": text, "zone": text, "re": text, "key": text, "ttl": int}),
             &["to", "body"],
         ),
         tool_def(
