@@ -550,7 +550,7 @@
     #[test]
     fn priority_mail_flush_failure_keeps_reminder_eligible() {
         let mut priority = letter(); priority.urgent = true;
-        let (inner, _) = recording(Some(0), None);
+        let (inner, _) = recording(Some(1), None);
         let mut port = PriorityPort { inner, snapshot: vec![priority], fail_seen: false };
         assert!(deliver_mail(&mut port, "SessionStart", "me", 1, &mut FailingFlush).is_err());
         let mut out = Vec::new();
@@ -599,7 +599,7 @@
         let mut priority = letter();
         priority.id = 22;
         priority.urgent = true;
-        let (inner, log) = recording(Some(0), None);
+        let (inner, log) = recording(Some(1), None);
         let event: Event = serde_json::from_value(json!({"seq": 9, "type": "zone.requested", "payload": {}})).unwrap();
         let mut port = EventPort {
             priority: PriorityPort { inner, snapshot: vec![priority], fail_seen: false },

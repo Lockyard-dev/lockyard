@@ -16,8 +16,14 @@ pub(super) fn deliver_attention(
     use std::io::{Read, Seek, SeekFrom};
     let mut answer = decision;
     let mut shown = Vec::new();
-    let snapshot = port.peek_mail(agent, now);
     let unread = port.unread(agent).ok().flatten();
+    // Priority lines are unread mail: with a confirmed zero count skip the extra daemon round
+    // trip, which keeps the PreToolUse decision inside its latency budget.
+    let snapshot = if unread == Some(0) {
+        Ok(Some(Vec::new()))
+    } else {
+        port.peek_mail(agent, now)
+    };
     let mut state = None;
     let mut times: BTreeMap<i64, i64> = BTreeMap::new();
     // PreToolUse only adds priority mail lines: coordination events stay queued for
