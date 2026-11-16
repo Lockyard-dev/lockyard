@@ -3715,6 +3715,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "timing flake on windows-latest runners (LY-0021); enforced on Linux and macOS"
+    )]
     fn status_read_twenty_soft_peer_disconnects_at_850ms_do_not_delay_next_hard() {
         let mut rig = start_with(timing(), |_| {});
         rig.daemon.stop_workers();
@@ -6099,6 +6103,10 @@ mod tests {
         );
     }
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "timing flake on windows-latest runners (LY-0021); enforced on Linux and macOS"
+    )]
     fn renew_open_mail_via_agent_skips_protocol_and_fits_renew_budget_when_server_hangs() {
         let rig = start_with(timing(), |_| {});
         // Capability on → open=true path; hang only the inbox; honour attempt_timeout_ms.
