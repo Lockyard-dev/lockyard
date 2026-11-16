@@ -250,19 +250,41 @@ pub(crate) struct ProtocolState {
     completed_writes: BTreeSet<String>,
 }
 
+/// Close alone leaves a Unix flock alive in a descriptor inherited by a concurrent fork,
+/// until that child execs. Release ownership explicitly before closing our descriptor.
+#[derive(Debug)]
+struct PendingFileLock(std::fs::File);
+
+impl Drop for PendingFileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // Retry interrupted unlocks; the guard must release ownership before close.
+            while unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } != 0 {
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    break;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = self.0.unlock();
+    }
+}
+
 pub(crate) struct PendingSendGuard<'a> {
     state: &'a std::sync::Mutex<ProtocolState>,
     key: String,
     /// Directory whose flock serializes journal writes across processes. Held only while
     /// mutating the journal or a short non-poll send — never for the whole long poll.
     journal_dir: Option<&'a Path>,
-    journal: Option<std::fs::File>,
+    journal: Option<PendingFileLock>,
     /// Per-key ownership survives releasing the shared journal during a long poll.
-    operation: Option<std::fs::File>,
+    operation: Option<PendingFileLock>,
 }
 
 impl PendingSendGuard<'_> {
-    fn lock_operation(path: &Path) -> Result<std::fs::File, ClientError> {
+    fn lock_operation(path: &Path) -> Result<PendingFileLock, ClientError> {
         let mut options = StateOpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
@@ -283,7 +305,7 @@ impl PendingSendGuard<'_> {
         }
         #[cfg(not(unix))]
         file.try_lock().map_err(|_| ClientError::JournalBusy)?;
-        Ok(file)
+        Ok(PendingFileLock(file))
     }
 
     /// All contenders open operation locks while owning the shared journal lock.
@@ -328,7 +350,7 @@ impl PendingSendGuard<'_> {
         Ok(())
     }
 
-    fn lock_journal(directory: &Path) -> Result<std::fs::File, ClientError> {
+    fn lock_journal(directory: &Path) -> Result<PendingFileLock, ClientError> {
         private_directory(directory)?;
         let mut options = StateOpenOptions::new();
         options.read(true);
@@ -357,7 +379,7 @@ impl PendingSendGuard<'_> {
         {
             lock.try_lock().map_err(|_| ClientError::JournalBusy)?;
         }
-        Ok(lock)
+        Ok(PendingFileLock(lock))
     }
 
     /// Re-take the flock before journal cleanup after a long poll. Retries inside `budget`.
@@ -975,8 +997,18 @@ impl Client {
                 ));
             }
         }
-        if maintenance {
-            private_directory(&directory.join(LONG_POLL_MAINTENANCE))?;
+        let hint = directory.join(LONG_POLL_MAINTENANCE);
+        if maintenance && !hint.try_exists().unwrap_or(false) {
+            // Even this disposable hint mutates the shared journal. Take its flock
+            // briefly for legacy-sidecar restoration, never for the HTTP long poll.
+            // Current clients normally publish the hint with their sidecars, so this
+            // mostly runs for journals written by older clients. A busy owner never fails the
+            // load: the hint stays unpublished and the next open retries it.
+            match PendingSendGuard::lock_journal(&directory) {
+                Ok(_journal) => private_directory(&hint)?,
+                Err(error) if journal_busy(&error) => {}
+                Err(error) => return Err(error),
+            }
         }
         self.protocol_state
             .lock()
@@ -2388,6 +2420,27 @@ mod pending_completion_tests {
             .collect()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn send_locks_release_while_inherited_descriptors_remain_open() {
+        let root = tempfile::tempdir().unwrap();
+        let client = Client::new("http://127.0.0.1:1", "fixture".into())
+            .unwrap()
+            .with_pending_journal(root.path().canonicalize().unwrap())
+            .unwrap();
+        let mut guard = client.claim_pending_send("short").unwrap();
+        // dup and fork share the same open file description. CLOEXEC only closes it at exec,
+        // so a concurrently spawned child can retain ownership after the parent closes it.
+        let inherited_journal = guard.journal.as_ref().unwrap().0.try_clone().unwrap();
+        guard.release_journal().unwrap();
+        let inherited_operation = guard.operation.as_ref().unwrap().0.try_clone().unwrap();
+        drop(client.claim_pending_send("other").unwrap());
+        drop(guard);
+        drop(client.claim_pending_send("short").unwrap());
+        drop(inherited_operation);
+        drop(inherited_journal);
+    }
+
     #[test]
     fn survey_r6_short_sends_do_not_create_long_poll_files() {
         let root = tempfile::tempdir().unwrap();
@@ -2409,6 +2462,65 @@ mod pending_completion_tests {
             assert!(journal_files(directory).is_empty());
         }
         assert_eq!(MAINTENANCE_SCANS.get(), scans);
+    }
+
+    #[test]
+    fn ly0019_legacy_long_poll_hint_creation_and_cleanup_require_journal_lock() {
+        for extension in ["inflight", "completed"] {
+            let root = tempfile::tempdir().unwrap();
+            let root = root.path().canonicalize().unwrap();
+            let new_client = || {
+                Client::new("http://127.0.0.1:1", "fixture".into())
+                    .unwrap()
+                    .with_pending_journal(&root)
+            };
+            let sender = new_client().unwrap();
+            let directory = sender.pending_journal.as_ref().unwrap();
+            let hint = directory.join(LONG_POLL_MAINTENANCE);
+            let sidecar = journal_path(directory, "poll").with_extension(extension);
+            let holder = PendingSendGuard::lock_journal(directory).unwrap();
+            let record = pending(&sender, "poll");
+            sender.retain_pending(record.clone()).unwrap();
+            // Model an older journal with sidecars but no maintenance hint.
+            if extension == "inflight" {
+                drop(PendingSendGuard::lock_operation(&sidecar).unwrap());
+            } else {
+                sender.complete_pending_later(&record);
+            }
+            assert!(sidecar.exists());
+            assert!(!hint.exists());
+            // A busy journal never fails the load; the hint waits for the flock.
+            drop(new_client().expect("a busy journal must not fail the load"));
+            assert!(!hint.exists(), "{extension}: creation bypassed the flock");
+            drop(holder);
+
+            let restored = new_client().unwrap();
+            assert!(
+                hint.exists(),
+                "{extension}: restoration must publish the hint"
+            );
+            // Restoration releases the flock immediately; another owner can take it.
+            let holder = PendingSendGuard::lock_journal(directory).unwrap();
+            let error = restored.claim_pending_send("unrelated").err().unwrap();
+            assert!(journal_busy(&error), "{extension}: {error}");
+            assert!(hint.exists(), "{extension}: removal bypassed the flock");
+            assert!(sidecar.exists());
+            drop(holder);
+
+            // A published hint means loads skip the flock even while it is busy.
+            let holder = PendingSendGuard::lock_journal(directory).unwrap();
+            drop(new_client().expect("an existing hint must not need the flock"));
+            assert!(hint.exists());
+            drop(holder);
+
+            drop(restored.claim_pending_send("unrelated").unwrap());
+            assert!(!hint.exists(), "{extension}: cleanup must remove the hint");
+            assert!(!sidecar.exists());
+            assert_eq!(
+                restored.pending_operation("poll").is_some(),
+                extension == "inflight"
+            );
+        }
     }
 
     #[test]

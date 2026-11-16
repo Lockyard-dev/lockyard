@@ -5,6 +5,25 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.14] - 2026-11-16
+
+### Fixed
+
+- Restore the `.long-poll` maintenance hint only while holding the shared pending-journal
+  flock (LY-0019). Loading a journal that already has the hint takes no flock; if another
+  owner holds the journal, the load still succeeds and the hint is restored by a later
+  open. Hint cleanup also requires the shared flock; `zone wait`
+  continues to release it throughout the HTTP long poll (LY-0010).
+- Release pending-journal and operation flocks explicitly when their guard drops (LY-0020).
+  A child process forked meanwhile shares the open file description, so closing alone left
+  the journal "busy" until that child exec'd or exited.
+- Unit tests of the cloud client no longer race on the process-wide key directory, and the
+  fake server closes its listener and workers and reuses connections (LY-0020).
+
+### Added
+
+- Advance synchronized Rust, npm, PyPI and MCP registry versions to `0.3.14`.
+
 ## [0.3.13] - 2026-11-15
 
 ### Fixed

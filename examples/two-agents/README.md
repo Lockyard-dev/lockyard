@@ -46,7 +46,7 @@ $ alice zone release Z-1
 released 1
 
 Bob reads the answer
-$ bob msg inbox
+$ bob msg inbox --mark-read
 M-2  alice: about 10 minutes, I will release src/api when the routes compile
 
 Alice can see her message arrived and was read
