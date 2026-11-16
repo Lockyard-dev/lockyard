@@ -354,8 +354,10 @@ impl Client {
                 .get("seq")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            // Only structural failures may become tombstones. Key resolution and
-            // authentication happen afterwards and fail the entire page atomically.
+            // Structural failures and a plaintext event in an encrypted field become tombstones
+            // (content never surfaced): retrying cannot fix them, and one bad server event must
+            // not wedge the JSON cursor forever. Authentication failures and a missing key may be
+            // a key rotation in progress, so they fail the page and it is replayed later.
             let decoded = serde_json::from_value::<Event>(raw.clone())
                 .map_err(|e| ClientError::Decode(e.to_string()))
                 .and_then(|event| {
@@ -367,6 +369,10 @@ impl Client {
                 Ok(event) => {
                     *raw = serde_json::to_value(event)
                         .map_err(|e| ClientError::Decode(e.to_string()))?
+                }
+                Err(ClientError::Invalid(error)) if error.ends_with("contains plaintext") => {
+                    eprintln!("lockyard: dropping JSON event {seq} with rejected content: {error}");
+                    *raw = serde_json::json!({"seq":seq,"type":"","payload":null});
                 }
                 Err(error) if !matches!(error, ClientError::Decode(_)) => return Err(error),
                 Err(_) => {

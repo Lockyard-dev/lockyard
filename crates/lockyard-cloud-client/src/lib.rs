@@ -2003,10 +2003,17 @@ mod tests {
             Reply::json(200, json!({})).delay(Duration::from_millis(2000)),
             Reply::json(200, json!({})).delay(Duration::from_millis(2000)),
             Reply::json(200, json!({})).delay(Duration::from_millis(2000)),
-            // Hold reserved slots long enough to observe write+poll flags; deadline below is 1000 ms.
-            Reply::json(200, json!({})).delay(Duration::from_millis(200)),
-            Reply::json(200, json!({})).delay(Duration::from_millis(200)),
         ]);
+        // Reserved calls race each other, so route their protocol-shaped replies by path.
+        // Hold both slots long enough to observe write+poll flags (deadline: 1000 ms).
+        server.enqueue(
+            "/api/v1/events",
+            Reply::json(200, json!([])).delay(Duration::from_millis(200)),
+        );
+        server.enqueue(
+            "/api/v1/presence",
+            Reply::json(200, json!({})).delay(Duration::from_millis(200)),
+        );
         let mut client = Client::new(&server.url(), "fixture".into()).unwrap();
         client.set_http_worker_limit(8);
         client.negotiated_protocol("me").unwrap();
@@ -3217,11 +3224,9 @@ mod tests {
                 json!([{"value":"lyenc1.tampered.envelope"}]),
             ),
         ] {
-            let skippable_event = path == "/api/v1/events"
-                && matches!(
-                    body[0]["type"].as_str(),
-                    Some("new.content" | "presence.heartbeat")
-                );
+            // Every plaintext event becomes a cursor-bearing tombstone (content never surfaced);
+            // non-event content responses still fail closed.
+            let skippable_event = path == "/api/v1/events";
             let server = FakeServer::start(vec![Reply::json(200, body)]);
             let result =
                 forced_client(&server, key.clone()).call(&Call::get("node-job", path.into()));
@@ -3231,8 +3236,7 @@ mod tests {
                     json!({"seq":1,"type":"","payload":null})
                 );
             } else {
-                // A required-content policy/authentication failure must stop the page;
-                // only structural/unsupported events admit cursor-bearing tombstones.
+                // Plaintext or tampered non-event content fails the whole response.
                 assert!(result.is_err(), "{path}");
             }
         }
@@ -3270,6 +3274,8 @@ mod tests {
                 .unwrap()[0]["payload"]["reason"],
             "taken"
         );
+        // Plaintext required content is dropped as a tombstone: it is never shown and it
+        // cannot wedge the cursor (retrying would never fix it).
         assert_eq!(
             client
                 .call(&Call::get("node-job", "/api/v1/events".into()))

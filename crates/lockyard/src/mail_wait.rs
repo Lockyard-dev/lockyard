@@ -72,11 +72,22 @@ pub(crate) fn hook_session() -> Option<String> {
 }
 #[cfg(unix)]
 fn hook_session_fd(fd: std::os::fd::RawFd) -> Option<String> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(200);
+    hook_session_fd_with_poll(fd, |poll| {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        // SAFETY: one valid pollfd; the caller keeps the descriptor open.
+        !left.is_zero() && unsafe { libc::poll(poll, 1, left.as_millis().min(200) as i32) } > 0
+    })
+}
+#[cfg(unix)]
+fn hook_session_fd_with_poll(
+    fd: std::os::fd::RawFd,
+    mut poll_input: impl FnMut(&mut libc::pollfd) -> bool,
+) -> Option<String> {
     // TTY input is optional and must never wait for a user keystroke.
     if unsafe { libc::isatty(fd) } == 1 {
         return None;
     }
-    let deadline = std::time::Instant::now() + Duration::from_millis(200);
     let mut bytes = Vec::new();
     const MAX: usize = 64 * 1024;
     loop {
@@ -85,12 +96,7 @@ fn hook_session_fd(fd: std::os::fd::RawFd) -> Option<String> {
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: one valid pollfd; stdin remains open for this function.
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        if unsafe { libc::poll(&mut poll, 1, left.as_millis().min(200) as i32) } <= 0 {
+        if !poll_input(&mut poll) {
             break;
         }
         if poll.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
@@ -117,6 +123,7 @@ pub(crate) fn hook_session() -> Option<String> {
     None
 }
 
+#[cfg(unix)]
 fn session_from_hook(bytes: &[u8]) -> Option<String> {
     serde_json::from_slice::<serde_json::Value>(bytes)
         .ok()?
@@ -263,16 +270,29 @@ mod tests {
     fn mail_wait_hook_waits_for_delayed_fragmented_pipe_input() {
         use std::{io::Write, os::fd::AsRawFd, os::unix::net::UnixStream};
         let (input, mut output) = UnixStream::pair().unwrap();
+        let (next_fragment, requested) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(40));
+            requested.recv().unwrap();
             output.write_all(br#"{"session_id":"delayed"#).unwrap();
-            std::thread::sleep(Duration::from_millis(40));
+            requested.recv().unwrap();
             output.write_all(br#"-session"}"#).unwrap();
         });
+        let mut waits = 0;
         assert_eq!(
-            hook_session_fd(input.as_raw_fd()).as_deref(),
+            hook_session_fd_with_poll(input.as_raw_fd(), |poll| {
+                // Each fragment is sent only after the reader needs more input.
+                // Exercise the real poll/read loop without racing its 200 ms budget
+                // against the writer's scheduling; the idle-budget test is separate.
+                assert_eq!(unsafe { libc::poll(poll, 1, 0) }, 0);
+                waits += 1;
+                next_fragment.send(()).unwrap();
+                // SAFETY: one valid pollfd, with input kept open throughout the read.
+                unsafe { libc::poll(poll, 1, -1) > 0 }
+            })
+            .as_deref(),
             Some("delayed-session")
         );
+        assert_eq!(waits, 2, "both fragments must require a separate read");
         worker.join().unwrap();
     }
 }
