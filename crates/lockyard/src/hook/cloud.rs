@@ -121,21 +121,30 @@ impl Port for AgentPort {
     }
 
     fn unread(&mut self, agent: &str) -> Result<Option<i64>> {
+        let path = self
+            .reminder_dir()
+            .map(|dir| super::mail::attention_path(&dir, &self.root, agent));
+        let now = crate::now_ms();
+        if let Some(path) = &path {
+            super::mail::reconcile_attention_acks(path, now, None);
+        }
         let reply = self
             .socket
             .ask(&Request::Unread {
-                attention_ack: self
-                    .reminder_dir()
-                    .map(|dir| {
-                        super::mail::pending_attention_acks(&super::mail::attention_path(
-                            &dir, &self.root, agent,
-                        ))
-                    })
+                attention_ack: path
+                    .as_deref()
+                    .map(super::mail::pending_attention_acks)
                     .unwrap_or_default(),
                 attention: true,
                 session: agent.to_string(),
             })
             .map_err(failed)?;
+        if let Some(error) = reply.error {
+            return Err(error.into());
+        }
+        if let Some(path) = path {
+            super::mail::reconcile_attention_acks(&path, now, reply.lost.as_deref());
+        }
         self.attention = reply.lost.unwrap_or_default();
         self.claims = reply.claims.unwrap_or_default();
         Ok(reply.unread)

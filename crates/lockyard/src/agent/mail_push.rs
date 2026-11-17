@@ -220,7 +220,7 @@ impl<T: Transport + 'static> Shared<T> {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn take_zone_alerts(&self, session: &str) -> Vec<lockyard_core::proto::LostClaim> {
         let alerts = self.zone_alerts(session);
         self.ack_zone_alerts(session, &alerts);
@@ -487,23 +487,24 @@ impl<T: Transport + 'static> Shared<T> {
             .filter(|c| c.session == session)
             .map(|c| c.id)
             .collect();
-        let missing: HashSet<_> = {
+        let (missing, acquired): (HashSet<_>, Vec<_>) = {
             let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
-            push.seen_claims
-                .entry(session.into())
-                .or_default()
-                .extend(current.iter().copied());
+            let seen = push.seen_claims.entry(session.into()).or_default();
+            let acquired: Vec<_> = claims
+                .iter()
+                .filter(|claim| claim.session == session && seen.insert(claim.id))
+                .map(|claim| (claim.id, claim.paths.clone()))
+                .collect();
             let previous = push.status_claims.entry(session.into()).or_default();
             let missing = previous.difference(&current).copied().collect();
             previous.extend(current.iter().copied());
-            missing
+            (missing, acquired)
         };
-        // A snapshot has no mutation reason and is also the restart baseline. Only
-        // a previously unseen claimed/granted event can acknowledge reacquisition.
-        if missing.is_empty() || budget.is_zero() {
-            return;
-        }
-        if let Ok(lost) = backend.lost_within(session, budget) {
+        // Repeated snapshots of the same id cannot acknowledge a later loss.
+        if !missing.is_empty()
+            && !budget.is_zero()
+            && let Ok(lost) = backend.lost_within(session, budget)
+        {
             let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
             push.status_claims
                 .entry(session.into())
@@ -535,6 +536,11 @@ impl<T: Transport + 'static> Shared<T> {
                     alerts.remove(&id);
                 }
             }
+        }
+        // Share acquisition history with SSE and clear after fallback seeding so
+        // an old /lost record cannot resurrect an alert in this same snapshot.
+        for (id, paths) in acquired {
+            self.clear_reclaimed_alerts(session, id, &paths);
         }
     }
 
@@ -1711,12 +1717,12 @@ impl<T: Transport + 'static> Shared<T> {
     }
 
     fn coordination_loop_with_interval(&self, interval: Duration) {
-        let mut next_discovery = Instant::now();
+        let mut next_discovery = self.push_now();
         let mut fallback_until = None;
         let mut first_discovery = true;
         let mut pause = self.timing().retry_min;
         while !self.stopped() {
-            if Instant::now() >= next_discovery {
+            if self.push_now() >= next_discovery {
                 let discovery = if first_discovery {
                     self.transport.mail_push_v1(&self.session)
                 } else {
@@ -1728,16 +1734,16 @@ impl<T: Transport + 'static> Shared<T> {
                         self.mail_protocol
                             .store(i64::from(supported), Ordering::Release);
                         self.mail_ready.notify_all();
-                        next_discovery = Instant::now() + interval;
+                        next_discovery = self.push_now() + interval;
                     }
                     Err(error) => {
                         eprintln!("lockyard agent: mail protocol discovery: {error}");
-                        next_discovery = Instant::now() + self.timing().retry_min;
+                        next_discovery = self.push_now() + self.timing().retry_min;
                     }
                 }
             }
             if self.mail_protocol.load(Ordering::Acquire) == 1
-                && fallback_until.is_none_or(|until| Instant::now() >= until)
+                && fallback_until.is_none_or(|until| self.push_now() >= until)
                 && self.replacement_allows_stream(&self.active_push_sessions())
             {
                 self.push_fallback.store(false, Ordering::Release);
@@ -1751,8 +1757,8 @@ impl<T: Transport + 'static> Shared<T> {
                 if matches!(exit, PushExit::Unavailable) {
                     // Incompatibility/failures renegotiate immediately, then retain JSON
                     // for the discovery interval even if push remains advertised.
-                    fallback_until = Some(Instant::now() + interval);
-                    next_discovery = Instant::now();
+                    fallback_until = Some(self.push_now() + interval);
+                    next_discovery = self.push_now();
                 } else {
                     // Replacement has its own retry policy, independent of discovery.
                     fallback_until = None;
@@ -1774,7 +1780,7 @@ impl<T: Transport + 'static> Shared<T> {
                     .min(if replacement_pending { 1 } else { u64::MAX })
                     .min(
                         next_discovery
-                            .saturating_duration_since(Instant::now())
+                            .saturating_duration_since(self.push_now())
                             .as_secs(),
                     ),
                 session: Some(self.session.clone()),
@@ -1823,6 +1829,8 @@ mod tests {
     };
     use std::sync::mpsc;
 
+    const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+
     struct Rig {
         daemon: Daemon<Client>,
         server: FakeServer,
@@ -1830,7 +1838,7 @@ mod tests {
     }
     #[track_caller]
     fn eventually(mut test: impl FnMut() -> bool) {
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + EVENT_TIMEOUT;
         while !test() {
             assert!(Instant::now() < until, "condition timed out");
             thread::sleep(Duration::from_millis(5));
@@ -1936,7 +1944,7 @@ mod tests {
             &rig.daemon.shared.config.socket,
             &rig.server.url(),
             "test",
-            Duration::from_secs(1),
+            EVENT_TIMEOUT,
         )
         .unwrap()
     }
@@ -1998,7 +2006,7 @@ mod tests {
     fn mail_push_wait_urgent_reply_ack_info_and_cache_without_polling() {
         for (urgent, needs) in [(true, "none"), (false, "reply"), (false, "ack")] {
             let rig = rig(true, None);
-            let (received, worker) = waiting(&rig, "alice", Duration::from_secs(3));
+            let (received, worker) = waiting(&rig, "alice", EVENT_TIMEOUT);
             seeded(&rig, "alice");
             let reads = rig
                 .server
@@ -2017,7 +2025,7 @@ mod tests {
                 "another recipient must not wake"
             );
             publish(&rig, 3, mail(3, "alice", urgent, needs));
-            let reply = received.recv_timeout(Duration::from_secs(2)).unwrap();
+            let reply = received.recv_timeout(EVENT_TIMEOUT).unwrap();
             worker.join().unwrap();
             assert_eq!(reply.messages.unwrap()[0].id, 3);
             assert_eq!(rig.daemon.shared.unread("alice").unread, Some(2));
@@ -2073,7 +2081,7 @@ mod tests {
         publish(&rig, 43, mail(43, "alice", true, "reply"));
         assert_eq!(
             socket(&rig)
-                .wait_mail("alice", 0, Duration::from_secs(1))
+                .wait_mail("alice", 0, EVENT_TIMEOUT)
                 .unwrap()
                 .messages
                 .unwrap()[0]
@@ -2083,7 +2091,7 @@ mod tests {
         publish(&rig, 44, mail(41, "alice", true, "reply"));
         assert_eq!(
             socket(&rig)
-                .wait_mail("alice", 0, Duration::from_secs(1))
+                .wait_mail("alice", 0, EVENT_TIMEOUT)
                 .unwrap()
                 .messages
                 .unwrap()[0]
@@ -2108,7 +2116,7 @@ mod tests {
     #[test]
     fn mail_push_wait_timeout_and_replacement_are_silent() {
         let rig = rig(true, None);
-        let (old, first) = waiting(&rig, "alice", Duration::from_secs(3));
+        let (old, first) = waiting(&rig, "alice", EVENT_TIMEOUT);
         seeded(&rig, "alice");
         eventually(|| {
             rig.daemon
@@ -2122,13 +2130,9 @@ mod tests {
         let token = rig.daemon.shared.push.lock().unwrap().waiters["alice"];
         let (new, second) = waiting(&rig, "alice", Duration::from_millis(500));
         eventually(|| rig.daemon.shared.push.lock().unwrap().next_waiter > token);
-        assert!(
-            crate::mail_wait::outcome(old.recv_timeout(Duration::from_secs(1)).unwrap()).is_none()
-        );
+        assert!(crate::mail_wait::outcome(old.recv_timeout(EVENT_TIMEOUT).unwrap()).is_none());
         first.join().unwrap();
-        assert!(
-            crate::mail_wait::outcome(new.recv_timeout(Duration::from_secs(2)).unwrap()).is_none()
-        );
+        assert!(crate::mail_wait::outcome(new.recv_timeout(EVENT_TIMEOUT).unwrap()).is_none());
         second.join().unwrap();
         eventually(|| {
             !rig.daemon
@@ -2144,10 +2148,10 @@ mod tests {
     #[test]
     fn mail_push_sse_reconnect_last_event_id_and_no_session_polls() {
         let rig = rig(true, None);
-        let (received, worker) = waiting(&rig, "alice", Duration::from_secs(2));
+        let (received, worker) = waiting(&rig, "alice", EVENT_TIMEOUT);
         seeded(&rig, "alice");
         publish(&rig, 7, mail(70, "alice", true, "none"));
-        received.recv_timeout(Duration::from_secs(1)).unwrap();
+        received.recv_timeout(EVENT_TIMEOUT).unwrap();
         worker.join().unwrap();
         rig.daemon.shared.hear("charlie");
         eventually(|| {
@@ -2252,7 +2256,7 @@ mod tests {
     #[test]
     fn mail_push_envelope_recipient_groups_and_sender_copy() {
         let rig = rig(true, None);
-        let (received, worker) = waiting(&rig, "alice", Duration::from_secs(3));
+        let (received, worker) = waiting(&rig, "alice", EVENT_TIMEOUT);
         seeded(&rig, "alice");
         let mut group = mail(1, "*", true, "reply");
         group["address"] = "@zone:client".into();
@@ -2266,7 +2270,7 @@ mod tests {
         group["id"] = json!(i64::from(i32::MAX) + 10);
         group["thread_id"] = json!(i64::from(i32::MAX) + 10);
         publish_to(&rig, 3, "alice", group);
-        let reply = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        let reply = received.recv_timeout(EVENT_TIMEOUT).unwrap();
         assert_eq!(reply.messages.unwrap()[0].id, i64::from(i32::MAX) + 10);
         worker.join().unwrap();
     }
@@ -2317,13 +2321,14 @@ mod tests {
     #[test]
     fn mail_push_seed_race_preserves_arrival_and_read_tombstone() {
         let rig = rig(true, None);
+        let (release, gated) = mpsc::channel();
         rig.server.enqueue(
             "/api/v1/bus/inbox",
             HttpReply::json(
                 200,
                 json!({"messages":[mail(9,"alice",true,"reply")],"skipped":0}),
             )
-            .delay(Duration::from_millis(150)),
+            .gated(gated),
         );
         let (received, worker) = waiting(&rig, "alice", Duration::from_millis(500));
         eventually(|| {
@@ -2348,10 +2353,9 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(
-            crate::mail_wait::outcome(received.recv_timeout(Duration::from_secs(2)).unwrap())
-                .is_none()
-        );
+        release.send(()).unwrap();
+        seeded(&rig, "alice");
+        assert!(crate::mail_wait::outcome(received.recv_timeout(EVENT_TIMEOUT).unwrap()).is_none());
         worker.join().unwrap();
         assert_eq!(rig.daemon.shared.unread("alice").unread, Some(0));
     }
@@ -2362,6 +2366,39 @@ mod tests {
             event["payload"]["by"] = json!(actor);
         }
         serde_json::from_value(event).unwrap()
+    }
+
+    #[test]
+    fn round6_status_reacquisition_clears_loss_before_or_without_sse() {
+        for with_sse in [false, true] {
+            let mut rig = rig(true, None);
+            rig.daemon.stop_workers();
+            let shared = &rig.daemon.shared;
+            shared.hear("alice");
+            let backend = lockyard_cloud_client::CloudBackend::new(
+                Client::new(&rig.server.url(), "test-token".into()).unwrap(),
+                "alice",
+            );
+            let claim = |id| {
+                serde_json::from_value::<Claim>(
+                    json!({"id":id,"session":"alice","paths":["src"],"fence":1}),
+                )
+                .unwrap()
+            };
+            shared.observe_status_claims("alice", &[claim(42)], &backend, Duration::ZERO);
+            shared.push_event(round4_zone(1, "zone.released", 42, 2, Some("bob")));
+            shared.observe_status_claims("alice", &[claim(43)], &backend, Duration::ZERO);
+            assert!(shared.push.lock().unwrap().zone_alerts["alice"].is_empty());
+            if with_sse {
+                let mut event = round4_zone(2, "zone.claimed", 43, 3, None);
+                event.payload["reason"] = json!("claimed");
+                shared.push_event(event);
+                assert!(shared.take_zone_alerts("alice").is_empty());
+            }
+            shared.push_event(round4_zone(3, "zone.released", 43, 4, Some("bob")));
+            shared.observe_status_claims("alice", &[claim(43)], &backend, Duration::ZERO);
+            assert_eq!(shared.push.lock().unwrap().zone_alerts["alice"].len(), 1);
+        }
     }
 
     #[test]
@@ -2387,7 +2424,7 @@ mod tests {
             );
         }
         let claim: Claim =
-            serde_json::from_value(json!({"id":43,"session":"alice","paths":["src"],"fence":1}))
+            serde_json::from_value(json!({"id":42,"session":"alice","paths":["src"],"fence":1}))
                 .unwrap();
         let backend = lockyard_cloud_client::CloudBackend::new(
             Client::new(&rig.server.url(), "test-token".into()).unwrap(),
@@ -2400,7 +2437,7 @@ mod tests {
             "restart baseline"
         );
         // A repeated grant for a known id also cannot hide a later loss.
-        let mut seen = round4_zone(6, "zone.granted", 43, 7, None);
+        let mut seen = round4_zone(6, "zone.granted", 42, 7, None);
         seen.payload["reason"] = json!("granted");
         shared.push_event(seen);
         assert_eq!(shared.push.lock().unwrap().zone_alerts["alice"].len(), 1);
@@ -2470,7 +2507,7 @@ mod tests {
                 json!({"lost":[{"claim_id":42,"paths":["src"],"reason":"expired"}]}),
             ),
         );
-        shared.observe_status_claims("alice", &[], &backend, Duration::from_secs(1));
+        shared.observe_status_claims("alice", &[], &backend, EVENT_TIMEOUT);
         let printed = rig
             .daemon
             .handle(Request::Unread {
@@ -2833,7 +2870,7 @@ mod tests {
         rig.daemon.shared.push_ready.store(false, Ordering::Release);
         rig.daemon.shared.push.lock().unwrap().clock_now = Some(start + Duration::from_secs(61));
         rig.daemon.shared.mail_ready.notify_all();
-        let answer = received.recv_timeout(Duration::from_secs(1));
+        let answer = received.recv_timeout(EVENT_TIMEOUT);
         rig.daemon.shared.push.lock().unwrap().clock_now = Some(start + Duration::from_secs(601));
         rig.daemon.shared.mail_ready.notify_all();
         worker.join().unwrap();
@@ -2882,12 +2919,9 @@ mod tests {
         let claim: Claim =
             serde_json::from_value(json!({"id":42,"session":"alice","paths":["src"],"fence":1}))
                 .unwrap();
-        rig.daemon.shared.observe_status_claims(
-            "alice",
-            &[claim],
-            &backend,
-            Duration::from_secs(1),
-        );
+        rig.daemon
+            .shared
+            .observe_status_claims("alice", &[claim], &backend, EVENT_TIMEOUT);
         for (seq, kind, reason) in [
             (10, "zone.released", "narrowed"),
             (12, "zone.lost", "holder offline"),
@@ -2898,7 +2932,7 @@ mod tests {
         rig.server.enqueue("/api/v1/zones/lost",HttpReply::json(200,json!({"claims":[{"claim_id":42,"session":"alice","paths":["src"],"reason":"holder offline"}]})));
         rig.daemon
             .shared
-            .observe_status_claims("alice", &[], &backend, Duration::from_secs(1));
+            .observe_status_claims("alice", &[], &backend, EVENT_TIMEOUT);
         assert_eq!(
             rig.daemon.shared.take_zone_alerts("alice")[0]
                 .reason
@@ -2913,7 +2947,7 @@ mod tests {
             .count();
         rig.daemon
             .shared
-            .observe_status_claims("alice", &[], &backend, Duration::from_secs(1));
+            .observe_status_claims("alice", &[], &backend, EVENT_TIMEOUT);
         assert_eq!(
             rig.server
                 .requests()
@@ -2956,7 +2990,7 @@ mod tests {
     #[test]
     fn mail_push_metadata_only_event_hydrates_reminder_without_marking_read() {
         let rig = rig(true, None);
-        let (received, worker) = waiting(&rig, "alice", Duration::from_secs(2));
+        let (received, worker) = waiting(&rig, "alice", EVENT_TIMEOUT);
         seeded(&rig, "alice");
         rig.server.enqueue(
             "/api/v1/bus/threads/42",
@@ -2965,7 +2999,7 @@ mod tests {
         let mut metadata = mail(42, "alice", true, "reply");
         metadata.as_object_mut().unwrap().remove("body");
         publish(&rig, 1, metadata);
-        let reply = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        let reply = received.recv_timeout(EVENT_TIMEOUT).unwrap();
         worker.join().unwrap();
         assert_eq!(reply.messages.unwrap()[0].body, "hello");
         assert!(
@@ -2978,10 +3012,10 @@ mod tests {
     #[test]
     fn mail_push_status_uses_event_mail_cache_within_existing_budget() {
         let rig = rig(true, None);
-        let (received, worker) = waiting(&rig, "alice", Duration::from_secs(2));
+        let (received, worker) = waiting(&rig, "alice", EVENT_TIMEOUT);
         seeded(&rig, "alice");
         publish(&rig, 1, mail(42, "alice", true, "reply"));
-        received.recv_timeout(Duration::from_secs(1)).unwrap();
+        received.recv_timeout(EVENT_TIMEOUT).unwrap();
         worker.join().unwrap();
         let reads = rig
             .server
@@ -3013,6 +3047,7 @@ mod tests {
     }
     #[test]
     fn mail_push_replay_before_ready_old_cursor_never_wakes_seen_mail() {
+        let (release, gated) = mpsc::channel();
         let rig = rig_with(true, None, |server, config| {
             let state = config.state_root.join(state_folder(config));
             fs::create_dir_all(&state).unwrap();
@@ -3021,7 +3056,7 @@ mod tests {
             let seen = json!({"seq":6,"type":"bus.seen","session":"alice","payload":{"seen":[42]}});
             server.enqueue("/api/v1/events", HttpReply::sse(&format!(
                 "id: 5\nevent: bus.message\ndata: {message}\n\nid: 6\nevent: bus.seen\ndata: {seen}\n\nid: 6\nevent: ready\ndata: {{\"head\":6}}\n\n"))
-                .delay(Duration::from_millis(150)));
+                .gated(gated));
         });
         let (received, worker) = waiting(&rig, "alice", Duration::from_millis(400));
         eventually(|| {
@@ -3052,9 +3087,12 @@ mod tests {
             rig.server.requests().len() > count,
             "session polling remains active before ready"
         );
+        release.send(()).unwrap();
+        eventually(|| inbox_count(&rig.server, "alice") > 0);
+        eventually(|| rig.daemon.shared.coordination_seq.load(Ordering::Relaxed) == 6);
         assert!(
             received
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(EVENT_TIMEOUT)
                 .unwrap()
                 .messages
                 .is_none()
@@ -3087,13 +3125,13 @@ mod tests {
             .shared
             .push_enabled
             .store(false, Ordering::Release);
-        let (received, worker) = waiting(&rig, "alice", Duration::from_secs(2));
+        let (received, worker) = waiting(&rig, "alice", EVENT_TIMEOUT);
         seeded(&rig, "alice");
         assert!(received.try_recv().is_err());
         publish(&rig, 1, mail(100, "alice", true, "reply"));
         assert_eq!(
             received
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(EVENT_TIMEOUT)
                 .unwrap()
                 .messages
                 .unwrap()[0]
@@ -3114,7 +3152,7 @@ mod tests {
     #[test]
     fn mail_push_malformed_frames_advance_cursor_without_reconnect() {
         let rig = rig(true, None);
-        let (received, worker) = waiting(&rig, "alice", Duration::from_secs(3));
+        let (received, worker) = waiting(&rig, "alice", EVENT_TIMEOUT);
         seeded(&rig, "alice");
         let connections = rig
             .server
@@ -3145,7 +3183,7 @@ mod tests {
         );
         assert!(
             received
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(EVENT_TIMEOUT)
                 .unwrap()
                 .messages
                 .is_some()
@@ -3428,10 +3466,10 @@ mod tests {
     #[test]
     fn mail_push_reply_to_closes_parent_including_sender_copy() {
         let rig = rig(true, None);
-        let (received, worker) = waiting(&rig, "alice", Duration::from_secs(2));
+        let (received, worker) = waiting(&rig, "alice", EVENT_TIMEOUT);
         seeded(&rig, "alice");
         publish(&rig, 1, mail(42, "alice", true, "reply"));
-        received.recv_timeout(Duration::from_secs(1)).unwrap();
+        received.recv_timeout(EVENT_TIMEOUT).unwrap();
         worker.join().unwrap();
         let mut reply = mail(43, "bob", false, "none");
         reply["reply_to"] = 42.into();
@@ -3567,12 +3605,12 @@ mod tests {
         );
         drop(failing);
         let mut rig = rig(true, None);
-        let (received, worker) = waiting(&rig, "alice", Duration::from_secs(3));
+        let (received, worker) = waiting(&rig, "alice", EVENT_TIMEOUT);
         seeded(&rig, "alice");
         let started = Instant::now();
         rig.daemon.shutdown();
         assert!(started.elapsed() < Duration::from_secs(1));
-        received.recv_timeout(Duration::from_secs(1)).unwrap();
+        received.recv_timeout(EVENT_TIMEOUT).unwrap();
         worker.join().unwrap();
     }
 
@@ -3657,15 +3695,44 @@ mod tests {
         rig.daemon.shared.hear("alice");
         rig.server
             .enqueue("/api/v1/events#sse", HttpReply::text(406, "no SSE"));
+        let start = Instant::now();
+        let interval = Duration::from_secs(600);
+        rig.daemon.shared.push.lock().unwrap().clock_now = Some(start);
         let before = rig.server.discovery_requests().len();
+        let polls = || {
+            rig.server
+                .requests()
+                .iter()
+                .filter(|r| {
+                    r.path.starts_with("/api/v1/events")
+                        && r.header("accept") != Some("text/event-stream")
+                })
+                .count()
+        };
+        let initial_polls = polls();
         let shared = rig.daemon.shared.clone();
-        let worker = thread::spawn(move || {
-            shared.coordination_loop_with_interval(Duration::from_millis(200))
+        let worker = thread::spawn(move || shared.coordination_loop_with_interval(interval));
+        // The JSON request proves the immediate post-failure discovery completed and
+        // scheduled its next deadline before we move the clock.
+        eventually(|| {
+            rig.server.discovery_requests().len() == before + 1 && polls() > initial_polls
         });
-        eventually(|| rig.server.discovery_requests().len() > before);
         assert!(!rig.daemon.shared.push_enabled.load(Ordering::Acquire));
+        rig.daemon.shared.push.lock().unwrap().clock_now =
+            Some(start + interval - Duration::from_secs(1));
+        let before_boundary = polls();
+        rig.daemon.shared.nudge();
+        eventually(|| polls() > before_boundary);
+        assert_eq!(
+            rig.server.discovery_requests().len(),
+            before + 1,
+            "no early interval retry"
+        );
+        assert_eq!(stream_count(&rig.server), 1);
+        rig.daemon.shared.push.lock().unwrap().clock_now = Some(start + interval);
+        rig.daemon.shared.nudge();
+        eventually(|| rig.server.discovery_requests().len() == before + 2);
         eventually(|| rig.daemon.shared.push_ready.load(Ordering::Acquire));
-        assert!(rig.server.discovery_requests().len() >= before + 2);
         assert_eq!(
             rig.server
                 .requests()
@@ -3694,9 +3761,9 @@ mod tests {
     #[test]
     fn mail_push_fake_fanout_uses_envelopes_and_does_not_wake_sender() {
         let rig = rig(true, None);
-        let (alice, a) = waiting(&rig, "alice", Duration::from_secs(2));
+        let (alice, a) = waiting(&rig, "alice", EVENT_TIMEOUT);
         seeded(&rig, "alice");
-        let (charlie, c) = waiting(&rig, "charlie", Duration::from_secs(2));
+        let (charlie, c) = waiting(&rig, "charlie", EVENT_TIMEOUT);
         seeded(&rig, "charlie");
         let (bob, b) = waiting(&rig, "bob", Duration::from_millis(400));
         seeded(&rig, "bob");
@@ -3707,29 +3774,19 @@ mod tests {
             HttpReply::mail(1, &["alice", "charlie"], message),
         );
         assert_eq!(
-            alice
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap()
-                .messages
-                .unwrap()[0]
-                .to,
+            alice.recv_timeout(EVENT_TIMEOUT).unwrap().messages.unwrap()[0].to,
             "alice"
         );
         assert_eq!(
             charlie
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(EVENT_TIMEOUT)
                 .unwrap()
                 .messages
                 .unwrap()[0]
                 .to,
             "charlie"
         );
-        assert!(
-            bob.recv_timeout(Duration::from_secs(1))
-                .unwrap()
-                .messages
-                .is_none()
-        );
+        assert!(bob.recv_timeout(EVENT_TIMEOUT).unwrap().messages.is_none());
         a.join().unwrap();
         c.join().unwrap();
         b.join().unwrap();
@@ -3740,13 +3797,14 @@ mod tests {
         struct Pending {
             client: Client,
             gate: Arc<(Mutex<bool>, Condvar)>,
+            entered: mpsc::Sender<()>,
         }
         impl Pending {
             fn ready(&self) {
                 let (lock, wake) = &*self.gate;
                 let guard = lock.lock().unwrap();
                 let (_guard, timeout) = wake
-                    .wait_timeout_while(guard, Duration::from_secs(1), |ready| !*ready)
+                    .wait_timeout_while(guard, EVENT_TIMEOUT, |ready| !*ready)
                     .unwrap();
                 assert!(!timeout.timed_out());
             }
@@ -3759,6 +3817,7 @@ mod tests {
             fn call(&self, call: &Call) -> Result<Value, ClientError> {
                 if call.path == "/api/v1/protocol" {
                     assert_eq!(call.deadline_ms, Some(2000));
+                    self.entered.send(()).unwrap();
                     self.ready();
                     Ok(json!({"selected_protocol":2,"capabilities":["mail_push_v1"]}))
                 } else {
@@ -3769,6 +3828,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server = FakeServer::start_routed(Vec::new());
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (entered, pending) = mpsc::channel();
         let config = AgentConfig {
             url: server.url(),
             workspace: "test".into(),
@@ -3782,19 +3842,15 @@ mod tests {
             Pending {
                 client: Client::new(&server.url(), "test-token".into()).unwrap(),
                 gate: gate.clone(),
+                entered,
             },
         )
         .unwrap();
-        let socket = AgentSocket::connect(
-            &config.socket,
-            &server.url(),
-            "test",
-            Duration::from_secs(1),
-        )
-        .unwrap();
+        let socket =
+            AgentSocket::connect(&config.socket, &server.url(), "test", EVENT_TIMEOUT).unwrap();
         assert!(!daemon.shared.push_enabled.load(Ordering::Acquire));
         let release = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
+            pending.recv_timeout(EVENT_TIMEOUT).unwrap();
             *gate.0.lock().unwrap() = true;
             gate.1.notify_all();
         });
@@ -3829,7 +3885,7 @@ mod tests {
         let (received, worker) = waiting(&rig, "alic-typo", Duration::from_millis(350));
         assert!(
             received
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(EVENT_TIMEOUT)
                 .unwrap()
                 .messages
                 .is_none()
@@ -3911,7 +3967,15 @@ mod tests {
         let rig = rig(true, None);
         let (received, worker) = waiting(&rig, "alice", Duration::from_millis(5500));
         seeded(&rig, "alice");
-        thread::sleep(Duration::from_millis(100));
+        eventually(|| {
+            rig.daemon
+                .shared
+                .push
+                .lock()
+                .unwrap()
+                .waiters
+                .contains_key("alice")
+        });
         let reads = inbox_count(&rig.server, "alice");
         let cycles = rig.daemon.shared.upkeep_cycles.load(Ordering::Relaxed);
         thread::sleep(Duration::from_secs(5));
@@ -3923,7 +3987,7 @@ mod tests {
         );
         assert!(
             received
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(EVENT_TIMEOUT)
                 .unwrap()
                 .messages
                 .is_none()
@@ -3949,14 +4013,26 @@ mod tests {
             server.enqueue("/api/v1/events#sse", HttpReply::text(406, "old"));
         });
         rig.daemon.shared.hear("bob");
-        let (received, worker) = waiting(&rig, "alice", Duration::from_millis(5500));
+        let (received, worker) = waiting(&rig, "alice", EVENT_TIMEOUT);
         seeded(&rig, "alice");
         seeded(&rig, "bob");
-        thread::sleep(Duration::from_millis(100));
+        eventually(|| {
+            rig.daemon
+                .shared
+                .push
+                .lock()
+                .unwrap()
+                .waiters
+                .contains_key("alice")
+        });
         let bob_reads = inbox_count(&rig.server, "bob");
         let alice_reads = inbox_count(&rig.server, "alice");
         let cycles = rig.daemon.shared.upkeep_cycles.load(Ordering::Relaxed);
-        thread::sleep(Duration::from_secs(5));
+        let observation = Instant::now();
+        eventually(|| {
+            observation.elapsed() >= Duration::from_secs(5)
+                && inbox_count(&rig.server, "alice") >= alice_reads + 6
+        });
         assert_eq!(inbox_count(&rig.server, "bob"), bob_reads);
         let reads = inbox_count(&rig.server, "alice") - alice_reads;
         assert!(
@@ -3968,14 +4044,21 @@ mod tests {
             rounds <= 7,
             "fallback waiter caused {rounds} maintenance cycles"
         );
-        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        rig.daemon.shared.stop();
+        assert!(
+            received
+                .recv_timeout(EVENT_TIMEOUT)
+                .unwrap()
+                .messages
+                .is_none()
+        );
         worker.join().unwrap();
     }
 
     #[test]
     fn mail_push_self_mail_recipient_wakes_sender_copy_does_not() {
         let rig = rig(true, None);
-        let (received, worker) = waiting(&rig, "alice", Duration::from_secs(3));
+        let (received, worker) = waiting(&rig, "alice", EVENT_TIMEOUT);
         seeded(&rig, "alice");
         let mut message = mail(77, "alice", true, "reply");
         message["from"] = "alice".into();
@@ -3988,7 +4071,7 @@ mod tests {
             .enqueue("/api/v1/events", HttpReply::mail(2, &["alice"], message));
         assert_eq!(
             received
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(EVENT_TIMEOUT)
                 .unwrap()
                 .messages
                 .unwrap()[0]
@@ -4021,7 +4104,7 @@ mod tests {
         }
         assert!(
             received
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(EVENT_TIMEOUT)
                 .unwrap()
                 .messages
                 .is_none()
@@ -4174,14 +4257,14 @@ mod tests {
     #[test]
     fn mail_push_plain_none_does_not_wake_but_reply_to_my_ask_does() {
         let rig = rig(true, None);
-        let (received, worker) = waiting(&rig, "alice", Duration::from_secs(3));
+        let (received, worker) = waiting(&rig, "alice", EVENT_TIMEOUT);
         seeded(&rig, "alice");
         publish(&rig, 1, mail(29, "alice", false, "none"));
         assert!(received.recv_timeout(Duration::from_millis(150)).is_err());
         let mut reply = mail(30, "alice", false, "none");
         reply["reply_to"] = json!(12);
         publish(&rig, 2, reply);
-        let answer = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        let answer = received.recv_timeout(EVENT_TIMEOUT).unwrap();
         worker.join().unwrap();
         assert_eq!(answer.messages.unwrap()[0].id, 30);
         assert!(
@@ -4326,14 +4409,17 @@ mod tests {
             track.push_bound = true;
             track.heard = Some(Instant::now());
         }
-        let (received, worker) = waiting(&rig, "session-32", Duration::from_millis(1500));
+        let (received, worker) = waiting(&rig, "session-32", EVENT_TIMEOUT);
         rig.daemon.shared.nudge();
         seeded(&rig, "session-32");
         assert_eq!(rig.daemon.shared.active_push_sessions().len(), 32);
         assert!(!rig.daemon.shared.push_fallback.load(Ordering::Acquire));
         assert!(rig.daemon.shared.poll_push_session("session-32"));
         assert!(!rig.daemon.shared.poll_push_session("session-00"));
-        received.recv_timeout(Duration::from_secs(3)).unwrap();
+        eventually(|| inbox_count(&rig.server, "session-32") >= 4);
+        eventually(|| inbox_count(&rig.server, "session-00") == 2);
+        rig.daemon.shared.stop();
+        received.recv_timeout(EVENT_TIMEOUT).unwrap();
         worker.join().unwrap();
         assert!(inbox_count(&rig.server, "session-32") >= 4);
         assert_eq!(inbox_count(&rig.server, "session-00"), 2);
@@ -4353,7 +4439,7 @@ mod tests {
         assert_eq!(rig.daemon.shared.push.lock().unwrap().woken["alice"].id, 0);
         assert!(
             socket(&rig)
-                .wait_mail("alice", 0, Duration::from_secs(1))
+                .wait_mail("alice", 0, EVENT_TIMEOUT)
                 .unwrap()
                 .messages
                 .is_some()

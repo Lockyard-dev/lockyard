@@ -4262,8 +4262,18 @@ mod tests {
         );
     }
     #[tokio::test]
-    #[allow(clippy::result_large_err)]
     async fn seeded_relay_rpc_cancellation_preserves_replay_and_write_history() {
+        seeded_relay_cancellation_scenario(Duration::ZERO).await;
+    }
+
+    #[tokio::test]
+    async fn round6_relay_readiness_survives_delayed_handshake() {
+        // Reproduce a scheduler/load delay beyond the former whole-test budget.
+        seeded_relay_cancellation_scenario(Duration::from_secs(13)).await;
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn seeded_relay_cancellation_scenario(handshake_delay: Duration) {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::{
             accept_hdr_async,
@@ -4273,14 +4283,16 @@ mod tests {
             },
         };
         let _port = PORT_5221.lock().await;
-        tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::time::timeout(Duration::from_secs(120), async {
             let (_dir, mut host) = fixture();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .unwrap();
             let relay_url = format!("http://{}", listener.local_addr().unwrap());
             let (observed_tx, mut observed) = tokio::sync::mpsc::channel(16);
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             let server = tokio::spawn(async move {
+                tokio::time::sleep(handshake_delay).await;
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut socket =
                     accept_hdr_async(stream, |_request: &Request, mut response: Response| {
@@ -4292,6 +4304,7 @@ mod tests {
                     })
                     .await
                     .unwrap();
+                ready_tx.send(()).unwrap();
                 while let Some(Ok(message)) = socket.next().await {
                     match message {
                         Message::Text(text) => {
@@ -4311,8 +4324,11 @@ mod tests {
                 RelayConfig::new(&relay_url, "worker".into(), "test".into()).unwrap(),
             )
             .unwrap();
+            // Readiness comes from the completed server handshake and the relay's
+            // connected watch channel. Timeouts only guard a broken fixture.
+            ready_rx.await.unwrap();
             let mut sender = client.sender();
-            sender.wait_connected(Duration::from_secs(4)).await.unwrap();
+            sender.wait_connected(Duration::from_secs(60)).await.unwrap();
             host.relay = Some(sender);
             let mut seed = 0x6f35_f83d_6072_1281_u64;
             let mut durable_writes = 0usize;

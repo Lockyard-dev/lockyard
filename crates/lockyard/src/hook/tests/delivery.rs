@@ -894,3 +894,49 @@ fn round5_attention_ack_is_saved_only_after_successful_output_flush() {
     assert!(String::from_utf8(out).unwrap().contains("сужена"));
     assert_eq!(mail::pending_attention_acks(&path), port.lost);
 }
+
+#[test]
+fn round6_attention_ack_file_is_pruned_without_output_and_bounded() {
+    let (inner, _) = recording(Some(0), None);
+    let mut port = PriorityPort {inner,snapshot:Vec::new(),fail_seen:false,lost:Vec::new()};
+    let path = mail::attention_path(&port.reminder_dir().unwrap(),port.root(),"me");
+    for id in 1..=100 {
+        port.lost.push(serde_json::from_value(json!({"claim_id":id,"session":"me","paths":["src"],"reason":"taken"})).unwrap());
+        deliver_attention(&mut port,"PreToolUse","me",1000+id,None,&mut Vec::new()).unwrap();
+    }
+    let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(value["acknowledgements"].as_array().unwrap().len()<=64);
+    assert!(value["shown"].as_object().unwrap().len()<=64);
+    port.lost.clear();
+    let mut out = Vec::new();
+    deliver_attention(&mut port,"PreToolUse","me",2000,None,&mut out).unwrap();
+    assert!(out.is_empty());
+    assert!(mail::pending_attention_acks(&path).is_empty());
+}
+
+#[test]
+fn round6_pending_ack_expires_after_thirty_minutes_even_on_unknown_unread() {
+    let (inner, _) = recording(Some(0), None);
+    let lost=serde_json::from_value(json!({"claim_id":42,"session":"me","paths":["src"],"reason":"taken"})).unwrap();
+    let mut port = PriorityPort {inner,snapshot:Vec::new(),fail_seen:false,lost:vec![lost]};
+    let path=mail::attention_path(&port.reminder_dir().unwrap(),port.root(),"me");
+    deliver_attention(&mut port,"PreToolUse","me",1000,None,&mut Vec::new()).unwrap();
+    port.lost.clear();
+    port.inner.unread=None;
+    deliver_attention(&mut port,"PreToolUse","me",1_801_001,None,&mut Vec::new()).unwrap();
+    assert!(mail::pending_attention_acks(&path).is_empty());
+}
+
+#[test]
+fn round6_legacy_hook_mail_state_preserves_throttle_and_migrates() {
+    let (inner, _) = recording(Some(1), None);
+    let mut port=PriorityPort {inner,snapshot:vec![{ let mut m=letter(); m.reply_to=Some(1); m }],fail_seen:false,lost:Vec::new()};
+    let path=mail::attention_path(&port.reminder_dir().unwrap(),port.root(),"me");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, br#"{"4":1000}"#).unwrap();
+    let mut out=Vec::new();
+    deliver_attention(&mut port,"PreToolUse","me",2000,None,&mut out).unwrap();
+    assert!(out.is_empty(), "legacy throttle was discarded");
+    let value:Value=serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(value["shown"]["4"],1000);
+}

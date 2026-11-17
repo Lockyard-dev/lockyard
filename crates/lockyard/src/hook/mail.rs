@@ -2,12 +2,78 @@
 
 use super::*;
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Default, serde::Serialize)]
 pub(super) struct AttentionState {
     #[serde(default)]
     pub shown: std::collections::BTreeMap<String, i64>,
     #[serde(default)]
     pub acknowledgements: Vec<lockyard_core::proto::LostClaim>,
+    #[serde(default)]
+    pub acknowledged_at: std::collections::BTreeMap<String, i64>,
+}
+
+impl<'de> serde::Deserialize<'de> for AttentionState {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum State {
+            Current {
+                shown: std::collections::BTreeMap<String, i64>,
+                #[serde(default)]
+                acknowledgements: Vec<lockyard_core::proto::LostClaim>,
+                #[serde(default)]
+                acknowledged_at: std::collections::BTreeMap<String, i64>,
+            },
+            Legacy(std::collections::BTreeMap<String, i64>),
+        }
+        Ok(match State::deserialize(deserializer)? {
+            State::Current {
+                shown,
+                acknowledgements,
+                acknowledged_at,
+            } => Self {
+                shown,
+                acknowledgements,
+                acknowledged_at,
+            },
+            State::Legacy(shown) => Self {
+                shown,
+                ..Self::default()
+            },
+        })
+    }
+}
+
+impl AttentionState {
+    fn prune(&mut self, now: i64, pending: Option<&[lockyard_core::proto::LostClaim]>) {
+        self.shown.retain(|_, at| now.saturating_sub(*at) < 300_000);
+        self.acknowledgements.retain(|ack| {
+            let at = *self
+                .acknowledged_at
+                .entry(ack.claim_id.to_string())
+                .or_insert(now);
+            now.saturating_sub(at) < 1_800_000 && pending.is_none_or(|lost| lost.contains(ack))
+        });
+        while self.acknowledgements.len() > 64 {
+            self.acknowledgements.remove(0);
+        }
+        self.acknowledged_at.retain(|id, _| {
+            self.acknowledgements
+                .iter()
+                .any(|ack| ack.claim_id.to_string() == *id)
+        });
+        while self.shown.len() > 64 {
+            let oldest = self
+                .shown
+                .iter()
+                .min_by_key(|(_, at)| *at)
+                .map(|(key, _)| key.clone())
+                .unwrap();
+            self.shown.remove(&oldest);
+        }
+    }
 }
 
 pub(super) fn attention_path(dir: &Path, root: &Path, agent: &str) -> PathBuf {
@@ -46,7 +112,7 @@ pub(super) fn deliver_attention(
     decision: Option<Value>,
     out: &mut dyn Write,
 ) -> Result<()> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::Read;
     let mut answer = decision;
     let mut shown = Vec::new();
     let unread = port.unread(agent).ok().flatten();
@@ -106,9 +172,7 @@ pub(super) fn deliver_attention(
                     if file.read_to_string(&mut bytes).is_ok() {
                         delivery = serde_json::from_str(&bytes).unwrap_or_default();
                     }
-                    delivery
-                        .shown
-                        .retain(|_, at| now.saturating_sub(*at) < 300_000);
+                    delivery.prune(now, unread.map(|_| lost.as_slice()));
                     state = Some(file);
                 }
             }
@@ -225,29 +289,20 @@ pub(super) fn deliver_attention(
     }
     if let Some(answer) = answer {
         emit(out, &answer.to_string())?;
-        if !shown.is_empty()
-            && let Some(mut file) = state
-        {
-            for id in shown {
-                delivery.shown.insert(id, now);
-            }
-            for claim in confirmed {
-                delivery
-                    .acknowledgements
-                    .retain(|ack| ack.claim_id != claim.claim_id);
-                delivery.acknowledgements.push(claim);
-            }
-            if delivery.acknowledgements.len() > 256 {
-                delivery
-                    .acknowledgements
-                    .drain(..delivery.acknowledgements.len() - 256);
-            }
-            file.seek(SeekFrom::Start(0))?;
-            let bytes =
-                serde_json::to_vec(&delivery).map_err(|e| std::io::Error::other(e.to_string()))?;
-            file.write_all(&bytes)?;
-            file.set_len(bytes.len() as u64)?;
-            file.sync_data()?;
+        for id in shown {
+            delivery.shown.insert(id, now);
+        }
+        for claim in confirmed {
+            delivery
+                .acknowledgements
+                .retain(|ack| ack.claim_id != claim.claim_id);
+            delivery
+                .acknowledged_at
+                .insert(claim.claim_id.to_string(), now);
+            delivery.acknowledgements.push(claim);
+        }
+        if let Some(file) = state.take() {
+            save_attention(file, &mut delivery, now)?;
         }
         let ids: Vec<_> = mail.iter().map(|m| m.id).collect();
         if !ids.is_empty() {
@@ -257,7 +312,55 @@ pub(super) fn deliver_attention(
             let _ = port.ack_events(agent, through);
         }
     }
+    if let Some(file) = state {
+        save_attention(file, &mut delivery, now)?;
+    }
     Ok(())
+}
+
+fn save_attention(mut file: std::fs::File, delivery: &mut AttentionState, now: i64) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    delivery.prune(now, None);
+    let bytes = serde_json::to_vec(&delivery).map_err(|e| std::io::Error::other(e.to_string()))?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut current = Vec::new();
+    file.read_to_end(&mut current)?;
+    if current == bytes {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&bytes)?;
+    file.set_len(bytes.len() as u64)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+/// Reconcile the exact snapshots accepted by Unread, even if unread count is unknown.
+/// A failed or unclassified reply must never consume pending acknowledgements.
+pub(super) fn reconcile_attention_acks(
+    path: &Path,
+    now: i64,
+    pending: Option<&[lockyard_core::proto::LostClaim]>,
+) {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    if let Ok(mut file) = options.open(path)
+        && file.try_lock().is_ok()
+    {
+        let mut bytes = String::new();
+        if file.read_to_string(&mut bytes).is_ok()
+            && let Ok(mut delivery) = serde_json::from_str::<AttentionState>(&bytes)
+        {
+            delivery.prune(now, pending);
+            let _ = save_attention(file, &mut delivery, now);
+        }
+    }
 }
 
 pub(super) fn deliver_mail(

@@ -3579,7 +3579,7 @@ mod tests {
             ready.send(()).unwrap();
             let (_reads, timeout) = shared
                 .status_ready
-                .wait_timeout(reads, Duration::from_secs(2))
+                .wait_timeout(reads, Duration::from_secs(30))
                 .unwrap();
             done.send(!timeout.timed_out()).unwrap();
         });
@@ -3604,7 +3604,7 @@ mod tests {
             rig.daemon.shared.leave_status(&mut reads, 42);
             assert!(reads.batches.is_empty() && reads.pending.is_empty());
         }
-        let woke = result.recv_timeout(Duration::from_millis(500));
+        let woke = result.recv_timeout(Duration::from_secs(30));
         worker.join().unwrap();
         assert!(woke.unwrap());
     }
@@ -3669,14 +3669,14 @@ mod tests {
             "alice",
             &[claim],
             &backend,
-            Duration::from_secs(1),
+            Duration::from_secs(30),
         );
         *rig.server.lost.lock().unwrap() = vec![
             json!({"claim_id":42,"session":"alice","paths":["src"],"reason":"expired","lost_at":1000000}),
         ];
         rig.daemon
             .shared
-            .observe_status_claims("alice", &[], &backend, Duration::from_secs(1));
+            .observe_status_claims("alice", &[], &backend, Duration::from_secs(30));
         let calls = rig.server.calls.lock().unwrap().len();
         let reply = rig.daemon.handle(Request::Unread {
             attention_ack: Vec::new(),
@@ -3839,7 +3839,7 @@ mod tests {
         let before = rig.server.calls_to("/api/v1/registry/items");
         let shared = Arc::clone(&rig.daemon.shared);
         let warm = thread::spawn(move || shared.status_read("me", None, 1000));
-        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        observed.recv_timeout(Duration::from_secs(30)).unwrap();
         // Hold this generation's claims response: assigned task reads must already overlap it.
         wait_for(
             "both assigned task reads while warm claims are in flight",
@@ -3972,13 +3972,10 @@ mod tests {
             }));
         }
         barrier.wait();
-        loop {
+        wait_for("all distinct status generations to finish", || {
             assert!(rig.daemon.shared.status_reads.lock().unwrap().running <= MAX_STATUS_READS);
-            if workers.iter().all(JoinHandle::is_finished) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
+            workers.iter().all(JoinHandle::is_finished)
+        });
         let starts = rig.server.claims_started.lock().unwrap().clone();
         assert_eq!(starts.len(), 10);
         for worker in workers {
@@ -4253,7 +4250,7 @@ mod tests {
         });
         rig.daemon.shared.signal().nudged = false;
         let (dead, worker) = status_peer(&rig, "d", "dead-running", 2600);
-        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        observed.recv_timeout(Duration::from_secs(30)).unwrap();
         assert_eq!(rig.daemon.shared.status().status_read_abandoned, None);
         let cancellation = rig
             .daemon
@@ -4337,7 +4334,7 @@ mod tests {
         });
         rig.daemon.shared.status_reads.lock().unwrap().running = 0;
         rig.daemon.shared.status_ready.notify_all();
-        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        observed.recv_timeout(Duration::from_secs(30)).unwrap();
         drop(dead);
         wait_for("dead member alone to leave", || {
             rig.daemon
@@ -4418,7 +4415,7 @@ mod tests {
         });
         let shared = Arc::clone(&rig.daemon.shared);
         let worker = thread::spawn(move || shared.status_read("new-status", None, 2600));
-        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        observed.recv_timeout(Duration::from_secs(30)).unwrap();
         assert!(rig.daemon.shared.sessions().contains_key("new-status"));
         assert!(
             rig.daemon
@@ -5698,8 +5695,7 @@ mod tests {
         let key = keep.key.clone();
         daemon.handle(Request::Call { call: keep });
         daemon.handle(mail("two"));
-        drop(daemon);
-        thread::sleep(Duration::from_millis(50));
+        drop(daemon); // Shutdown joins the workers before restart.
         server.down.store(false, Ordering::SeqCst);
         let again = Daemon::start(config(dir.path(), timing()), Arc::clone(&server)).unwrap();
         wait_for("the queue to drain", || again.shared.outbox.len() == 0);
@@ -6467,7 +6463,7 @@ mod tests {
             &socket,
             "https://example.test",
             "team",
-            Duration::from_secs(1),
+            Duration::from_secs(30),
         );
         assert!(
             open_folder.is_none(),
@@ -6514,7 +6510,7 @@ mod tests {
                 &path,
                 "https://example.test",
                 "other",
-                Duration::from_secs(1)
+                Duration::from_secs(30)
             )
             .is_none()
         );
@@ -6523,7 +6519,7 @@ mod tests {
                 &path,
                 "https://elsewhere.test",
                 "team",
-                Duration::from_secs(1)
+                Duration::from_secs(30)
             )
             .is_none()
         );

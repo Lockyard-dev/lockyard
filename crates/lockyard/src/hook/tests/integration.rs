@@ -501,3 +501,49 @@ fn old_daemon_hook_uses_take_mail_and_zone_wait_uses_checks_without_new_requests
     );
     peer.join().unwrap();
 }
+
+
+#[cfg(unix)]
+#[test]
+fn round6_cloud_unread_reconciles_accepted_acks_with_unknown_mail_count() {
+    use crate::agent::socket::AgentSocket;
+    use crate::agent::wire::{AgentStatus,Envelope,Reply,Request};
+    use std::io::{BufRead,BufReader};
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+    let dir=tempfile::tempdir().unwrap();
+    crate::agent::private_dir(dir.path()).unwrap();
+    let socket_path=dir.path().join("agent.sock");
+    let listener=UnixListener::bind(&socket_path).unwrap();
+    let state_dir=dir.path().join("hook-state");
+    std::fs::create_dir(&state_dir).unwrap();
+    let state_path=mail::attention_path(&state_dir,dir.path(),"me");
+    let now=crate::now_ms();
+    let ack:lockyard_core::proto::LostClaim=serde_json::from_value(json!({"claim_id":42,"session":"me","paths":["src"],"reason":"taken"})).unwrap();
+    std::fs::write(&state_path,serde_json::to_vec(&json!({"shown":{},"acknowledgements":[ack],"acknowledged_at":{"42":now}})).unwrap()).unwrap();
+    let peer=std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream,_)=listener.accept().unwrap();
+            let mut line=String::new();
+            BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+            let envelope:Envelope=serde_json::from_str(&line).unwrap();
+            let reply=match envelope.request {
+                Request::Ping=>Reply {status:Some(AgentStatus {url:"http://fixture".into(),workspace:"team".into(),hook_mail_state_dir:Some(state_dir.clone()),..Default::default()}),..Default::default()},
+                Request::Unread {attention_ack,..}=> {
+                    assert_eq!(attention_ack,vec![ack.clone()]);
+                    Reply {lost:Some(vec![]),unread:None,..Default::default()}
+                }
+                other=>panic!("unexpected request: {other:?}"),
+            };
+            serde_json::to_writer(&mut stream,&reply).unwrap();
+            stream.write_all(b"\n").unwrap();
+        }
+    });
+    let socket=AgentSocket::connect(&socket_path,"http://fixture","team",Duration::from_secs(2)).unwrap();
+    let mut port=cloud::AgentPort {socket,root:dir.path().into(),tool:Tool::Codex,repository:None,repository_confirmed:false,attention:Vec::new(),claims:Vec::new()};
+    assert_eq!(port.unread("me").unwrap(),None);
+    assert!(mail::pending_attention_acks(&state_path).is_empty());
+    // connect performs one handshake ping; no additional RPC is needed for cleanup.
+    drop(port);
+    peer.join().unwrap();
+}

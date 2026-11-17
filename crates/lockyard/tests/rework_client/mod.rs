@@ -624,8 +624,26 @@ fn round5_e2ee_handover_keeps_label_and_both_sessions_can_read_all_views() {
         } else { assert_eq!(status["claims"], json!([])); }
         json_of(&cli(dir.path(),runtime.path(), &["--agent",session,"--json","zone","check","src"]));
     }
+    // Copying the same acquisition marker into another claim makes both
+    // identities ambiguous, including when the original cipher is intact.
+    let mut duplicate = server.state.lock().unwrap().claims[0].clone();
+    duplicate["id"] = json!(99);
+    server.state.lock().unwrap().claims.push(duplicate);
+    for session in ["alice", "bob"] {
+        let listed = json_of(&cli(dir.path(),runtime.path(), &["--agent",session,"--json","zone","list"]));
+        for claim in listed.as_array().unwrap() {
+            assert_eq!(claim["meta"]["identity_unavailable"],true);
+            assert!(claim["meta"].get("session_label").is_none());
+            assert!(claim["meta"].get("$lockyard_session_v1").is_none());
+        }
+        let text = cli(dir.path(),runtime.path(), &["--agent",session,"zone","list"]);
+        assert_eq!(String::from_utf8_lossy(&text.stdout).matches("identity недоступна").count(),2);
+    }
+    server.state.lock().unwrap().claims.pop();
     let mut damaged = server.state.lock().unwrap().claims[0].clone();
     damaged["id"] = json!(99);
+    // An unrelated damaged identity must still be isolated from this claim.
+    damaged["meta"]["lockyard_start_work_nonce"] = json!(lockyard_cloud_client::ulid());
     damaged["meta"]["$lockyard_session_v1"] = json!("lyenc1.corrupt");
     server.state.lock().unwrap().claims.push(damaged);
     for session in ["alice","bob"] {

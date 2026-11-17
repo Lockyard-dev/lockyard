@@ -16,6 +16,7 @@ pub struct Reply {
     body: String,
     headers: Vec<(String, String)>,
     delay: std::time::Duration,
+    release: Option<mpsc::Receiver<()>>,
 }
 
 impl Reply {
@@ -29,6 +30,7 @@ impl Reply {
             body: body.to_string(),
             headers: Vec::new(),
             delay: std::time::Duration::ZERO,
+            release: None,
         }
     }
 
@@ -88,6 +90,20 @@ impl Reply {
     pub fn delay(mut self, delay: std::time::Duration) -> Self {
         self.delay = delay;
         self
+    }
+
+    /// Hold the response until the test explicitly releases it.
+    pub fn gated(mut self, release: mpsc::Receiver<()>) -> Self {
+        self.release = Some(release);
+        self
+    }
+
+    fn wait(&self) {
+        if let Some(release) = &self.release {
+            // A dropped sender also releases cleanup after a failed test assertion.
+            let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+        }
+        thread::sleep(self.delay);
     }
 }
 
@@ -678,7 +694,7 @@ fn answer(
             .as_ref()
             .is_some_and(|r| r.body.contains("event: ready"));
         if let Some(reply) = routed_reply {
-            thread::sleep(reply.delay);
+            reply.wait();
             if !write_chunk(stream, &reply.body) {
                 return false;
             }
@@ -719,7 +735,7 @@ fn answer(
                 })
             };
             if let Some(reply) = reply {
-                thread::sleep(reply.delay);
+                reply.wait();
                 if !write_chunk(stream, &reply.body) {
                     return false;
                 }
@@ -774,6 +790,7 @@ fn answer(
                 body,
                 headers: Vec::new(),
                 delay: std::time::Duration::ZERO,
+                release: None,
             }
         });
     if mode.routed
@@ -788,7 +805,7 @@ fn answer(
             .or_insert(token);
     }
     merge_headers(&mut reply, &mode.default_headers);
-    std::thread::sleep(reply.delay);
+    reply.wait();
     if let Some(protocol) = protocol
         && !reply
             .headers
