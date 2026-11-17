@@ -3537,12 +3537,7 @@ fn the_config_selects_the_cloud_backend_and_the_token_comes_only_from_the_enviro
     assert!(String::from_utf8_lossy(&bare.stderr).contains("LOCKYARD_TOKEN"));
 
     let token_file = runtime.path().join("token");
-    std::fs::write(&token_file, "test-token\n").unwrap();
-    std::fs::set_permissions(
-        &token_file,
-        std::os::unix::fs::PermissionsExt::from_mode(0o600),
-    )
-    .unwrap();
+    lockyard_core::fsio::replace(&token_file, b"test-token\n", 0o600).unwrap();
     let listed = binary(dir.path(), runtime.path())
         .args(["--json", "zone", "list"])
         .env_remove("LOCKYARD_TOKEN")
@@ -3997,7 +3992,7 @@ fn install_refuses_a_bare_token_and_writes_a_unit_naming_the_file() {
     assert!(String::from_utf8_lossy(&bare.stderr).contains("LOCKYARD_TOKEN_FILE"));
 
     let token = home.path().join("token");
-    std::fs::write(&token, "test-token").unwrap();
+    lockyard_core::fsio::replace(&token, b"test-token", 0o600).unwrap();
     let installed = binary(dir.path(), home.path())
         .args(["--json", "agent", "install", "--no-start"])
         .env("HOME", home.path())

@@ -329,7 +329,6 @@ mod tests {
     #[test]
     fn token_for_uses_mcp_token_file_without_reading_inline_host_secret() {
         let _guard = crate::test_env_lock();
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let cfg = dir.path().join("cfg");
@@ -343,8 +342,7 @@ mod tests {
         )
         .unwrap();
         let token_path = dir.path().join("agent.token");
-        fs::write(&token_path, "from-mcp-trap\n").unwrap();
-        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::fsio::replace(&token_path, b"from-mcp-trap\n", 0o600).unwrap();
         fs::write(
             dir.path().join(".mcp.json"),
             format!(
@@ -356,8 +354,7 @@ mod tests {
         // Owner-token under the default search must not be used automatically.
         let owner = cfg.join("lockyard/owner-token");
         fs::create_dir_all(owner.parent().unwrap()).unwrap();
-        fs::write(&owner, "owner-secret\n").unwrap();
-        fs::set_permissions(&owner, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::fsio::replace(&owner, b"owner-secret\n", 0o600).unwrap();
 
         let previous = std::env::current_dir().unwrap();
         let prior_token = std::env::var_os("LOCKYARD_TOKEN");
@@ -468,12 +465,7 @@ mod tests {
     fn token_file_name_does_not_change_explicit_access() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner-token");
-        fs::write(&path, "secret").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        crate::fsio::replace(&path, b"secret", 0o600).unwrap();
         assert_eq!(
             read_token_file(&path, TokenFileSource::DefaultAgent).unwrap(),
             "secret"

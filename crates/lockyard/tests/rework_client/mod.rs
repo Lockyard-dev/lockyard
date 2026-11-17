@@ -271,13 +271,11 @@ fn keepalive_ping_and_file_inputs_reach_real_cloud_requests() {
 
 #[test]
 fn cli_without_env_uses_the_same_project_mcp_token_file() {
-    use std::os::unix::fs::PermissionsExt;
     let server = Server::start();
     let dir = cloud_project(&server);
     let runtime = tempfile::tempdir().unwrap();
     let token = runtime.path().join("mcp-agent.token");
-    std::fs::write(&token, "test-token\n").unwrap();
-    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    lockyard_core::fsio::replace(&token, b"test-token\n", 0o600).unwrap();
     std::fs::write(dir.path().join(".mcp.json"),json!({"mcpServers":{"lockyard":{"command":"lockyard","args":["mcp"],"env":{"LOCKYARD_URL":server.url,"LOCKYARD_TOKEN_FILE":token}}}}).to_string()).unwrap();
     let result = binary(dir.path(), runtime.path())
         .args(["task", "list", "--json"])

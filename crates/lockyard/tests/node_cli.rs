@@ -72,12 +72,7 @@ fn init_requires_existing_key_and_refuses_overwrite() {
     fs::create_dir_all(&keys).unwrap();
     fs::set_permissions(keys.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&keys, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(keys.join("test-workspace.key"), [7u8; 32]).unwrap();
-    fs::set_permissions(
-        keys.join("test-workspace.key"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    lockyard_core::fsio::replace(&keys.join("test-workspace.key"), &[7u8; 32], 0o600).unwrap();
     let result = init(path);
     assert!(
         result.status.success(),
@@ -124,12 +119,7 @@ fn mcp_exposes_job_tools_and_reports_uncertain_submission_with_same_id_without_p
     fs::create_dir_all(&keys).unwrap();
     fs::set_permissions(keys.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&keys, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(keys.join("test-workspace.key"), [7u8; 32]).unwrap();
-    fs::set_permissions(
-        keys.join("test-workspace.key"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    lockyard_core::fsio::replace(&keys.join("test-workspace.key"), &[7u8; 32], 0o600).unwrap();
     assert!(init(dir.path()).status.success());
     let config = dir.path().join("node.toml");
     let mut child = command(dir.path())
@@ -184,12 +174,7 @@ fn real_node_service_serves_cli_and_mcp_over_control_socket() {
     fs::create_dir_all(&keys).unwrap();
     fs::set_permissions(keys.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&keys, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(keys.join("test-workspace.key"), [7u8; 32]).unwrap();
-    fs::set_permissions(
-        keys.join("test-workspace.key"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    lockyard_core::fsio::replace(&keys.join("test-workspace.key"), &[7u8; 32], 0o600).unwrap();
     assert!(init(path).status.success());
     let config = path.join("node.toml");
     let config_text = config.to_str().unwrap();
@@ -247,12 +232,7 @@ fn killed_submitter_recovers_id_and_rejects_changed_specification() {
     fs::create_dir_all(&keys).unwrap();
     fs::set_permissions(keys.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&keys, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(keys.join("test-workspace.key"), [7u8; 32]).unwrap();
-    fs::set_permissions(
-        keys.join("test-workspace.key"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    lockyard_core::fsio::replace(&keys.join("test-workspace.key"), &[7u8; 32], 0o600).unwrap();
     assert!(init(path).status.success());
     let config = path.join("node.toml");
     let config_text = config.to_str().unwrap();
@@ -377,12 +357,7 @@ fn concurrent_different_specs_cannot_claim_one_receipt_id() {
     fs::create_dir_all(&keys).unwrap();
     fs::set_permissions(keys.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&keys, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(keys.join("test-workspace.key"), [7u8; 32]).unwrap();
-    fs::set_permissions(
-        keys.join("test-workspace.key"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    lockyard_core::fsio::replace(&keys.join("test-workspace.key"), &[7u8; 32], 0o600).unwrap();
     assert!(init(path).status.success());
     let config = path.join("node.toml");
     let config = config.to_str().unwrap();

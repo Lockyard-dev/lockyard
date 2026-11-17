@@ -3038,8 +3038,7 @@ mod tests {
             .create(&directory)
             .unwrap();
         let orphan = directory.join(".lykey-stage-interrupted-fixture");
-        fs::write(&orphan, [1; 16]).unwrap();
-        fs::set_permissions(&orphan, fs::Permissions::from_mode(0o600)).unwrap();
+        lockyard_core::fsio::replace(&orphan, &[1; 16], 0o600).unwrap();
         let destination = directory.join("fixture-workspace.key");
         let left = destination.clone();
         let right = destination.clone();

@@ -1343,18 +1343,12 @@ fn logout_forgets_one_server_and_login_refuses_a_plain_http_one() {
     let empty: Value = serde_json::from_slice(&empty.stdout).unwrap();
     assert_eq!(empty["removed"], false);
 
-    std::fs::write(
+    lockyard_core::fsio::replace(
         &credentials,
-        "[servers.\"https://cloud.test\"]\ntoken = \"lk_1\"\nworkspace_name = \"Team\"\n",
+        b"[servers.\"https://cloud.test\"]\ntoken = \"lk_1\"\nworkspace_name = \"Team\"\n",
+        0o600,
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
-    }
-    #[cfg(windows)]
-    lockyard_core::windows::secure_owned(&credentials).unwrap();
     let gone = run(&["--json", "cloud", "logout", "--url", "https://cloud.test/"]);
     let gone: Value = serde_json::from_slice(&gone.stdout).unwrap();
     assert_eq!(gone["removed"], true);
