@@ -37,6 +37,30 @@ pub(crate) fn keepalive(
         },
         now,
     )?;
+    if claims.is_empty()
+        && id.is_none()
+        && let Ok(lost) = backend.lost(agent)
+        && let Some(lost) = lost.last()
+    {
+        return Err(Error::Invalid(format!(
+            "no claims of yours; {}",
+            loss_text(lost)
+        )));
+    }
+    if let Some(id) = id
+        && !claims.iter().any(|claim| claim.id == id)
+        && let Ok(lost) = backend.lost(agent)
+        && let Some(lost) = lost.iter().find(|lost| lost.claim_id == id)
+    {
+        return Err(Error::NotFound(format!(
+            "claim Z-{id} lost: {} at {}",
+            lost.reason.as_deref().unwrap_or("expired or released"),
+            lost.lost_at
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unknown time".into())
+        )));
+    }
     let selected = select_claims(claims, id, all)?;
     let mut touched = Vec::new();
     for claim in &selected {
@@ -72,6 +96,18 @@ fn select_claims(claims: Vec<Claim>, id: Option<i64>, all: bool) -> Result<Vec<C
         ));
     }
     Ok(selected)
+}
+
+pub(crate) fn loss_text(lost: &lockyard_core::proto::LostClaim) -> String {
+    format!(
+        "claim Z-{} lost: {} at {}",
+        lost.claim_id,
+        lost.reason.as_deref().unwrap_or("expired or released"),
+        lost.lost_at
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "unknown time".into())
+    )
 }
 
 #[cfg(test)]

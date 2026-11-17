@@ -329,12 +329,7 @@ fn node_sigterm_stops_runtime_and_checkpoints_existing_project_database() {
         .mode(0o700)
         .create(&keys)
         .unwrap();
-    fs::write(keys.join("workspace.key"), [7u8; 32]).unwrap();
-    fs::set_permissions(
-        keys.join("workspace.key"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    lockyard_core::fsio::replace(&keys.join("workspace.key"), &[7u8; 32], 0o600).unwrap();
     let configuration = private_root.join("node.toml");
     let config = json!({"node_id":"worker", "workspace":"workspace", "state_dir":state,
         "certificate":identity.certificate, "private_key":identity.private_key,

@@ -135,12 +135,17 @@ pub fn write_agent_config(root: &Path, config: &Config) -> Result<PathBuf> {
         project_config_mtime,
     };
     let state = super::state_root()?;
-    let _ = super::private_dir(&state);
+    super::private_dir(&state)?;
     let path = state.join(AGENT_CONFIG_NAME);
-    let text = toml::to_string_pretty(&snapshot)
-        .map_err(|error| Error::Invalid(format!("cannot encode agent-config.toml: {error}")))?;
-    fs::write(&path, text)?;
+    write_agent_snapshot(&path, &snapshot)?;
     Ok(path)
+}
+
+fn write_agent_snapshot(path: &Path, snapshot: &AgentServiceConfig) -> Result<()> {
+    let text = toml::to_string_pretty(snapshot)
+        .map_err(|error| Error::Invalid(format!("cannot encode agent-config.toml: {error}")))?;
+    lockyard_core::fsio::replace(path, text.as_bytes(), 0o600)?;
+    Ok(())
 }
 
 pub fn load_agent_config() -> Result<AgentServiceConfig> {
@@ -283,5 +288,49 @@ mod tests {
             .unwrap();
         assert!(grant.success(), "cannot expose fixture token");
         assert!(read_service_token(&token).is_err());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_replaces_complete_file_and_preserves_old_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::private_dir(dir.path()).unwrap();
+        let path = dir.path().join("agent-config.toml");
+        let mut snapshot = AgentServiceConfig {
+            url: "http://127.0.0.1:1".into(),
+            workspace: "old".into(),
+            repository: None,
+            project_root: dir.path().display().to_string(),
+            project_config_mtime: None,
+        };
+        write_agent_snapshot(&path, &snapshot).unwrap();
+        #[cfg(unix)]
+        let mut old_reader = fs::File::open(&path).unwrap();
+        snapshot.workspace = "new".into();
+        write_agent_snapshot(&path, &snapshot).unwrap();
+        let current: AgentServiceConfig =
+            toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(current, snapshot);
+        #[cfg(unix)]
+        {
+            use std::io::Read;
+            use std::os::unix::fs::PermissionsExt;
+            let mut old = String::new();
+            old_reader.read_to_string(&mut old).unwrap();
+            let old: AgentServiceConfig = toml::from_str(&old).unwrap();
+            assert_eq!(
+                old.workspace, "old",
+                "an open reader must retain the old inode"
+            );
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

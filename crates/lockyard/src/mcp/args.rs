@@ -286,7 +286,8 @@ pub(super) fn claim_paths(
                 let text = error.to_string();
                 if text.contains("zone_unknown") || error.kind() == "zone_unknown" {
                     let message = format!(
-                        "{error}; zones are catalog names; use paths:[\"sun-host/sims\"] for workspace-root paths"
+                        "{error}; zones are catalog names; use paths:{} for workspace-root paths",
+                        serde_json::to_string(&zones).unwrap_or_default()
                     );
                     return Err(match error {
                         Error::Cloud {

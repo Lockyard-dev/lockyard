@@ -71,7 +71,7 @@ pub fn merge_session_meta(existing: Option<Value>) -> lockyard_core::Result<Valu
         };
         let object = label.as_object_mut().expect("session label is an object");
         for (key, value) in map {
-            object.entry(key).or_insert(value);
+            object.insert(key, value);
         }
     }
     if label.to_string().len() > 4096 {
@@ -92,6 +92,13 @@ mod tests {
         assert_eq!(merged["note"], "x");
         assert!(merged["pid"].as_u64().is_some());
         assert!(merged["parent_pid"].as_u64().is_some());
+    }
+
+    #[test]
+    fn merge_preserves_explicit_session_label_and_pid() {
+        let merged = merge_session_meta(Some(json!({"session_label":"caller", "pid":17}))).unwrap();
+        assert_eq!(merged["session_label"], "caller");
+        assert_eq!(merged["pid"], 17);
     }
 
     #[test]

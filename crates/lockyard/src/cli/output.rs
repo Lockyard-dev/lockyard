@@ -42,6 +42,9 @@ pub(super) fn claim_line(claim: &Claim, clock: Option<i64>) -> String {
         claim.mode
     );
     if let Some(meta) = &claim.meta {
+        if meta["identity_unavailable"] == true {
+            line.push_str("  identity недоступна");
+        }
         if let Some(label) = meta["session_label"].as_str() {
             line.push_str(&format!("  session={}", escape_controls(label)));
         }

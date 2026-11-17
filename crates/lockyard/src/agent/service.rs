@@ -91,10 +91,15 @@ pub fn write_agent_config(root: &Path, config: &Config) -> Result<PathBuf> {
     let state = super::state_root().map_err(Error::Io)?;
     super::private_dir(&state).map_err(Error::Io)?;
     let path = state.join(AGENT_CONFIG_NAME);
-    let text = toml::to_string_pretty(&snapshot)
-        .map_err(|error| Error::Invalid(format!("cannot encode agent-config.toml: {error}")))?;
-    fs::write(&path, text)?;
+    write_agent_snapshot(&path, &snapshot)?;
     Ok(path)
+}
+
+fn write_agent_snapshot(path: &Path, snapshot: &AgentServiceConfig) -> Result<()> {
+    let text = toml::to_string_pretty(snapshot)
+        .map_err(|error| Error::Invalid(format!("cannot encode agent-config.toml: {error}")))?;
+    lockyard_core::fsio::replace(path, text.as_bytes(), 0o600)?;
+    Ok(())
 }
 
 /// Settings the running service uses — never the live project tree.
@@ -262,7 +267,7 @@ pub fn install(root: &Path, config: &Config, start: bool) -> Result<PathBuf> {
     } else {
         systemd_unit(&spec)
     };
-    fs::write(&path, text)?;
+    lockyard_core::fsio::replace(&path, text.as_bytes(), 0o600)?;
     if start {
         if launchd() {
             // Replacing a loaded service fails, and removing one that is absent fails too.
@@ -393,19 +398,33 @@ pub fn socket_missing_hint(socket: &Path) -> Option<&'static str> {
         return None;
     }
     let pid = service_pid()?;
-    let age = process_age(pid).unwrap_or(Duration::ZERO);
-    if age < SOCKET_WAIT_HINT_AFTER {
+    socket_missing_hint_for(false, process_age(pid))
+}
+
+fn socket_missing_hint_for(exists: bool, live_age: Option<Duration>) -> Option<&'static str> {
+    if exists || live_age.is_none_or(|age| age < SOCKET_WAIT_HINT_AFTER) {
         return None;
     }
     Some(
-        "служба не открыла сокет: возможно, ждёт разрешения macOS на папку; \
-         Системные настройки → Конфиденциальность → Полный доступ к диску",
+        "служба не открыла сокет: возможно, ждёт разрешения macOS на папку; Системные настройки → Конфиденциальность → Полный доступ к диску",
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_service_without_a_socket_gets_the_tcc_hint_after_the_startup_window() {
+        assert!(
+            socket_missing_hint_for(false, Some(SOCKET_WAIT_HINT_AFTER))
+                .unwrap()
+                .contains("Полный доступ к диску")
+        );
+        assert!(socket_missing_hint_for(false, Some(Duration::ZERO)).is_none());
+        assert!(socket_missing_hint_for(false, None).is_none());
+        assert!(socket_missing_hint_for(true, Some(SOCKET_WAIT_HINT_AFTER)).is_none());
+    }
 
     fn spec() -> UnitSpec {
         UnitSpec {
@@ -483,5 +502,49 @@ mod tests {
         assert!(age >= Duration::from_secs(1), "{age:?}");
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_replaces_complete_file_and_preserves_old_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::private_dir(dir.path()).unwrap();
+        let path = dir.path().join("agent-config.toml");
+        let mut snapshot = AgentServiceConfig {
+            url: "http://127.0.0.1:1".into(),
+            workspace: "old".into(),
+            repository: None,
+            project_root: dir.path().display().to_string(),
+            project_config_mtime: None,
+        };
+        write_agent_snapshot(&path, &snapshot).unwrap();
+        #[cfg(unix)]
+        let mut old_reader = fs::File::open(&path).unwrap();
+        snapshot.workspace = "new".into();
+        write_agent_snapshot(&path, &snapshot).unwrap();
+        let current: AgentServiceConfig =
+            toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(current, snapshot);
+        #[cfg(unix)]
+        {
+            use std::io::Read;
+            use std::os::unix::fs::PermissionsExt;
+            let mut old = String::new();
+            old_reader.read_to_string(&mut old).unwrap();
+            let old: AgentServiceConfig = toml::from_str(&old).unwrap();
+            assert_eq!(
+                old.workspace, "old",
+                "an open reader must retain the old inode"
+            );
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

@@ -38,8 +38,7 @@ fn cli(root: &Path, args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 fn private_write(path: &Path, bytes: &[u8]) {
-    fs::write(path, bytes).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    lockyard_core::fsio::replace(path, bytes, 0o600).unwrap();
 }
 fn init(root: &Path, node: &str) -> (PathBuf, NodeConfig) {
     fs::create_dir(root).unwrap();

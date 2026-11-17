@@ -187,6 +187,16 @@ pub trait Backend {
     ) -> Result<AccessRecord> {
         cloud("zone answer")
     }
+    /// Partial claim operations; paths are workspace relative before transport scoping.
+    fn partial_zone(
+        &mut self,
+        _agent: &str,
+        _id: i64,
+        _operation: &str,
+        _body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        cloud("partial zone mutation")
+    }
     fn handover(
         &mut self,
         _agent: &str,
@@ -234,6 +244,9 @@ pub trait Backend {
     }
     fn dirty_adopt(&mut self, _agent: &str, _paths: &[String], _reason: &str) -> Result<()> {
         cloud("zone dirty adopt")
+    }
+    fn lost_within(&self, agent: &str, _budget: Duration) -> Result<Vec<LostClaim>> {
+        self.lost(agent)
     }
     fn lost(&self, _agent: &str) -> Result<Vec<LostClaim>> {
         cloud("zone lost")

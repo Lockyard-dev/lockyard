@@ -130,12 +130,12 @@ fn survey_0015_zones_paths_ttl_minutes_and_workspace_root() {
     std::fs::create_dir(&nested).unwrap();
     let runtime = tempfile::tempdir().unwrap();
     let answers = mcp_calls(&nested, runtime.path(), "compact", &[
-        ("start_work",json!({"zones":["sun-host/sims"]})),
+        ("start_work",json!({"zones":["project/unique-zone"]})),
         ("start_work",json!({"paths":["sun-host/sims"],"ttl":1800})),
         ("start_work",json!({"paths":["sun-host/sims"],"ttl":10})),
     ]);
     assert_eq!(answers[0]["isError"], true);
-    assert!(answers[0]["content"][0]["text"].as_str().unwrap().contains("paths:"), "{answers:?}");
+    assert!(answers[0]["content"][0]["text"].as_str().unwrap().contains("paths:[\"project/unique-zone\"]"), "{answers:?}");
     assert_eq!(answers[1]["isError"], true);
     assert!(answers[1]["content"][0]["text"].as_str().unwrap().contains("minutes"));
     assert_eq!(answers[2]["isError"], false, "{answers:?}");
@@ -166,6 +166,19 @@ fn survey_0016_lost_reason_time_and_finish_work_ids() {
     let cli_result = cli(dir.path(), runtime.path(), &["zone","release","9"]);
     let text = String::from_utf8_lossy(&cli_result.stderr);
     assert!(text.contains("idle_released") && text.contains("12:34"), "{text}");
+    let keepalive = cli(dir.path(), runtime.path(), &["keepalive","9"]);
+    assert!(!keepalive.status.success());
+    let reason = String::from_utf8_lossy(&keepalive.stderr);
+    assert!(reason.contains("idle_released") && reason.contains("12:34"), "{reason}");
+    let loss = mcp_calls(dir.path(), runtime.path(), "compact", &[
+        ("keepalive",json!({"id":9})),
+        ("handover",json!({"id":9,"to":"bob"})),
+    ]);
+    for answer in loss {
+        assert_eq!(answer["isError"],true,"{answer}");
+        let reason=answer["content"][0]["text"].as_str().unwrap();
+        assert!(reason.contains("idle_released") && reason.contains("12:34"),"{reason}");
+    }
     let lost = json_of(&cli(dir.path(), runtime.path(), &["--json","status","--lost"]));
     assert_eq!(lost[0]["claim_id"], 9);
     server.state.lock().unwrap().refuse_release = None;

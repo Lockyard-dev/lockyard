@@ -220,10 +220,24 @@ permissions `0600`, under the server it belongs to, and is never printed. A URL 
 part of signing in; a URL that only came out of a project file has to be trusted first, because that file arrives
 with the clone.
 
-The workspace is a label: the server takes the real one from the token. The token comes from `LOCKYARD_TOKEN`, then
-the file named by `LOCKYARD_TOKEN_FILE`, then the credentials file — never from the project config, so a CI job that
-exports a token is unaffected by whoever is logged in on the machine. A session can be addressed once it has sent a
-heartbeat: `lockyard presence beat`, or any hook through the agent process.
+The workspace is a label: the server takes the real one from the token. CLI and MCP first use
+`LOCKYARD_TOKEN`, then `LOCKYARD_TOKEN_FILE`, then the login credentials file, then
+`$XDG_CONFIG_HOME/lockyard/token` (or `~/.config/lockyard/token`). With none of these four sources,
+CLI can use a running agent's socket, or the current project's `.mcp.json` Lockyard
+`env.LOCKYARD_TOKEN_FILE` setting. Relative token-file paths are relative to the project root;
+a configured `LOCKYARD_URL` must match. Inline host tokens are not imported. Access errors name
+the config and token paths tried; token contents are never printed.
+
+In encrypted workspaces, claim `meta` carries the chat label and process IDs in an
+authenticated encrypted envelope. Workspace peers recover these fields with their shared
+key; the server sees only ciphertext. Changing the claim note preserves this identity.
+
+If `agent status` finds a live service whose socket is missing after five seconds, it shows
+a macOS Full Disk Access (TCC) hint. Grant access in System Settings → Privacy & Security,
+then restart the service yourself. The hint is printed by `lockyard agent status`; JSON output
+sets `socket_missing_hint: true`. During the initial five-second startup window it stays quiet. Manual `agent --root` selects that project without changing
+the installed service's saved configuration.
+
 Before the client or `lockyard agent` sends a user token to the URL in a project file, trust that URL with
 `lockyard cloud trust https://your-server.example`. This adds it to
 `~/.config/lockyard/trusted-servers` (or `$XDG_CONFIG_HOME/lockyard/trusted-servers`) with private file permissions.
@@ -361,6 +375,18 @@ See [repository namespaces](docs/repositories.md) before changing an active proj
 - [docs/threat-model.md](docs/threat-model.md) — what the lock does and does not stop
 - [docs/privacy.md](docs/privacy.md) — local mode sends nothing; cloud data inventory; no telemetry
 - [docs/json-schemas.md](docs/json-schemas.md) — stable `--json` shapes
+
+## Direct commands and automatic claim-loss alerts
+
+The running agent records its own `narrow` calls and their receipt fences. When a
+command uses direct HTTP instead (for example an explicit direct client or a
+fallback after agent IPC fails), it does not register that mutation with the
+agent. If the server's subsequent event omits `actor`/`by`, the agent may show
+that narrowing as an automatic loss. Renew and meta/add-path updates never
+clear that warning; a fresh claim/grant or confirmed hook output does. Use the
+normal agent route when it is available. Direct commands do not silently claim
+to have registered a local mutation with a running agent.
+
 
 ## License
 

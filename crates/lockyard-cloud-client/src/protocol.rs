@@ -70,6 +70,8 @@ pub struct PendingWrite {
     pub code: String,
     pub cause_code: String,
     pub cause_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
     pub protocol: NegotiatedProtocol,
     pub method: String,
     pub path: String,
@@ -1436,6 +1438,7 @@ impl Client {
                 &NegotiatedProtocol::candidate(selected),
                 Some(&capability),
                 Some(&auto_area_capability),
+                true,
             );
             match result {
                 Ok(value) => {
@@ -1770,8 +1773,15 @@ impl Client {
             object.remove("zone");
             object.remove("zones");
         }
+        let session = if call.session == crate::ANONYMOUS_SESSION {
+            self.service_session(crate::ANONYMOUS_SESSION)
+        } else {
+            call.session.clone()
+        };
+        let mut identity_context = body.clone().unwrap_or_else(|| json!({}));
+        identity_context["session"] = json!(session);
         if let (Some(value), Some(workspace)) = (&mut body, self.workspace.as_deref()) {
-            crate::crypto::transform_fields_policy(
+            crate::crypto::transform_fields_policy_context(
                 value,
                 &call.method,
                 &call.path,
@@ -1779,6 +1789,7 @@ impl Client {
                 content_key.as_ref(),
                 self.encryption_enabled,
                 self.expected_e2ee_workspace.is_some(),
+                Some(&identity_context),
             )
             .map_err(content_error)?;
         }
@@ -1801,6 +1812,7 @@ impl Client {
                 code: "outcome_unknown".into(),
                 cause_code: "outcome_unknown".into(),
                 cause_status: None,
+                diagnostic: None,
                 protocol: protocol.clone(),
                 method: call.method.clone(),
                 path: wire_call.path.clone(),
@@ -1847,6 +1859,7 @@ impl Client {
                 &protocol,
                 registry_capability,
                 None,
+                attempt == 1,
             ) {
                 Ok(mut value) => {
                     let journal_owned = !call.long_poll
@@ -1940,7 +1953,10 @@ impl Client {
                 Failure::Final(error) => (error, false),
                 Failure::Retry(error) => (error, true),
             };
-            let uncertain = matches!(&error, ClientError::Transport(_) | ClientError::Decode(_))
+            let uncertain = (error.status() == Some(408)
+                && call.method == "POST"
+                && call.path == "/api/v1/registry/items")
+                || matches!(&error, ClientError::Transport(_) | ClientError::Decode(_))
                 || matches!(
                     error.code(),
                     Some("protocol_response_invalid" | "content_authentication_failed")
@@ -1958,11 +1974,15 @@ impl Client {
                 }) {
                     let cause = error.code().unwrap_or("outcome_unknown").to_string();
                     let unknown = self.unknown(pending, &cause, error.status());
-                    return Err(if call.defer_pending_ack {
-                        unknown
-                    } else {
-                        error
-                    });
+                    return Err(
+                        if call.defer_pending_ack
+                            || (call.method == "POST" && call.path == "/api/v1/registry/items")
+                        {
+                            unknown
+                        } else {
+                            error
+                        },
+                    );
                 }
                 if pre_execution_refusal(&error) {
                     refused_pending = Some(self.retain_refusal(pending, &error)?);
@@ -2116,24 +2136,34 @@ impl Client {
         }
         // No discovery, route preparation or encryption: those would mutate the operation.
         // A refusal after an originally unknown attempt cannot prove that earlier write failed.
-        let mut value =
-            match self.attempt(&wire, pending.body.as_deref(), remaining, &pending.protocol) {
-                Ok(value) => value,
-                Err(failure) => {
-                    let error = failure_error(failure);
-                    if refused && pre_execution_refusal(&error) {
-                        self.retain_refusal(pending, &error)?;
-                        return Err(error);
-                    }
-                    if refused && error.api_error().is_some_and(|api| api.status < 500) {
-                        // Retire safe-retry permission, while retaining the original bytes/key.
-                        // A later call must reconcile rather than encrypt a new body for this key.
-                        return Err(error);
-                    }
-                    let cause = error.code().unwrap_or("outcome_unknown").to_owned();
-                    return Err(self.unknown(pending, &cause, error.status()));
+        let mut value = match self.attempt_observed(
+            &wire,
+            pending.body.as_deref(),
+            remaining,
+            &pending.protocol,
+            None,
+            None,
+            false,
+        ) {
+            Ok(value) => value,
+            Err(failure) => {
+                let error = failure_error(failure);
+                if refused && pre_execution_refusal(&error) {
+                    self.retain_refusal(pending, &error)?;
+                    return Err(error);
                 }
-            };
+                if refused && error.api_error().is_some_and(|api| api.status < 500) {
+                    // Retire safe-retry permission, while retaining the original bytes/key.
+                    // A later call must reconcile rather than encrypt a new body for this key.
+                    return Err(error);
+                }
+                let cause = error.code().unwrap_or("outcome_unknown").to_owned();
+                if cause == "protocol_response_invalid" {
+                    pending.diagnostic = Some(error.to_string());
+                }
+                return Err(self.unknown(pending, &cause, error.status()));
+            }
+        };
         let held = self.resolved_content_key()?;
         if let Some(workspace) = self.workspace.as_deref()
             && let Err(message) = crate::crypto::transform_fields_policy(
@@ -2748,11 +2778,68 @@ mod pending_completion_tests {
         }
     }
 
+    #[test]
+    fn task_receipt_ack_waits_for_journal_owner_without_resending() {
+        use crate::Transport;
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let client = std::sync::Arc::new(
+            Client::new("http://127.0.0.1:1", "fixture".into())
+                .unwrap()
+                .with_pending_journal(&root)
+                .unwrap(),
+        );
+        let mut call = Call::write(
+            "fixture",
+            "POST",
+            "/api/v1/registry/items".into(),
+            json!({"title":"same"}),
+        );
+        call.deadline_ms = Some(2_000);
+        let key = call.key.as_deref().unwrap();
+        let mut record = pending(&client, key);
+        record.path = call.path.clone();
+        record.request_path = call.path.clone();
+        record.request_digest = Some(crate::request_identity(&call));
+        client.retain_pending(record).unwrap();
+        let owner =
+            PendingSendGuard::lock_journal(client.pending_journal.as_ref().unwrap()).unwrap();
+        let mut short = call.clone();
+        short.deadline_ms = Some(50);
+        assert!(matches!(
+            client.acknowledge_write(&short),
+            Err(ClientError::JournalBusy)
+        ));
+        assert!(client.pending_operation(key).is_some());
+        let (send, done) = std::sync::mpsc::channel();
+        let worker_client = std::sync::Arc::clone(&client);
+        let worker_call = call.clone();
+        let worker = std::thread::spawn(move || {
+            send.send(worker_client.acknowledge_write(&worker_call))
+                .unwrap();
+        });
+        assert!(matches!(
+            done.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(client.pending_operation(key).is_some());
+        drop(owner);
+        done.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        worker.join().unwrap();
+        assert!(client.pending_operations().is_empty());
+        let restored = Client::new("http://127.0.0.1:1", "fixture".into())
+            .unwrap()
+            .with_pending_journal(&root)
+            .unwrap();
+        assert!(restored.pending_operations().is_empty());
+    }
+
     fn pending(client: &Client, key: &str) -> PendingWrite {
         PendingWrite {
             code: "outcome_unknown".into(),
             cause_code: "outcome_unknown".into(),
             cause_status: None,
+            diagnostic: None,
             protocol: NegotiatedProtocol::candidate(2),
             method: "POST".into(),
             path: "/api/v1/presence".into(),

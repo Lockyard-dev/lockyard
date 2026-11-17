@@ -20,6 +20,8 @@ pub struct AgentPort {
     pub tool: Tool,
     pub repository: Option<String>,
     pub repository_confirmed: bool,
+    pub attention: Vec<lockyard_core::proto::LostClaim>,
+    pub claims: Vec<lockyard_core::proto::Claim>,
 }
 
 /// Connects to the agent. `None` when none is running for this workspace.
@@ -37,6 +39,8 @@ pub fn connect(url: &str, workspace: &str, root: PathBuf, tool: Tool) -> Option<
         tool,
         repository,
         repository_confirmed: false,
+        attention: Vec::new(),
+        claims: Vec::new(),
     })
 }
 
@@ -117,13 +121,45 @@ impl Port for AgentPort {
     }
 
     fn unread(&mut self, agent: &str) -> Result<Option<i64>> {
+        let path = self
+            .reminder_dir()
+            .map(|dir| super::mail::attention_path(&dir, &self.root, agent));
+        let now = crate::now_ms();
+        if let Some(path) = &path {
+            super::mail::reconcile_attention_acks(path, now, None);
+        }
         let reply = self
             .socket
             .ask(&Request::Unread {
+                attention_ack: path
+                    .as_deref()
+                    .map(super::mail::pending_attention_acks)
+                    .unwrap_or_default(),
+                attention: true,
                 session: agent.to_string(),
             })
             .map_err(failed)?;
+        if let Some(error) = reply.error {
+            return Err(error.into());
+        }
+        if let Some(path) = path {
+            super::mail::reconcile_attention_acks(&path, now, reply.lost.as_deref());
+        }
+        self.attention = reply.lost.unwrap_or_default();
+        self.claims = reply.claims.unwrap_or_default();
         Ok(reply.unread)
+    }
+
+    fn lost_attention(&self) -> Vec<lockyard_core::proto::LostClaim> {
+        self.attention.clone()
+    }
+
+    fn own_claims(&self, agent: &str, _now: i64) -> Vec<lockyard_core::proto::Claim> {
+        self.claims
+            .iter()
+            .filter(|c| c.session == agent)
+            .cloned()
+            .collect()
     }
 
     fn take_mail(&mut self, agent: &str, limit: usize, _now: i64) -> Result<Option<Vec<Message>>> {

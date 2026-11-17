@@ -68,12 +68,8 @@ impl Config {
         Self::token_for("")
     }
 
-    /// Resolve a cloud bearer token without reading editor/MCP host configs.
-    ///
-    /// Order: `LOCKYARD_TOKEN` → `LOCKYARD_TOKEN_FILE` → `credentials::find(url)` →
-    /// `~/.config/lockyard/token`. MCP host files (`.mcp.json`, `~/.claude.json`, …) are never
-    /// opened. A path whose final component is the canonical `owner-token` name is refused unless
-    /// the caller set `LOCKYARD_TOKEN_FILE` to that path explicitly.
+    /// Resolve cloud access: explicit env, login credentials, default token, then the
+    /// current project's MCP token-file setting. Inline MCP bearer tokens are ignored.
     pub fn token_for(url: &str) -> Result<String> {
         let mut searched = Vec::new();
         if let Ok(token) = std::env::var("LOCKYARD_TOKEN") {
@@ -113,19 +109,28 @@ impl Config {
                 Ok(token) if !token.trim().is_empty() => return Ok(token.trim().to_string()),
                 Ok(_) => {}
                 Err(error) => {
-                    // Surface an explicit owner-token refusal; other read failures stay "not found".
-                    if error.to_string().contains("owner-token") {
-                        return Err(error);
-                    }
+                    searched.push(error.to_string());
                 }
             }
         } else {
             searched.push("default token file (HOME unset)".into());
         }
+        for (config, token_path) in mcp_token_files(url) {
+            searched.push(format!(
+                "MCP {} -> {}",
+                config.display(),
+                token_path.display()
+            ));
+            if let Ok(token) = read_token_file(&token_path, TokenFileSource::ExplicitEnv)
+                && !token.trim().is_empty()
+            {
+                return Ok(token.trim().to_string());
+            }
+        }
         Err(Error::Invalid(format!(
             "no token for the cloud: run `lockyard cloud login`, or set LOCKYARD_TOKEN \
-             or LOCKYARD_TOKEN_FILE. MCP in this chat gets its token from its own settings; \
-             for the command line set LOCKYARD_TOKEN_FILE=<path to the agent token file>. \
+             or LOCKYARD_TOKEN_FILE. MCP token-file settings are searched in the project .mcp.json; \
+             for the command line set LOCKYARD_TOKEN_FILE=<path shown below>. \
              Looked in: {}",
             searched.join("; ")
         )))
@@ -144,23 +149,70 @@ fn default_token_file() -> Option<std::path::PathBuf> {
 enum TokenFileSource {
     /// `LOCKYARD_TOKEN_FILE` was set by the caller — owner-token is allowed.
     ExplicitEnv,
-    /// Default agent path — refuse canonical `owner-token` file names.
+    /// Conventional agent path, with the same private-file checks as explicit paths.
     DefaultAgent,
 }
 
-fn is_owner_token_name(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "owner-token")
+/// Search only the current project's MCP settings. Never use an inline host secret.
+fn mcp_token_files(url: &str) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let root = crate::paths::find_root(&cwd).unwrap_or(cwd);
+    let config = root.join(".mcp.json");
+    let Ok(bytes) = fs::read(&config) else {
+        return Vec::new();
+    };
+    let Ok(settings) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    let Some(servers) = settings
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for (name, server) in servers {
+        let command = server
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if name != "lockyard"
+            && std::path::Path::new(command)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                != Some("lockyard")
+        {
+            continue;
+        }
+        let Some(env) = server.get("env") else {
+            continue;
+        };
+        if let Some(target) = env.get("LOCKYARD_URL").and_then(serde_json::Value::as_str)
+            && target.trim_end_matches('/') != url.trim_end_matches('/')
+        {
+            continue;
+        }
+        if let Some(path) = env
+            .get("LOCKYARD_TOKEN_FILE")
+            .and_then(serde_json::Value::as_str)
+        {
+            let path = std::path::PathBuf::from(path);
+            files.push((
+                config.clone(),
+                if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                },
+            ));
+        }
+    }
+    files
 }
 
-fn read_token_file(path: &Path, source: TokenFileSource) -> Result<String> {
-    if matches!(source, TokenFileSource::DefaultAgent) && is_owner_token_name(path) {
-        return Err(Error::Invalid(
-            "owner-token is not used automatically; set LOCKYARD_TOKEN_FILE explicitly in your command"
-                .into(),
-        ));
-    }
+fn read_token_file(path: &Path, _source: TokenFileSource) -> Result<String> {
     #[cfg(windows)]
     return crate::windows::read_private(path, 1024 * 1024)
         .and_then(|bytes| {
@@ -275,8 +327,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn token_for_ignores_mcp_json_and_does_not_open_claude_json() {
-        use std::os::unix::fs::PermissionsExt;
+    fn token_for_uses_mcp_token_file_without_reading_inline_host_secret() {
+        let _guard = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let cfg = dir.path().join("cfg");
@@ -290,8 +342,7 @@ mod tests {
         )
         .unwrap();
         let token_path = dir.path().join("agent.token");
-        fs::write(&token_path, "from-mcp-trap\n").unwrap();
-        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::fsio::replace(&token_path, b"from-mcp-trap\n", 0o600).unwrap();
         fs::write(
             dir.path().join(".mcp.json"),
             format!(
@@ -303,8 +354,7 @@ mod tests {
         // Owner-token under the default search must not be used automatically.
         let owner = cfg.join("lockyard/owner-token");
         fs::create_dir_all(owner.parent().unwrap()).unwrap();
-        fs::write(&owner, "owner-secret\n").unwrap();
-        fs::set_permissions(&owner, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::fsio::replace(&owner, b"owner-secret\n", 0o600).unwrap();
 
         let previous = std::env::current_dir().unwrap();
         let prior_token = std::env::var_os("LOCKYARD_TOKEN");
@@ -354,30 +404,14 @@ mod tests {
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
-        let err = got.unwrap_err().to_string();
-        assert!(
-            !err.contains("from-mcp-trap") && !err.contains(".mcp.json"),
-            "{err}"
-        );
-        assert!(err.contains("Looked in:"), "{err}");
-        assert!(err.contains("LOCKYARD_TOKEN"), "{err}");
-        assert!(err.contains("LOCKYARD_TOKEN_FILE"), "{err}");
-        assert!(err.contains("credentials"), "{err}");
-        assert!(err.contains("default token file"), "{err}");
-        assert!(
-            err.contains("MCP in this chat") && err.contains("LOCKYARD_TOKEN_FILE="),
-            "{err}"
-        );
-        assert!(!err.contains(".claude.json"), "{err}");
-        assert_eq!(
-            claude_before, claude_after,
-            "HOME/.claude.json must not be opened"
-        );
+        assert_eq!(got.unwrap(), "from-mcp-trap");
+        assert_eq!(claude_before, claude_after);
         assert_eq!(explicit.unwrap(), "owner-secret");
     }
 
     #[test]
     fn token_for_error_lists_only_four_sources() {
+        let _guard = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let previous = std::env::current_dir().unwrap();
         let prior_token = std::env::var_os("LOCKYARD_TOKEN");
@@ -428,25 +462,17 @@ mod tests {
     }
 
     #[test]
-    fn default_agent_path_refuses_owner_token_name() {
+    fn token_file_name_does_not_change_explicit_access() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner-token");
-        fs::write(&path, "secret").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let error = read_token_file(&path, TokenFileSource::DefaultAgent)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("owner-token is not used automatically"),
-            "{error}"
+        crate::fsio::replace(&path, b"secret", 0o600).unwrap();
+        assert_eq!(
+            read_token_file(&path, TokenFileSource::DefaultAgent).unwrap(),
+            "secret"
         );
-        assert!(
-            read_token_file(&path, TokenFileSource::ExplicitEnv).is_ok() || cfg!(windows),
-            "explicit LOCKYARD_TOKEN_FILE may use owner-token"
+        assert_eq!(
+            read_token_file(&path, TokenFileSource::ExplicitEnv).unwrap(),
+            "secret"
         );
     }
 }

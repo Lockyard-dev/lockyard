@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 const LABEL: &[u8] = b"lockyard-cloud-key-id-v1";
 const WORDS: &str = include_str!("english.txt");
 const PREFIX: &str = "lyenc1.";
+const SESSION_META: &str = "$lockyard_session_v1";
 const FIELDS: &str = include_str!("../content-fields.json");
 const OPENAPI: &str = include_str!("../tests/fixtures/openapi.json");
 #[derive(Debug, Clone)]
@@ -237,6 +238,29 @@ pub(crate) fn transform_fields_policy(
     encrypt: bool,
     require_encrypted: bool,
 ) -> Result<(), String> {
+    transform_fields_policy_context(
+        value,
+        method,
+        route,
+        workspace,
+        key,
+        encrypt,
+        require_encrypted,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn transform_fields_policy_context(
+    value: &mut Value,
+    method: &str,
+    route: &str,
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    encrypt: bool,
+    require_encrypted: bool,
+    identity_context: Option<&Value>,
+) -> Result<(), String> {
     if route.split('?').next() == Some("/api/v1/zones/catalog")
         && (require_encrypted || value.get("format").is_some() || value.get("catalog").is_some())
     {
@@ -327,6 +351,15 @@ pub(crate) fn transform_fields_policy(
             }
         }
     }
+    if !encrypt
+        && method == "DELETE"
+        && openapi_path_matches("/api/v1/zones/claims/{id}", normalized)
+        && value.get("paths").is_some()
+        && value.get("deleted") != Some(&Value::Bool(true))
+    {
+        schemas.clear();
+        schemas.push("CoordinationClaim".into());
+    }
     if require_encrypted && !matched {
         return Err("required node encryption does not support this API operation".into());
     }
@@ -359,17 +392,66 @@ pub(crate) fn transform_fields_policy(
             validate_inline_metadata_request(value, definition, &api["components"]["schemas"])?;
         }
     }
-    // Identity is classified for compatibility with other clients' claims, but this
-    // client must not publish a chat label or process IDs in an encrypted workspace.
+    if encrypt
+        && matches!(normalized, "/api/v1/zones/claims" | "/api/v1/zones/queue")
+        && let Some(meta) = value.get("meta").and_then(Value::as_object)
+    {
+        let identity: serde_json::Map<String, Value> = meta
+            .iter()
+            .filter(|(name, _)| matches!(name.as_str(), "session_label" | "parent_pid" | "pid"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if !identity.is_empty() && !safe_start_work_meta(&Value::Object(identity)) {
+            return Err("encrypted session identity requires session_label of 1..64 ASCII label characters and numeric pid/parent_pid".into());
+        }
+    }
+    // Session changes on handover. Bind identity to the immutable acquisition nonce,
+    // and to the claim id only when the caller already knows it.
+    if encrypt
+        && matches!(normalized, "/api/v1/zones/claims" | "/api/v1/zones/queue")
+        && let Some(meta) = value.get_mut("meta").and_then(Value::as_object_mut)
+        && meta
+            .keys()
+            .any(|name| matches!(name.as_str(), "session_label" | "parent_pid" | "pid"))
+    {
+        meta.entry("lockyard_start_work_nonce")
+            .or_insert_with(|| Value::String(crate::ulid()));
+    }
+    let session_context =
+        if encrypt && matches!(normalized, "/api/v1/zones/claims" | "/api/v1/zones/queue") {
+            let mut context = identity_context.cloned().unwrap_or_else(|| value.clone());
+            if let Some(object) = context.as_object_mut() {
+                object.insert(
+                    "meta".into(),
+                    value.get("meta").cloned().unwrap_or(Value::Null),
+                );
+            }
+            stable_session_meta_context_object(
+                context.as_object().ok_or("invalid identity context")?,
+                true,
+            )
+        } else {
+            String::new()
+        };
+    // Keep identity in meta so editing a claim's note cannot erase the chat label.
+    // Only the acquisition nonce stays clear; peers authenticate the encrypted envelope.
     if encrypt
         && matches!(normalized, "/api/v1/zones/claims" | "/api/v1/zones/queue")
         && let Some(meta) = value.get_mut("meta").and_then(Value::as_object_mut)
     {
+        let mut identity = serde_json::Map::new();
         for name in ["session_label", "parent_pid", "pid"] {
-            meta.remove(name);
+            if let Some(field) = meta.remove(name) {
+                identity.insert(name.into(), field);
+            }
         }
-        if meta.is_empty() {
-            value.as_object_mut().expect("claim object").remove("meta");
+        if !identity.is_empty() {
+            let cipher = key.ok_or("session metadata key unavailable")?.encrypt(
+                workspace,
+                &session_context,
+                &Value::Object(identity).to_string(),
+            )?;
+            meta.insert(SESSION_META.into(), Value::String(cipher));
         }
     }
     if encrypt && normalized.starts_with("/api/v1/bus/messages") {
@@ -377,6 +459,7 @@ pub(crate) fn transform_fields_policy(
             .as_object_mut()
             .map(|object| object.remove("from_client"));
     }
+    let duplicate_nonces = duplicate_session_meta_nonces(value);
     let mut touched = Vec::new();
     for schema in schemas {
         visit(
@@ -392,8 +475,190 @@ pub(crate) fn transform_fields_policy(
             &mut touched,
         )?;
     }
+    if !encrypt {
+        restore_encrypted_session_meta(value, workspace, key, &duplicate_nonces)?;
+    }
     Ok(())
 }
+
+fn duplicate_session_meta_nonces(value: &Value) -> std::collections::HashSet<String> {
+    // A server can copy an envelope with its nonce between claims. Neither copy
+    // is an authenticated identity when the acquisition marker is ambiguous.
+    fn collect(
+        value: &Value,
+        seen: &mut std::collections::HashSet<String>,
+        duplicates: &mut std::collections::HashSet<String>,
+    ) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    collect(item, seen, duplicates);
+                }
+            }
+            Value::Object(object) => {
+                if let Some(meta) = object.get("meta")
+                    && let Some(nonce) = meta
+                        .get("lockyard_start_work_nonce")
+                        .and_then(Value::as_str)
+                    && !seen.insert(nonce.to_string())
+                {
+                    duplicates.insert(nonce.to_string());
+                }
+                for (name, child) in object {
+                    if name != "meta" {
+                        collect(child, seen, duplicates);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut duplicates = std::collections::HashSet::new();
+    collect(
+        value,
+        &mut std::collections::HashSet::new(),
+        &mut duplicates,
+    );
+    duplicates
+}
+
+fn restore_encrypted_session_meta(
+    value: &mut Value,
+    workspace: &str,
+    key: Option<&WorkspaceKey>,
+    duplicates: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                restore_encrypted_session_meta(item, workspace, key, duplicates)?;
+            }
+        }
+        Value::Object(object) => {
+            let contexts = [
+                stable_session_meta_context_object(object, true),
+                stable_session_meta_context_object(object, false),
+                session_meta_context_object(object, true),
+                session_meta_context_object(object, false),
+            ];
+            if let Some(meta) = object.get_mut("meta").and_then(Value::as_object_mut)
+                && let Some(cipher) = meta.remove(SESSION_META)
+            {
+                let identity = (|| -> Result<Value, String> {
+                    if meta
+                        .get("lockyard_start_work_nonce")
+                        .and_then(Value::as_str)
+                        .is_some_and(|nonce| duplicates.contains(nonce))
+                    {
+                        return Err("ambiguous session identity nonce".into());
+                    }
+                    let cipher = cipher
+                        .as_str()
+                        .filter(|cipher| cipher.starts_with(PREFIX) && cipher.len() <= 2048)
+                        .ok_or("invalid encrypted session metadata")?;
+                    let key = key.ok_or("session metadata key unavailable")?;
+                    let text = contexts
+                        .iter()
+                        .find_map(|context| key.decrypt(workspace, context, cipher).ok())
+                        .ok_or("session identity authentication failed")?;
+                    let identity: Value = serde_json::from_str(&text)
+                        .map_err(|_| "invalid encrypted session identity")?;
+                    if !safe_start_work_meta(&identity)
+                        || !identity.as_object().is_some_and(|identity| {
+                            identity.keys().all(|name| {
+                                matches!(name.as_str(), "session_label" | "parent_pid" | "pid")
+                            })
+                        })
+                    {
+                        return Err("unclassified encrypted session identity".into());
+                    }
+                    Ok(identity)
+                })();
+                // Identity is display-only. A damaged or old handover envelope must
+                // never prevent lock authority, status or another claim from being read.
+                for name in ["session_label", "pid", "parent_pid"] {
+                    meta.remove(name);
+                }
+                match identity {
+                    Ok(Value::Object(identity)) => {
+                        meta.extend(identity);
+                    }
+                    _ => {
+                        meta.insert("identity_unavailable".into(), Value::Bool(true));
+                    }
+                }
+            }
+            for (name, child) in object {
+                if name != "meta" {
+                    restore_encrypted_session_meta(child, workspace, key, duplicates)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Wire metadata admits only a bounded ciphertext and the existing acquisition nonce.
+fn safe_encrypted_session_meta(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.contains_key(SESSION_META)
+            && object.iter().all(|(name, value)| {
+                if name == SESSION_META {
+                    value
+                        .as_str()
+                        .is_some_and(|cipher| cipher.starts_with(PREFIX) && cipher.len() <= 2048)
+                } else {
+                    name == "lockyard_start_work_nonce"
+                        && safe_start_work_meta(&serde_json::json!({name: value}))
+                }
+            })
+    })
+}
+
+fn stable_session_meta_context_object(
+    value: &serde_json::Map<String, Value>,
+    with_claim: bool,
+) -> String {
+    let nonce = value
+        .get("meta")
+        .and_then(|meta| meta.get("lockyard_start_work_nonce"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let claim = if with_claim {
+        value
+            .get("id")
+            .or_else(|| value.get("claim_id"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    format!("session_meta_v2:{}", serde_json::json!([nonce, claim]))
+}
+
+// Round-4 envelopes used the mutable session, retained only as a read fallback.
+#[cfg(test)]
+fn session_meta_context(value: &Value, with_claim: bool) -> String {
+    value.as_object().map_or_else(
+        || "session_meta:[\"\",null]".into(),
+        |object| session_meta_context_object(object, with_claim),
+    )
+}
+
+fn session_meta_context_object(value: &serde_json::Map<String, Value>, with_claim: bool) -> String {
+    let session = value
+        .get("session")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let claim = with_claim
+        .then(|| value.get("id").or_else(|| value.get("claim_id")))
+        .flatten()
+        .cloned()
+        .unwrap_or(Value::Null);
+    format!("session_meta:{}", serde_json::json!([session, claim]))
+}
+
 fn validate_inline_metadata_request(
     value: &Value,
     definition: &Value,
@@ -679,6 +944,17 @@ fn visit(
                     continue;
                 }
                 if !enc
+                    && schema == "CoordinationClaim"
+                    && p == "meta"
+                    && slot.get(SESSION_META).is_some()
+                    && !safe_encrypted_session_meta(slot)
+                {
+                    // Consume malformed display envelopes without exposing arbitrary JSON
+                    // or preventing other claims from being read.
+                    *slot = serde_json::json!({"identity_unavailable":true});
+                    continue;
+                }
+                if !enc
                     && require_encrypted
                     && !slot.is_null()
                     && (p == "hold_until_ref"
@@ -687,7 +963,13 @@ fn visit(
                                 schema,
                                 "CoordinationPresence" | "CoordinationPresenceActivity"
                             ) && safe_activity_meta(slot))
-                                || (schema == "CoordinationClaim" && safe_start_work_meta(slot)))))
+                                || (schema == "CoordinationClaim"
+                                    && ((safe_start_work_meta(slot)
+                                        && slot.as_object().is_some_and(|meta| {
+                                            meta.keys()
+                                                .all(|name| name == "lockyard_start_work_nonce")
+                                        }))
+                                        || safe_encrypted_session_meta(slot))))))
                 {
                     return Err("required node response contains unclassified metadata".into());
                 }
@@ -2756,8 +3038,7 @@ mod tests {
             .create(&directory)
             .unwrap();
         let orphan = directory.join(".lykey-stage-interrupted-fixture");
-        fs::write(&orphan, [1; 16]).unwrap();
-        fs::set_permissions(&orphan, fs::Permissions::from_mode(0o600)).unwrap();
+        lockyard_core::fsio::replace(&orphan, &[1; 16], 0o600).unwrap();
         let destination = directory.join("fixture-workspace.key");
         let left = destination.clone();
         let right = destination.clone();
@@ -3002,38 +3283,210 @@ mod tests {
     }
 
     #[test]
-    fn survey_r2_classified_session_meta_accepts_foreign_claims_and_hides_outgoing_identity() {
-        let key = WorkspaceKey::from_entropy([9; 32]);
-        let meta = serde_json::json!({"session_label":"review-session", "parent_pid":123, "pid":456,
-            "lockyard_start_work_nonce":"01K00000000000000000000000"});
-        let mut request = serde_json::json!({"paths":["src"], "note":"work", "meta":meta});
+    fn required_partial_zone_mutations_classify_paths_and_remaining_claim_receipts() {
+        let key = WorkspaceKey::from_entropy([18; 32]);
+        for (method, route, mut body) in [
+            (
+                "POST",
+                "/api/v1/zones/claims/7/narrow",
+                serde_json::json!({"except":["src/private"],"fence":1}),
+            ),
+            (
+                "POST",
+                "/api/v1/zones/claims/7/handover",
+                serde_json::json!({"to":"bob","paths":["src/a"],"fence":1}),
+            ),
+            (
+                "POST",
+                "/api/v1/zones/claims/7/takeover",
+                serde_json::json!({"reason":"silent holder","paths":["src/b"]}),
+            ),
+            (
+                "DELETE",
+                "/api/v1/zones/claims/7",
+                serde_json::json!({"paths":["src/a"],"fence":1}),
+            ),
+        ] {
+            transform_fields_policy(&mut body, method, route, "w", Some(&key), true, true).unwrap();
+            assert!(body.get("except").is_some() || body.get("paths").is_some());
+        }
+        let mut remaining =
+            serde_json::json!({"id":7,"session":"alice","paths":["src/b"],"fence":2});
         transform_fields_policy(
-            &mut request,
-            "POST",
-            "/api/v1/zones/claims",
-            "w",
-            Some(&key),
-            true,
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            request["meta"],
-            serde_json::json!({"lockyard_start_work_nonce":"01K00000000000000000000000"})
-        );
-        let mut response =
-            serde_json::json!([{"id":7,"session":"other","paths":["src"],"meta":meta}]);
-        transform_fields_policy(
-            &mut response,
-            "GET",
-            "/api/v1/zones/claims",
+            &mut remaining,
+            "DELETE",
+            "/api/v1/zones/claims/7",
             "w",
             Some(&key),
             false,
             true,
         )
         .unwrap();
-        assert_eq!(response[0]["meta"], meta);
+        assert_eq!(remaining["paths"], serde_json::json!(["src/b"]));
+        let mut deleted = serde_json::json!({"id":7,"deleted":true,"paths":["src/b"]});
+        transform_fields_policy(
+            &mut deleted,
+            "DELETE",
+            "/api/v1/zones/claims/7",
+            "w",
+            Some(&key),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(deleted["paths"], serde_json::json!(["src/b"]));
+    }
+
+    #[test]
+    fn encrypted_session_identity_rejects_unsupported_labels_before_mutation() {
+        let key = WorkspaceKey::from_entropy([20; 32]);
+        let original = serde_json::json!({"paths":["src"],"note":"work","meta":{"session_label":"Ревью","pid":17}});
+        let mut request = original.clone();
+        let error = transform_fields_policy(
+            &mut request,
+            "POST",
+            "/api/v1/zones/claims",
+            "w",
+            Some(&key),
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("session_label"), "{error}");
+        assert_eq!(request, original);
+    }
+
+    #[test]
+    fn session_note_cannot_restore_unclassified_metadata() {
+        for identity in [
+            serde_json::json!({"session_label":"chat","admin":true}),
+            serde_json::json!({"pid":"not a pid"}),
+        ] {
+            let note =
+                serde_json::json!({"$lockyard_session_v1":identity,"text":"work"}).to_string();
+            let mut claim = serde_json::json!({"paths":["src"],"note":note});
+            transform_fields_policy(
+                &mut claim,
+                "GET",
+                "/api/v1/zones/claims",
+                "w",
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+            assert_eq!(claim["note"], note);
+            assert!(claim.get("meta").is_none());
+        }
+    }
+
+    fn encrypt_identity_request(value: &mut Value, key: &WorkspaceKey) -> Result<(), String> {
+        let identity_context = value.clone();
+        value.as_object_mut().unwrap().remove("session");
+        value.as_object_mut().unwrap().remove("id");
+        transform_fields_policy_context(
+            value,
+            "POST",
+            "/api/v1/zones/claims",
+            "w",
+            Some(key),
+            true,
+            true,
+            Some(&identity_context),
+        )
+    }
+
+    #[test]
+    fn encrypted_session_identity_is_restored_in_json_and_sse_event_payloads() {
+        let key = WorkspaceKey::from_entropy([19; 32]);
+        let mut request = serde_json::json!({"session":"alice","paths":["src"],"note":"work", "meta":{"session_label":"chat","pid":17}});
+        encrypt_identity_request(&mut request, &key).unwrap();
+        for envelope in [false, true] {
+            let event = serde_json::json!({"seq":1,"type":"zone.claimed","session":"alice","payload":{"claim_id":7,"session":"alice","paths":["src"],"note":request["note"],"meta":request["meta"],"reason":"claimed","fence":1}});
+            let mut frame = if envelope {
+                serde_json::json!([event])
+            } else {
+                event
+            };
+            transform_fields_policy(
+                &mut frame,
+                "GET",
+                "/api/v1/events",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+            .unwrap();
+            let payload = if envelope {
+                &frame[0]["payload"]
+            } else {
+                &frame["payload"]
+            };
+            assert_eq!(payload["note"], "work");
+            assert_eq!(payload["meta"]["session_label"], "chat");
+            assert_eq!(payload["meta"]["pid"], 17);
+        }
+    }
+
+    #[test]
+    fn survey_r2_classified_session_meta_accepts_foreign_claims_and_hides_outgoing_identity() {
+        let key = WorkspaceKey::from_entropy([9; 32]);
+        let meta = serde_json::json!({"session_label":"review-session", "parent_pid":123, "pid":456,
+            "lockyard_start_work_nonce":"01K00000000000000000000000"});
+        let mut request =
+            serde_json::json!({"session":"other","paths":["src"], "note":"work", "meta":meta});
+        encrypt_identity_request(&mut request, &key).unwrap();
+        assert_eq!(
+            request["meta"]["lockyard_start_work_nonce"],
+            "01K00000000000000000000000"
+        );
+        assert!(
+            request["meta"][SESSION_META]
+                .as_str()
+                .unwrap()
+                .starts_with(PREFIX)
+        );
+        assert!(request["meta"].get("session_label").is_none());
+        assert!(request["meta"].get("pid").is_none());
+        assert!(request["meta"].get("parent_pid").is_none());
+        assert_eq!(
+            key.decrypt("w", "note", request["note"].as_str().unwrap())
+                .unwrap(),
+            "work"
+        );
+        assert!(!request.to_string().contains("review-session"));
+        let peer_key = WorkspaceKey::from_entropy([9; 32]);
+        let mut recovered = serde_json::json!([{"id":7,"session":"other","paths":["src"],"meta":request["meta"],"note":request["note"]}]);
+        transform_fields_policy(
+            &mut recovered,
+            "GET",
+            "/api/v1/zones/claims",
+            "w",
+            Some(&peer_key),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(recovered[0]["session"], "other");
+        assert_eq!(recovered[0]["meta"]["session_label"], "review-session");
+        assert_eq!(recovered[0]["meta"]["pid"], 456);
+        assert_eq!(recovered[0]["meta"]["parent_pid"], 123);
+        assert_eq!(recovered[0]["note"], "work");
+        let mut response =
+            serde_json::json!([{"id":7,"session":"other","paths":["src"],"meta":meta}]);
+        assert!(
+            transform_fields_policy(
+                &mut response,
+                "GET",
+                "/api/v1/zones/claims",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+            .is_err()
+        );
         for bad in [
             serde_json::json!({"session_label":"x".repeat(65)}),
             serde_json::json!({"session_label":"x\n"}),
@@ -3059,6 +3512,372 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_session_meta_survives_note_changes_and_authenticates_key_and_workspace() {
+        let key = WorkspaceKey::from_entropy([23; 32]);
+        let mut request = serde_json::json!({"session":"other","paths":["src"],"note":"original", "meta":{"session_label":"peer-chat","pid":42}});
+        encrypt_identity_request(&mut request, &key).unwrap();
+        request["note"] = serde_json::json!(key.encrypt("w", "note", "edited separately").unwrap());
+        let wire = serde_json::json!([{"id":7,"session":"other","paths":["src"],"meta":request["meta"],"note":request["note"]}]);
+        let mut recovered = wire.clone();
+        transform_fields_policy(
+            &mut recovered,
+            "GET",
+            "/api/v1/zones/claims",
+            "w",
+            Some(&key),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(recovered[0]["meta"]["session_label"], "peer-chat");
+        assert_eq!(recovered[0]["note"], "edited separately");
+        let mut legacy_note = wire.clone();
+        let legacy = serde_json::json!({"$lockyard_session_v1":{"session_label":"old-chat"},"text":"old note"}).to_string();
+        legacy_note[0]["note"] = serde_json::json!(key.encrypt("w", "note", &legacy).unwrap());
+        transform_fields_policy(
+            &mut legacy_note,
+            "GET",
+            "/api/v1/zones/claims",
+            "w",
+            Some(&key),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(legacy_note[0]["meta"]["session_label"], "peer-chat");
+        assert_eq!(legacy_note[0]["note"], legacy);
+        let wrong_key = WorkspaceKey::from_entropy([24; 32]);
+        for (workspace, decrypt_key) in [("w", &wrong_key), ("other-workspace", &key)] {
+            let mut response = wire.clone();
+            assert!(
+                transform_fields_policy(
+                    &mut response,
+                    "GET",
+                    "/api/v1/zones/claims",
+                    workspace,
+                    Some(decrypt_key),
+                    false,
+                    true
+                )
+                .is_err()
+            );
+        }
+        // Display identity failure is isolated; the encrypted note still fails closed above.
+        let mut no_note = wire.clone();
+        no_note[0].as_object_mut().unwrap().remove("note");
+        transform_fields_policy(
+            &mut no_note,
+            "GET",
+            "/api/v1/zones/claims",
+            "w",
+            Some(&wrong_key),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(no_note[0]["meta"]["identity_unavailable"], true);
+    }
+
+    #[test]
+    fn round6_duplicate_nonce_invalidates_both_identities() {
+        let key = WorkspaceKey::from_entropy([61; 32]);
+        let mut request = serde_json::json!({"session":"alice","paths":["src"],"meta":{"session_label":"alice-chat"}});
+        encrypt_identity_request(&mut request, &key).unwrap();
+        let mut claims = serde_json::json!([
+            {"id":42,"session":"alice","paths":["src"],"meta":request["meta"]},
+            {"id":43,"session":"bob","paths":["docs"],"meta":request["meta"]}
+        ]);
+        transform_fields_policy(
+            &mut claims,
+            "GET",
+            "/api/v1/zones/claims",
+            "w",
+            Some(&key),
+            false,
+            true,
+        )
+        .unwrap();
+        for claim in claims.as_array().unwrap() {
+            assert_eq!(claim["meta"]["identity_unavailable"], true);
+            assert!(claim["meta"].get("session_label").is_none());
+        }
+    }
+
+    #[test]
+    fn round6_required_response_rejects_clear_identity() {
+        let key = WorkspaceKey::from_entropy([62; 32]);
+        for meta in [
+            serde_json::json!({"session_label":"forged"}),
+            serde_json::json!({"pid":123}),
+            serde_json::json!({"parent_pid":456}),
+        ] {
+            let mut response =
+                serde_json::json!([{"id":42,"session":"alice","paths":["src"],"meta":meta}]);
+            assert!(
+                transform_fields_policy(
+                    &mut response,
+                    "GET",
+                    "/api/v1/zones/claims",
+                    "w",
+                    Some(&key),
+                    false,
+                    true
+                )
+                .is_err()
+            );
+            let mut event = serde_json::json!({"seq":1,"type":"zone.claimed","payload":{"session":"alice","claim_id":42,"meta":meta,"reason":"claimed"}});
+            assert!(
+                transform_fields_policy(
+                    &mut event,
+                    "GET",
+                    "/api/v1/events",
+                    "w",
+                    Some(&key),
+                    false,
+                    true
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn round6_encrypted_slot_is_bounded_and_consumed_without_paths() {
+        for cipher in [
+            serde_json::json!(17),
+            serde_json::json!({"secret":"arbitrary"}),
+            serde_json::json!("plain secret"),
+            serde_json::json!(format!("lyenc1.{}", "x".repeat(2048))),
+        ] {
+            assert!(!safe_encrypted_session_meta(
+                &serde_json::json!({SESSION_META:cipher})
+            ));
+        }
+        assert!(safe_encrypted_session_meta(
+            &serde_json::json!({SESSION_META:format!("lyenc1.{}", "x".repeat(2041))})
+        ));
+    }
+
+    #[test]
+    fn round6_encrypted_slot_without_paths_never_reaches_json() {
+        let mut value = serde_json::json!({"meta":{SESSION_META:{"secret":"arbitrary"}}});
+        transform_fields_policy(
+            &mut value,
+            "GET",
+            "/api/v1/zones/claims",
+            "w",
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"meta":{"identity_unavailable":true}})
+        );
+        let mut unclassified = serde_json::json!({"meta":{SESSION_META:{"secret":"arbitrary"}}});
+        restore_encrypted_session_meta(
+            &mut unclassified,
+            "w",
+            None,
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            unclassified,
+            serde_json::json!({"meta":{"identity_unavailable":true}})
+        );
+    }
+
+    #[test]
+    fn round5_identity_survives_handover_and_corrupt_peer_is_isolated() {
+        let key = WorkspaceKey::from_entropy([51; 32]);
+        let mut request = serde_json::json!({"session":"alice","paths":["src"],"meta":{"session_label":"alice-chat"}});
+        encrypt_identity_request(&mut request, &key).unwrap();
+        let wire =
+            serde_json::json!({"id":42,"session":"bob","paths":["src"],"meta":request["meta"]});
+        for (method, route) in [
+            ("POST", "/api/v1/zones/claims/42/accept"),
+            ("GET", "/api/v1/zones/claims"),
+        ] {
+            let mut response = if method == "POST" {
+                wire.clone()
+            } else {
+                serde_json::json!([wire.clone()])
+            };
+            transform_fields_policy(&mut response, method, route, "w", Some(&key), false, true)
+                .unwrap();
+            let claim = if response.is_array() {
+                &response[0]
+            } else {
+                &response
+            };
+            assert_eq!(claim["meta"]["session_label"], "alice-chat");
+        }
+        for cipher in [serde_json::json!("lyenc1.broken"), serde_json::json!(7)] {
+            let mut damaged = wire.clone();
+            damaged["id"] = serde_json::json!(99);
+            damaged["meta"]["lockyard_start_work_nonce"] = serde_json::json!(crate::ulid());
+            damaged["meta"][SESSION_META] = cipher;
+            let mut response = serde_json::json!([damaged, wire.clone()]);
+            transform_fields_policy(
+                &mut response,
+                "GET",
+                "/api/v1/zones/claims",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(response[0]["meta"]["identity_unavailable"], true);
+            assert!(response[0]["meta"].get("session_label").is_none());
+            assert_eq!(response[1]["meta"]["session_label"], "alice-chat");
+        }
+    }
+
+    #[test]
+    fn round5_legacy_identity_still_reads_with_original_aad() {
+        let key = WorkspaceKey::from_entropy([52; 32]);
+        for with_claim in [false, true] {
+            let context =
+                session_meta_context(&serde_json::json!({"session":"alice","id":42}), with_claim);
+            let cipher = key
+                .encrypt("w", &context, r#"{"session_label":"old-chat"}"#)
+                .unwrap();
+            let mut claim = serde_json::json!({"id":42,"session":"alice","paths":["src"],"meta":{SESSION_META:cipher}});
+            transform_fields_policy(
+                &mut claim,
+                "GET",
+                "/api/v1/zones/claims",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(claim["meta"]["session_label"], "old-chat");
+        }
+    }
+
+    #[test]
+    fn round5_session_metadata_follows_owner_but_authenticates_nonce_and_known_claim() {
+        let key = WorkspaceKey::from_entropy([41; 32]);
+        for id in [None, Some(7)] {
+            let mut request = serde_json::json!({"session":"alice","paths":["src"],"meta":{"session_label":"alice-chat"}});
+            if let Some(id) = id {
+                request["id"] = serde_json::json!(id);
+            }
+            encrypt_identity_request(&mut request, &key).unwrap();
+            let wire = serde_json::json!({"id":7,"session":"alice","paths":["src"],"meta":request["meta"]});
+            let mut valid = wire.clone();
+            transform_fields_policy(
+                &mut valid,
+                "GET",
+                "/api/v1/zones/claims",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+            .unwrap();
+            let mut transferred = wire.clone();
+            transferred["session"] = serde_json::json!("bob");
+            transform_fields_policy(
+                &mut transferred,
+                "GET",
+                "/api/v1/zones/claims",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(transferred["meta"]["session_label"], "alice-chat");
+            let mut transplanted = wire.clone();
+            transplanted["meta"]["lockyard_start_work_nonce"] =
+                serde_json::json!("01K00000000000000000000001");
+            transform_fields_policy(
+                &mut transplanted,
+                "GET",
+                "/api/v1/zones/claims",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(transplanted["meta"]["identity_unavailable"], true);
+            if id.is_some() {
+                let mut other = wire.clone();
+                other["id"] = serde_json::json!(8);
+                transform_fields_policy(
+                    &mut other,
+                    "GET",
+                    "/api/v1/zones/claims",
+                    "w",
+                    Some(&key),
+                    false,
+                    true,
+                )
+                .unwrap();
+                assert_eq!(other["meta"]["identity_unavailable"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn round4_note_envelope_is_ordinary_text_and_cannot_inject_identity() {
+        let key = WorkspaceKey::from_entropy([42; 32]);
+        let note =
+            serde_json::json!({"$lockyard_session_v1":{"session_label":"forged"},"text":"keep"})
+                .to_string();
+        let mut claim = serde_json::json!({"id":7,"session":"alice","paths":["src"],"note":key.encrypt("w","note",&note).unwrap()});
+        transform_fields_policy(
+            &mut claim,
+            "GET",
+            "/api/v1/zones/claims",
+            "w",
+            Some(&key),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(claim["note"], note);
+        assert!(claim.get("meta").is_none());
+    }
+
+    #[test]
+    fn encrypted_session_meta_rejects_unclassified_decrypted_identity() {
+        let key = WorkspaceKey::from_entropy([25; 32]);
+        for identity in [
+            serde_json::json!({"session_label":"chat","admin":true}),
+            serde_json::json!({"pid":"not a pid"}),
+        ] {
+            let cipher = key
+                .encrypt(
+                    "w",
+                    &session_meta_context(&serde_json::json!({"session":"alice","id":7}), true),
+                    &identity.to_string(),
+                )
+                .unwrap();
+            let mut response = serde_json::json!([{"id":7,"session":"alice","paths":["src"],"meta":{SESSION_META:cipher}}]);
+            transform_fields_policy(
+                &mut response,
+                "GET",
+                "/api/v1/zones/claims",
+                "w",
+                Some(&key),
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(response[0]["meta"]["identity_unavailable"], true);
+            assert!(response[0]["meta"].get("session_label").is_none());
+        }
+    }
+
+    #[test]
     fn start_work_nonce_is_classified_only_on_required_claim_requests() {
         let key = WorkspaceKey::from_entropy([9; 32]);
         let meta = serde_json::json!({"lockyard_start_work_nonce":"01K00000000000000000000000"});
@@ -3066,16 +3885,7 @@ mod tests {
             "paths":["src"], "note":"private work", "ttl_minutes":30,
             "mode":"exclusive", "purpose":"work", "lazy":false, "meta":meta
         });
-        transform_fields_policy(
-            &mut request,
-            "POST",
-            "/api/v1/zones/claims",
-            "w",
-            Some(&key),
-            true,
-            true,
-        )
-        .unwrap();
+        encrypt_identity_request(&mut request, &key).unwrap();
         assert_eq!(request["meta"], meta);
         assert_eq!(
             key.decrypt("w", "note", request["note"].as_str().unwrap())

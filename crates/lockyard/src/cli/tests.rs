@@ -998,7 +998,64 @@ fn incoming_path_requests_keep_unanswered_foreign_asks() {
 }
 
 #[test]
+fn round4_busy_agent_probe_preserves_the_normal_command_route() {
+    for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+        assert!(no_access_probe_allows_route(
+            Err(std::io::Error::from(kind)),
+            "http://127.0.0.1:9",
+            "w"
+        ));
+    }
+    assert!(!no_access_probe_allows_route(
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        "http://127.0.0.1:9",
+        "w"
+    ));
+}
+
+#[test]
+fn round4_absent_agent_probe_has_a_short_windows_budget() {
+    assert!(no_access_probe_budget() <= std::time::Duration::from_millis(250));
+    let dir = tempfile::tempdir().unwrap();
+    let start = std::time::Instant::now();
+    assert!(
+        crate::agent::socket::AgentSocket::status(
+            &dir.path().join("absent"),
+            no_access_probe_budget()
+        )
+        .is_err()
+    );
+    assert!(start.elapsed() < std::time::Duration::from_millis(500));
+}
+
+#[test]
 fn no_cloud_access_exits_with_dedicated_code_and_message() {
+    const CHILD: &str = "LOCKYARD_NO_ACCESS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::no_cloud_access_exits_with_dedicated_code_and_message",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env("XDG_RUNTIME_DIR", dir.path().join("run"))
+            .env("LOCKYARD_CREDENTIALS", dir.path().join("missing"))
+            .env_remove("LOCKYARD_TOKEN")
+            .env_remove("LOCKYARD_TOKEN_FILE")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stdout).contains("1 passed"),
+            "child filter missed test: {result:?}"
+        );
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join(".lockyard")).unwrap();

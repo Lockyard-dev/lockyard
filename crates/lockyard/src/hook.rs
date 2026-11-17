@@ -12,7 +12,7 @@
 //! In cloud mode a hook talks to the agent socket and nothing else: no HTTP and no async runtime.
 
 use lockyard_core::config::{Config, Mode};
-use lockyard_core::proto::{Event, InboxQuery, Message};
+use lockyard_core::proto::{Event, InboxQuery, Message, Stamp};
 use lockyard_core::zones::Conflict;
 use lockyard_core::{Backend, Result, Store, ZonePath};
 use serde_json::{Value, json};
@@ -101,6 +101,13 @@ trait Port {
     fn check(&mut self, agent: &str, path: &str, now: i64) -> Result<Verdict>;
     /// `None` means the count is unknown.
     fn unread(&mut self, agent: &str) -> Result<Option<i64>>;
+    fn lost_attention(&self) -> Vec<lockyard_core::proto::LostClaim> {
+        Vec::new()
+    }
+    /// Cloud implementations use the same memory snapshot as Unread, never a new RPC.
+    fn own_claims(&self, _agent: &str, _now: i64) -> Vec<lockyard_core::proto::Claim> {
+        Vec::new()
+    }
     /// Reserves mail for this hook. `None` means unknown.
     fn take_mail(&mut self, agent: &str, limit: usize, now: i64) -> Result<Option<Vec<Message>>>;
     fn mark_seen(&mut self, agent: &str, ids: &[i64], now: i64) -> Result<()>;
@@ -143,6 +150,18 @@ impl Port for LocalPort {
 
     fn unread(&mut self, agent: &str) -> Result<Option<i64>> {
         Ok(Some(Backend::unread(&self.store, agent)?))
+    }
+
+    fn own_claims(&self, agent: &str, now: i64) -> Vec<lockyard_core::proto::Claim> {
+        Backend::claims(
+            &self.store,
+            &lockyard_core::proto::ClaimQuery {
+                session: Some(agent.into()),
+                path: None,
+            },
+            now,
+        )
+        .unwrap_or_default()
     }
 
     fn take_mail(&mut self, agent: &str, limit: usize, now: i64) -> Result<Option<Vec<Message>>> {

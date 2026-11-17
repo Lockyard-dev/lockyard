@@ -9,6 +9,19 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Registry item types accepted by the cloud API, CLI and MCP schema.
+pub const REGISTRY_TASK_TYPES: [&str; 9] = [
+    "code",
+    "ops",
+    "incident",
+    "finding",
+    "management",
+    "owner_decision",
+    "certification",
+    "external",
+    "housekeeping",
+];
+
 const MINUTE_MS: i64 = 60_000;
 const COLUMNS: &str = "task_key, title, body, status, author, assignee, lease_until, evidence, created_at, updated_at";
 

@@ -392,12 +392,33 @@ pub(super) fn run_tool(
             encode(&opened.backend.zone_answer(me()?, args.id()?, &answer)?)
         }
         "zone_handover" => {
+            let paths = opened.workspace_zone_paths(cwd, &args.strings("paths")?)?;
+            if !paths.is_empty() {
+                return opened.backend.partial_zone(
+                    me()?,
+                    args.id()?,
+                    "handover",
+                    &json!({"to":args.text("to")?,"paths":paths,"fence":args.some_int("fence")?}),
+                );
+            }
             opened
                 .backend
                 .handover(me()?, args.id()?, args.text("to")?, args.some_int("fence")?)
         }
         "zone_accept" => encode(&opened.backend.handover_accept(me()?, args.id()?)?),
         "zone_narrow" => {
+            let except = opened.workspace_zone_paths(cwd, &args.strings("except")?)?;
+            if !except.is_empty() {
+                if !args.strings("paths")?.is_empty() {
+                    return Err(Error::Invalid("use paths or except, not both".into()));
+                }
+                return opened.backend.partial_zone(
+                    me()?,
+                    args.id()?,
+                    "narrow",
+                    &json!({"except":except,"fence":args.some_int("fence")?}),
+                );
+            }
             let paths = opened.workspace_zone_paths(cwd, &args.strings("paths")?)?;
             encode(
                 &opened
@@ -421,22 +442,30 @@ pub(super) fn run_tool(
                 ));
             }
             let paths = opened.workspace_zone_paths(cwd, &paths)?;
-            let mut claim = None;
-            let mut fence = fence;
-            for path in &paths {
-                let expanded = opened.backend.add_path(agent, id, path, fence)?;
-                if fence.is_some() {
-                    fence = Some(expanded.fence);
-                }
-                claim = Some(expanded);
-            }
-            encode(&claim.expect("checked non-empty"))
+            encode(&crate::cli_zones::add_paths_atomic(
+                opened.backend.as_mut(),
+                agent,
+                id,
+                &paths,
+                fence,
+            )?)
         }
-        "zone_takeover" => encode(&opened.backend.takeover(
-            me()?,
-            args.id()?,
-            args.text("reason")?,
-        )?),
+        "zone_takeover" => {
+            let paths = opened.workspace_zone_paths(cwd, &args.strings("paths")?)?;
+            if !paths.is_empty() {
+                return opened.backend.partial_zone(
+                    me()?,
+                    args.id()?,
+                    "takeover",
+                    &json!({"paths":paths,"reason":args.text("reason")?}),
+                );
+            }
+            encode(
+                &opened
+                    .backend
+                    .takeover(me()?, args.id()?, args.text("reason")?)?,
+            )
+        }
         "zone_dirty" => {
             let (owner, reason) = (args.some_text("owner")?, args.some_text("reason")?);
             let task = args
@@ -507,17 +536,37 @@ pub(super) fn run_tool(
             };
             let renewed = opened.backend.renew(agent, id, &request, now)?;
             let mut answer = json!({"renewed": renewed});
-            if let Some(count) = crate::open_mail::open_mail_count_within(
+            if let Some(snap) = crate::open_mail::open_mail_within(
                 opened.backend.as_ref(),
                 agent,
                 now,
                 crate::open_mail::RENEW_BUDGET,
             ) {
-                answer["open_mail_count"] = json!(count);
+                answer["open_mail_count"] = json!(snap.items.len());
+                answer["open_mail"] = json!(snap.items);
+                if snap.truncated {
+                    answer["open_mail_truncated"] = json!(true);
+                }
+            } else {
+                answer["open_mail_unknown"] = json!(true);
             }
             Ok(answer)
         }
         "zone_release" => {
+            let mut paths = args.strings("paths")?;
+            if let Some(path) = args.some_text("path")? {
+                if !paths.is_empty() {
+                    return Err(Error::Invalid("use path or paths, not both".into()));
+                }
+                paths.push(path);
+            }
+            if !paths.is_empty() {
+                if args.flag("all")? {
+                    return Err(Error::Invalid("partial release cannot use all".into()));
+                }
+                let paths = opened.workspace_zone_paths(cwd, &paths)?;
+                return opened.backend.partial_zone(me()?, args.id()?, "release", &json!({"paths":paths,"fence":args.some_int("fence")?,"leave_dirty":args.flag("leave_dirty")?,"note":args.some_text("note")?}));
+            }
             let request = ReleaseRequest {
                 note: args.some_text("note")?,
                 leave_dirty: args.flag("leave_dirty")?,
@@ -707,7 +756,7 @@ pub(super) fn run_tool(
                 Err(error) => Err(error),
             }
         }
-        "task_plan" => {
+        "task_plan" | "task_update" => {
             let plan = TaskPlan {
                 priority: args.some_text("priority")?,
                 p0_category: args.some_text("p0_category")?,

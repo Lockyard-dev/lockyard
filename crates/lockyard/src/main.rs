@@ -176,7 +176,6 @@ fn resolve_agent(flag: Option<&String>) -> Result<String> {
 /// (`status_read` / `cloud()`).
 fn no_cloud_access_output(cwd: &Path) -> Result<Option<Output>> {
     use lockyard_core::config::{Config, Mode};
-    use std::time::Duration;
     let Some(root) = lockyard_core::paths::find_root(cwd) else {
         return Ok(None);
     };
@@ -191,12 +190,19 @@ fn no_cloud_access_output(cwd: &Path) -> Result<Option<Output>> {
         return Ok(None);
     }
     let socket = crate::agent::socket_path_for(&url, &workspace);
-    let probe = Duration::from_millis(100);
-    // Tokenless callers keep the existing daemon-only route (connect_status / cloud).
-    if crate::agent::socket::AgentSocket::connect_status(&socket, &url, &workspace, None, probe)
-        .is_some()
-        || crate::agent::socket::AgentSocket::connect(&socket, &url, &workspace, probe).is_some()
-    {
+    // An existing endpoint may be busy. Let the normal command route wait within its
+    // own budget instead of turning a short handshake timeout into "no access".
+    // This guard is used by mail/path-request commands, never PreToolUse.
+    if socket.exists() {
+        return Ok(None);
+    }
+    let probe = no_access_probe_budget();
+    // Also probe named pipes on Windows, which have no filesystem socket entry.
+    if no_access_probe_allows_route(
+        crate::agent::socket::AgentSocket::status(&socket, probe),
+        &url,
+        &workspace,
+    ) {
         return Ok(None);
     }
     let mut out = output(
@@ -205,6 +211,28 @@ fn no_cloud_access_output(cwd: &Path) -> Result<Option<Output>> {
     )?;
     out.exit = EXIT_NO_CLOUD_ACCESS;
     Ok(Some(out))
+}
+
+fn no_access_probe_allows_route(
+    result: std::io::Result<crate::agent::wire::AgentStatus>,
+    url: &str,
+    workspace: &str,
+) -> bool {
+    match result {
+        Ok(status) => {
+            status.url.trim_end_matches('/') == url.trim_end_matches('/')
+                && status.workspace == workspace
+        }
+        // A busy pipe or slow handshake is inconclusive; the command keeps its normal budget.
+        Err(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ),
+    }
+}
+
+fn no_access_probe_budget() -> std::time::Duration {
+    std::time::Duration::from_millis(250)
 }
 
 /// Outcome of an optional path-request peek on a hot path.

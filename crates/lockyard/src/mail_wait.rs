@@ -9,16 +9,20 @@ pub(crate) fn actionable(mail: &Message) -> bool {
     !matches!(mail.status.as_deref(), Some("ack" | "info"))
         && mail.role.as_deref() != Some("sender")
         && (mail.urgent
-            || (mail.reply_to.is_some() && mail.needs.as_deref().unwrap_or("none") != "none")
+            || (mail.reply_to.is_some()
+                && !mail.to.is_empty()
+                && !matches!(mail.to.as_str(), "*" | "all" | "everyone")
+                && !mail.to.starts_with('@')
+                && mail
+                    .address
+                    .as_deref()
+                    .is_none_or(|address| address == mail.to))
             || matches!(mail.needs.as_deref(), Some("reply" | "ack")))
 }
 
-/// Received replies are routed by the server to the original asker. This is display-only.
+/// Priority follows the same recipient and terminal-state rules as waking.
 pub(crate) fn hook_priority(mail: &Message) -> bool {
     actionable(mail)
-        || (mail.reply_to.is_some()
-            && mail.role.as_deref() != Some("sender")
-            && !matches!(mail.status.as_deref(), Some("ack" | "info")))
 }
 
 pub(crate) fn reminder(mail: &Message) -> String {
@@ -155,14 +159,28 @@ pub(crate) fn run(cwd: &Path, session: &str, timeout: Duration) -> u8 {
 mod tests {
     use super::*;
     use serde_json::json;
+
     #[test]
-    fn mail_plain_reply_is_display_only_but_needs_or_urgent_wake() {
+    fn round4_reply_in_someone_elses_broadcast_does_not_wake() {
+        for to in ["*", "all", "@codex"] {
+            let mail: Message = serde_json::from_value(json!({"id":1,"from":"author","to":to,"address":"@codex","role":"recipient","reply_to":9,"needs":"none","body":"follow-up"})).unwrap();
+            assert!(!actionable(&mail), "{to}");
+            assert!(!hook_priority(&mail));
+        }
+    }
+
+    #[test]
+    fn mail_plain_none_is_display_only_but_reply_to_my_ask_wakes() {
         let mut mail: Message = serde_json::from_value(
             json!({"id":1,"from":"bob","to":"alice","reply_to":9,"needs":"none","body":"Принято"}),
         )
         .unwrap();
-        assert!(!actionable(&mail));
+        assert!(actionable(&mail));
         assert!(hook_priority(&mail));
+        mail.reply_to = None;
+        assert!(!actionable(&mail));
+        assert!(!hook_priority(&mail));
+        mail.reply_to = Some(9);
         for needs in ["ack", "reply", "custom"] {
             mail.needs = Some(needs.into());
             assert!(actionable(&mail));

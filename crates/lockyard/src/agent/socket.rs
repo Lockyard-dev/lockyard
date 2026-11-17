@@ -29,6 +29,7 @@ pub struct AgentSocket {
     workspace: String,
     timeout: Duration,
     prepare_task_create_v1: bool,
+    hook_mail_state_dir: Option<PathBuf>,
     #[cfg(windows)]
     state_root: PathBuf,
 }
@@ -41,6 +42,7 @@ impl AgentSocket {
             workspace: workspace.to_string(),
             timeout,
             prepare_task_create_v1: false,
+            hook_mail_state_dir: None,
             #[cfg(windows)]
             state_root: super::state_root().ok()?,
         };
@@ -62,6 +64,7 @@ impl AgentSocket {
             workspace: workspace.to_string(),
             timeout,
             prepare_task_create_v1: false,
+            hook_mail_state_dir: None,
             #[cfg(windows)]
             state_root: super::state_root().ok()?,
         };
@@ -104,6 +107,7 @@ impl AgentSocket {
     fn match_target(mut self, url: &str, workspace: &str) -> Option<Self> {
         let status = self.ping().ok()?;
         self.prepare_task_create_v1 = status.prepare_task_create_v1;
+        self.hook_mail_state_dir = status.hook_mail_state_dir;
         (status.url.trim_end_matches('/') == url.trim_end_matches('/')
             && status.workspace == workspace)
             .then_some(self)
@@ -122,6 +126,7 @@ impl AgentSocket {
             workspace: workspace.to_string(),
             timeout,
             prepare_task_create_v1: false,
+            hook_mail_state_dir: None,
             state_root: state_root.to_path_buf(),
         }
         .match_target(url, workspace)
@@ -137,8 +142,8 @@ impl AgentSocket {
     }
 
     pub fn hook_mail_dir(&self) -> io::Result<PathBuf> {
-        self.ping()?
-            .hook_mail_state_dir
+        self.hook_mail_state_dir
+            .clone()
             .ok_or_else(|| io::Error::other("agent omitted hook mail state directory"))
     }
 
@@ -149,6 +154,7 @@ impl AgentSocket {
             workspace: String::new(),
             timeout,
             prepare_task_create_v1: false,
+            hook_mail_state_dir: None,
             #[cfg(windows)]
             state_root: super::state_root()?,
         }
@@ -585,6 +591,8 @@ impl Transport for AgentSocket {
 
     fn fast_unread(&self, session: &str) -> Option<Result<Option<i64>, ClientError>> {
         let request = Request::Unread {
+            attention_ack: Vec::new(),
+            attention: false,
             session: session.to_string(),
         };
         Some(self.ask_for(&request).map(|reply| reply.unread))
@@ -653,6 +661,7 @@ mod tests {
                     workspace: "team".into(),
                     timeout: Duration::from_secs(2),
                     prepare_task_create_v1: false,
+                    hook_mail_state_dir: None,
                 };
                 let mut backend = CloudBackend::new(socket, "me");
                 backend
@@ -741,6 +750,7 @@ mod tests {
             workspace: "test".into(),
             timeout: Duration::from_secs(2),
             prepare_task_create_v1: false,
+            hook_mail_state_dir: None,
         }
         .call(&call);
         peer.join().unwrap();
@@ -942,6 +952,7 @@ mod tests {
             workspace: "team".into(),
             timeout: Duration::from_secs(1),
             prepare_task_create_v1: false,
+            hook_mail_state_dir: None,
         };
         let started = Instant::now();
         let error = socket

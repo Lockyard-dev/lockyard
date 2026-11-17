@@ -213,23 +213,23 @@ impl<T: Transport> CloudBackend<T> {
         path: &str,
         timeout: std::time::Duration,
     ) -> Result<bool> {
-        self.wait_zone_stream_with_recheck(agent, path, timeout, std::time::Duration::from_secs(60))
+        self.wait_zone_stream_with_clock(agent, path, timeout, std::time::Instant::now)
     }
 
-    fn wait_zone_stream_with_recheck(
+    fn wait_zone_stream_with_clock(
         &self,
         agent: &str,
         path: &str,
         timeout: std::time::Duration,
-        recheck_every: std::time::Duration,
+        now: impl Fn() -> std::time::Instant + Sync,
     ) -> Result<bool> {
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
             mpsc,
         };
-        use std::time::{Duration, Instant};
-        let deadline = Instant::now()
+        use std::time::Duration;
+        let deadline = now()
             .checked_add(timeout)
             .ok_or_else(|| Error::Invalid("zone wait timeout is too large".into()))?;
         if timeout.is_zero() {
@@ -239,20 +239,16 @@ impl<T: Transport> CloudBackend<T> {
             || self.transport.owns_event_stream()
             || !self.transport.mail_push_v1(agent)?
         {
-            if self.zone_is_free(
-                agent,
-                path,
-                deadline.saturating_duration_since(Instant::now()),
-            )? {
+            if self.zone_is_free(agent, path, deadline.saturating_duration_since(now()))? {
                 return Ok(true);
             }
             loop {
-                let left = deadline.saturating_duration_since(Instant::now());
+                let left = deadline.saturating_duration_since(now());
                 if left.is_zero() {
                     return Ok(false);
                 }
-                std::thread::sleep(left.min(Duration::from_secs(10)));
-                let left = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(left.min(Duration::from_secs(60)));
+                let left = deadline.saturating_duration_since(now());
                 if left.is_zero() {
                     return Ok(false);
                 }
@@ -265,7 +261,7 @@ impl<T: Transport> CloudBackend<T> {
         // not replace an existing stream; replay preceding this head is irrelevant to a wait.
         let mut after = 0;
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline.saturating_duration_since(now());
             if left.is_zero() {
                 return Ok(false);
             }
@@ -284,11 +280,12 @@ impl<T: Transport> CloudBackend<T> {
         }
         let interrupt = Arc::new(AtomicBool::new(false));
         let (done, completion) = mpsc::channel::<()>();
+        let now = &now;
         std::thread::scope(|scope| {
             let stop = interrupt.clone();
             scope.spawn(move || {
                 if completion
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .recv_timeout(deadline.saturating_duration_since(now()))
                     .is_err()
                 {
                     stop.store(true, Ordering::Release);
@@ -315,29 +312,13 @@ impl<T: Transport> CloudBackend<T> {
                 });
                 let result = (|| {
                     let mut ready = false;
-                    let mut recheck = Instant::now() + recheck_every;
                     loop {
-                        let now = Instant::now();
-                        if now >= deadline {
+                        let current = now();
+                        if current >= deadline {
                             return Ok(false);
                         }
-                        if ready && now >= recheck {
-                            if self.zone_is_free(
-                                agent,
-                                path,
-                                deadline.saturating_duration_since(now),
-                            )? {
-                                return Ok(true);
-                            }
-                            recheck = Instant::now() + recheck_every;
-                        }
-                        let until = if ready {
-                            deadline.min(recheck)
-                        } else {
-                            deadline
-                        };
                         let next = match receive
-                            .recv_timeout(until.saturating_duration_since(Instant::now()))
+                            .recv_timeout(deadline.saturating_duration_since(now()))
                         {
                             Ok(next) => next,
                             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -373,15 +354,14 @@ impl<T: Transport> CloudBackend<T> {
                             || frame
                                 .decode()?
                                 .is_some_and(|event| event.kind.starts_with("zone."));
-                        if changed {
-                            if self.zone_is_free(
+                        if changed
+                            && self.zone_is_free(
                                 agent,
                                 path,
-                                deadline.saturating_duration_since(Instant::now()),
-                            )? {
-                                return Ok(true);
-                            }
-                            recheck = Instant::now() + recheck_every;
+                                deadline.saturating_duration_since(now()),
+                            )?
+                        {
+                            return Ok(true);
                         }
                     }
                 })();
@@ -391,7 +371,7 @@ impl<T: Transport> CloudBackend<T> {
                 result
             })();
             let _ = done.send(());
-            if result.is_err() && Instant::now() >= deadline {
+            if result.is_err() && now() >= deadline {
                 Ok(false)
             } else {
                 result
@@ -440,10 +420,11 @@ impl<T: Transport> CloudBackend<T> {
             && !matches!(
                 &error,
                 Error::Cloud {
-                    status: Some(404),
+                    status: Some(403 | 404 | 409),
                     ..
                 }
             )
+            && !matches!(&error, Error::Denied(_) | Error::Contended(_))
         {
             return error;
         }
@@ -461,15 +442,69 @@ impl<T: Transport> CloudBackend<T> {
                     claim.claim_id == id && (claim.session.is_empty() || claim.session == agent)
                 })
             });
+        // A refusal alone does not prove a loss (e.g. a hold/version conflict).
+        // Preserve it unless the loss feed confirms this specific session and claim.
+        if lost.is_none()
+            && error.kind() != "not_found"
+            && !matches!(
+                &error,
+                Error::Cloud {
+                    status: Some(404),
+                    ..
+                }
+            )
+        {
+            return error;
+        }
         let detail = match lost {
-            Some(claim) => format!(
-                "{}{}",
-                claim.reason.as_deref().unwrap_or("expired or released"),
-                claim
-                    .lost_at
-                    .map(|at| format!(" at {at}"))
-                    .unwrap_or_default()
-            ),
+            Some(claim) => {
+                let reason = claim.reason.as_deref().unwrap_or("expired or released");
+                let takeover = matches!(
+                    &error,
+                    Error::Denied(_)
+                        | Error::Cloud {
+                            status: Some(403),
+                            ..
+                        }
+                ) || reason == "taken"
+                    || reason.starts_with("taken:");
+                let action = if takeover {
+                    let owner = self
+                        .get_with_timeout(
+                            agent,
+                            "/api/v1/zones/claims".into(),
+                            Some(std::time::Duration::from_millis(500)),
+                        )
+                        .ok()
+                        .and_then(|value| list::<Claim>(value, &["claims", "items"]).ok())
+                        .and_then(|claims| {
+                            claims
+                                .into_iter()
+                                .find(|c| c.id == id && c.session != agent)
+                        })
+                        .map(|c| c.session)
+                        .unwrap_or_else(|| "другим агентом".into());
+                    format!("перехвачена {owner}")
+                } else {
+                    match reason {
+                        "expired" | "ttl" => "истекла по ttl".into(),
+                        "idle" | "idle_released" => "истекла по простою".into(),
+                        _ => "потеряна".into(),
+                    }
+                };
+                let at = claim.lost_at.map(|at| match at {
+                    lockyard_core::proto::Stamp::Millis(ms) => lockyard_core::proto::rfc3339(ms),
+                    lockyard_core::proto::Stamp::Text(text) => text,
+                });
+                let time = at
+                    .as_deref()
+                    .map(|at| format!(" в {}", at.get(11..16).unwrap_or(at)))
+                    .unwrap_or_default();
+                format!(
+                    "{action}{time} ({reason}{})",
+                    at.map(|at| format!(" at {at}")).unwrap_or_default()
+                )
+            }
             None => match &error {
                 Error::Cloud { details, .. } if details.get("reason").is_some() => format!(
                     "{}{}",
@@ -495,6 +530,8 @@ impl<T: Transport> CloudBackend<T> {
                 details,
                 message,
             },
+            Error::Denied(_) => Error::Denied(message),
+            Error::Contended(_) => Error::Contended(message),
             _ => Error::NotFound(message),
         }
     }
@@ -1285,6 +1322,25 @@ impl<T: Transport> Backend for CloudBackend<T> {
         Ok(one(value, "request")?)
     }
 
+    fn partial_zone(
+        &mut self,
+        agent: &str,
+        id: i64,
+        operation: &str,
+        body: &Value,
+    ) -> Result<Value> {
+        if !matches!(operation, "narrow" | "handover" | "takeover" | "release") {
+            return Err(Error::Invalid("unsupported partial zone mutation".into()));
+        }
+        let (method, path) = if operation == "release" {
+            ("DELETE", format!("/api/v1/zones/claims/{id}"))
+        } else {
+            ("POST", format!("/api/v1/zones/claims/{id}/{operation}"))
+        };
+        self.write(agent, method, path, body)
+            .map_err(|error| self.claim_error(agent, id, error))
+    }
+
     fn handover(&mut self, agent: &str, id: i64, to: &str, fence: Option<i64>) -> Result<Value> {
         let mut body = json!({"to": to});
         if let Some(fence) = fence {
@@ -1335,6 +1391,42 @@ impl<T: Transport> Backend for CloudBackend<T> {
             body["fence"] = json!(fence);
         }
         let value = self.post(agent, format!("/api/v1/zones/claims/{id}/add-path"), &body)?;
+        if value.get("queued") == Some(&Value::Bool(true)) {
+            let queue = value
+                .get("priority_of")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| {
+                    Error::Unavailable(format!(
+                        "add-path {path} queued without an id; inspect Z-{id} before retrying"
+                    ))
+                })?;
+            if let Err(error) = self.queue_cancel(agent, queue) {
+                if error.kind() == "not_found"
+                    || matches!(
+                        error,
+                        Error::Cloud {
+                            status: Some(404),
+                            ..
+                        }
+                    )
+                {
+                    return Err(Error::Cloud {
+                        code: "add_path_queue_consumed".into(),
+                        status: Some(404),
+                        details: json!({"queue_id":queue,"claim_id":id,"path":path}),
+                        message: format!(
+                            "Q-{queue} consumed before cancellation; reconcile Z-{id}"
+                        ),
+                    });
+                }
+                return Err(Error::Unavailable(format!(
+                    "add-path {path} queued as Q-{queue}; cancellation unconfirmed: {error}; inspect queue before retrying"
+                )));
+            }
+            return Err(Error::Contended(format!(
+                "add-path {path} queued as Q-{queue}; queue cancelled; path not added"
+            )));
+        }
         Ok(one(value, "claim")?)
     }
 
@@ -1380,6 +1472,12 @@ impl<T: Transport> Backend for CloudBackend<T> {
         Ok(())
     }
 
+    fn lost_within(&self, agent: &str, budget: std::time::Duration) -> Result<Vec<LostClaim>> {
+        let tail = query(&[("session", Some(agent.to_string()))]);
+        let value =
+            self.get_with_timeout(agent, format!("/api/v1/zones/lost{tail}"), Some(budget))?;
+        Ok(list(value, &["lost", "claims", "items"])?)
+    }
     fn lost(&self, agent: &str) -> Result<Vec<LostClaim>> {
         let tail = query(&[("session", Some(agent.to_string()))]);
         let value = self.get(agent, format!("/api/v1/zones/lost{tail}"))?;
@@ -1771,6 +1869,27 @@ impl<T: Transport> Backend for CloudBackend<T> {
 
     fn add_task(&mut self, author: &str, spec: &tasks::TaskSpec, now: i64) -> Result<tasks::Task> {
         validate_title(&spec.title)?;
+        let categories = [
+            "player_money",
+            "security_breach",
+            "prod_outage",
+            "cert_slip",
+        ];
+        if spec.priority.as_deref() == Some("P0") && spec.p0_category.is_none() {
+            return Err(Error::Invalid(
+                "P0 requires p0_category: player_money, security_breach, prod_outage, cert_slip"
+                    .into(),
+            ));
+        }
+        if spec
+            .p0_category
+            .as_deref()
+            .is_some_and(|value| !categories.contains(&value))
+        {
+            return Err(Error::Invalid(
+                "invalid p0_category: player_money, security_breach, prod_outage, cert_slip".into(),
+            ));
+        }
         validate_registry_text("body", &spec.body)?;
         validate_registry_text(
             "acceptance",
@@ -1902,6 +2021,27 @@ impl<T: Transport> Backend for CloudBackend<T> {
             "revisit_on": item["revisit_on"],
             "expected_version": item["version"],
         });
+        let category = body["p0_category"].as_str();
+        let allowed = [
+            "player_money",
+            "security_breach",
+            "prod_outage",
+            "cert_slip",
+        ];
+        if body["priority"] == "P0"
+            && category.is_none()
+            && (plan.p0_category.is_some() || item["priority"] != "P0")
+        {
+            return Err(Error::Invalid(
+                "P0 requires p0_category: player_money, security_breach, prod_outage, cert_slip"
+                    .into(),
+            ));
+        }
+        if category.is_some_and(|value| !allowed.contains(&value)) {
+            return Err(Error::Invalid(
+                "invalid p0_category: player_money, security_breach, prod_outage, cert_slip".into(),
+            ));
+        }
         task_from(&self.post(agent, format!("{ITEMS}/{}/plan", id), &body)?)
     }
 
@@ -4328,14 +4468,15 @@ mod tests {
     }
 
     #[test]
-    fn zone_wait_free_rechecks_a_quiet_sse_and_stops_the_reader() {
+    fn zone_wait_free_quiet_sse_five_controlled_minutes_never_polls_and_stops_reader() {
         use std::sync::{
             Arc,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         };
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
         struct Quiet {
             stopped: Arc<AtomicBool>,
+            seconds: Arc<AtomicU64>,
             ready: std::io::Cursor<Vec<u8>>,
         }
         impl std::io::Read for Quiet {
@@ -4344,18 +4485,18 @@ mod tests {
                 if count > 0 {
                     return Ok(count);
                 }
-                while !self.stopped.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(2));
+                if self.stopped.load(Ordering::Acquire) {
+                    return Ok(0);
                 }
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    "stopped",
-                ))
+                self.seconds.fetch_add(5, Ordering::SeqCst);
+                let heartbeat = b": quiet\n\n";
+                out[..heartbeat.len()].copy_from_slice(heartbeat);
+                Ok(heartbeat.len())
             }
         }
         struct QuietZone {
             checks: AtomicUsize,
-            stopped: Arc<AtomicBool>,
+            seconds: Arc<AtomicU64>,
         }
         impl Transport for QuietZone {
             fn mail_push_v1(&self, _: &str) -> std::result::Result<bool, ClientError> {
@@ -4365,12 +4506,9 @@ mod tests {
                 if call.path.starts_with("/api/v1/events?") {
                     return Ok(json!({"events":[]}));
                 }
-                let state = if self.checks.fetch_add(1, Ordering::SeqCst) == 0 {
-                    "held"
-                } else {
-                    "free"
-                };
-                Ok(json!({"paths":[{"path":"src","status":state}]}))
+                assert_eq!(call.path, "/api/v1/zones/check");
+                self.checks.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"paths":[{"path":"src","status":"held"}]}))
             }
             fn event_stream_sessions(
                 &self,
@@ -4379,37 +4517,40 @@ mod tests {
                 _: i64,
                 interrupt: Arc<AtomicBool>,
             ) -> std::result::Result<crate::sse::EventStream, ClientError> {
-                // The test reader observes the same cancellation token as a real network reader.
-                self.stopped.store(false, Ordering::Release);
                 Ok(crate::sse::EventStream::new(Box::new(Quiet {
                     stopped: interrupt,
+                    seconds: self.seconds.clone(),
                     ready: std::io::Cursor::new(
                         b"id: 0\nevent: ready\ndata: {\"head\":0}\n\n".to_vec(),
                     ),
                 })))
             }
         }
+        let seconds = Arc::new(AtomicU64::new(0));
         let cloud = CloudBackend::new(
             QuietZone {
                 checks: AtomicUsize::new(0),
-                stopped: Arc::new(AtomicBool::new(false)),
+                seconds: seconds.clone(),
             },
             "alice",
         );
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         assert!(
-            cloud
-                .wait_zone_stream_with_recheck(
-                    "alice",
-                    "src",
-                    Duration::from_secs(1),
-                    Duration::from_millis(25)
-                )
+            !cloud
+                .wait_zone_stream_with_clock("alice", "src", Duration::from_secs(300), || start
+                    + Duration::from_secs(seconds.load(Ordering::SeqCst)))
                 .unwrap()
         );
-        assert_eq!(cloud.transport.checks.load(Ordering::SeqCst), 2);
-        assert!(start.elapsed() >= Duration::from_millis(25));
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(seconds.load(Ordering::SeqCst) >= 300);
+        assert_eq!(
+            cloud.transport.checks.load(Ordering::SeqCst),
+            1,
+            "only ready may check; five quiet minutes add zero checks"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "reader did not stop"
+        );
     }
 
     /// Keeps the calls it is given, for what HTTP does not show.

@@ -9,7 +9,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,7 @@ struct Seen {
 
 #[derive(Default)]
 struct State {
+    coordination_event_sessions: std::collections::HashSet<String>,
     survey_handled_failure: bool,
     survey_release_failure_id: Option<i64>,
     survey_handled: bool,
@@ -51,9 +53,14 @@ struct State {
     omit_claim_meta: bool,
     echo_reused_claim_meta: bool,
     refuse_renew: Option<(u16, Value)>,
+    refuse_add_path: Option<String>,
+    queued_add_path: Option<String>,
+    deferred_add_paths: Vec<(i64, String)>,
+    grant_before_queue_cancel: bool,
     ignore_renew_hold: bool,
     refuse_release: Option<(u16, Value)>,
     refuse_registry_claim: bool,
+    refuse_registry_create: Option<(u16, Value)>,
     refuse_registry_get: Option<(u16, Value)>,
     refuse_filtered_registry_once: Option<(u16, Value)>,
     registry_hide_protocol_on_refusal: bool,
@@ -96,25 +103,83 @@ struct Latency {
     keep_alive: bool,
 }
 
+// Bound concurrent subprocess-heavy fixtures, rather than changing product deadlines.
+// Each fixture still exercises its own concurrent CLI/MCP/daemon requests.
+static FIXTURES: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+struct FixturePermit;
+impl FixturePermit {
+    fn acquire() -> Self {
+        let (count, ready) = &FIXTURES;
+        let mut active = count.lock().unwrap();
+        while *active >= 1 {
+            active = ready.wait(active).unwrap();
+        }
+        *active += 1;
+        Self
+    }
+}
+impl Drop for FixturePermit {
+    fn drop(&mut self) {
+        *FIXTURES.0.lock().unwrap() -= 1;
+        FIXTURES.1.notify_one();
+    }
+}
+
 #[derive(Clone)]
 struct Server {
+    _permit: Arc<FixturePermit>,
+    _lifecycle: Arc<ServerLifecycle>,
     url: String,
     state: Arc<Mutex<State>>,
 }
 
+struct ServerLifecycle {
+    stop: Arc<AtomicBool>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+impl Drop for ServerLifecycle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.get_mut().unwrap().take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
 impl Server {
     fn start() -> Self {
+        let permit = Arc::new(FixturePermit::acquire());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(Mutex::new(State::default()));
         let shared = Arc::clone(&state);
-        thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let shared = Arc::clone(&shared);
-                thread::spawn(move || serve(stream, &shared));
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            while !stopping.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let shared = Arc::clone(&shared);
+                        thread::spawn(move || serve(stream, &shared));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("fixture listener failed: {error}"),
+                }
             }
         });
-        Self { url, state }
+        Self {
+            url,
+            state,
+            _permit: permit,
+            _lifecycle: Arc::new(ServerLifecycle {
+                stop,
+                worker: Mutex::new(Some(worker)),
+            }),
+        }
     }
 
     fn seen(&self, method: &str, route: &str) -> Vec<Seen> {
@@ -228,6 +293,11 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
         }
         let (status, answer, capabilities) = {
             let mut state = state.lock().unwrap();
+            if route == "/api/v1/events"
+                && let Some(session) = &session
+            {
+                state.coordination_event_sessions.insert(session.clone());
+            }
             if !route.ends_with("/events") {
                 let record = Seen {
                     method: method.clone(),
@@ -385,36 +455,96 @@ fn route_reply(
             }
             (200, reply)
         }
+        ("POST", _)
+            if route.starts_with("/api/v1/zones/claims/")
+                && (route.ends_with("/handover") || route.ends_with("/accept"))
+                && state.claims.iter().any(|claim| {
+                    route
+                        .split('/')
+                        .nth(5)
+                        .and_then(|id| id.parse::<i64>().ok())
+                        == claim["id"].as_i64()
+                }) =>
+        {
+            let id: i64 = route.split('/').nth(5).unwrap().parse().unwrap();
+            let claim = state
+                .claims
+                .iter_mut()
+                .find(|claim| claim["id"] == id)
+                .unwrap();
+            if route.ends_with("/handover") {
+                claim["handover_to"] = body["to"].clone();
+            } else {
+                assert_eq!(claim["handover_to"].as_str(), session);
+                claim["session"] = json!(session);
+                claim.as_object_mut().unwrap().remove("handover_to");
+                claim["fence"] = json!(claim["fence"].as_i64().unwrap() + 1);
+            }
+            // Production handover keeps the exact original meta bytes.
+            (200, claim.clone())
+        }
         ("GET", "/api/v1/zones/claims") => state
             .refuse_claims_get_once
             .take()
             .or_else(|| state.refuse_claims_get.clone())
             .unwrap_or_else(|| {
-                (
-                    200,
+                (200, {
+                    let claims: Vec<_> = state
+                        .claims
+                        .iter()
+                        .filter(|claim| {
+                            query_value(path, "session")
+                                .is_none_or(|session| claim["session"] == session)
+                        })
+                        .cloned()
+                        .collect();
                     if state.encryption_key_id.is_some() {
-                        json!(state.claims)
+                        json!(claims)
                     } else {
-                        json!({"claims": state.claims})
-                    },
-                )
+                        json!({"claims":claims})
+                    }
+                })
             }),
         ("POST", _)
             if route.starts_with("/api/v1/zones/claims/")
                 && (route.ends_with("/add-path") || route.ends_with("/narrow")) =>
         {
+            if route.ends_with("/add-path")
+                && state.queued_add_path.is_some()
+                && body["path"].as_str() == state.queued_add_path.as_deref()
+            {
+                let id = route.rsplit('/').nth(1).unwrap().parse().unwrap();
+                state
+                    .deferred_add_paths
+                    .push((id, body["path"].as_str().unwrap().into()));
+                return (200, json!({"queued":true,"priority_of":900,"conflicts":[]}));
+            }
+            if route.ends_with("/add-path")
+                && body["path"].as_str() == state.refuse_add_path.as_deref()
+                && state.refuse_add_path.is_some()
+            {
+                return (
+                    409,
+                    json!({"error":{"code":"conflict","message":"fixture path held"}}),
+                );
+            }
             let id = route.rsplit('/').nth(1).unwrap().parse::<i64>().unwrap();
             let Some(claim) = state.claims.iter_mut().find(|claim| claim["id"] == id) else {
                 return (200, json!({"id":id,"session":"alice","paths":[],"fence":2}));
             };
             if route.ends_with("/narrow") {
-                claim["paths"] = body["paths"].clone();
+                if let Some(except) = body.get("except") {
+                    claim["excluded_paths"] = except.clone();
+                } else {
+                    claim["paths"] = body["paths"].clone();
+                }
             } else {
                 claim["paths"]
                     .as_array_mut()
                     .unwrap()
                     .push(body["path"].clone());
             }
+            claim["fence"] = json!(claim["fence"].as_i64().unwrap_or(1) + 1);
             (200, claim.clone())
         }
         ("POST", _) if route.starts_with("/api/v1/zones/claims/") && route.ends_with("/renew") => {
@@ -589,6 +719,9 @@ fn route_reply(
             }
             (200, json!({"handled":ids.len()}))
         }
+        ("POST", "/api/v1/registry/items") if state.refuse_registry_create.is_some() => {
+            state.refuse_registry_create.clone().unwrap()
+        }
         ("POST", "/api/v1/registry/items") if state.survey_uncertain_create => {
             if state.survey_echo_client_key
                 && let Some(task) = state
@@ -632,6 +765,49 @@ fn route_reply(
             409,
             json!({"error":{"code":"conflict", "message":"task is already taken"}}),
         ),
+        ("GET", _) if route.starts_with("/api/v1/registry/items/") => {
+            let id = route.rsplit('/').next().unwrap();
+            state
+                .registry_items
+                .iter()
+                .find(|item| item["id"] == id)
+                .cloned()
+                .map(|item| (200, item))
+                .unwrap_or((
+                    404,
+                    json!({"error":{"code":"not_found","message":"task missing"}}),
+                ))
+        }
+        ("POST", _) if route.starts_with("/api/v1/registry/items/") && route.ends_with("/plan") => {
+            let id = route.rsplit('/').nth(1).unwrap();
+            let mut item = state
+                .registry_items
+                .iter()
+                .find(|item| item["id"] == id)
+                .cloned()
+                .unwrap();
+            item.as_object_mut()
+                .unwrap()
+                .extend(body.as_object().unwrap().clone());
+            (200, item)
+        }
+        ("DELETE", "/api/v1/zones/queue/900") => {
+            if state.grant_before_queue_cancel {
+                for (id, path) in std::mem::take(&mut state.deferred_add_paths) {
+                    if let Some(claim) = state.claims.iter_mut().find(|claim| claim["id"] == id) {
+                        claim["paths"].as_array_mut().unwrap().push(json!(path));
+                        claim["fence"] = json!(claim["fence"].as_i64().unwrap() + 1);
+                    }
+                }
+                (
+                    404,
+                    json!({"error":{"code":"not_found","message":"queue already granted"}}),
+                )
+            } else {
+                state.deferred_add_paths.clear();
+                (200, json!({"id":900,"deleted":true}))
+            }
+        }
         ("GET", "/api/v1/workspace/encryption") => (
             200,
             json!({"encryption": if state.encryption_key_id.is_some(){"required"}else{"off"}, "key_id": state.encryption_key_id, "workspace_id": "00000000-0000-0000-0000-000000000001"}),
@@ -2024,7 +2200,7 @@ fn agent_service_opens_socket_when_project_root_is_unreadable() {
     let runtime = tempfile::tempdir().unwrap();
     write_agent_service_config(dir.path(), runtime.path());
     let project = dir.path().canonicalize().unwrap();
-    // cwd stays on the safe runtime; --root names the unreadable project (LY-0007).
+    // Service starts without --root use the copy from a safe cwd (LY-0007).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2037,8 +2213,7 @@ fn agent_service_opens_socket_when_project_root_is_unreadable() {
     );
     command
         .current_dir(runtime.path())
-        .args(["agent", "--root"])
-        .arg(&project)
+        .arg("agent")
         .env("LOCKYARD_URL", &url)
         .env("LOCKYARD_TOKEN", "test-token")
         .env("XDG_RUNTIME_DIR", runtime.path())
@@ -2070,7 +2245,7 @@ fn agent_service_opens_socket_when_project_root_is_unreadable() {
     restore();
     assert!(
         ready,
-        "agent never opened its socket with an unreadable --root"
+        "service agent never opened its socket with an unreadable project"
     );
     drop(agent);
 }
@@ -3362,12 +3537,7 @@ fn the_config_selects_the_cloud_backend_and_the_token_comes_only_from_the_enviro
     assert!(String::from_utf8_lossy(&bare.stderr).contains("LOCKYARD_TOKEN"));
 
     let token_file = runtime.path().join("token");
-    std::fs::write(&token_file, "test-token\n").unwrap();
-    std::fs::set_permissions(
-        &token_file,
-        std::os::unix::fs::PermissionsExt::from_mode(0o600),
-    )
-    .unwrap();
+    lockyard_core::fsio::replace(&token_file, b"test-token\n", 0o600).unwrap();
     let listed = binary(dir.path(), runtime.path())
         .args(["--json", "zone", "list"])
         .env_remove("LOCKYARD_TOKEN")
@@ -3538,6 +3708,18 @@ fn hook(dir: &Path, runtime: &Path, event: &Value) -> Output {
 /// Kills the agent process when a test ends, however it ends.
 struct Agent(Child);
 
+impl Agent {
+    /// Join the temporary daemon's workers so journal assertions see no upkeep in flight.
+    fn stop(mut self) {
+        let result = unsafe { libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM) };
+        assert_eq!(result, 0, "cannot signal temporary test daemon");
+        assert!(
+            self.0.wait().unwrap().success(),
+            "test daemon shutdown failed"
+        );
+    }
+}
+
 impl Drop for Agent {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -3576,7 +3758,9 @@ fn write_agent_service_config(dir: &Path, runtime: &Path) {
 }
 
 fn start_agent_until(dir: &Path, runtime: &Path, wait_for_view: bool) -> Agent {
-    write_agent_service_config(dir, runtime);
+    if !runtime.join("state/lockyard/agent-config.toml").exists() {
+        write_agent_service_config(dir, runtime);
+    }
     let child = binary(dir, runtime)
         .arg("agent")
         .env("LOCKYARD_TOKEN", "test-token")
@@ -3585,10 +3769,16 @@ fn start_agent_until(dir: &Path, runtime: &Path, wait_for_view: bool) -> Agent {
     let agent = Agent(child);
     let end = Instant::now() + Duration::from_secs(10);
     loop {
-        let status = cli(dir, runtime, &["--json", "agent", "status"]);
-        let status = json_of(&status);
-        if status["running"] == true && (!wait_for_view || status["status"]["view_fresh"] == true) {
-            return agent;
+        // Probe only our temporary daemon, after its socket exists; do not query
+        // the installed service manager while this private child is starting.
+        if socket(runtime).exists() {
+            let status = cli(dir, runtime, &["--json", "agent", "status"]);
+            let status = json_of(&status);
+            if status["running"] == true
+                && (!wait_for_view || status["status"]["view_fresh"] == true)
+            {
+                return agent;
+            }
         }
         assert!(Instant::now() < end, "the agent never became ready");
         thread::sleep(Duration::from_millis(20));
@@ -3710,23 +3900,68 @@ fn mail_through_agent_hook_reminds_without_reading_until_explicit_inbox() {
 
 #[test]
 fn the_cli_goes_through_a_running_agent_and_needs_no_token() {
-    let server = Server::start();
-    let dir = cloud_project(&server);
-    let runtime = tempfile::tempdir().unwrap();
-    let _agent = start_agent(dir.path(), runtime.path());
-    let sent = binary(dir.path(), runtime.path())
-        .args(["--json", "msg", "send", "bob", "hello"])
-        .env("LOCKYARD_AGENT", "alice")
-        .env_remove("LOCKYARD_TOKEN")
-        .output()
-        .unwrap();
-    assert_eq!(json_of(&sent)["id"], 44);
-    assert_eq!(
-        server.seen("POST", "/api/v1/bus/messages")[0]
-            .session
-            .as_deref(),
-        Some("alice")
-    );
+    for delayed in [false, true] {
+        let server = Server::start();
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        let _agent = start_agent(dir.path(), runtime.path());
+        if delayed {
+            server.state.lock().unwrap().latency = Latency {
+                stall_route: Some("/api/v1/bus/messages".into()),
+                stall: Duration::from_millis(2800),
+                ..Latency::default()
+            };
+        }
+        let sent = binary(dir.path(), runtime.path())
+            .args(["--json", "msg", "send", "bob", "hello"])
+            .env("LOCKYARD_AGENT", "alice")
+            .env_remove("LOCKYARD_TOKEN")
+            .output()
+            .unwrap();
+        let receipt = json_of(&sent);
+        if receipt["queued"] == true {
+            assert_eq!(receipt["id"], 0);
+            assert!(receipt["key"].as_str().is_some_and(|key| !key.is_empty()));
+            let end = Instant::now() + Duration::from_secs(10);
+            loop {
+                let status = json_of(&cli(
+                    dir.path(),
+                    runtime.path(),
+                    &["--json", "agent", "status"],
+                ));
+                if status["status"]["outbox"] == 0
+                    && !server.seen("POST", "/api/v1/bus/messages").is_empty()
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < end,
+                    "queued message was never delivered: {status}"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            let delivered = server.seen("POST", "/api/v1/bus/messages");
+            assert!(
+                delivered
+                    .iter()
+                    .any(|request| request.key.as_deref() == receipt["key"].as_str())
+            );
+        } else {
+            assert_eq!(receipt["id"], 44);
+        }
+        if delayed {
+            assert_eq!(
+                receipt["queued"], true,
+                "fixture must exercise the queued outcome"
+            );
+        }
+        assert_eq!(
+            server.seen("POST", "/api/v1/bus/messages")[0]
+                .session
+                .as_deref(),
+            Some("alice")
+        );
+    }
 }
 
 #[test]
@@ -3757,7 +3992,7 @@ fn install_refuses_a_bare_token_and_writes_a_unit_naming_the_file() {
     assert!(String::from_utf8_lossy(&bare.stderr).contains("LOCKYARD_TOKEN_FILE"));
 
     let token = home.path().join("token");
-    std::fs::write(&token, "test-token").unwrap();
+    lockyard_core::fsio::replace(&token, b"test-token", 0o600).unwrap();
     let installed = binary(dir.path(), home.path())
         .args(["--json", "agent", "install", "--no-start"])
         .env("HOME", home.path())
@@ -4273,7 +4508,7 @@ fn task_add_cli_and_mcp_reconcile_two_lost_create_responses_without_duplicates()
         }
         let dir = cloud_project(&server);
         let runtime = tempfile::tempdir().unwrap();
-        let _agent = use_agent.then(|| start_agent(dir.path(), runtime.path()));
+        let agent = use_agent.then(|| start_agent(dir.path(), runtime.path()));
         if use_mcp {
             let answers = mcp_calls(
                 dir.path(),
@@ -4300,6 +4535,11 @@ fn task_add_cli_and_mcp_reconcile_two_lost_create_responses_without_duplicates()
         assert_eq!(lookups.len(), 1);
         assert!(lookups[0].path.contains("client_key="));
         assert_eq!(server.state.lock().unwrap().registry_items.len(), 251);
+        // All create/receipt assertions above run against the live agent. Only then join
+        // its background writers before requiring the *entire* journal to be empty.
+        if let Some(agent) = agent {
+            agent.stop();
+        }
         let journal = runtime
             .path()
             .join("state/lockyard/pending-writes")
@@ -4309,6 +4549,200 @@ fn task_add_cli_and_mcp_reconcile_two_lost_create_responses_without_duplicates()
             .unwrap()
             .with_pending_journal(journal)
             .unwrap();
-        assert!(client.pending_operations().is_empty());
+        assert!(
+            client.pending_operations().is_empty(),
+            "mcp={use_mcp} agent={use_agent}: {:?}",
+            client.pending_operations()
+        );
     }
 }
+
+#[test]
+fn task_add_invalid_type_is_rejected_by_cli_before_any_network() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let result = cli(
+        dir.path(),
+        runtime.path(),
+        &["task", "add", "invalid", "--type", "task"],
+    );
+    assert_eq!(result.status.code(), Some(2));
+    let error = String::from_utf8_lossy(&result.stderr);
+    for kind in lockyard_core::tasks::REGISTRY_TASK_TYPES {
+        assert!(error.contains(kind), "{error}");
+    }
+    assert!(server.state.lock().unwrap().seen.is_empty());
+}
+
+#[test]
+fn task_add_400_rejections_are_not_unknown_or_retained_for_replay() {
+    for body in [
+        json!({"status":400,"code":"invalid_type","type":"urn:lockyard:problem:invalid_type",
+               "detail":"invalid task type","details":{}}),
+        json!({"status":400,"type":"https://tools.ietf.org/html/rfc9110#section-15.5.1",
+               "title":"One or more validation errors occurred.",
+               "errors":{"type":["The JSON value could not be converted to RegistryItemType."]}}),
+    ] {
+        for use_agent in [false, true] {
+            for use_mcp in [false, true] {
+                let server = Server::start();
+                {
+                    let mut state = server.state.lock().unwrap();
+                    state.registry_areas = vec![json!({"id":"area","key":"engine","prefix":"FE"})];
+                    state.refuse_registry_create = Some((400, body.clone()));
+                }
+                let dir = cloud_project(&server);
+                let runtime = tempfile::tempdir().unwrap();
+                let _agent = use_agent.then(|| start_agent(dir.path(), runtime.path()));
+                let error = if use_mcp {
+                    let replies = mcp_calls(
+                        dir.path(),
+                        runtime.path(),
+                        "compact",
+                        &[("task_add", json!({"title":"rejected","area":"engine"}))],
+                    );
+                    assert_eq!(replies[0]["isError"], true);
+                    replies[0].to_string()
+                } else {
+                    let result = cli(
+                        dir.path(),
+                        runtime.path(),
+                        &["--json", "task", "add", "rejected", "--area", "engine"],
+                    );
+                    assert!(!result.status.success());
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&result.stdout),
+                        String::from_utf8_lossy(&result.stderr)
+                    )
+                };
+                assert!(
+                    error.contains("invalid_type") || error.contains("nothing created"),
+                    "{error}"
+                );
+                assert!(
+                    !error.contains("unknown") && !error.contains("unconfirmed"),
+                    "{error}"
+                );
+                assert_eq!(server.seen("POST", "/api/v1/registry/items").len(), 1);
+                assert!(server.state.lock().unwrap().registry_items.is_empty());
+                let journal = runtime
+                    .path()
+                    .join("state/lockyard/pending-writes")
+                    .canonicalize()
+                    .unwrap();
+                let client = lockyard_cloud_client::Client::new(&server.url, "test-token".into())
+                    .unwrap()
+                    .with_pending_journal(journal)
+                    .unwrap();
+                assert!(
+                    client
+                        .pending_operations()
+                        .iter()
+                        .all(|p| p.request_path != "/api/v1/registry/items")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn tokenless_mail_with_a_busy_agent_socket_does_not_exit_with_no_access() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(runtime.path().join("lockyard")).unwrap();
+    std::fs::set_permissions(
+        runtime.path().join("lockyard"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let listener = UnixListener::bind(socket(runtime.path())).unwrap();
+    std::fs::set_permissions(
+        socket(runtime.path()),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    // Return a real connection refusal after a busy interval. Previously the two
+    // 100 ms probes returned exit 5 before this listener had time to respond.
+    let worker = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < end,
+                        "CLI never connected to the busy test socket"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("test socket accept failed: {error}"),
+            }
+        };
+        thread::sleep(Duration::from_millis(350));
+        drop(stream);
+    });
+    let result = binary(dir.path(), runtime.path())
+        .args(["msg", "inbox"])
+        .env("LOCKYARD_AGENT", "alice")
+        .env_remove("LOCKYARD_TOKEN")
+        .env_remove("LOCKYARD_TOKEN_FILE")
+        .output()
+        .unwrap();
+    worker.join().unwrap();
+    assert_ne!(result.status.code(), Some(5), "{result:?}");
+    assert!(server.state.lock().unwrap().seen.is_empty());
+}
+
+#[test]
+fn manual_agent_root_wins_and_missing_copy_works_without_writing_one() {
+    for (with_copy, explicit_root) in [(false, false), (false, true), (true, true)] {
+        let server = Server::start();
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        let path = runtime.path().join("state/lockyard/agent-config.toml");
+        let original = if with_copy {
+            write_agent_service_config(dir.path(), runtime.path());
+            let installed = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace(&server.url, "http://127.0.0.1:1");
+            std::fs::write(&path, installed).unwrap();
+            Some(std::fs::read(&path).unwrap())
+        } else {
+            None
+        };
+        let mut command = binary(dir.path(), runtime.path());
+        command.arg("agent");
+        if explicit_root {
+            command.arg("--root").arg(dir.path());
+        }
+        let child = command
+            .env("LOCKYARD_TOKEN", "test-token")
+            .env_remove("LOCKYARD_AGENT_ROOT")
+            .spawn()
+            .unwrap();
+        let mut agent = Agent(child);
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(agent.0.try_wait().unwrap().is_none(), "manual agent exited");
+            if socket(runtime.path()).exists() {
+                let result = cli(dir.path(), runtime.path(), &["--json", "agent", "status"]);
+                let status = json_of(&result);
+                if status["running"] == true {
+                    assert_eq!(status["status"]["url"], server.url);
+                    break;
+                }
+            }
+            assert!(Instant::now() < end, "manual agent never opened socket");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read(&path).ok(), original);
+    }
+}
+
+include!("rework_client/mod.rs");

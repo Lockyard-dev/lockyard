@@ -33647,7 +33647,7 @@
             },
             "content": {
               "application/json": {
-                "schema": { }
+                "schema": {}
               }
             }
           },
@@ -53535,7 +53535,7 @@
           "code": {
             "type": "string"
           },
-          "details": { },
+          "details": {},
           "error": {
             "$ref": "#/components/schemas/ApiProblemError"
           }
@@ -53550,7 +53550,7 @@
           "message": {
             "type": "string"
           },
-          "details": { }
+          "details": {}
         }
       },
       "AuditEntry": {
@@ -54624,6 +54624,7 @@
           "id": {
             "$ref": "#/components/schemas/JsonElement"
           },
+          "paths": {"type": "array", "items": {"type": "string"}},
           "deleted": {
             "type": "boolean"
           },
@@ -55055,6 +55056,15 @@
               "string"
             ],
             "format": "int32"
+          },
+          "paths": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
@@ -55429,6 +55439,15 @@
               "string"
             ],
             "format": "int32"
+          },
+          "except": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
@@ -55874,6 +55893,15 @@
               "null",
               "string"
             ]
+          },
+          "paths": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
@@ -56136,6 +56164,15 @@
               "null",
               "string"
             ]
+          },
+          "paths": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
@@ -57125,7 +57162,7 @@
           }
         }
       },
-      "JsonElement": { },
+      "JsonElement": {},
       "JsonObject": {
         "type": "object"
       },
