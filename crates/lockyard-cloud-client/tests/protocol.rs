@@ -216,7 +216,11 @@ impl Server {
                 let reply = replies
                     .next()
                     .unwrap_or_else(|| Reply::json(500, json!({}), None));
-                let body = reply.body.to_string();
+                let body = if reply.extra.contains("text/html") {
+                    reply.body.as_str().unwrap().to_string()
+                } else {
+                    reply.body.to_string()
+                };
                 let echo = reply
                     .protocol
                     .map(|value| format!("Lockyard-Protocol: {value}\r\n"))
@@ -1895,4 +1899,142 @@ fn pre_execution_protocol_rejection_quarantines_the_original_ciphertext() {
     let pending = client.pending_operation(key).unwrap();
     assert_eq!(pending.body, original.body);
     assert_eq!(pending.key, original.key);
+}
+
+#[test]
+fn registry_create_non_lockyard_4xx_is_definitively_rejected_and_not_replayed() {
+    for status in [400, 401, 403, 404, 405, 409, 413, 415, 422, 429] {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().canonicalize().unwrap();
+        let server = Server::start(vec![
+            discovery(2, 1, 2, &[]),
+            Reply::json(
+                status,
+                json!({"type":"about:blank", "status":status, "title":"Rejected"}),
+                None,
+            ),
+        ]);
+        let call = Call::write(
+            "fixture",
+            "POST",
+            "/api/v1/registry/items".into(),
+            json!({"title":"refused"}),
+        );
+        let client = server.client().with_pending_journal(&journal).unwrap();
+        let error = client.call(&call).unwrap_err();
+        assert_eq!(error.status(), Some(status));
+        assert_eq!(error.code(), Some("request_rejected"));
+        assert!(error.to_string().contains("nothing created"));
+        assert!(client.pending_operations().is_empty());
+        assert!(
+            server
+                .client()
+                .with_pending_journal(&journal)
+                .unwrap()
+                .pending_operations()
+                .is_empty()
+        );
+        assert_eq!(server.requests().len(), 2);
+    }
+}
+
+#[test]
+fn registry_create_timeout_and_server_errors_keep_unknown_outcome_and_journal() {
+    for status in [408, 500, 502] {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::start(vec![
+            discovery(2, 1, 2, &[]),
+            problem(status, "request_failed", json!({}), Some("2")),
+        ]);
+        let call = Call::write(
+            "fixture",
+            "POST",
+            "/api/v1/registry/items".into(),
+            json!({"title":"uncertain"}),
+        );
+        let client = server
+            .client()
+            .with_pending_journal(dir.path().canonicalize().unwrap())
+            .unwrap();
+        assert!(matches!(
+            client.call(&call),
+            Err(ClientError::OutcomeUnknown(_))
+        ));
+        assert_eq!(client.pending_operations().len(), 1);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start_with_hook(
+        vec![
+            discovery(2, 1, 2, &[]),
+            Reply::json(200, json!({"id":"FE-1"}), Some("2")),
+        ],
+        |request| {
+            if request.path == "/api/v1/registry/items" {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        },
+    );
+    let client = server
+        .client()
+        .with_pending_journal(dir.path().canonicalize().unwrap())
+        .unwrap();
+    // Negotiate before starting the short mutation deadline; discovery scheduling is unrelated.
+    client.negotiated_protocol("fixture").unwrap();
+    let mut call = Call::write(
+        "fixture",
+        "POST",
+        "/api/v1/registry/items".into(),
+        json!({"title":"timeout"}),
+    );
+    call.attempt_timeout_ms = Some(100);
+    let error = client.call(&call).unwrap_err();
+    assert!(matches!(error, ClientError::OutcomeUnknown(_)), "{error:?}");
+    assert_eq!(client.pending_operations().len(), 1);
+}
+
+#[test]
+fn round4_unknown_registry_retry_html_400_keeps_journal_and_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut html = Reply::json(400, json!("<html>proxy rejected this request</html>"), None);
+    html.extra = "Content-Type: text/html\r\n";
+    let server = Server::start(vec![
+        discovery(2, 1, 2, &[]),
+        problem(502, "request_failed", json!({}), Some("2")),
+        html,
+    ]);
+    let client = server
+        .client()
+        .with_pending_journal(dir.path().canonicalize().unwrap())
+        .unwrap();
+    let call = Call::write(
+        "fixture",
+        "POST",
+        "/api/v1/registry/items".into(),
+        json!({"title":"uncertain","client_key":"round4-unknown"}),
+    );
+    assert!(matches!(
+        client.call(&call),
+        Err(ClientError::OutcomeUnknown(_))
+    ));
+    let original = client.pending_operations().remove(0);
+    let error = client.call(&call).unwrap_err();
+    assert!(matches!(error, ClientError::OutcomeUnknown(_)), "{error}");
+    assert!(error.to_string().contains("proxy rejected"), "{error}");
+    let restored = server
+        .client()
+        .with_pending_journal(dir.path().canonicalize().unwrap())
+        .unwrap();
+    let pending = restored.pending_operations().remove(0);
+    assert_eq!(pending.body, original.body);
+    assert_eq!(pending.key, original.key);
+    assert_eq!(pending.code, "outcome_unknown");
+    assert_eq!(pending.cause_code, "protocol_response_invalid");
+    assert!(
+        pending
+            .diagnostic
+            .as_deref()
+            .unwrap()
+            .contains("proxy rejected")
+    );
+    assert_eq!(server.requests().len(), 3);
 }

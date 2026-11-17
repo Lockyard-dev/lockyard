@@ -1,5 +1,18 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
+#[test]
+fn task_add_schema_lists_every_p0_category_in_description_and_enum() {
+    for surface in [Surface::Full, Surface::Compact] {
+        let task = tools(surface).into_iter().find(|t| t["name"] == "task_add").unwrap();
+        let category = &task["inputSchema"]["properties"]["p0_category"];
+        assert_eq!(category["enum"], json!(P0_CATEGORIES));
+        for name in P0_CATEGORIES {
+            assert!(task["description"].as_str().unwrap().contains(name));
+            assert!(category["description"].as_str().unwrap().contains(name));
+        }
+    }
+}
+
     #[test]
     fn survey_r4_mode_schema_explains_omission_and_explicit_exclusive() {
         for tool in tools(Surface::Full) {

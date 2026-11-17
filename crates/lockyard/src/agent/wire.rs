@@ -9,6 +9,10 @@ use lockyard_core::proto::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 /// What a hook reports about a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -50,9 +54,13 @@ pub enum Request {
         session: String,
         paths: Vec<String>,
     },
-    /// How much mail is waiting?
+    /// How much mail is waiting? Zone alerts retire only after confirmed hook output.
     Unread {
         session: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        attention: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attention_ack: Vec<lockyard_core::proto::LostClaim>,
     },
     /// A memory-only snapshot of coordination state for one session.
     ZoneSnapshot {
@@ -266,6 +274,8 @@ mod tests {
         let envelope = Envelope {
             workspace: "w".into(),
             request: Request::Unread {
+                attention_ack: Vec::new(),
+                attention: false,
                 session: "s".into(),
             },
         };

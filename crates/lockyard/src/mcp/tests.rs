@@ -153,3 +153,28 @@ fn task_add_schema_accepts_client_key() {
         "string"
     );
 }
+
+#[test]
+fn task_add_schema_enumerates_server_types_on_both_surfaces() {
+    for surface in [Surface::Compact, Surface::Full] {
+        let registry = tools(surface);
+        let add = registry
+            .iter()
+            .find(|tool| tool["name"] == "task_add")
+            .unwrap();
+        assert_eq!(
+            add["inputSchema"]["properties"]["type"]["enum"],
+            json!([
+                "code",
+                "ops",
+                "incident",
+                "finding",
+                "management",
+                "owner_decision",
+                "certification",
+                "external",
+                "housekeeping"
+            ])
+        );
+    }
+}

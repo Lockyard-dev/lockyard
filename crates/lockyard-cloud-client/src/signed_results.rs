@@ -261,6 +261,7 @@ impl Client {
                 code: "outcome_unknown".into(),
                 cause_code: "outcome_unknown".into(),
                 cause_status: None,
+                diagnostic: None,
                 protocol,
                 method: "PUT".into(),
                 path: call.path.clone(),

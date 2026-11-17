@@ -93,7 +93,7 @@ impl ToolRegistry {
             tool_def(
                 "handover",
                 "Offer your claim to another agent and tell them why.",
-                json!({"to": text, "id": int, "note": text}),
+                json!({"to": text, "id": int, "note": text, "paths":{"type":"array","items":{"type":"string"}}}),
                 &["to"],
             ),
             tool_def(
@@ -479,15 +479,15 @@ fn primitive_definitions() -> Vec<Value> {
         tool_def(
             "zone_handover",
             "Offer a claim to another agent",
-            json!({"id": int, "to": text, "fence": int}),
+            json!({"id": int, "to": text, "fence": int, "paths":paths}),
             &["id", "to"],
         ),
         id_only("zone_accept", "Accept a claim offered to this agent"),
         tool_def(
             "zone_narrow",
             "Shrink a claim to some of its paths",
-            json!({"id": int, "paths": paths, "fence": int}),
-            &["id", "paths"],
+            json!({"id": int, "paths": paths, "except":paths, "fence": int}),
+            &["id"],
         ),
         tool_def(
             "zone_add_path",
@@ -498,7 +498,7 @@ fn primitive_definitions() -> Vec<Value> {
         tool_def(
             "zone_takeover",
             "Take the claim of an unresponsive session, with a reason",
-            json!({"id": int, "reason": text}),
+            json!({"id": int, "reason": text, "paths":paths}),
             &["id", "reason"],
         ),
         tool_def(
@@ -542,7 +542,7 @@ fn primitive_definitions() -> Vec<Value> {
         tool_def(
             "zone_release",
             "Release one claim of this agent. Without id, release the sole claim; with several, pass id or all: true",
-            json!({"id": int, "note": text, "leave_dirty": flag, "fence": int, "all": flag}),
+            json!({"id": int, "note": text, "leave_dirty": flag, "fence": int, "all": flag, "path":text, "paths":paths}),
             &[],
         ),
         tool_def(
@@ -603,7 +603,7 @@ fn primitive_definitions() -> Vec<Value> {
                 "title": text, "body": text, "acceptance": text, "priority": text,
                 "p0_category": {"type":"string","enum":["player_money","security_breach","prod_outage","cert_slip"],
                     "description":"Required with priority P0: player_money, security_breach, prod_outage, or cert_slip."},
-                "type": text, "target": text, "verification": text, "area": text, "prefix": text,
+                "type": {"type":"string","enum":lockyard_core::tasks::REGISTRY_TASK_TYPES}, "target": text, "verification": text, "area": text, "prefix": text,
                 "pad": int, "due": text, "evidence": text, "client_key": text,
                 "paths": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64,
                     "description":"Files or directories the task concerns, relative to the workspace root. Required with registry_auto_area_v1: the server determines the area from these paths. On other servers paths are not sent; supply area."}
@@ -612,6 +612,12 @@ fn primitive_definitions() -> Vec<Value> {
         ),
         tool_def(
             "task_plan",
+            "Change the urgency of a task",
+            json!({"id": task_identifier, "priority": text, "p0_category": text, "due": text}),
+            &["id"],
+        ),
+        tool_def(
+            "task_update",
             "Change the urgency of a task",
             json!({"id": task_identifier, "priority": text, "p0_category": text, "due": text}),
             &["id"],

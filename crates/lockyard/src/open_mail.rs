@@ -111,6 +111,7 @@ pub fn open_mail_within(
 }
 
 /// Open-mail count for renew answers within a caller-owned budget.
+#[cfg(test)]
 pub fn open_mail_count_within(
     backend: &dyn Backend,
     me: &str,

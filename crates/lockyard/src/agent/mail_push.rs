@@ -7,6 +7,13 @@ use std::collections::BTreeMap;
 #[derive(Default)]
 pub(super) struct PushState {
     epoch: u64,
+    zone_alerts: HashMap<String, BTreeMap<i64, lockyard_core::proto::LostClaim>>,
+    zone_alert_versions: HashMap<(String, i64), i64>,
+    status_claims: HashMap<String, HashSet<i64>>,
+    local_zone_mutations: HashMap<(String, i64), Vec<LocalZoneMutation>>,
+    next_zone_mutation: u64,
+    seen_claims: HashMap<String, HashSet<i64>>,
+    zone_alert_times: HashMap<(String, i64), Instant>,
     replacement: Option<Replacement>,
     #[cfg(test)]
     clock_now: Option<Instant>,
@@ -20,6 +27,30 @@ pub(super) struct PushState {
     arrivals: VecDeque<(i64, String, Message)>,
     woken: HashMap<String, WakeCursor>,
     pending_wakes: HashSet<String>,
+}
+
+impl PushState {
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.clock_now {
+            return now;
+        }
+        Instant::now()
+    }
+}
+
+struct LocalZoneMutation {
+    token: u64,
+    input_fence: Option<i64>,
+    result_fence: Option<i64>,
+    until: Instant,
+    events: Vec<Event>,
+}
+
+fn paths_overlap(a: &str, b: &str) -> bool {
+    a == b
+        || a.strip_prefix(b).is_some_and(|tail| tail.starts_with('/'))
+        || b.strip_prefix(a).is_some_and(|tail| tail.starts_with('/'))
 }
 
 enum PushExit {
@@ -124,7 +155,9 @@ fn wakes(message: &Message) -> bool {
 
 fn is_open(mail: &Message) -> bool {
     !matches!(mail.status.as_deref(), Some("ack" | "info"))
-        && (wakes(mail)
+        && (mail.urgent
+            || matches!(mail.needs.as_deref(), Some("reply" | "ack"))
+            || (mail.reply_to.is_some() && mail.needs.as_deref().unwrap_or("none") != "none")
             || (mail.reply_to.is_none() && mail.kind.as_deref().unwrap_or("ask") == "ask"))
 }
 
@@ -140,6 +173,371 @@ fn addressed(event: &Event, session: &str) -> bool {
 }
 
 impl<T: Transport + 'static> Shared<T> {
+    pub(super) fn zone_alerts(&self, session: &str) -> Vec<lockyard_core::proto::LostClaim> {
+        let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = push.now();
+        let expired: Vec<_> = push
+            .zone_alert_times
+            .iter()
+            .filter(|((owner, _), at)| {
+                owner == session && now.saturating_duration_since(**at) > Duration::from_secs(1800)
+            })
+            .map(|((_, id), _)| *id)
+            .collect();
+        for id in expired {
+            if let Some(alerts) = push.zone_alerts.get_mut(session) {
+                alerts.remove(&id);
+            }
+            push.zone_alert_times.remove(&(session.into(), id));
+        }
+        push.zone_alerts
+            .get(session)
+            .map(|alerts| alerts.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn ack_zone_alerts(
+        &self,
+        session: &str,
+        acknowledgements: &[lockyard_core::proto::LostClaim],
+    ) {
+        let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+        for ack in acknowledgements {
+            if ack.session == session
+                && push
+                    .zone_alerts
+                    .get(session)
+                    .and_then(|alerts| alerts.get(&ack.claim_id))
+                    == Some(ack)
+            {
+                push.zone_alerts
+                    .get_mut(session)
+                    .unwrap()
+                    .remove(&ack.claim_id);
+                push.zone_alert_times
+                    .remove(&(session.into(), ack.claim_id));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn take_zone_alerts(&self, session: &str) -> Vec<lockyard_core::proto::LostClaim> {
+        let alerts = self.zone_alerts(session);
+        self.ack_zone_alerts(session, &alerts);
+        alerts
+    }
+
+    pub(super) fn retain_zone_sessions(&self, sessions: &HashMap<String, SessionTrack>) {
+        let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+        push.seen_claims
+            .retain(|session, _| sessions.contains_key(session));
+        push.status_claims
+            .retain(|session, _| sessions.contains_key(session));
+        push.zone_alerts
+            .retain(|session, _| sessions.contains_key(session));
+        push.zone_alert_versions
+            .retain(|(session, _), _| sessions.contains_key(session));
+        push.zone_alert_times
+            .retain(|(session, _), _| sessions.contains_key(session));
+        push.local_zone_mutations
+            .retain(|(session, _), _| sessions.contains_key(session));
+    }
+
+    pub(super) fn begin_zone_mutation(&self, call: &Call) -> Option<(String, i64, u64)> {
+        let route = call.path.split('?').next()?;
+        let parts: Vec<_> = route.split('/').collect();
+        if call.method != "POST"
+            || !matches!(
+                parts.as_slice(),
+                ["", "api", "v1", "zones", "claims", _, "narrow"]
+            )
+        {
+            return None;
+        }
+        let id = parts[5].parse().ok()?;
+        // Some callers omit the optional precondition. The successful receipt still
+        // supplies the fence needed to identify our event, including an early SSE.
+        let fence = call.body.as_ref()?.get("fence").and_then(Value::as_i64);
+        let key = (call.session.clone(), id);
+        let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = push.now();
+        push.local_zone_mutations.retain(|_, mutations| {
+            mutations.retain(|mutation| mutation.until > now);
+            !mutations.is_empty()
+        });
+        push.next_zone_mutation += 1;
+        let token = push.next_zone_mutation;
+        let mutations = push.local_zone_mutations.entry(key.clone()).or_default();
+        // Keep every receipt fence until its echo-retention deadline; replacing an
+        // older completed mutation can misclassify its delayed SSE as a foreign loss.
+        mutations.push(LocalZoneMutation {
+            token,
+            input_fence: fence,
+            result_fence: None,
+            until: now + Duration::from_secs(1800),
+            events: Vec::new(),
+        });
+        Some((key.0, key.1, token))
+    }
+
+    pub(super) fn finish_zone_mutation(
+        &self,
+        mutation: Option<(String, i64, u64)>,
+        value: Option<&Value>,
+    ) {
+        let Some((session, id, token)) = mutation else {
+            return;
+        };
+        let events = {
+            let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(mutations) = push.local_zone_mutations.get_mut(&(session, id)) else {
+                return;
+            };
+            let Some(index) = mutations.iter().position(|m| m.token == token) else {
+                return;
+            };
+            if let Some(fence) = value
+                .and_then(|value| value.get("fence"))
+                .and_then(Value::as_i64)
+            {
+                mutations[index].result_fence = Some(fence);
+                std::mem::take(&mut mutations[index].events)
+            } else {
+                mutations.remove(index).events
+            }
+        };
+        for event in events {
+            self.observe_zone_loss(&event);
+        }
+    }
+
+    fn clear_reclaimed_alerts(&self, session: &str, new_id: i64, paths: &[String]) {
+        let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(alerts) = push.zone_alerts.get_mut(session) {
+            alerts.retain(|id, alert| {
+                *id == new_id
+                    || !alert
+                        .paths
+                        .iter()
+                        .any(|old| paths.iter().any(|new| paths_overlap(old, new)))
+            });
+            let remaining: HashSet<_> = alerts.keys().copied().collect();
+            push.zone_alert_times
+                .retain(|(owner, id), _| owner != session || remaining.contains(id));
+        }
+    }
+
+    fn observe_zone_loss(&self, event: &Event) {
+        if !event.kind.starts_with("zone.") {
+            return;
+        }
+        if matches!(event.kind.as_str(), "zone.claimed" | "zone.granted") {
+            if let (Some(session), Some(id)) = (
+                event.field("session").and_then(Value::as_str),
+                event.field("claim_id").and_then(Value::as_i64),
+            ) {
+                if !self.sessions().contains_key(session) {
+                    return;
+                }
+                let unseen = self
+                    .push
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .seen_claims
+                    .entry(session.into())
+                    .or_default()
+                    .insert(id);
+                if unseen
+                    && matches!(
+                        event.field("reason").and_then(Value::as_str),
+                        Some("claimed" | "granted")
+                    )
+                {
+                    let paths: Vec<String> = event
+                        .field("paths")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value(v).ok())
+                        .unwrap_or_default();
+                    self.clear_reclaimed_alerts(session, id, &paths);
+                }
+            }
+            return;
+        }
+        let reason = event
+            .field("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("expired");
+        if !matches!(
+            event.kind.as_str(),
+            "zone.expired" | "zone.lost" | "zone.taken"
+        ) && !(event.kind == "zone.released"
+            && matches!(reason, "narrowed" | "taken" | "idle" | "unused_grant"))
+        {
+            return;
+        }
+        let Some(session) = event.field("session").and_then(Value::as_str) else {
+            return;
+        };
+        if !self.sessions().contains_key(session) {
+            return;
+        }
+        let Some(id) = event.field("claim_id").and_then(Value::as_i64) else {
+            return;
+        };
+        if event.kind == "zone.released" && reason == "narrowed" {
+            let actor = event
+                .field("actor")
+                .or_else(|| event.field("by"))
+                .and_then(|actor| {
+                    actor
+                        .as_str()
+                        .or_else(|| actor.get("session").and_then(Value::as_str))
+                });
+            if actor == Some(session) {
+                return;
+            }
+            if actor.is_none() {
+                let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+                let now = push.now();
+                if let Some(mutations) = push.local_zone_mutations.get_mut(&(session.into(), id)) {
+                    mutations.retain(|m| m.until > now);
+                    let fence = event.field("fence").and_then(Value::as_i64);
+                    if mutations.iter().any(|m| {
+                        fence.is_some()
+                            && m.result_fence == fence
+                            && m.input_fence.is_none_or(|input| fence.unwrap() >= input)
+                    }) {
+                        return;
+                    }
+                    if let Some(mutation) = mutations.iter_mut().find(|m| m.result_fence.is_none())
+                    {
+                        if mutation.events.len() < 256 {
+                            mutation.events.push(event.clone());
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        let paths = event
+            .field("paths")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        let at = event
+            .field("at")
+            .or_else(|| event.field("created_at"))
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or(lockyard_core::proto::Stamp::Millis(now_ms()));
+        let lost = lockyard_core::proto::LostClaim {
+            claim_id: id,
+            session: session.into(),
+            paths,
+            reason: Some(
+                if matches!(event.kind.as_str(), "zone.lost" | "zone.taken") {
+                    if reason == "taken" || reason.starts_with("taken:") {
+                        reason.into()
+                    } else {
+                        format!("taken: {reason}")
+                    }
+                } else {
+                    reason.into()
+                },
+            ),
+            lost_at: Some(at),
+        };
+        let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+        push.seen_claims
+            .entry(session.into())
+            .or_default()
+            .insert(id);
+        let version = push
+            .zone_alert_versions
+            .entry((session.into(), id))
+            .or_insert(i64::MIN);
+        if *version >= event.seq {
+            return;
+        }
+        *version = event.seq;
+        let now = push.now();
+        push.zone_alert_times.insert((session.into(), id), now);
+        let alerts = push.zone_alerts.entry(session.into()).or_default();
+        alerts.insert(id, lost);
+        let mut removed = Vec::new();
+        while alerts.len() > 256 {
+            let key = *alerts.keys().next().unwrap();
+            alerts.remove(&key);
+            removed.push(key);
+        }
+        for id in removed {
+            push.zone_alert_versions.remove(&(session.into(), id));
+        }
+    }
+
+    pub(super) fn observe_status_claims(
+        &self,
+        session: &str,
+        claims: &[Claim],
+        backend: &dyn Backend,
+        budget: Duration,
+    ) {
+        let current: HashSet<_> = claims
+            .iter()
+            .filter(|c| c.session == session)
+            .map(|c| c.id)
+            .collect();
+        let missing: HashSet<_> = {
+            let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+            push.seen_claims
+                .entry(session.into())
+                .or_default()
+                .extend(current.iter().copied());
+            let previous = push.status_claims.entry(session.into()).or_default();
+            let missing = previous.difference(&current).copied().collect();
+            previous.extend(current.iter().copied());
+            missing
+        };
+        // A snapshot has no mutation reason and is also the restart baseline. Only
+        // a previously unseen claimed/granted event can acknowledge reacquisition.
+        if missing.is_empty() || budget.is_zero() {
+            return;
+        }
+        if let Ok(lost) = backend.lost_within(session, budget) {
+            let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+            push.status_claims
+                .entry(session.into())
+                .or_default()
+                .retain(|id| !missing.contains(id));
+            for mut claim in lost.into_iter().filter(|c| {
+                missing.contains(&c.claim_id) && (c.session.is_empty() || c.session == session)
+            }) {
+                if push
+                    .zone_alert_versions
+                    .contains_key(&(session.into(), claim.claim_id))
+                {
+                    continue;
+                }
+                // Older lost endpoints omit the owner. Preserve the known mailbox
+                // identity so an exact output acknowledgement can retire this alert.
+                if claim.session.is_empty() {
+                    claim.session = session.into();
+                }
+                let now = push.now();
+                push.zone_alert_times
+                    .insert((session.into(), claim.claim_id), now);
+                push.zone_alert_versions
+                    .insert((session.into(), claim.claim_id), i64::MIN);
+                let alerts = push.zone_alerts.entry(session.into()).or_default();
+                alerts.insert(claim.claim_id, claim);
+                while alerts.len() > 256 {
+                    let id = *alerts.keys().next().unwrap();
+                    alerts.remove(&id);
+                }
+            }
+        }
+    }
+
     pub(super) fn peek_hook_mail(&self, session: &str) -> Reply {
         self.hear(session);
         let push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
@@ -175,11 +573,12 @@ impl<T: Transport + 'static> Shared<T> {
         disconnected: &mut dyn FnMut() -> bool,
     ) -> Reply {
         let result = (|| -> lockyard_core::Result<bool> {
-            let deadline = Instant::now()
+            let deadline = self
+                .push_now()
                 .checked_add(Duration::from_millis(timeout_ms))
                 .ok_or_else(|| Error::Invalid("zone wait timeout is too large".into()))?;
             self.hear(session);
-            let push_server = self.transport.mail_push_v1(session)?;
+
             loop {
                 // Capture before the authoritative read so an event racing the read is observed.
                 let version = self
@@ -194,13 +593,13 @@ impl<T: Transport + 'static> Shared<T> {
                     json!({"paths":[path],"mode":"exclusive"}),
                 );
                 call.key = None;
-                let left = deadline.saturating_duration_since(Instant::now());
+                let left = deadline.saturating_duration_since(self.push_now());
                 let ms = left.as_millis().max(1).min(u64::MAX as u128) as u64;
                 call.deadline_ms = Some(ms);
                 call.attempt_timeout_ms = Some(ms);
                 let answer = match self.transport.call(&call) {
                     Ok(answer) => answer,
-                    Err(_) if Instant::now() >= deadline && timeout_ms > 0 => return Ok(false),
+                    Err(_) if self.push_now() >= deadline && timeout_ms > 0 => return Ok(false),
                     Err(error) => return Err(error.into()),
                 };
                 self.confirm_session_binding(&call);
@@ -216,21 +615,26 @@ impl<T: Transport + 'static> Shared<T> {
                         ));
                     }
                 }
-                if Instant::now() >= deadline || self.stopped() {
+                if self.push_now() >= deadline || self.stopped() {
                     return Ok(false);
                 }
-                let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
-                let next = if push_server {
-                    deadline.min(Instant::now() + Duration::from_secs(60))
+                let push_ready = self.push_ready.load(Ordering::Acquire);
+                let next = if push_ready {
+                    deadline
                 } else {
-                    deadline.min(Instant::now() + Duration::from_secs(10))
+                    deadline.min(self.push_now() + Duration::from_secs(60))
                 };
-                while push.zone_version == version && Instant::now() < next && !self.stopped() {
+                let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+                while push.zone_version == version
+                    && push.now() < next
+                    && !self.stopped()
+                    && self.push_ready.load(Ordering::Acquire) == push_ready
+                {
                     if disconnected() {
                         return Ok(false);
                     }
                     let wait = next
-                        .saturating_duration_since(Instant::now())
+                        .saturating_duration_since(push.now())
                         .min(Duration::from_millis(100));
                     push = self
                         .mail_ready
@@ -242,7 +646,8 @@ impl<T: Transport + 'static> Shared<T> {
                     self.hear(session);
                     push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
                 }
-                if Instant::now() >= deadline || self.stopped() {
+                drop(push);
+                if self.push_now() >= deadline || self.stopped() {
                     return Ok(false);
                 }
             }
@@ -837,6 +1242,7 @@ impl<T: Transport + 'static> Shared<T> {
     }
 
     fn apply_push_event(&self, event: Event) -> bool {
+        self.observe_zone_loss(&event);
         if matches!(event.kind.as_str(), "bus.delivery_claimed" | "bus.imported") {
             return true;
         }
@@ -1025,21 +1431,15 @@ impl<T: Transport + 'static> Shared<T> {
         }
     }
 
-    fn replacement_now(&self) -> Instant {
-        #[cfg(test)]
-        if let Some(now) = self
-            .push
+    fn push_now(&self) -> Instant {
+        self.push
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clock_now
-        {
-            return now;
-        }
-        Instant::now()
+            .now()
     }
 
     fn replacement_allows_stream(&self, sessions: &[String]) -> bool {
-        let now = self.replacement_now();
+        let now = self.push_now();
         let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
         if push
             .replacement
@@ -1054,7 +1454,7 @@ impl<T: Transport + 'static> Shared<T> {
     }
 
     fn stream_replaced(&self, sessions: Vec<String>, started: Instant) {
-        let now = self.replacement_now();
+        let now = self.push_now();
         let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
         let retried = push
             .replacement
@@ -1121,7 +1521,7 @@ impl<T: Transport + 'static> Shared<T> {
                     if self.stopped() || self.active_push_sessions() != sessions {
                         interrupt.store(true, Ordering::Release);
                     }
-                    let started = self.replacement_now();
+                    let started = self.push_now();
                     let mut ready = false;
                     let mut replaced = false;
                     while !self.stopped() && !interrupt.load(Ordering::Acquire) {
@@ -1437,12 +1837,12 @@ mod tests {
         }
     }
     #[test]
-    fn mail_reply_without_needs_is_closed_and_does_not_wake() {
+    fn mail_reply_without_needs_is_closed_but_wakes_the_asker() {
         let mut mail: Message = serde_json::from_value(
             json!({"id":1,"from":"bob","to":"alice","reply_to":9,"needs":"none","body":"Принято"}),
         )
         .unwrap();
-        assert!(!wakes(&mail));
+        assert!(wakes(&mail));
         assert!(!is_open(&mail));
         mail.needs = Some("ack".into());
         assert!(wakes(&mail));
@@ -1955,6 +2355,576 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(rig.daemon.shared.unread("alice").unread, Some(0));
     }
+
+    fn round4_zone(seq: i64, kind: &str, id: i64, fence: i64, actor: Option<&str>) -> Event {
+        let mut event = json!({"seq":seq,"type":kind,"session":"alice","payload":{"session":"alice","claim_id":id,"fence":fence,"paths":["src"],"reason":if kind == "zone.lost" {"taken"} else {"narrowed"}}});
+        if let Some(actor) = actor {
+            event["payload"]["by"] = json!(actor);
+        }
+        serde_json::from_value(event).unwrap()
+    }
+
+    #[test]
+    fn round5_same_claim_mutations_and_restart_snapshot_do_not_clear_loss() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        shared.push_event(round4_zone(1, "zone.released", 42, 2, Some("bob")));
+        for (seq, reason) in [
+            (2, "renewed"),
+            (3, "meta_updated"),
+            (4, "add_path"),
+            (5, "claimed"),
+        ] {
+            let mut event = round4_zone(seq, "zone.claimed", 42, seq, None);
+            event.payload["reason"] = json!(reason);
+            shared.push_event(event);
+            assert_eq!(
+                shared.push.lock().unwrap().zone_alerts["alice"].len(),
+                1,
+                "{reason}"
+            );
+        }
+        let claim: Claim =
+            serde_json::from_value(json!({"id":43,"session":"alice","paths":["src"],"fence":1}))
+                .unwrap();
+        let backend = lockyard_cloud_client::CloudBackend::new(
+            Client::new(&rig.server.url(), "test-token".into()).unwrap(),
+            "alice",
+        );
+        shared.observe_status_claims("alice", &[claim], &backend, Duration::ZERO);
+        assert_eq!(
+            shared.push.lock().unwrap().zone_alerts["alice"].len(),
+            1,
+            "restart baseline"
+        );
+        // A repeated grant for a known id also cannot hide a later loss.
+        let mut seen = round4_zone(6, "zone.granted", 43, 7, None);
+        seen.payload["reason"] = json!("granted");
+        shared.push_event(seen);
+        assert_eq!(shared.push.lock().unwrap().zone_alerts["alice"].len(), 1);
+        let mut fresh = round4_zone(7, "zone.claimed", 44, 8, None);
+        fresh.payload["reason"] = json!("claimed");
+        shared.push_event(fresh);
+        assert!(shared.take_zone_alerts("alice").is_empty());
+    }
+
+    #[test]
+    fn round5_multiple_own_fences_suppress_delayed_echoes() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        for fence in [1, 2] {
+            let mutation = shared.begin_zone_mutation(&Call::write(
+                "alice",
+                "POST",
+                "/api/v1/zones/claims/42/narrow".into(),
+                json!({"fence":fence,"paths":["docs"]}),
+            ));
+            shared.finish_zone_mutation(mutation, Some(&json!({"fence":fence+1})));
+        }
+        shared.push_event(round4_zone(1, "zone.released", 42, 2, None));
+        shared.push_event(round4_zone(2, "zone.released", 42, 3, None));
+        assert!(
+            shared.take_zone_alerts("alice").is_empty(),
+            "first fence was overwritten"
+        );
+        shared.push_event(round4_zone(3, "zone.released", 42, 4, None));
+        assert_eq!(shared.take_zone_alerts("alice").len(), 1);
+    }
+
+    #[test]
+    fn round5_abandoned_unread_does_not_consume_attention() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        rig.daemon.shared.hear("alice");
+        rig.daemon
+            .shared
+            .push_event(round4_zone(1, "zone.lost", 42, 2, None));
+        for _ in 0..2 {
+            let reply = rig.daemon.handle(Request::Unread {
+                attention_ack: Vec::new(),
+                session: "alice".into(),
+                attention: true,
+            });
+            assert_eq!(reply.lost.unwrap().len(), 1, "socket closed before output");
+        }
+    }
+
+    #[test]
+    fn round5_fallback_loss_without_session_can_be_acknowledged() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let backend = shared.backend("alice");
+        let claim: Claim =
+            serde_json::from_value(json!({"id":42,"session":"alice","paths":["src"]})).unwrap();
+        shared.observe_status_claims("alice", &[claim], &backend, Duration::ZERO);
+        rig.server.enqueue(
+            "/api/v1/zones/lost",
+            HttpReply::json(
+                200,
+                json!({"lost":[{"claim_id":42,"paths":["src"],"reason":"expired"}]}),
+            ),
+        );
+        shared.observe_status_claims("alice", &[], &backend, Duration::from_secs(1));
+        let printed = rig
+            .daemon
+            .handle(Request::Unread {
+                session: "alice".into(),
+                attention: true,
+                attention_ack: Vec::new(),
+            })
+            .lost
+            .unwrap();
+        assert_eq!(printed.len(), 1);
+        let after = rig.daemon.handle(Request::Unread {
+            session: "alice".into(),
+            attention: true,
+            attention_ack: printed,
+        });
+        assert!(
+            after.lost.unwrap().is_empty(),
+            "confirmed fallback alert must retire too"
+        );
+    }
+
+    #[test]
+    fn round5_ack_only_removes_the_printed_snapshot() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        rig.daemon.shared.hear("alice");
+        rig.daemon
+            .shared
+            .push_event(round4_zone(1, "zone.released", 42, 2, Some("bob")));
+        let printed = rig
+            .daemon
+            .handle(Request::Unread {
+                session: "alice".into(),
+                attention: true,
+                attention_ack: Vec::new(),
+            })
+            .lost
+            .unwrap();
+        rig.daemon
+            .shared
+            .push_event(round4_zone(2, "zone.lost", 42, 3, None));
+        let newer = rig
+            .daemon
+            .handle(Request::Unread {
+                session: "alice".into(),
+                attention: true,
+                attention_ack: printed,
+            })
+            .lost
+            .unwrap();
+        assert_eq!(newer.len(), 1);
+        assert_eq!(newer[0].reason.as_deref(), Some("taken"));
+        let confirmed = rig.daemon.handle(Request::Unread {
+            session: "alice".into(),
+            attention: true,
+            attention_ack: newer,
+        });
+        assert!(confirmed.lost.unwrap().is_empty());
+    }
+
+    #[test]
+    fn round5_socket_disconnect_before_output_keeps_attention() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        let rig = rig(true, None);
+        rig.daemon.shared.hear("alice");
+        rig.daemon
+            .shared
+            .push_event(round4_zone(1, "zone.lost", 42, 2, None));
+        {
+            let mut peer = UnixStream::connect(&rig.daemon.shared.config.socket).unwrap();
+            peer.write_all(b"{\"workspace\":\"test\",\"op\":\"unread\",\"session\":\"alice\",\"attention\":true}\n").unwrap();
+            // The hook exits before receiving or rendering the answer.
+        }
+        for _ in 0..2 {
+            let reply = socket(&rig)
+                .ask(&Request::Unread {
+                    session: "alice".into(),
+                    attention: true,
+                    attention_ack: Vec::new(),
+                })
+                .unwrap();
+            assert_eq!(reply.lost.unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn round5_direct_http_while_agent_runs_has_documented_mutation_boundary() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        rig.daemon.shared.hear("alice");
+        rig.server.enqueue(
+            "/api/v1/zones/claims/42/narrow",
+            HttpReply::json(
+                200,
+                json!({"id":42,"session":"alice","paths":["docs"],"fence":2}),
+            ),
+        );
+        let direct = Client::new(&rig.server.url(), "test-token".into()).unwrap();
+        direct
+            .call(&Call::write(
+                "alice",
+                "POST",
+                "/api/v1/zones/claims/42/narrow".into(),
+                json!({"paths":["docs"],"fence":1}),
+            ))
+            .unwrap();
+        assert!(
+            rig.daemon
+                .shared
+                .push
+                .lock()
+                .unwrap()
+                .local_zone_mutations
+                .is_empty()
+        );
+        // With no actor, direct HTTP has no receipt registered in the running daemon.
+        rig.daemon
+            .shared
+            .push_event(round4_zone(1, "zone.released", 42, 2, None));
+        assert_eq!(rig.daemon.shared.zone_alerts("alice").len(), 1);
+    }
+
+    #[test]
+    fn round4_own_narrow_actor_and_receipt_fence_do_not_alert() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        rig.daemon.shared.hear("alice");
+        let shared = &rig.daemon.shared;
+        assert!(shared.push_event(round4_zone(1, "zone.released", 42, 2, Some("alice"))));
+        assert!(shared.take_zone_alerts("alice").is_empty());
+        rig.server.enqueue(
+            "/api/v1/zones/claims/43/narrow",
+            HttpReply::json(
+                200,
+                json!({"id":43,"session":"alice","paths":["docs"],"fence":5}),
+            ),
+        );
+        let reply = shared.forward(Call::write(
+            "alice",
+            "POST",
+            "/api/v1/zones/claims/43/narrow".into(),
+            json!({"fence":3,"paths":["docs"]}),
+        ));
+        assert!(reply.error.is_none(), "{reply:?}");
+        assert!(shared.push_event(round4_zone(2, "zone.released", 43, 5, None)));
+        assert!(shared.take_zone_alerts("alice").is_empty());
+        // A different fence is not an echo of our mutation.
+        assert!(shared.push_event(round4_zone(3, "zone.released", 43, 6, None)));
+        assert_eq!(shared.take_zone_alerts("alice").len(), 1);
+    }
+
+    #[test]
+    fn round4_own_narrow_without_request_fence_uses_the_receipt_fence() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        rig.server.enqueue(
+            "/api/v1/zones/claims/43/narrow",
+            HttpReply::json(
+                200,
+                json!({"id":43,"session":"alice","paths":["docs"],"fence":5}),
+            ),
+        );
+        let shared = &rig.daemon.shared;
+        let reply = shared.forward(Call::write(
+            "alice",
+            "POST",
+            "/api/v1/zones/claims/43/narrow".into(),
+            json!({"paths":["docs"]}),
+        ));
+        assert!(reply.error.is_none(), "{reply:?}");
+        shared.push_event(round4_zone(1, "zone.released", 43, 5, None));
+        assert!(
+            shared.take_zone_alerts("alice").is_empty(),
+            "our fenceless narrow was mistaken for a foreign loss"
+        );
+        // The receipt identifies only our mutation, never a later foreign loss.
+        shared.push_event(round4_zone(2, "zone.released", 43, 5, Some("bob")));
+        assert_eq!(shared.take_zone_alerts("alice").len(), 1);
+        shared.push_event(round4_zone(3, "zone.released", 43, 6, None));
+        assert_eq!(shared.take_zone_alerts("alice").len(), 1);
+
+        // The same optional precondition applies when SSE precedes the receipt.
+        let mutation = shared.begin_zone_mutation(&Call::write(
+            "alice",
+            "POST",
+            "/api/v1/zones/claims/44/narrow".into(),
+            json!({"paths":["docs"]}),
+        ));
+        assert!(mutation.is_some());
+        shared.push_event(round4_zone(4, "zone.released", 44, 7, None));
+        assert!(shared.take_zone_alerts("alice").is_empty());
+        shared.finish_zone_mutation(mutation, Some(&json!({"id":44,"fence":7})));
+        assert!(shared.take_zone_alerts("alice").is_empty());
+    }
+
+    #[test]
+    fn round4_early_own_event_waits_for_mutation_receipt_and_foreign_actor_wins() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let call = Call::write(
+            "alice",
+            "POST",
+            "/api/v1/zones/claims/42/narrow".into(),
+            json!({"fence":1,"paths":["docs"]}),
+        );
+        let mutation = shared.begin_zone_mutation(&call);
+        shared.push_event(round4_zone(1, "zone.released", 42, 2, None));
+        assert!(shared.take_zone_alerts("alice").is_empty());
+        shared.finish_zone_mutation(mutation, Some(&json!({"id":42,"fence":2})));
+        assert!(shared.take_zone_alerts("alice").is_empty());
+        shared.push_event(round4_zone(2, "zone.released", 42, 2, Some("bob")));
+        assert_eq!(shared.take_zone_alerts("alice").len(), 1);
+    }
+
+    #[test]
+    fn round4_foreign_narrow_once_and_new_claim_clears_stale_alert() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let event = round4_zone(1, "zone.released", 42, 2, Some("bob"));
+        shared.push_event(event.clone());
+        assert_eq!(shared.take_zone_alerts("alice").len(), 1);
+        assert!(shared.take_zone_alerts("alice").is_empty());
+        shared.push_event(event);
+        assert!(shared.take_zone_alerts("alice").is_empty());
+        shared.push_event(round4_zone(2, "zone.released", 43, 3, Some("bob")));
+        let mut claimed = round4_zone(3, "zone.claimed", 44, 4, None);
+        claimed.payload["reason"] = json!("claimed");
+        shared.push_event(claimed);
+        assert!(shared.take_zone_alerts("alice").is_empty());
+        assert!(
+            shared
+                .push
+                .lock()
+                .unwrap()
+                .zone_alerts
+                .get("alice")
+                .is_none_or(|a| a.is_empty())
+        );
+    }
+
+    #[test]
+    fn round4_new_claim_suppresses_an_undelivered_loss_on_the_same_paths() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        shared.push_event(round4_zone(1, "zone.released", 42, 2, Some("bob")));
+        let mut claim = round4_zone(2, "zone.claimed", 43, 3, None);
+        claim.payload["reason"] = json!("claimed");
+        shared.push_event(claim);
+        assert!(shared.take_zone_alerts("alice").is_empty());
+    }
+
+    #[test]
+    fn round4_mail_counter_cannot_consume_hook_zone_attention() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        rig.daemon.shared.hear("alice");
+        rig.daemon
+            .shared
+            .push_event(round4_zone(1, "zone.lost", 42, 2, None));
+        let count = rig.daemon.handle(Request::Unread {
+            attention_ack: Vec::new(),
+            session: "alice".into(),
+            attention: false,
+        });
+        assert!(count.lost.unwrap().is_empty());
+        let first = rig.daemon.handle(Request::Unread {
+            attention_ack: Vec::new(),
+            session: "alice".into(),
+            attention: true,
+        });
+        let printed = first.lost.unwrap();
+        assert_eq!(printed.len(), 1);
+        let next = rig.daemon.handle(Request::Unread {
+            attention_ack: printed,
+            session: "alice".into(),
+            attention: true,
+        });
+        assert!(next.lost.unwrap().is_empty());
+    }
+
+    #[test]
+    fn round4_finished_sessions_retire_zone_tracking() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        shared.push_event(round4_zone(1, "zone.lost", 42, 2, None));
+        shared
+            .push
+            .lock()
+            .unwrap()
+            .status_claims
+            .insert("alice".into(), HashSet::from([42]));
+        shared.sessions().get_mut("alice").unwrap().heard =
+            Some(Instant::now() - shared.timing().active_window - Duration::from_secs(1));
+        shared.refresh_unread();
+        let push = shared.push.lock().unwrap();
+        assert!(!push.status_claims.contains_key("alice"));
+        assert!(
+            !push
+                .zone_alert_versions
+                .keys()
+                .any(|(session, _)| session == "alice")
+        );
+        assert!(!push.zone_alerts.contains_key("alice"));
+    }
+
+    #[test]
+    fn round4_lost_taken_reason_is_not_duplicated() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        rig.daemon.shared.hear("alice");
+        rig.daemon
+            .shared
+            .push_event(round4_zone(1, "zone.lost", 42, 2, None));
+        assert_eq!(
+            rig.daemon.shared.take_zone_alerts("alice")[0]
+                .reason
+                .as_deref(),
+            Some("taken")
+        );
+    }
+
+    #[test]
+    fn round4_stream_disconnect_rechecks_zone_within_sixty_seconds() {
+        let rig = rig(true, None);
+        rig.daemon.shared.hear("alice");
+        seeded(&rig, "alice");
+        let start = Instant::now();
+        rig.daemon.shared.push.lock().unwrap().clock_now = Some(start);
+        rig.server.enqueue(
+            "/api/v1/zones/check",
+            HttpReply::json(200, json!({"paths":[{"path":"src","status":"held"}]})),
+        );
+        let before = rig
+            .server
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/api/v1/zones/check")
+            .count();
+        let shared = rig.daemon.shared.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let polled = progress.clone();
+        let worker = thread::spawn(move || {
+            let reply = shared.wait_zone_free("alice", "src", 600_000, &mut || {
+                polled.fetch_add(1, Ordering::SeqCst);
+                false
+            });
+            sent.send(reply).unwrap();
+        });
+        eventually(|| progress.load(Ordering::SeqCst) > 0);
+        rig.daemon.shared.push_ready.store(false, Ordering::Release);
+        rig.daemon.shared.push.lock().unwrap().clock_now = Some(start + Duration::from_secs(61));
+        rig.daemon.shared.mail_ready.notify_all();
+        let answer = received.recv_timeout(Duration::from_secs(1));
+        rig.daemon.shared.push.lock().unwrap().clock_now = Some(start + Duration::from_secs(601));
+        rig.daemon.shared.mail_ready.notify_all();
+        worker.join().unwrap();
+        assert!(answer.is_ok(), "disconnected stream prevented recheck");
+        assert_eq!(answer.unwrap().value.unwrap()["free"], true);
+        assert!(
+            rig.server
+                .requests()
+                .iter()
+                .filter(|r| r.path == "/api/v1/zones/check")
+                .count()
+                > before + 1
+        );
+    }
+
+    #[test]
+    fn zone_expiry_takeover_and_auto_narrowing_are_cached_only_for_the_holder() {
+        let mut rig = rig(true, None);
+        // This test injects events directly and measures cache reads. Join unrelated
+        // upkeep/stream workers so their HTTP requests cannot race the no-RPC assertion.
+        rig.daemon.stop_workers();
+        rig.daemon.shared.hear("alice");
+        for (id, kind, reason) in [
+            (42, "zone.expired", "expired"),
+            (43, "zone.lost", "taken"),
+            (44, "zone.released", "narrowed"),
+        ] {
+            let event = serde_json::from_value(
+                json!({"seq":id,"type":kind,"at":"2026-11-17T12:34:00Z", "session":"alice",
+                "payload":{"session":"alice","claim_id":id,"paths":["src"],"reason":reason}}),
+            )
+            .unwrap();
+            assert!(rig.daemon.shared.push_event(event));
+        }
+        let before = rig.server.requests().len();
+        assert_eq!(rig.daemon.shared.take_zone_alerts("alice").len(), 3);
+        assert!(rig.daemon.shared.take_zone_alerts("bob").is_empty());
+        assert_eq!(rig.server.requests().len(), before);
+    }
+
+    #[test]
+    fn newer_loss_replaces_narrowing_and_status_cannot_overwrite_sse() {
+        let rig = rig(true, None);
+        rig.daemon.shared.hear("alice");
+        let backend = rig.daemon.shared.backend("alice");
+        let claim: Claim =
+            serde_json::from_value(json!({"id":42,"session":"alice","paths":["src"],"fence":1}))
+                .unwrap();
+        rig.daemon.shared.observe_status_claims(
+            "alice",
+            &[claim],
+            &backend,
+            Duration::from_secs(1),
+        );
+        for (seq, kind, reason) in [
+            (10, "zone.released", "narrowed"),
+            (12, "zone.lost", "holder offline"),
+            (11, "zone.released", "narrowed"),
+        ] {
+            rig.daemon.shared.push_event(serde_json::from_value(json!({"seq":seq,"type":kind,"session":"alice","payload":{"session":"alice","claim_id":42,"paths":["src"],"reason":reason}})).unwrap());
+        }
+        rig.server.enqueue("/api/v1/zones/lost",HttpReply::json(200,json!({"claims":[{"claim_id":42,"session":"alice","paths":["src"],"reason":"holder offline"}]})));
+        rig.daemon
+            .shared
+            .observe_status_claims("alice", &[], &backend, Duration::from_secs(1));
+        assert_eq!(
+            rig.daemon.shared.take_zone_alerts("alice")[0]
+                .reason
+                .as_deref(),
+            Some("taken: holder offline")
+        );
+        let before = rig
+            .server
+            .requests()
+            .iter()
+            .filter(|r| r.path.starts_with("/api/v1/zones/lost"))
+            .count();
+        rig.daemon
+            .shared
+            .observe_status_claims("alice", &[], &backend, Duration::from_secs(1));
+        assert_eq!(
+            rig.server
+                .requests()
+                .iter()
+                .filter(|r| r.path.starts_with("/api/v1/zones/lost"))
+                .count(),
+            before,
+            "a successfully reconciled missing claim must retire"
+        );
+    }
+
     #[test]
     fn mail_push_coordination_events_keep_socket_ack_semantics() {
         let rig = rig(true, None);
@@ -3104,6 +4074,58 @@ mod tests {
     }
 
     #[test]
+    fn zone_wait_free_quiet_sse_five_controlled_minutes_adds_zero_checks() {
+        let rig = rig(true, None);
+        rig.daemon.shared.hear("alice");
+        seeded(&rig, "alice");
+        let start = Instant::now();
+        rig.daemon.shared.push.lock().unwrap().clock_now = Some(start);
+        rig.server.enqueue(
+            "/api/v1/zones/check",
+            HttpReply::json(200, json!({"paths":[{"path":"src","status":"held"}]})),
+        );
+        let before = rig
+            .server
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/api/v1/zones/check")
+            .count();
+        let shared = Arc::clone(&rig.daemon.shared);
+        let observed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let progress = observed.clone();
+        let worker = thread::spawn(move || {
+            shared.wait_zone_free("alice", "src", 600_000, &mut || {
+                progress.fetch_add(1, Ordering::SeqCst);
+                false
+            })
+        });
+        eventually(|| observed.load(Ordering::SeqCst) > 0);
+        for minute in 1..=5 {
+            let before_tick = observed.load(Ordering::SeqCst);
+            rig.daemon.shared.push.lock().unwrap().clock_now =
+                Some(start + Duration::from_secs(61 * minute));
+            rig.daemon.shared.mail_ready.notify_all();
+            eventually(|| observed.load(Ordering::SeqCst) > before_tick || worker.is_finished());
+        }
+        // Finish the waiter before asserting so a broken polling implementation cannot leak it.
+        let checks = rig
+            .server
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/api/v1/zones/check")
+            .count();
+        rig.daemon.shared.push.lock().unwrap().clock_now = Some(start + Duration::from_secs(601));
+        rig.daemon.shared.mail_ready.notify_all();
+        let reply = worker.join().unwrap();
+        assert_eq!(
+            checks,
+            before + 1,
+            "five quiet minutes must add zero checks after the initial read"
+        );
+        assert_eq!(reply.value.unwrap()["timed_out"], true);
+    }
+
+    #[test]
     fn zone_wait_free_reuses_daemon_sse_and_checks_only_after_zone_event() {
         let rig = rig(true, None);
         rig.daemon.shared.hear("alice");
@@ -3150,14 +4172,18 @@ mod tests {
     }
 
     #[test]
-    fn mail_push_reply_to_needs_none_is_hook_only_without_wake_or_read_receipt() {
+    fn mail_push_plain_none_does_not_wake_but_reply_to_my_ask_does() {
         let rig = rig(true, None);
         let (received, worker) = waiting(&rig, "alice", Duration::from_secs(3));
         seeded(&rig, "alice");
+        publish(&rig, 1, mail(29, "alice", false, "none"));
+        assert!(received.recv_timeout(Duration::from_millis(150)).is_err());
         let mut reply = mail(30, "alice", false, "none");
         reply["reply_to"] = json!(12);
-        publish(&rig, 1, reply);
-        assert!(received.recv_timeout(Duration::from_millis(150)).is_err());
+        publish(&rig, 2, reply);
+        let answer = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(answer.messages.unwrap()[0].id, 30);
         assert!(
             !rig.daemon
                 .shared
@@ -3166,19 +4192,6 @@ mod tests {
                 .items
                 .iter()
                 .any(|item| item.id == 30)
-        );
-        let mut urgent = mail(31, "alice", true, "none");
-        urgent["reply_to"] = json!(12);
-        publish(&rig, 2, urgent);
-        let answer = received.recv_timeout(Duration::from_secs(2)).unwrap();
-        worker.join().unwrap();
-        assert_eq!(answer.messages.unwrap()[0].id, 31);
-        let peek = rig.daemon.shared.peek_hook_mail("alice");
-        assert!(
-            peek.messages
-                .unwrap()
-                .iter()
-                .any(|message| message.id == 30)
         );
         assert!(
             !rig.server

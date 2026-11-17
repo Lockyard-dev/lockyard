@@ -224,7 +224,13 @@ impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Protocol(problem) => write!(f, "{}: {}", problem.code, problem.detail),
-            Self::OutcomeUnknown(pending) => write!(f, "outcome_unknown: {}", pending.cause_code),
+            Self::OutcomeUnknown(pending) => {
+                write!(f, "outcome_unknown: {}", pending.cause_code)?;
+                if let Some(diagnostic) = &pending.diagnostic {
+                    write!(f, ": {diagnostic}")?;
+                }
+                Ok(())
+            }
             Self::Invalid(text) | Self::Transport(text) | Self::Decode(text) => f.write_str(text),
             Self::JournalBusy => f.write_str("pending journal is busy"),
             Self::Unauthorized(error)
@@ -1024,14 +1030,25 @@ impl Client {
         self
     }
 
-    /// Load the workspace key once for a call. An on-disk key is accepted only when its
-    /// `key_id` matches the workspace encryption setting (when that setting is known).
+    /// With a known key id, matching memory avoids disk I/O. Without a setting, reload
+    /// disk on every call so imports take effect; unreadable disk falls back to memory.
     pub(crate) fn resolved_content_key(&self) -> Result<Option<WorkspaceKey>, ClientError> {
         let Some(workspace) = self.workspace.as_deref() else {
             return Ok(self.content_key.clone());
         };
-        let disk = WorkspaceKey::load_for_workspace(workspace).map_err(ClientError::Invalid)?;
         let expected = self.expected_key_id.as_deref();
+        if let Some(memory) = &self.content_key
+            && expected.is_some_and(|id| memory.key_id() == id)
+        {
+            return Ok(Some(memory.clone()));
+        }
+        let disk = match WorkspaceKey::load_for_workspace(workspace) {
+            Ok(disk) => disk,
+            Err(_) if expected.is_none() && self.content_key.is_some() => {
+                return Ok(self.content_key.clone());
+            }
+            Err(error) => return Err(ClientError::Invalid(error)),
+        };
         match (expected, &self.content_key, disk) {
             (Some(expected), _, Some(disk)) if disk.key_id() == expected => Ok(Some(disk)),
             (Some(expected), _, Some(disk)) => Err(ClientError::Invalid(format!(
@@ -1171,9 +1188,10 @@ impl Client {
         remaining: Option<Duration>,
         protocol: &NegotiatedProtocol,
     ) -> Result<Value, Failure> {
-        self.attempt_observed(call, encoded, remaining, protocol, None, None)
+        self.attempt_observed(call, encoded, remaining, protocol, None, None, true)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn attempt_observed(
         &self,
         call: &Call,
@@ -1182,6 +1200,7 @@ impl Client {
         protocol: &NegotiatedProtocol,
         registry_capability: Option<&AtomicBool>,
         auto_area_capability: Option<&AtomicBool>,
+        first_attempt: bool,
     ) -> Result<Value, Failure> {
         let request_started = Instant::now();
         let _worker = self
@@ -1407,8 +1426,76 @@ impl Client {
                     .and_then(|value| value.parse::<u64>().ok());
                 let echo = protocol::verify_echo(&response, protocol);
                 let body = response.into_string().unwrap_or_default();
-                let mut api_error = protocol::parse_api_error(status, &body, retry_after)
-                    .map_err(Failure::Final)?;
+                // A definitive rejection of a registry create did not create an item, even
+                // when ASP.NET model binding (or a proxy) returns a non-Lockyard envelope.
+                // HTTP 408 can follow a forwarded write whose outcome is still unknown.
+                let create_rejected = first_attempt
+                    && call.method == "POST"
+                    && call.path == "/api/v1/registry/items"
+                    && (400..500).contains(&status)
+                    && status != 408;
+                let rejection = || ApiError {
+                    status,
+                    code: "request_rejected".into(),
+                    message: format!(
+                        "task creation rejected (HTTP {status}); nothing created: {}",
+                        body.chars()
+                            .filter(|c| !c.is_control())
+                            .take(200)
+                            .collect::<String>()
+                    ),
+                    retry_after,
+                    ..ApiError::default()
+                };
+                let mut api_error = match protocol::parse_api_error(status, &body, retry_after) {
+                    Ok(error) => error,
+                    Err(_) if create_rejected => {
+                        return Err(Failure::Final(ClientError::from_api(rejection())));
+                    }
+                    Err(_) => {
+                        return Err(Failure::Final(protocol::local(
+                            "protocol_response_invalid",
+                            &format!(
+                                "HTTP {status}: {}",
+                                body.chars()
+                                    .filter(|c| !c.is_control())
+                                    .take(200)
+                                    .collect::<String>()
+                            ),
+                        )));
+                    }
+                };
+                if create_rejected
+                    && (api_error.code.is_empty()
+                        || (echo.is_err()
+                            && !matches!(
+                                api_error.code.as_str(),
+                                "protocol_invalid" | "protocol_unsupported"
+                            )))
+                {
+                    return Err(Failure::Final(ClientError::from_api(rejection())));
+                }
+                if !first_attempt
+                    && call.method == "POST"
+                    && call.path == "/api/v1/registry/items"
+                    && (api_error.code.is_empty()
+                        || (echo.is_err()
+                            && !matches!(
+                                api_error.code.as_str(),
+                                "protocol_invalid" | "protocol_unsupported"
+                            )))
+                {
+                    return Err(Failure::Final(protocol::local(
+                        "protocol_response_invalid",
+                        &format!(
+                            "unconfirmed task creation (HTTP {status}): {}",
+                            body.chars()
+                                .filter(|c| !c.is_control())
+                                .take(200)
+                                .collect::<String>()
+                        ),
+                    )));
+                }
                 if protocol.selected >= 2
                     && !protocol.legacy
                     && api_error.code.is_empty()
@@ -1609,7 +1696,27 @@ impl Transport for Client {
         let Some(key) = &call.key else {
             return Ok(());
         };
-        let _send = self.claim_pending_send(key)?;
+        // A verified receipt must not fail because upkeep briefly owns the journal.
+        // This only retries local ownership; it never resends the confirmed mutation.
+        let started = Instant::now();
+        let budget = call
+            .deadline_ms
+            .map(Duration::from_millis)
+            .unwrap_or(MAX_RETRY_WAIT);
+        let _send = loop {
+            call.check_cancelled()?;
+            match self.claim_pending_send(key) {
+                Ok(guard) => break guard,
+                Err(error) if protocol::journal_busy(&error) => {
+                    let left = budget.saturating_sub(started.elapsed());
+                    if left.is_zero() {
+                        return Err(error);
+                    }
+                    call.wait(left.min(Duration::from_millis(25)))?;
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let Some(pending) = self.pending_operation(key) else {
             return Ok(());
         };
@@ -2350,7 +2457,18 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
-    static KEY_ENV: Mutex<()> = Mutex::new(());
+    struct EnvLock;
+    impl EnvLock {
+        fn lock(
+            &self,
+        ) -> Result<
+            std::sync::MutexGuard<'static, ()>,
+            std::sync::PoisonError<std::sync::MutexGuard<'static, ()>>,
+        > {
+            Ok(lockyard_core::test_env_lock())
+        }
+    }
+    static KEY_ENV: EnvLock = EnvLock;
 
     #[test]
     fn encrypted_claims_and_queue_send_paths_without_catalog_labels() {
@@ -3563,29 +3681,33 @@ mod tests {
             .with_content_encryption("wave2reload", None, true);
         let resolved = empty.resolved_content_key().unwrap().expect("disk key");
         assert_eq!(resolved.key_id(), key.key_id());
-        // Without an expected workspace key id, a newer on-disk key wins over memory.
         let newer = WorkspaceKey::from_entropy([99; 32]);
         let path = WorkspaceKey::storage_path("wave2reload").unwrap();
         std::fs::remove_file(&path).unwrap();
-        newer.store_for_workspace("wave2reload").unwrap();
-        let stale = Client::new("http://127.0.0.1:9", "fixture".into())
-            .unwrap()
-            .with_content_encryption("wave2reload", Some(key.clone()), true);
-        let reloaded = stale
-            .resolved_content_key()
-            .unwrap()
-            .expect("newer disk key");
-        assert_eq!(reloaded.key_id(), newer.key_id());
-        // With an expected id, a mismatched on-disk key is refused.
+        std::fs::create_dir(&path).unwrap(); // Reading this as a key must fail.
         let mut pinned = Client::new("http://127.0.0.1:9", "fixture".into())
             .unwrap()
             .with_content_encryption("wave2reload", Some(key.clone()), true);
         pinned.expected_key_id = Some(key.key_id());
-        let err = match pinned.resolved_content_key() {
-            Err(error) => error.to_string(),
-            Ok(_) => panic!("expected key id mismatch"),
-        };
-        assert!(err.contains("key id mismatch"), "{err}");
+        assert_eq!(
+            pinned.resolved_content_key().unwrap().unwrap().key_id(),
+            key.key_id()
+        );
+        std::fs::remove_dir(&path).unwrap();
+        newer.store_for_workspace("wave2reload").unwrap();
+        pinned.expected_key_id = None;
+        assert_eq!(
+            pinned.resolved_content_key().unwrap().unwrap().key_id(),
+            newer.key_id()
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(
+            pinned.resolved_content_key().unwrap().unwrap().key_id(),
+            key.key_id()
+        );
+        std::fs::remove_dir(&path).unwrap();
+        newer.store_for_workspace("wave2reload").unwrap();
         // Matching expected id accepts the disk key.
         pinned.expected_key_id = Some(newer.key_id());
         assert_eq!(

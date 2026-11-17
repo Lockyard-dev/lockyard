@@ -65,6 +65,14 @@ pub fn about() -> String {
     format!("Lockyard {BUILD_VERSION}\n{SUMMARY}\n{HOMEPAGE}")
 }
 
+/// One process-wide lock for tests mutating environment variables or the current directory.
+#[doc(hidden)]
+pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -99,6 +99,8 @@ pub(super) enum ZoneCommand {
     },
     /// Offer a claim to another agent.
     Handover {
+        #[arg(long, num_args = 1..)]
+        paths: Vec<String>,
         #[arg(value_parser = parse_id)]
         id: i64,
         #[arg(long)]
@@ -113,9 +115,11 @@ pub(super) enum ZoneCommand {
     },
     /// Shrink a claim to some of its paths.
     Narrow {
+        #[arg(long = "except", num_args = 1.., conflicts_with = "paths")]
+        except: Vec<String>,
         #[arg(value_parser = parse_id)]
         id: i64,
-        #[arg(required = true)]
+        #[arg(required_unless_present = "except")]
         paths: Vec<String>,
         #[arg(long)]
         fence: Option<i64>,
@@ -130,8 +134,10 @@ pub(super) enum ZoneCommand {
         #[arg(long)]
         fence: Option<i64>,
     },
-    /// Take the claim of an unresponsive session. Needs the lead role and a reason.
+    /// Take the claim of an unresponsive session, with a reason.
     Takeover {
+        #[arg(long, num_args = 1..)]
+        paths: Vec<String>,
         #[arg(value_parser = parse_id)]
         id: i64,
         #[arg(long)]
@@ -178,6 +184,8 @@ pub(super) enum ZoneCommand {
     },
     /// Release one claim; with several claims, give an id or --all.
     Release {
+        #[arg(long = "path", alias = "paths", num_args = 1.., requires = "id", conflicts_with = "all")]
+        paths: Vec<String>,
         #[arg(value_parser = parse_id)]
         id: Option<i64>,
         /// Release all this agent's claims. Cannot be combined with an id.
@@ -404,8 +412,8 @@ pub(super) enum TaskCommand {
         /// Required with P0: player_money, security_breach, prod_outage or cert_slip.
         #[arg(long)]
         p0_category: Option<String>,
-        /// Item type, such as code, ops or finding. Cloud mode.
-        #[arg(long = "type")]
+        /// Registry item type. Cloud mode.
+        #[arg(long = "type", value_parser = lockyard_core::tasks::REGISTRY_TASK_TYPES)]
         kind: Option<String>,
         /// What done means, such as code_accepted or ci_passed. Cloud mode.
         #[arg(long)]

@@ -1002,11 +1002,7 @@ use std::fs::OpenOptions;
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::{
-        os::unix::fs::{PermissionsExt, symlink},
-        sync::Mutex,
-    };
-    static KEY_ENV: Mutex<()> = Mutex::new(());
+    use std::os::unix::fs::{PermissionsExt, symlink};
     const WORKSPACE: &str = "123e4567-e89b-12d3-a456-426614174000";
     #[test]
     fn native_preparation_cannot_reserve_a_browser_identity() {
@@ -1309,7 +1305,7 @@ mod tests {
 
     #[test]
     fn staged_workspace_key_is_private_create_only_and_cannot_follow_a_symlink() {
-        let _lock = KEY_ENV.lock().unwrap();
+        let _lock = lockyard_core::test_env_lock();
         let temp = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.path()) };

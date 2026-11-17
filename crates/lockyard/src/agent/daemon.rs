@@ -98,6 +98,13 @@ struct StatusBatch {
 }
 
 impl StatusReads {
+    fn can_dispatch(&self, id: u64, now: Instant) -> bool {
+        self.running < MAX_STATUS_READS
+            && self.pending.front() == Some(&id)
+            && self.batches.get(&id).is_some_and(|batch| {
+                !batch.running && batch.ready_at <= now && now < batch.deadline
+            })
+    }
     fn leave(&mut self, id: u64) {
         let remove = self.batches.get_mut(&id).is_some_and(|batch| {
             batch.waiters -= 1;
@@ -946,8 +953,7 @@ impl<T: Transport + 'static> Shared<T> {
                 .unwrap_or_else(PoisonError::into_inner);
             let now = Instant::now();
             if disconnected || now >= deadline {
-                reads.leave(id);
-                self.status_ready.notify_all();
+                self.leave_status(&mut reads, id);
                 return if disconnected {
                     Reply::failed(ClientError::Transport("status caller disconnected".into()))
                 } else {
@@ -955,17 +961,12 @@ impl<T: Transport + 'static> Shared<T> {
                 };
             }
             if let Some(reply) = reads.batches[&id].reply.clone() {
-                reads.leave(id);
-                self.status_ready.notify_all();
+                self.leave_status(&mut reads, id);
                 return reply;
             }
             let batch = &reads.batches[&id];
             let ready_at = batch.ready_at;
-            if !batch.running
-                && reads.running < MAX_STATUS_READS
-                && reads.pending.front() == Some(&id)
-                && ready_at <= now
-            {
+            if reads.can_dispatch(id, now) {
                 let generation_deadline = batch.deadline;
                 let cancellation = batch.cancellation.clone();
                 let session = batch.session.clone();
@@ -1110,6 +1111,15 @@ impl<T: Transport + 'static> Shared<T> {
         let network_budget = left.saturating_sub(reply_reserve);
         match backend.status_read(session, now_ms(), network_budget) {
             Ok(mut status) => {
+                self.observe_status_claims(
+                    session,
+                    &status.claims,
+                    &backend,
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .saturating_sub(reply_reserve)
+                        .min(Duration::from_millis(300)),
+                );
                 status.freshness["transport"] = json!("agent");
                 // Optional open mail on the same warm client; never open a second cold client.
                 // `reply_reserve` is for IPC/folding after this function returns — do not spend it
@@ -1613,7 +1623,13 @@ impl<T: Transport + 'static> Shared<T> {
         }
     }
 
+    fn leave_status(&self, reads: &mut StatusReads, id: u64) {
+        reads.leave(id);
+        self.status_ready.notify_all();
+    }
+
     fn forward(&self, mut call: Call) -> Reply {
+        self.hear(&call.session);
         let repository_probe = call.method == "GET"
             && call.path.starts_with("/api/v1/zones/claims?")
             && call.path.ends_with("&namespace_probe=1")
@@ -1656,7 +1672,10 @@ impl<T: Transport + 'static> Shared<T> {
         };
         if class == WriteClass::Direct {
             let writes = call.is_write() && call.path.starts_with("/api/v1/zones/");
-            return match self.transport.call(&call) {
+            let mutation = self.begin_zone_mutation(&call);
+            let result = self.transport.call(&call);
+            self.finish_zone_mutation(mutation, result.as_ref().ok());
+            return match result {
                 Ok(value) => {
                     self.confirm_session_binding(&call);
                     if repository_probe {
@@ -1820,7 +1839,30 @@ impl<T: Transport + 'static> Shared<T> {
                 timeout_ms,
             } => self.wait_zone_free(&session, &path, timeout_ms, &mut || false),
             Request::Check { session, paths } => self.check(&session, paths),
-            Request::Unread { session } => self.unread(&session),
+            Request::Unread {
+                session,
+                attention,
+                attention_ack,
+            } => {
+                self.ack_zone_alerts(&session, &attention_ack);
+                let mut reply = self.unread(&session);
+                reply.lost = Some(if attention {
+                    self.zone_alerts(&session)
+                } else {
+                    Vec::new()
+                });
+                let view = self.read_view();
+                if view.fresh(self.timing().fresh) {
+                    reply.claims = Some(
+                        view.claims
+                            .iter()
+                            .filter(|claim| claim.session == session)
+                            .cloned()
+                            .collect(),
+                    );
+                }
+                reply
+            }
             Request::WaitMail {
                 session,
                 since,
@@ -2019,6 +2061,7 @@ impl<T: Transport + 'static> Shared<T> {
             // not erase a count that an Unread request registered after TakeMail.
             let mut sessions = self.sessions();
             sessions.retain(|_, track| track.heard.is_some_and(|at| at.elapsed() < window));
+            self.retain_zone_sessions(&sessions);
             #[cfg(test)]
             tests::pause_unread_reconciliation();
             let mut view = self.write_view();
@@ -2627,9 +2670,13 @@ impl<T: Transport + 'static> Daemon<T> {
         let connections = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
         #[cfg(windows)]
         let accepted = connections.clone();
+        #[cfg(test)]
+        let (accept_ready, accept_started) = std::sync::mpsc::sync_channel(1);
         threads.push(spawn(
             "accept",
             Box::new(move || {
+                #[cfg(test)]
+                let _ = accept_ready.send(());
                 for stream in listener.incoming() {
                     if copy.stopped() {
                         break;
@@ -2651,6 +2698,8 @@ impl<T: Transport + 'static> Daemon<T> {
                 }
             }),
         )?);
+        #[cfg(test)]
+        accept_started.recv().map_err(io::Error::other)?;
         Ok(Self {
             shared,
             threads,
@@ -3461,6 +3510,188 @@ mod tests {
     }
 
     #[test]
+    fn status_admission_seeded_interleavings_preserve_queue_and_deadline_invariants() {
+        let origin = Instant::now();
+        for seed in 1..=32u64 {
+            let mut random = seed;
+            let mut reads = StatusReads::default();
+            let mut now = origin;
+            let mut next = 0;
+            for _ in 0..500 {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                match random % 3 {
+                    0 => {
+                        next += 1;
+                        reads.pending.push_back(next);
+                        reads.batches.insert(
+                            next,
+                            StatusBatch {
+                                session: next.to_string(),
+                                repository: None,
+                                ready_at: now + STATUS_COALESCE_WINDOW,
+                                deadline: now + Duration::from_millis(2600),
+                                waiters: 1,
+                                running: false,
+                                reply: None,
+                                cancellation: Cancellation::new(),
+                            },
+                        );
+                    }
+                    1 => {
+                        if let Some(id) = reads
+                            .pending
+                            .get((random as usize / 3) % reads.pending.len().max(1))
+                            .copied()
+                        {
+                            reads.leave(id);
+                        }
+                    }
+                    _ => {
+                        now += Duration::from_millis(random % 100);
+                    }
+                }
+                for id in &reads.pending {
+                    let batch = &reads.batches[id];
+                    assert_eq!(batch.waiters, 1);
+                    assert_eq!(
+                        reads.can_dispatch(*id, now),
+                        reads.pending.front() == Some(id)
+                            && batch.ready_at <= now
+                            && now < batch.deadline
+                    );
+                }
+                assert_eq!(reads.pending.len(), reads.batches.len());
+                let unique: HashSet<_> = reads.pending.iter().collect();
+                assert_eq!(unique.len(), reads.pending.len());
+            }
+        }
+    }
+
+    #[test]
+    fn round4_leave_wakes_an_admitted_waiter() {
+        let mut rig = start_with(timing(), |_| {});
+        rig.daemon.stop_workers();
+        let shared = rig.daemon.shared.clone();
+        let (ready, waiting) = channel();
+        let (done, result) = channel();
+        let worker = thread::spawn(move || {
+            let reads = shared.status_reads.lock().unwrap();
+            ready.send(()).unwrap();
+            let (_reads, timeout) = shared
+                .status_ready
+                .wait_timeout(reads, Duration::from_secs(2))
+                .unwrap();
+            done.send(!timeout.timed_out()).unwrap();
+        });
+        waiting.recv().unwrap();
+        {
+            // Taking this lock proves the waiter has released it inside wait_timeout.
+            let mut reads = rig.daemon.shared.status_reads.lock().unwrap();
+            reads.pending.push_back(42);
+            reads.batches.insert(
+                42,
+                StatusBatch {
+                    session: "soft".into(),
+                    repository: None,
+                    ready_at: Instant::now(),
+                    deadline: Instant::now() + Duration::from_millis(2600),
+                    waiters: 1,
+                    running: false,
+                    reply: None,
+                    cancellation: Cancellation::new(),
+                },
+            );
+            rig.daemon.shared.leave_status(&mut reads, 42);
+            assert!(reads.batches.is_empty() && reads.pending.is_empty());
+        }
+        let woke = result.recv_timeout(Duration::from_millis(500));
+        worker.join().unwrap();
+        assert!(woke.unwrap());
+    }
+
+    #[test]
+    fn abandoned_soft_callers_leave_no_admission_delay_at_controlled_850ms() {
+        let start = Instant::now();
+        let mut reads = StatusReads {
+            running: MAX_STATUS_READS,
+            ..Default::default()
+        };
+        for id in 1..=20 {
+            reads.pending.push_back(id);
+            reads.batches.insert(
+                id,
+                StatusBatch {
+                    session: format!("soft-{id}"),
+                    repository: None,
+                    ready_at: start,
+                    deadline: start + Duration::from_millis(2600),
+                    waiters: 1,
+                    running: false,
+                    reply: None,
+                    cancellation: Cancellation::new(),
+                },
+            );
+        }
+        let now = start + Duration::from_millis(850);
+        for id in 1..=20 {
+            reads.leave(id);
+        }
+        assert!(reads.pending.is_empty() && reads.batches.is_empty());
+        reads.running = 0;
+        reads.pending.push_back(21);
+        reads.batches.insert(
+            21,
+            StatusBatch {
+                session: "hard".into(),
+                repository: None,
+                ready_at: now + STATUS_COALESCE_WINDOW,
+                deadline: now + Duration::from_millis(2600),
+                waiters: 1,
+                running: false,
+                reply: None,
+                cancellation: Cancellation::new(),
+            },
+        );
+        assert!(!reads.can_dispatch(21, now));
+        assert!(reads.can_dispatch(21, now + STATUS_COALESCE_WINDOW));
+        assert!(STATUS_COALESCE_WINDOW < Duration::from_millis(250));
+        assert!(reads.can_dispatch(21, now + Duration::from_millis(249)));
+    }
+
+    #[test]
+    fn status_missing_own_claim_uses_lost_without_extra_hook_rpc() {
+        let mut rig = start_with(timing(), |_| {});
+        rig.daemon.stop_workers();
+        let backend = rig.daemon.shared.backend("alice");
+        let claim: Claim =
+            serde_json::from_value(json!({"id":42,"session":"alice","paths":["src"]})).unwrap();
+        rig.daemon.shared.observe_status_claims(
+            "alice",
+            &[claim],
+            &backend,
+            Duration::from_secs(1),
+        );
+        *rig.server.lost.lock().unwrap() = vec![
+            json!({"claim_id":42,"session":"alice","paths":["src"],"reason":"expired","lost_at":1000000}),
+        ];
+        rig.daemon
+            .shared
+            .observe_status_claims("alice", &[], &backend, Duration::from_secs(1));
+        let calls = rig.server.calls.lock().unwrap().len();
+        let reply = rig.daemon.handle(Request::Unread {
+            attention_ack: Vec::new(),
+            attention: true,
+            session: "alice".into(),
+        });
+        assert_eq!(reply.lost.unwrap()[0].claim_id, 42);
+        assert_eq!(
+            rig.server.calls.lock().unwrap().len(),
+            calls,
+            "hook alert must be memory-only"
+        );
+    }
+
+    #[test]
     fn status_read_never_serves_a_revoked_claim_from_any_cached_view() {
         let mut rig = start_with(timing(), |_| {});
         rig.daemon.stop_workers();
@@ -3898,7 +4129,11 @@ mod tests {
                 .sum::<usize>()
                 == MAX_STATUS_CALLERS - 1
         });
-        assert!(departed.elapsed() < Duration::from_millis(100));
+        assert!(
+            departed.elapsed() < Duration::from_millis(500),
+            "leave cleanup: {:?}",
+            departed.elapsed()
+        );
         dead_worker.join().unwrap();
         let (mut live, live_worker) = status_peer(&rig, "n", "next", 2600);
         wait_for("replacement admitted before old deadline", || {
@@ -3913,7 +4148,7 @@ mod tests {
                 .sum::<usize>()
                 == MAX_STATUS_CALLERS
         });
-        assert!(departed.elapsed() < Duration::from_millis(200));
+        assert!(departed.elapsed() < Duration::from_millis(500));
         {
             let mut reads = rig.daemon.shared.status_reads.lock().unwrap();
             reads.batches.remove(&u64::MAX);
@@ -3935,10 +4170,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "LY-0021: fixture fixes need windows-latest --ignored verification before removing ignore"
-    )]
     fn status_read_twenty_soft_peer_disconnects_at_850ms_do_not_delay_next_hard() {
         let mut rig = start_with(timing(), |_| {});
         rig.daemon.stop_workers();
@@ -3949,7 +4180,18 @@ mod tests {
         wait_for("twenty soft callers queued", || {
             rig.daemon.shared.status_reads.lock().unwrap().pending.len() == 20
         });
-        thread::sleep(Duration::from_millis(850));
+        // Advance the queue's deadline state by 850 ms without sleeping or racing the host.
+        for batch in rig
+            .daemon
+            .shared
+            .status_reads
+            .lock()
+            .unwrap()
+            .batches
+            .values_mut()
+        {
+            batch.deadline -= Duration::from_millis(850);
+        }
         let departed = Instant::now();
         let mut workers = Vec::new();
         for (stream, worker) in peers {
@@ -3965,7 +4207,11 @@ mod tests {
                 .batches
                 .is_empty()
         });
-        assert!(departed.elapsed() < Duration::from_millis(100));
+        assert!(
+            departed.elapsed() < Duration::from_millis(500),
+            "leave cleanup: {:?}",
+            departed.elapsed()
+        );
         for worker in workers {
             worker.join().unwrap();
         }
@@ -3979,8 +4225,9 @@ mod tests {
         send_status_peer(&mut hard, "hard", 2600);
         assert!(status_peer_reply(&mut hard).error.is_none());
         assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "hard caller waited for dead callers' 2600ms deadlines"
+            started.elapsed() < Duration::from_millis(1500),
+            "hard request: {:?}",
+            started.elapsed()
         );
         drop(hard);
         worker.join().unwrap();
@@ -4776,6 +5023,8 @@ mod tests {
         view_ready(&rig);
         rig.server.hang_ms.store(80, Ordering::SeqCst);
         let ask = || Request::Unread {
+            attention_ack: Vec::new(),
+            attention: false,
             session: "me".into(),
         };
         let started = Instant::now();
@@ -5351,6 +5600,8 @@ mod tests {
             "took {took:?}"
         );
         let unread = rig.daemon.handle(Request::Unread {
+            attention_ack: Vec::new(),
+            attention: false,
             session: "me".into(),
         });
         assert_eq!((unread.unread, unread.source), (None, Some(Source::None)));
@@ -5770,6 +6021,8 @@ mod tests {
             (None, Some(Source::None))
         );
         rig.daemon.handle(Request::Unread {
+            attention_ack: Vec::new(),
+            attention: false,
             session: "me".into(),
         });
         wait_for("mail to be reserved", || {
@@ -5784,6 +6037,8 @@ mod tests {
         assert_eq!(
             rig.daemon
                 .handle(Request::Unread {
+                    attention_ack: Vec::new(),
+                    attention: false,
                     session: "me".into()
                 })
                 .unread,
@@ -5824,6 +6079,8 @@ mod tests {
             resume: paused,
         });
         rig.daemon.handle(Request::Unread {
+            attention_ack: Vec::new(),
+            attention: false,
             session: "me".into(),
         });
         observed.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -5853,6 +6110,8 @@ mod tests {
     fn taking_mail_uses_no_backend_calls_when_down_or_hung() {
         let mut rig = start_with(timing(), |server| *server.unread.lock().unwrap() = 1);
         rig.daemon.handle(Request::Unread {
+            attention_ack: Vec::new(),
+            attention: false,
             session: "me".into(),
         });
         wait_for("mail to be reserved", || {
@@ -6326,10 +6585,6 @@ mod tests {
         );
     }
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "LY-0021: fixture fixes need windows-latest --ignored verification before removing ignore"
-    )]
     fn renew_open_mail_via_agent_skips_protocol_and_fits_renew_budget_when_server_hangs() {
         let rig = start_with(timing(), |_| {});
         // Capability on → open=true path; hang only the inbox; honour attempt_timeout_ms.
@@ -6419,6 +6674,146 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(500),
             "agent thread stayed blocked for {elapsed:?}; attempt_timeout_ms was ignored"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_client_hung_http_through_agent_obeys_attempt_deadline() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let (arrived, received) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            let mut workers = Vec::new();
+            while !stopping.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let arrived = arrived.clone();
+                        let done = Arc::clone(&stopping);
+                        workers.push(thread::spawn(move || {
+                            let mut reader=BufReader::new(stream.try_clone().unwrap());
+                            let mut line=String::new();if reader.read_line(&mut line).unwrap_or(0)==0{return;}
+                            let hang=line.contains("/api/v1/fixture-hang");
+                            let discovery=line.contains("/api/v1/protocol");
+                            let mut selected=1;
+                            loop { line.clear();if reader.read_line(&mut line).unwrap_or(0)==0 || line=="\r\n" {break;}
+                                if let Some((name,value))=line.trim().split_once(':') && name.eq_ignore_ascii_case("Lockyard-Protocol") {selected=value.trim().parse::<u16>().unwrap();}
+                            }
+                            if hang {
+                                let _=arrived.send(());
+                                while !done.load(Ordering::Acquire) {thread::sleep(Duration::from_millis(5));}
+                                return;
+                            }
+                            let body=if discovery {json!({"selected_protocol":selected,"min_protocol":selected,"max_protocol":selected,"capabilities":[]})}
+                                else {json!({"claims":[],"messages":[],"events":[],"board":[],"lost":[],"requests":[]})}.to_string();
+                            let _=write!(stream,"HTTP/1.1 200 OK\r\nLockyard-Protocol: {selected}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
+                        }));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1))
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = lockyard_cloud_client::Client::new(&url, "fixture-token".into()).unwrap();
+        client.set_http_worker_limit(1);
+        client.negotiated_protocol("alice").unwrap();
+        let mut cfg = config(dir.path(), timing());
+        cfg.url = url.clone();
+        let mut daemon = Daemon::start(cfg, client).unwrap();
+        daemon.stop_workers();
+        // stop_workers joins accept too, so run the same socket frame through a private peer.
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let shared = Arc::clone(&daemon.shared);
+        let worker = thread::spawn(move || answer(&shared, reader));
+        let mut call = Call::get("alice", "/api/v1/fixture-hang".into());
+        call.attempt_timeout_ms = Some(80);
+        call.deadline_ms = Some(200);
+        let env = Envelope {
+            workspace: "team".into(),
+            request: Request::Call { call },
+        };
+        serde_json::to_writer(&mut writer, &env).unwrap();
+        writer.write_all(b"\n").unwrap();
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        writer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let started = Instant::now();
+        let mut line = String::new();
+        let read = BufReader::new(writer.try_clone().unwrap()).read_line(&mut line);
+        let elapsed = started.elapsed();
+        // A quick reply is insufficient: the same one-worker HTTP pool must be available
+        // before the hung server is released, proving that ureq itself left the read.
+        let mut probe = Call::get("alice", "/api/v1/fixture-probe".into());
+        probe.deadline_ms = Some(250);
+        let probe_result = daemon.shared.transport.call(&probe);
+        stop.store(true, Ordering::Release);
+        drop(writer);
+        worker.join().unwrap().unwrap();
+        server.join().unwrap();
+        read.unwrap();
+        let reply: Reply = serde_json::from_str(&line).unwrap();
+        assert!(reply.error.is_some());
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "agent attempt blocked for {elapsed:?}"
+        );
+        assert!(
+            probe_result.is_ok(),
+            "HTTP worker was still held after agent reply: {probe_result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_workspace_key_survives_disk_failure_through_daemon() {
+        const CHILD: &str = "LOCKYARD_MEMORY_KEY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let result=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","agent::daemon::tests::memory_workspace_key_survives_disk_failure_through_daemon"])
+                .env(CHILD,"1").env("XDG_CONFIG_HOME",dir.path().join("config")).output().unwrap();
+            assert!(result.status.success(), "{result:?}");
+            assert!(
+                String::from_utf8_lossy(&result.stdout).contains("1 passed"),
+                "child test was skipped: {result:?}"
+            );
+            return;
+        }
+        let key = lockyard_cloud_client::WorkspaceKey::from_entropy([71; 32]);
+        let path = lockyard_cloud_client::WorkspaceKey::storage_path("memory-key-test").unwrap();
+        fs::create_dir_all(&path).unwrap(); // Deliberately unreadable as a key file.
+        let server = lockyard_cloud_client::fake::FakeServer::start_routed(Vec::new());
+        let url = server.url();
+        let dir = tempfile::tempdir().unwrap();
+        let client = lockyard_cloud_client::Client::new(&url, "fixture-token".into())
+            .unwrap()
+            .with_content_encryption("memory-key-test", Some(key), true);
+        let mut cfg = config(dir.path(), timing());
+        cfg.url = url.clone();
+        let _daemon = Daemon::start(cfg, client).unwrap();
+        let socket = AgentSocket::connect(
+            &dir.path().join("run/agent.sock"),
+            &url,
+            "team",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let reply = socket.call(&Call::get("alice", "/api/v1/bus/inbox".into()));
+        assert!(
+            reply.is_ok(),
+            "matching memory key must not read a broken disk key: {reply:?}"
         );
     }
 

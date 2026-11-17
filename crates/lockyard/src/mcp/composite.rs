@@ -191,6 +191,9 @@ pub(super) fn run_composite_steps(
             // Only the cloud can offer a claim to a named agent; locally the honest move is to
             // let it go and say so, rather than pretend the other agent now holds it.
             let cloud = open(cwd, agent)?.backend.is_cloud();
+            if !cloud && args.get("paths").is_some() {
+                return Err(Error::Invalid("частичная передача только в облаке".into()));
+            }
             let id = if cloud {
                 match args.optional_id()? {
                     Some(id) => {
@@ -201,7 +204,16 @@ pub(super) fn run_composite_steps(
                             },
                             crate::now_ms(),
                         )?;
-                        validate_handover_claim(id, &claims)?;
+                        if let Err(error) = validate_handover_claim(id, &claims) {
+                            let lost = open(cwd, agent)?
+                                .backend
+                                .lost(agent.unwrap_or("lockyard-cli"))
+                                .unwrap_or_default();
+                            if let Some(lost) = lost.iter().find(|lost| lost.claim_id == id) {
+                                return Err(Error::NotFound(crate::keepalive::loss_text(lost)));
+                            }
+                            return Err(error);
+                        }
                         id
                     }
                     None => {
@@ -270,7 +282,7 @@ pub(super) fn run_composite_steps(
                 format!("Lockyard: claim released for you to take. {}", note)
             };
             let mut answer = if cloud {
-                json!({"mode": "offered", "claim": step("zone_handover", json!({"id": id, "to": to}), after)?})
+                json!({"mode": "offered", "claim": step("zone_handover", json!({"id": id, "to": to, "paths":args.strings("paths")?}), after)?})
             } else {
                 let released = if id == 0 && args.optional_id()?.is_none() {
                     json!({"released": 0})

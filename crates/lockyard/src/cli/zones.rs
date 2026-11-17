@@ -308,7 +308,22 @@ pub(super) fn run_zone(
             )?;
             output(&record, format!("answered R-{}", record.id))
         }
-        ZoneCommand::Handover { id, to, fence } => {
+        ZoneCommand::Handover {
+            id,
+            to,
+            fence,
+            paths,
+        } => {
+            if !paths.is_empty() {
+                let paths = opened.workspace_zone_paths(cwd, &paths)?;
+                let record = opened.backend.partial_zone(
+                    &resolve_agent(agent)?,
+                    id,
+                    "handover",
+                    &json!({"to":to,"paths":paths,"fence":fence}),
+                )?;
+                return output(&record, format!("Z-{id} paths offered to {to}"));
+            }
             let record = opened
                 .backend
                 .handover(&resolve_agent(agent)?, id, &to, fence)?;
@@ -319,7 +334,22 @@ pub(super) fn run_zone(
             let text = claim_line(&claim, lease);
             output(&claim, text)
         }
-        ZoneCommand::Narrow { id, paths, fence } => {
+        ZoneCommand::Narrow {
+            id,
+            paths,
+            fence,
+            except,
+        } => {
+            if !except.is_empty() {
+                let except = opened.workspace_zone_paths(cwd, &except)?;
+                let record = opened.backend.partial_zone(
+                    &resolve_agent(agent)?,
+                    id,
+                    "narrow",
+                    &json!({"except":except,"fence":fence}),
+                )?;
+                return output(&record, format!("Z-{id} excluded subpaths"));
+            }
             let paths = opened.workspace_zone_paths(cwd, &paths)?;
             let claim = opened
                 .backend
@@ -330,21 +360,21 @@ pub(super) fn run_zone(
         ZoneCommand::AddPath { id, paths, fence } => {
             let agent = resolve_agent(agent)?;
             let paths = opened.workspace_zone_paths(cwd, &paths)?;
-            let mut claim = None;
-            let mut fence = fence;
-            for path in &paths {
-                let expanded = opened.backend.add_path(&agent, id, path, fence)?;
-                if fence.is_some() {
-                    fence = Some(expanded.fence);
-                }
-                claim = Some(expanded);
-            }
-            let claim =
-                claim.ok_or_else(|| Error::Invalid("add-path needs at least one path".into()))?;
+            let claim = add_paths_atomic(opened.backend.as_mut(), &agent, id, &paths, fence)?;
             let text = claim_line(&claim, lease);
             output(&claim, text)
         }
-        ZoneCommand::Takeover { id, reason } => {
+        ZoneCommand::Takeover { id, reason, paths } => {
+            if !paths.is_empty() {
+                let paths = opened.workspace_zone_paths(cwd, &paths)?;
+                let record = opened.backend.partial_zone(
+                    &resolve_agent(agent)?,
+                    id,
+                    "takeover",
+                    &json!({"paths":paths,"reason":reason}),
+                )?;
+                return output(&record, format!("Z-{id} paths taken"));
+            }
             let claim = opened
                 .backend
                 .takeover(&resolve_agent(agent)?, id, &reason)?;
@@ -433,18 +463,28 @@ pub(super) fn run_zone(
             let mut data = json!({ "renewed": renewed });
             let mut lines = vec![format!("renewed {renewed}")];
             attach_incoming(&mut data, &mut lines, incoming);
-            if let Some(count) = crate::open_mail::open_mail_count_within(
+            if let Some(snap) = crate::open_mail::open_mail_within(
                 opened.backend.as_ref(),
                 &agent,
                 now,
                 crate::open_mail::RENEW_BUDGET,
             ) {
-                data["open_mail_count"] = json!(count);
+                data["open_mail_count"] = json!(snap.items.len());
+                data["open_mail"] = json!(snap.items);
+                lines.push(format!("open mail: {}", snap.items.len()));
+                lines.extend(crate::open_mail::open_mail_lines(&snap.items));
+                if snap.truncated {
+                    data["open_mail_truncated"] = json!(true);
+                }
+            } else {
+                data["open_mail_unknown"] = json!(true);
+                lines.push("почта: неизвестно".into());
             }
             output(&data, lines.join("\n"))
         }
         ZoneCommand::Release {
             id,
+            paths,
             all,
             note,
             leave_dirty,
@@ -456,6 +496,15 @@ pub(super) fn run_zone(
                 leave_dirty,
                 fence,
             };
+            if !paths.is_empty() {
+                let paths = opened.workspace_zone_paths(cwd, &paths)?;
+                let id = id.ok_or_else(|| Error::Invalid("partial release requires id".into()))?;
+                let mut body =
+                    serde_json::to_value(&request).map_err(|e| Error::Invalid(e.to_string()))?;
+                body["paths"] = json!(paths);
+                let record = opened.backend.partial_zone(&agent, id, "release", &body)?;
+                return output(&record, format!("Z-{id} paths released"));
+            }
             let released = release_claims(opened.backend.as_mut(), &agent, id, all, &request, now)?;
             output(
                 &json!({ "released": released }),
@@ -565,4 +614,91 @@ pub(super) fn run_dirty(
             )
         }
     }
+}
+
+/// The server's add-path endpoint is singular. Restore original roots on a later rejection.
+pub(crate) fn add_paths_atomic(
+    backend: &mut dyn Backend,
+    agent: &str,
+    id: i64,
+    paths: &[String],
+    fence: Option<i64>,
+) -> Result<Claim> {
+    if paths.is_empty() {
+        return Err(Error::Invalid("add-path needs at least one path".into()));
+    }
+    if paths.len() == 1 {
+        return backend.add_path(agent, id, &paths[0], fence);
+    }
+    let original = backend
+        .claims(
+            &ClaimQuery {
+                session: Some(agent.into()),
+                path: None,
+            },
+            now_ms(),
+        )?
+        .into_iter()
+        .find(|claim| claim.id == id && claim.session == agent)
+        .ok_or_else(|| Error::NotFound(format!("claim Z-{id} is not yours")))?;
+    let mut current = original.clone();
+    let mut next_fence = fence.or(Some(current.fence));
+    let mut added = Vec::new();
+    for path in paths {
+        match backend.add_path(agent, id, path, next_fence) {
+            Ok(claim) => {
+                current = claim;
+                next_fence = Some(current.fence);
+                added.push(path.clone());
+            }
+            Err(error) => {
+                if error.kind() == "add_path_queue_consumed" {
+                    current = backend
+                        .claims(
+                            &ClaimQuery {
+                                session: Some(agent.into()),
+                                path: None,
+                            },
+                            now_ms(),
+                        )
+                        .map_err(|read| {
+                            Error::Unavailable(format!(
+                                "{error}; reconciliation failed: {read}; added {}; inspect Z-{id}",
+                                added.join(", ")
+                            ))
+                        })?
+                        .into_iter()
+                        .find(|claim| claim.id == id && claim.session == agent)
+                        .ok_or_else(|| {
+                            Error::NotFound(format!(
+                                "{error}; Z-{id} no longer owned; added {}",
+                                added.join(", ")
+                            ))
+                        })?;
+                    added.push(path.clone());
+                }
+                if added.is_empty() {
+                    return Err(error);
+                }
+                if error.kind().contains("unknown") || error.kind() == "unavailable" {
+                    return Err(Error::Invalid(format!(
+                        "{error}; added {}; outcome unknown, inspect Z-{id} before retrying",
+                        added.join(", ")
+                    )));
+                }
+                let restored = backend.narrow(agent, id, &original.paths, Some(current.fence));
+                return Err(Error::Invalid(match restored {
+                    Ok(_) => format!(
+                        "{error}; added {}; rolled back to original paths",
+                        added.join(", ")
+                    ),
+                    Err(rollback) => format!(
+                        "{error}; added {}; rollback failed: {rollback}; inspect Z-{id} before retrying",
+                        added.join(", ")
+                    ),
+                }));
+            }
+        }
+    }
+    Ok(current)
 }

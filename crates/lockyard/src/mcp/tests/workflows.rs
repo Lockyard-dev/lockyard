@@ -165,6 +165,7 @@
 
     #[test]
     fn the_surface_comes_from_the_flag_then_the_environment_then_the_default() {
+        let _guard = lockyard_core::test_env_lock();
         assert_eq!(Surface::choose(Some("full")).unwrap(), Surface::Full);
         assert_eq!(Surface::choose(Some("compact")).unwrap(), Surface::Compact);
         assert!(Surface::choose(Some("some")).is_err());
@@ -538,6 +539,19 @@
         assert!(text(&inbox).contains("\\u{202e}"));
     }
 
+
+    #[test]
+    fn round4_local_partial_handover_refuses_without_releasing_anything() {
+        let dir = project();
+        call(&dir, "a", "start_work", json!({"paths":["src", "docs"]}));
+        let answer = call(&dir, "a", "handover", json!({"to":"b", "paths":["src"]}));
+        assert_eq!(answer["isError"], true, "{answer}");
+        assert!(text(&answer).contains("частичная передача только в облаке"));
+        let claims = call(&dir, "a", "zone_list", json!({}));
+        assert!(text(&claims).contains("src") && text(&claims).contains("docs"));
+        assert!(text(&call(&dir, "b", "msg_unread", json!({}))).contains("\"unread\":0"));
+    }
+
     #[test]
     fn handover_in_local_mode_releases_the_zone_and_says_so() {
         let dir = project();
@@ -837,6 +851,21 @@
         let message = text(&refused);
         assert!(message.contains("player_money"), "{message}");
         assert!(message.contains("security_breach"), "{message}");
+    }
+
+    #[test]
+    fn task_add_rejects_p0_without_category_before_creating_a_task() {
+        let dir = project();
+        let refused = call(&dir, "lead", "task_add",
+            json!({"title":"money", "priority":"P0", "area":"general"}));
+        assert_eq!(refused["isError"], true);
+        let message = text(&refused);
+        assert!(message.contains("P0 requires p0_category"), "{message}");
+        for category in P0_CATEGORIES {
+            assert!(message.contains(category), "{message}");
+        }
+        let listed = call(&dir, "lead", "task_list", json!({}));
+        assert_eq!(listed["structuredContent"]["tasks"], json!([]), "{listed}");
     }
 
     #[test]

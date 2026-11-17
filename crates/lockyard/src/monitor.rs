@@ -647,6 +647,7 @@ mod tests {
 
     #[test]
     fn switching_the_events_off_leaves_a_working_timer() {
+        let _guard = lockyard_core::test_env_lock();
         let project = Project::new();
         let root = project.root();
         // SAFETY: single-threaded test; the variable is read once when the watcher starts.

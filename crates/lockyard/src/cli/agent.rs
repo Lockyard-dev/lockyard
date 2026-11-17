@@ -28,38 +28,21 @@ pub(super) fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
     match args.command {
         None => {
             let _shutdown = crate::shutdown::Guard::new(cwd)?;
-            // Prefer agent-config.toml so a unit never opens the project tree (LY-0007).
-            // When the copy is missing, inspect cwd/--root only for a clear local-mode error.
-            let snapshot = match service::load_agent_config() {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    // Units always have the copy after `agent install`. Manual/dev starts may
-                    // still launch from a cloud project; local mode keeps the old needs-cloud text.
-                    let project_cwd = args
-                        .root
-                        .clone()
-                        .or_else(|| {
-                            std::env::var_os("LOCKYARD_AGENT_ROOT")
-                                .filter(|value| !value.is_empty())
-                                .map(PathBuf::from)
-                        })
+            // An explicit manual target wins; service starts without --root read only the copy.
+            // Neither path writes the installed service's settings.
+            let snapshot = if let Some(root) = args.root.as_deref() {
+                project_snapshot(root)?
+            } else {
+                service::load_agent_config().or_else(|error| {
+                    let project_cwd = std::env::var_os("LOCKYARD_AGENT_ROOT")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
                         .unwrap_or_else(|| cwd.to_path_buf());
-                    let Some(root) = lockyard_core::paths::find_root(&project_cwd) else {
+                    if lockyard_core::paths::find_root(&project_cwd).is_none() {
                         return Err(error);
-                    };
-                    let config = Config::load(&root)?;
-                    if config.mode != Mode::Cloud {
-                        return Err(Error::needs_cloud("lockyard agent"));
                     }
-                    let (url, workspace) = open::endpoint(&config)?;
-                    service::AgentServiceConfig {
-                        url,
-                        workspace,
-                        repository: config.repository.clone(),
-                        project_root: root.display().to_string(),
-                        project_config_mtime: None,
-                    }
-                }
+                    project_snapshot(&project_cwd)
+                })?
             };
             let url = snapshot.url;
             let workspace = snapshot.workspace;
@@ -117,7 +100,7 @@ pub(super) fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
                     let socket = agent::socket_path();
                     #[cfg(windows)]
                     let socket = {
-                        let snapshot = service::load_agent_config()?;
+                        let snapshot = status_snapshot(&project_cwd)?;
                         agent::socket_path_for(&snapshot.url, &snapshot.workspace)
                     };
                     let stale = service::load_agent_config()
@@ -181,5 +164,66 @@ pub(super) fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
                 }
             }
         }
+    }
+}
+
+/// Read a manual project's target without updating the installed service snapshot.
+fn project_snapshot(cwd: &Path) -> Result<agent::service::AgentServiceConfig> {
+    let root = lockyard_core::paths::find_root(cwd).ok_or(Error::NoProject)?;
+    let config = lockyard_core::config::Config::load(&root)?;
+    if config.mode != lockyard_core::config::Mode::Cloud {
+        return Err(Error::needs_cloud("lockyard agent"));
+    }
+    let (url, workspace) = open::endpoint(&config)?;
+    Ok(agent::service::AgentServiceConfig {
+        url,
+        workspace,
+        repository: config.repository,
+        project_root: root.display().to_string(),
+        project_config_mtime: None,
+    })
+}
+
+#[cfg(windows)]
+fn status_snapshot(cwd: &Path) -> Result<agent::service::AgentServiceConfig> {
+    agent::service::load_agent_config().or_else(|_| project_snapshot(cwd))
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn status_without_installed_copy_uses_project_target() {
+        // Run this assertion in a child so its private XDG state cannot race other tests.
+        const CHILD: &str = "LOCKYARD_TEST_STATUS_NO_COPY";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let snapshot = status_snapshot(Path::new(&root)).unwrap();
+            assert_eq!(snapshot.workspace, "manual-status-test");
+            assert_eq!(snapshot.url, "http://127.0.0.1:1");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".lockyard")).unwrap();
+        std::fs::write(
+            dir.path().join(".lockyard/config.toml"),
+            "mode = 'cloud'\nurl = 'http://127.0.0.1:1'\nworkspace = 'manual-status-test'\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli_agent::windows_tests::status_without_installed_copy_uses_project_target",
+            ])
+            .env(CHILD, dir.path())
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child filter skipped regression: {output:?}"
+        );
+        assert!(!dir.path().join("state/lockyard/agent-config.toml").exists());
     }
 }

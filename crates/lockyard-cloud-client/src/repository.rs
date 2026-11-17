@@ -46,7 +46,12 @@ impl<T> RepositoryTransport<T> {
                         }
                     } else if matches!(
                         key.as_str(),
-                        "paths" | "excluded_paths" | "write_paths" | "adopted" | "disowned"
+                        "paths"
+                            | "except"
+                            | "excluded_paths"
+                            | "write_paths"
+                            | "adopted"
+                            | "disowned"
                     ) {
                         if let Some(paths) = child.as_array_mut() {
                             for path in paths {
