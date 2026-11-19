@@ -13,6 +13,33 @@ pub(super) fn env_lockyard_agent() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+use agent::daemon::CredentialProduct;
+
+fn credential_product(actor: &Value) -> CredentialProduct {
+    if actor["role"].as_str() != Some("agent") {
+        return CredentialProduct::Unknown;
+    }
+    // Older servers expose Claude through the authenticated acceptance permission.
+    if actor["can_accept_review"] == true {
+        return CredentialProduct::Claude;
+    }
+    match actor["product"]
+        .as_str()
+        .or_else(|| actor["review_product"].as_str())
+    {
+        Some("agent") => CredentialProduct::Agent,
+        Some("claude") => CredentialProduct::Claude,
+        // The production actor DTO omits product and returns an explicit permission.
+        None if actor["product"].is_null()
+            && actor["review_product"].is_null()
+            && actor["can_accept_review"] == false =>
+        {
+            CredentialProduct::Agent
+        }
+        _ => CredentialProduct::Unknown,
+    }
+}
+
 pub(super) fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
     use agent::daemon::{AgentConfig, Daemon};
     use agent::service;
@@ -47,15 +74,24 @@ pub(super) fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
             let url = snapshot.url;
             let workspace = snapshot.workspace;
             open::trusted_url(&url)?;
+            let session = crate::env_agent().unwrap_or_default();
             #[cfg(unix)]
-            let token = Config::token_for(&url)?;
+            let client = Client::for_session(&url, &session, None)?;
             #[cfg(windows)]
-            let token = match args.service_token_file.as_deref() {
-                Some(path) => service::read_service_token(path)?,
-                None => Config::token_for(&url)?,
+            let client = match args.service_token_file.as_deref() {
+                Some(path) => Client::new(&url, service::read_service_token(path)?)?,
+                None => Client::for_session(&url, &session, None)?,
             };
-            let token_id = lockyard_cloud_client::token_id(&token);
-            let mut client = agent_client(open::journal_client(Client::new(&url, token)?)?)?;
+            let actor = open::credential_actor(&client, Duration::from_millis(500));
+            let product = actor
+                .as_ref()
+                .map_or(CredentialProduct::Unknown, credential_product);
+            let token_id = client.credential_id();
+            let credential_proof = (product != CredentialProduct::Agent)
+                .then(|| crate::agent::wire::CredentialProof(client.ipc_credential_proof()));
+            let mut client = agent_client(open::journal_client(client)?)?
+                .with_live_write_encryption_policy()
+                .reconcile_pending_on_startup()?;
             // Includes upkeep and long polls. The bounded client explicitly reserves one worker
             // for writes and one for event long polls; general reads share the remaining six.
             client.set_http_worker_limit(8);
@@ -64,6 +100,8 @@ pub(super) fn run_agent(args: AgentArgs, cwd: &Path) -> Result<Output> {
                 url,
                 workspace,
                 token_id,
+                credential_proof,
+                credential_product: product,
                 socket,
                 state_root: agent::state_root()?,
                 timing: Default::default(),
@@ -192,6 +230,7 @@ fn status_snapshot(cwd: &Path) -> Result<agent::service::AgentServiceConfig> {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn status_without_installed_copy_uses_project_target() {

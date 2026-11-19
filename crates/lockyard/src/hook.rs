@@ -9,7 +9,8 @@
 //! Mail is leased, printed and flushed before marking it seen. Priority reminders precede
 //! ordinary delivery and their throttle is committed only after output flush.
 //!
-//! In cloud mode a hook talks to the agent socket and nothing else: no HTTP and no async runtime.
+//! Cloud hooks use the agent socket when its credential matches the session, otherwise
+//! a bounded direct client. No asynchronous runtime is needed.
 
 use lockyard_core::config::{Config, Mode};
 use lockyard_core::proto::{Event, InboxQuery, Message, Stamp};
@@ -119,6 +120,9 @@ trait Port {
     /// Memory-only on cloud hooks; observes mail without consuming receipts.
     fn peek_mail(&mut self, _agent: &str, _now: i64) -> Result<Option<Vec<Message>>> {
         Ok(None)
+    }
+    fn mail_truncated(&self) -> bool {
+        false
     }
     fn take_events(&mut self, _agent: &str) -> Result<Option<Vec<Event>>> {
         Ok(Some(Vec::new()))
@@ -374,12 +378,12 @@ fn run_cloud(
         );
     }
     let (url, workspace) = crate::open::endpoint(config)?;
-    let Some(mut port) = cloud::connect(&url, &workspace, root, tool) else {
+    let Some(mut port) = cloud::connect(&url, &workspace, agent, root, tool) else {
         // Fail closed: without the agent there is no zone mirror, so an edit cannot be allowed.
         return deny_cloud_unavailable(tool, event, out);
     };
     let machine = lockyard_core::machine::MachineConfig::load_user();
-    handle(tool, &mut port, event, agent, cwd, now, &machine, out)
+    handle(tool, port.as_mut(), event, agent, cwd, now, &machine, out)
 }
 
 /// Refuses a PreToolUse edit when cloud mode has no agent process to answer from.

@@ -191,6 +191,32 @@ denies `Edit`, `Write`, `MultiEdit` and `NotebookEdit` on a path another agent h
 agent's context. The agent's name is the session id unless `LOCKYARD_AGENT` is set. If the hook itself fails, the tool
 call goes through and the failure is printed on stderr.
 
+Claude setup sets the marker for automatic use of a separately issued Claude cloud key.
+For a manual setup, merge this environment setting into the Lockyard entry in Claude Code's
+`.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "lockyard": {
+      "command": "lockyard",
+      "args": ["mcp"],
+      "env": { "LOCKYARD_CLAUDE_MCP": "1" }
+    }
+  }
+}
+```
+
+Restart the MCP server after changing its environment. MCP selects the private
+`~/.config/lockyard/claude.token` only with this marker and a resolved agent name that is a
+session UUID supplied by `CLAUDE_CODE_SESSION_ID`. Codex and Cursor environments disable
+automatic Claude selection in MCP. CLI selection requires a nonempty `CLAUDE_CODE_SESSION_ID` matching
+the agent name; the MCP marker does not replace that CLI condition. Both channels exclude
+`LOCKYARD_PARENT_CLAIM` and honor an explicit `LOCKYARD_TOKEN_FILE` first. A missing Claude
+key uses the existing agent credentials; a `session_name_bound` response keeps the shared
+fallback to the agent key. `lockyard doctor` explains CLI and MCP selection without showing
+credential or environment values, including how to enable the MCP marker.
+
 ## Cloud mode
 
 Local mode has zones, mail, tasks, the board and presence. Everything else needs cloud mode, and says so when asked for
@@ -249,7 +275,7 @@ need either setting.
 The server starts with one owner token, set by `LOCKYARD_BOOTSTRAP_TOKEN`. Use it to make the others, then keep it safe.
 
 ```sh
-LOCKYARD_TOKEN=$OWNER lockyard cloud token create alice --role agent --days 90   # the raw token prints once
+LOCKYARD_TOKEN=$OWNER lockyard cloud token create alice --role agent --days 90 --output-file ./alice.key
 LOCKYARD_TOKEN=$OWNER lockyard cloud token list
 LOCKYARD_TOKEN=$OWNER lockyard cloud token revoke <id>
 ```

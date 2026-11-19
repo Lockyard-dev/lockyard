@@ -3910,7 +3910,12 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
                 let mut failed = false;
                 if let Some(executor) = host.executor.clone() {
                     failed |= !matches!(
-                        tokio::task::spawn_blocking(move || executor.purge_expired()).await,
+                        tokio::task::spawn_blocking(move || {
+                            let purged = executor.purge_expired();
+                            executor.maintain_signed_result_journal();
+                            purged
+                        })
+                        .await,
                         Ok(Ok(_))
                     );
                 }

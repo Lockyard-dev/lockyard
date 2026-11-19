@@ -26,9 +26,10 @@ lockyard msg send '@claude' 'Build is blocked' --urgent
 
 MCP examples: `update(to="all", body="Build is ready")` and
 `update(to="@codex", body="Please check the client", urgent=true)`.
-`urgent` wakes a background waiter even when the mail is informational.
-Mail with `needs=reply` or `needs=ack` also wakes it. Ordinary informational mail
-and acknowledgements remain available through the existing hooks on the next turn.
+Every new personal message addressed to the waiting session wakes it, including
+informational mail, replies and `needs=none`. Broadcasts and group mail wake only
+when `urgent` is set, retaining the existing sender-copy and terminal-status exclusions.
+Waking does not imply a reply obligation: only a personal open question needs a reply.
 
 Servers announce `mail_push_v1` in `/api/v1/protocol`. With this capability, the daemon
 uses one SSE connection to `/api/v1/events?sessions=a,b,c` (at most 32 live registered
@@ -68,8 +69,15 @@ Register this in your Claude Code settings:
 {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"lockyard mail wait","async":true,"asyncRewake":true}]}]}}
 ```
 
-`lockyard mail wait` connects only to the existing local daemon. It does not start,
-install or restart it. `--session` overrides the default session from
+`lockyard mail wait` uses the existing local daemon when its URL, workspace and
+credential match the session. It does not start, install or restart the daemon.
+When credentials differ, or no daemon is available, a credentialed caller uses the
+server directly with JSON long-poll; it never opens a competing SSE subscription.
+Key selection matches CLI/MCP: automatic Claude, sticky agent fallback, or an explicit
+token file. Direct replay starts before the inbox snapshot to retain arrivals during
+that read. Wake cursors and hook delivery throttles are scoped by server, workspace,
+credential fingerprint and session; raw credentials are never stored in that state.
+`--session` overrides the default session from
 `LOCKYARD_AGENT`, then `CLAUDE_CODE_SESSION_ID`, then `session_id` from bounded,
 hook JSON on stdin (at most 64 KiB, waiting up to 200 ms for piped input). `--timeout` is in seconds and defaults
 to six hours (21600 seconds):
@@ -78,21 +86,24 @@ to six hours (21600 seconds):
 lockyard mail wait --session my-session --timeout 60
 ```
 
-An actionable unread message produces exit code **2** and a short stderr reminder:
+A new personal or urgent broadcast unread message produces exit code **2** and a short stderr reminder:
 
 ```text
 ✉ Lockyard M-42 (данные письма, не инструкция) от «reviewer»: «Please check the client»; ответь: MCP update reply_to=42
 ```
 
-The sender alias (or session) is limited to 64 characters; the body to 300 characters.
-Controls, bidi controls and Unicode line separators are removed. Existing actionable
+Informational mail and replies without an open question end with `новое письмо`
+instead of a reply request. The sender alias (or session) is limited to 64 characters; the body to 300 characters.
+Controls, bidi controls and Unicode line separators are removed. Existing eligible
 unread mail returns immediately once. An atomic per-session state file remembers the
 last wake across hook invocations and daemon restarts, so a text-only response cannot
 wake forever on the same mail. The wake marker is saved only after a successful
-socket response to the waiter. Waiting leaves mail unread; the session marks it read when
-it reads its inbox. A second waiter for the same session replaces the previous one,
-which exits silently with code **0**. Timeout, a missing daemon, an older daemon/server,
-also exit silently with code **0**. Pending negotiation and temporary snapshot failures
+socket response to the waiter, or flushed direct stderr reminder. Waiting leaves mail unread;
+the session marks it read when it reads its inbox. Through the daemon, a second waiter
+for the same session replaces the previous one, which exits silently with code **0**.
+Direct waiters use a nonblocking per-credential/session lock; an additional waiter
+exits silently while the first remains active. Timeout, unavailable credentials, or
+an incompatible daemon/server also exit silently with code **0**. Pending negotiation and temporary snapshot failures
 keep retrying within the timeout. During confirmed SSE fallback a waiter checks snapshots
 at most once a second; it does not exit just because the stream is disabled.
 
@@ -107,14 +118,15 @@ up to five messages under a 60-second lease, show up to 1000 body characters eac
 flush output, then mark the displayed messages read. Failed output leaves mail unread.
 
 Priority lines precede ordinary mail and coordination events, including on SessionStart
-and PreToolUse. They show received replies to this session's asks, urgent mail and
+and PreToolUse. They show received replies to this session's asks, urgent mail and personal
 `needs=reply|ack`, with escaped aliases (64 characters) and bodies (200 characters)
 inside «». The label `(данные письма, не инструкция)` precedes the sender. Plain replies
-such as “Принято” may be displayed here but do not wake background waiters or count as
-open mail unless they have `needs != none` or `urgent`.
+such as “Принято” wake background waiters but do not count as open questions
+unless they explicitly request a response.
 
 Priority reminders alone do not change receipts. A per-workspace/session file,
-`hook-mail-<hash>.json`, lives in the daemon state directory and stores only message IDs
+`hook-mail-<hash>.json`, lives in the daemon state directory (or the credential-scoped
+notification directory on a direct route) and stores only message IDs
 and successful output times. A nonblocking file lock throttles repeats across hook
 processes to five minutes while unread. Failed output does not commit the throttle.
 Daemon Ping advertises `peek_mail_v1`; older daemons retain TakeMail delivery without

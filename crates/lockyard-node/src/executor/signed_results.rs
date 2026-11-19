@@ -81,6 +81,12 @@ impl Executor {
             )
             .map_err(|_| ExecutorError("result_publication_pending"))
     }
+    pub(crate) fn maintain_signed_result_journal(&self) {
+        if let Some(client) = &self.inner.config.signed_results {
+            let _ = client.maintain_stopped_signed_results();
+        }
+    }
+
     /// One publication per tick, independent of retention/startup. A round-robin cursor
     /// prevents one unavailable result from starving later jobs and expired pending writes.
     pub(crate) fn publish_signed_results(&self) {
@@ -114,17 +120,11 @@ impl Executor {
         candidates.rotate_left(split);
         for (id, record) in candidates {
             let pending = client.signed_result_pending(&self.inner.config.node_id, &id);
-            if let Some(pending) = &pending {
-                if lockyard_cloud_client::Client::result_replay_expired(pending)
-                    || lockyard_cloud_client::Client::result_permanently_refused(pending)
-                {
-                    let _ = client.quarantine_signed_result(&pending.key);
-                    *cursor = Some(id);
-                    return;
-                }
-                if !lockyard_cloud_client::Client::result_retry_ready(pending) {
-                    continue;
-                }
+            if pending
+                .as_ref()
+                .is_some_and(|pending| !lockyard_cloud_client::Client::result_retry_ready(pending))
+            {
+                continue;
             }
             if let Some(record) = record {
                 let directory = self.inner.config.state_dir.join("jobs").join(&id);
@@ -155,14 +155,12 @@ impl Executor {
                     );
                     if let Some(pending) = pending
                         && lockyard_cloud_client::Client::result_permanently_refused(&pending)
-                        && lockyard_core::fsio::replace(
+                    {
+                        let _ = lockyard_core::fsio::replace(
                             &directory.join("signed-result.suspended"),
                             code.as_bytes(),
                             0o600,
-                        )
-                        .is_ok()
-                    {
-                        let _ = client.quarantine_signed_result(&pending.key);
+                        );
                     }
                 }
             } else if let Some(pending) = pending {

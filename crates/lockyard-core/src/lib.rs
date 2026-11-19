@@ -21,6 +21,7 @@ pub mod paths;
 pub mod perf;
 pub mod proto;
 pub mod repository;
+pub mod session_key;
 mod store;
 pub mod task_id;
 pub mod tasks;

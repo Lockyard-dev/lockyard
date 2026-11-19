@@ -17,23 +17,47 @@ fn survey_0011_update_reply_new_mail_all_and_handled_capability() {
     let dir = cloud_project(&server);
     let runtime = tempfile::tempdir().unwrap();
     let answers = mcp_calls(dir.path(), runtime.path(), "compact", &[
-        ("update", json!({"peek":true})),
+        ("update", json!({})),
+        ("update", json!({})),
         ("update", json!({"peek":true,"all":true})),
         ("update", json!({"reply_to":11,"body":"done"})),
         ("update", json!({"handled":[10],"peek":true})),
     ]);
     assert_eq!(update_content(&answers[0])["mail"].as_array().unwrap().len(), 1);
-    assert_eq!(update_content(&answers[1])["mail"].as_array().unwrap().len(), 2);
-    assert_eq!(update_content(&answers[2])["sent"]["reply_to"], 11);
-    assert_eq!(answers[3]["isError"], true);
-    assert!(answers[3]["content"][0]["text"].as_str().unwrap().contains("mail_handled_v1"));
-    assert!(server.writes_to("/inbox/seen").is_empty());
+    assert!(update_content(&answers[1])["mail"].as_array().unwrap().is_empty());
+    assert_eq!(update_content(&answers[2])["mail"].as_array().unwrap().len(), 2);
+    assert_eq!(update_content(&answers[3])["sent"]["reply_to"], 11);
+    assert_eq!(answers[4]["isError"], true);
+    assert!(answers[4]["content"][0]["text"].as_str().unwrap().contains("mail_handled_v1"));
+    assert_eq!(server.writes_to("/inbox/seen").len(), 1);
+    assert_eq!(server.writes_to("/inbox/seen")[0].body, json!({"ids":[11]}));
     assert!(server.writes_to("/inbox/handled").is_empty());
     server.state.lock().unwrap().survey_handled = true;
     let handled = mcp_calls(dir.path(), runtime.path(), "compact", &[("update", json!({"handled":[10],"peek":true}))]);
     assert_eq!(update_content(&handled[0])["handled"]["marked"], 1);
     assert_eq!(server.writes_to("/inbox/handled")[0].body, json!({"ids":[10]}));
-    assert_eq!(server.state.lock().unwrap().seen_ids, vec![10]);
+    assert_eq!(server.state.lock().unwrap().seen_ids, vec![10,11]);
+}
+
+#[test]
+fn survey_0017_e2ee_mail_delivers_sender_label_without_disclosing_it_to_server() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    required_catalog_fixture(&server, dir.path(), runtime.path());
+    let sent = binary(dir.path(), runtime.path())
+        .args(["--json", "msg", "send", "bob", "private hello"])
+        .env("LOCKYARD_AGENT", "alice").env("LOCKYARD_TOKEN", "test-token")
+        .env("LOCKYARD_SESSION_LABEL", "sender-private-chat").output().unwrap();
+    assert!(sent.status.success(), "{}", String::from_utf8_lossy(&sent.stderr));
+    let wire = &server.seen("POST", "/api/v1/bus/messages")[0].body;
+    assert!(wire["from_client"].as_str().unwrap().starts_with("lyml1."));
+    assert!(!wire.to_string().contains("sender-private-chat"));
+    assert!(!wire.to_string().contains("private hello"));
+    server.state.lock().unwrap().inbox = vec![json!({"id":1,"from_session":"alice","to":"bob","body":wire["body"],"from_client":wire["from_client"]})];
+    let inbox = json_of(&cli(dir.path(), runtime.path(), &["--agent","bob","--json","msg","inbox","--peek"]));
+    assert_eq!(inbox[0]["body"], "private hello");
+    assert!(inbox[0]["from_client"].as_str().unwrap().contains("sender-private-chat"), "{inbox}");
 }
 
 #[test]

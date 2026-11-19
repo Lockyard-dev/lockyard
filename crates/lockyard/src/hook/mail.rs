@@ -216,7 +216,7 @@ pub(super) fn deliver_attention(
             }
             for mail in messages
                 .iter()
-                .filter(|m| crate::mail_wait::hook_priority(m))
+                .filter(|m| crate::mail_wait::hook_priority(m, agent))
             {
                 if delivery
                     .shown
@@ -239,22 +239,26 @@ pub(super) fn deliver_attention(
             }
         }
     }
-    let mail = match unread {
-        Some(count) if count > 0 && event != "PreToolUse" => {
-            match port.take_mail(agent, MAIL_PER_CALL, now) {
-                Ok(Some(mail)) => mail,
-                Ok(None) => {
-                    eprintln!("lockyard hook: mail reservation unknown");
-                    Vec::new()
-                }
-                Err(error) => {
-                    eprintln!("lockyard hook: could not reserve mail: {error}");
-                    Vec::new()
-                }
+    let mail = if event != "PreToolUse"
+        && (unread.is_some_and(|count| count > 0) || (unread.is_none() && !messages.is_empty()))
+    {
+        match port.take_mail(agent, MAIL_PER_CALL, now) {
+            Ok(Some(mail)) => mail,
+            Ok(None) => {
+                eprintln!("lockyard hook: mail reservation unknown");
+                Vec::new()
+            }
+            Err(error) => {
+                eprintln!("lockyard hook: could not reserve mail: {error}");
+                Vec::new()
             }
         }
-        _ => Vec::new(),
+    } else {
+        Vec::new()
     };
+    if port.mail_truncated() {
+        lines.push(crate::mail_wait::INCOMPLETE_INBOX.into());
+    }
     let ordinary: Vec<_> = mail
         .iter()
         .filter(|mail| !shown.contains(&mail.id.to_string()))

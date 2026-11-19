@@ -117,8 +117,10 @@ impl<'a> Args<'a> {
     }
 
     pub(super) fn ttl(self) -> Result<i64> {
-        self.get("ttl")
-            .map_or(Ok(DEFAULT_TTL_MINUTES), |_| self.int("ttl"))
+        self.get("ttl").map_or(Ok(DEFAULT_TTL_MINUTES), |_| {
+            self.int("ttl")
+                .map_err(|_| wrong_type("ttl", "an integer number of minutes (1-240)"))
+        })
     }
 
     pub(super) fn strings(self, key: &str) -> Result<Vec<String>> {

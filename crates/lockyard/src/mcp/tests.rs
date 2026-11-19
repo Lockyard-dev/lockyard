@@ -178,3 +178,37 @@ fn task_add_schema_enumerates_server_types_on_both_surfaces() {
         );
     }
 }
+
+#[test]
+fn survey1118_schema_describes_body_and_integer_ttl_minutes() {
+    for surface in [Surface::Full, Surface::Compact] {
+        let definitions = tools(surface);
+        let update = definitions
+            .iter()
+            .find(|tool| tool["name"] == "update")
+            .unwrap();
+        assert!(update["description"].as_str().unwrap().contains("body"));
+        assert!(
+            update["inputSchema"]["properties"]["body"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("body")
+        );
+        for name in ["start_work", "zone_renew"] {
+            let tool = definitions
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            let ttl = &tool["inputSchema"]["properties"]["ttl"];
+            assert_eq!(ttl["type"], "integer");
+            assert!(
+                ttl["description"]
+                    .as_str()
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains("integer")
+            );
+            assert!(ttl["description"].as_str().unwrap().contains("minutes"));
+        }
+    }
+}

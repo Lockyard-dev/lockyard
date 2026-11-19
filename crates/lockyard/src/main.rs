@@ -9,6 +9,7 @@ mod mail_wait;
 mod mcp;
 mod monitor;
 mod node_cli;
+mod notifications;
 mod onboarding;
 mod open;
 mod open_mail;
@@ -174,7 +175,7 @@ fn resolve_agent(flag: Option<&String>) -> Result<String> {
 /// When cloud mode has no token and the agent path is unavailable, mail and path-request
 /// surfaces exit with a dedicated code. A running agent still serves tokenless CLI callers
 /// (`status_read` / `cloud()`).
-fn no_cloud_access_output(cwd: &Path) -> Result<Option<Output>> {
+fn no_cloud_access_output(cwd: &Path, session: Option<&str>) -> Result<Option<Output>> {
     use lockyard_core::config::{Config, Mode};
     let Some(root) = lockyard_core::paths::find_root(cwd) else {
         return Ok(None);
@@ -186,7 +187,9 @@ fn no_cloud_access_output(cwd: &Path) -> Result<Option<Output>> {
     let Ok((url, workspace)) = open::endpoint(&config) else {
         return Ok(None);
     };
-    if Config::token_for(&url).is_ok() {
+    if lockyard_core::config::optional_session_token(&url, session.unwrap_or("lockyard-cli"))?
+        .is_some()
+    {
         return Ok(None);
     }
     let socket = crate::agent::socket_path_for(&url, &workspace);
@@ -313,9 +316,16 @@ pub(crate) type After = Box<dyn FnOnce() -> Result<()>>;
 fn run(cli: Cli, cwd: &Path) -> Result<Output> {
     let Cli {
         agent,
+        token_file,
         json,
         command,
     } = cli;
+    if let Some(path) = token_file {
+        // CLI dispatch precedes all worker threads and cloud clients.
+        unsafe {
+            std::env::set_var("LOCKYARD_TOKEN_FILE", path);
+        }
+    }
     let name = agent.clone().or_else(env_agent);
     let open = || open::open(cwd, name.as_deref());
     match command {
@@ -366,7 +376,7 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
             output(&agents, text)
         }
         Command::Status { lost } => {
-            if let Some(out) = no_cloud_access_output(cwd)? {
+            if let Some(out) = no_cloud_access_output(cwd, name.as_deref())? {
                 return Ok(out);
             }
             if lost {
@@ -377,7 +387,7 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
         }
         Command::Zone(command) => {
             if matches!(command, ZoneCommand::Requests)
-                && let Some(out) = no_cloud_access_output(cwd)?
+                && let Some(out) = no_cloud_access_output(cwd, name.as_deref())?
             {
                 return Ok(out);
             }
@@ -391,7 +401,7 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
         Command::Mail(_) => unreachable!("mail wait is handled before opening a backend"),
         Command::Msg(command) => {
             if matches!(command, MsgCommand::Inbox { .. } | MsgCommand::Open)
-                && let Some(out) = no_cloud_access_output(cwd)?
+                && let Some(out) = no_cloud_access_output(cwd, name.as_deref())?
             {
                 return Ok(out);
             }
@@ -413,6 +423,11 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
         Command::Cloud(CloudCommand::Logout { url }) => run_cloud_logout(cwd, url),
         Command::Cloud(CloudCommand::Key(command)) => run_cloud_key(cwd, command),
         Command::Cloud(CloudCommand::Encryption(command)) => run_cloud_encryption(cwd, command),
+        Command::Cloud(command @ CloudCommand::ReleaseSession { .. }) => run_cloud(
+            open::open(cwd, None)?,
+            command,
+            Some(&"lockyard-cli".to_string()),
+        ),
         Command::Cloud(command) => run_cloud(open()?, command, agent.as_ref()),
         Command::Keepalive { id, all } => run_keepalive(open()?, agent.as_ref(), id, all),
         Command::Ping { path } => run_ping(cwd, agent.as_ref(), path),
@@ -438,10 +453,75 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
         Command::Monitor(args) => run_monitor(args, agent.as_ref(), cwd, json),
         Command::Setup(args) => run_setup(args, cwd),
         Command::Doctor {
+            repair_pending,
+            forget_unknown,
+            confirm,
             client,
             smoke,
             node_config,
         } => {
+            if repair_pending || forget_unknown.is_some() {
+                if forget_unknown.is_some() && !confirm {
+                    return Err(Error::Invalid("repeat `lockyard doctor --forget-unknown <id|--all>` with --confirm to move the selected operations to the quarantine log".into()));
+                }
+                let root = lockyard_core::paths::find_root(cwd)
+                    .ok_or_else(|| Error::Invalid("no Lockyard project found".into()))?;
+                let config = lockyard_core::config::Config::load(&root)?;
+                let (url, _) = open::endpoint(&config)?;
+                open::trusted_url(&url)?;
+                let session = agent
+                    .clone()
+                    .or_else(env_agent)
+                    .unwrap_or_else(|| "lockyard-cli".into());
+                // Reconcile with original credentials and wire bytes; preserve all rows offline.
+                let token = lockyard_core::config::Config::token_for_session(&url, &session)?;
+                let client = lockyard_cloud_client::Client::new(&url, token)?
+                    .with_trusted_replica(open::trusted_drain_replica);
+                if let Some(selection) = forget_unknown {
+                    let count =
+                        client.forget_unknown_journal(open::pending_journal_root()?, &selection)?;
+                    return output(
+                        &serde_json::json!({"forgotten_unknown":count}),
+                        format!("Archived {count} unknown operations in quarantine.log."),
+                    );
+                }
+                let report = client
+                    .with_pending_encryption_policy()
+                    .repair_pending_journal(open::pending_journal_root()?)?;
+                let mut diagnostics = Vec::new();
+                if !report.unknown_ids.is_empty() {
+                    diagnostics.push(format!("Unknown ids: {}", report.unknown_ids.join(", ")));
+                }
+                for id in &report.drain_instance_mismatch {
+                    diagnostics.push(format!(
+                        "Drain {id}: original replica unresolved. Contact its trusted origin to verify the outcome, or archive with `lockyard doctor --forget-unknown {id} --confirm`."
+                    ));
+                }
+                return output(
+                    &serde_json::json!({"pending_repair":report,"network":!report.network_required}),
+                    format!(
+                        "Pending reconciliation: {} applied, {} rejected, {} quarantined, {} eligible records remaining. {} {} {}",
+                        report.applied,
+                        report.rejected,
+                        report.quarantined,
+                        report.remaining,
+                        if report.outcome_unknown > 0 {
+                            format!(
+                                "{} outcome_unknown without safe replay. Current state matches {} requests.",
+                                report.outcome_unknown, report.state_observed
+                            )
+                        } else {
+                            String::new()
+                        },
+                        if report.network_required {
+                            "Нужна сеть (network required); unresolved operations retained."
+                        } else {
+                            ""
+                        },
+                        diagnostics.join("\n"),
+                    ),
+                );
+            }
             if let Some(path) = node_config.as_deref() {
                 let data = node_cli::native_doctor(path)?;
                 let exit = if data["healthy"].as_bool() == Some(true) {
@@ -621,6 +701,12 @@ fn main() -> ExitCode {
     let parsing = lockyard_core::perf::Span::new("process.parse");
     let cli = Cli::parse();
     drop(parsing);
+    if let Some(path) = &cli.token_file {
+        // Startup precedes MCP, mail wait and all worker threads.
+        unsafe {
+            std::env::set_var("LOCKYARD_TOKEN_FILE", path);
+        }
+    }
     if let Command::Mail(MailCommand::Wait { session, timeout }) = &cli.command {
         let session = session
             .clone()
@@ -660,7 +746,16 @@ fn main() -> ExitCode {
     }
     let is_zone_wait = matches!(&cli.command, Command::Zone(ZoneCommand::WaitFree { .. }));
     let is_hook = matches!(&cli.command, Command::Hook(_));
-    match current_dir().and_then(|cwd| run(cli, &cwd)) {
+    let is_service = matches!(&cli.command, Command::Agent(args) if args.command.is_none());
+    let session = cli.agent.clone().or_else(env_agent);
+    let result = current_dir().and_then(|cwd| run(cli, &cwd));
+    if !is_service
+        && let (Ok(cwd), Some(session)) = (current_dir(), session)
+        && let Some(warning) = open::session_key_warning(&cwd, &session)
+    {
+        eprintln!("{warning}");
+    }
+    match result {
         Ok(_) if is_hook => ExitCode::SUCCESS,
         Ok(mut out) => {
             if let Err(error) = deliver(&out, json) {

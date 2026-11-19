@@ -78,7 +78,7 @@ pub(super) fn run_composite_steps(
             if let Some(shared) = args.0.get("shared") {
                 arguments["shared"] = shared.clone();
             }
-            let (claim, rollback) = {
+            let (claim, rollback, warning) = {
                 let me =
                     agent.ok_or_else(|| Error::Invalid("this write needs an agent name".into()))?;
                 let mut opened = open(cwd, agent)?;
@@ -103,9 +103,31 @@ pub(super) fn run_composite_steps(
                 let rollback = (created == Some(true)
                     && (!cloud || (claim.id > 0 && claim.fence > 0)))
                     .then_some((claim.id, cloud.then_some(claim.fence)));
-                (encode(&claim)?, rollback)
+                let warning = claim.excluded_paths_warning();
+                (encode(&claim)?, rollback, warning)
             };
             let mut answer = json!({"claim": claim});
+            if let Some(warning) = warning {
+                answer["warning"] = json!(warning);
+            }
+            if args.get("hold_reason").is_none() {
+                let idle = answer["claim"]
+                    .get("idle_release_at")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                answer["idle_release_at"] = idle.clone();
+                let time = idle
+                    .as_i64()
+                    .or_else(|| idle.as_str().and_then(lockyard_core::proto::parse_rfc3339));
+                if let Some(time) = time {
+                    let minutes = time.div_euclid(60_000).rem_euclid(24 * 60);
+                    let utc = format!("{:02}:{:02}", minutes / 60, minutes % 60);
+                    answer["notice"] = json!(format!(
+                        "без hold_reason заявка отпустится по простою в {} UTC",
+                        utc
+                    ));
+                }
+            }
             if let Some(id) = task {
                 match step("task_claim", json!({"id": id}), after) {
                     Ok(task) => answer["task"] = task,

@@ -15,6 +15,17 @@ pub(crate) fn is_result_path(path: &str) -> bool {
     matches!(parts.as_slice(), ["", "api", "v1", "nodes", node, "jobs", job, "signed-result"] if route(node, job).is_ok())
 }
 
+/// EP-09 replay is tied to the job's ULID time, independently of content expiry.
+pub(crate) fn replay_deadline_secs(path: &str) -> Option<u64> {
+    let parts = path.split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["", "api", "v1", "nodes", node, "jobs", job, "signed-result"] => route(node, job)
+            .ok()
+            .map(|(_, created)| created.saturating_add(YEAR_MS).div_ceil(1000)),
+        _ => None,
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -156,6 +167,7 @@ impl Client {
                 Ok(response)
             }
             Err(ureq::Error::Status(status, response)) => {
+                let lockyard_response = response.header("Lockyard-Protocol").is_some();
                 let echo = protocol::verify_echo(&response, protocol);
                 let retry = response.header("Retry-After").and_then(|s| s.parse().ok());
                 let bytes = read_bounded(response)?;
@@ -163,6 +175,15 @@ impl Client {
                     protocol::local("protocol_response_invalid", "invalid error response")
                 })?;
                 let mut error = protocol::parse_api_error(status, body, retry)?;
+                if error.code == "unavailable" && !protocol::looks_like_lockyard_error(body) {
+                    if lockyard_response {
+                        return Err(protocol::local(
+                            "protocol_response_invalid",
+                            "Lockyard error response omitted its envelope",
+                        ));
+                    }
+                    return Err(ClientError::from_api(error));
+                }
                 if error.code.is_empty() {
                     return Err(protocol::local(
                         "protocol_response_invalid",
@@ -215,14 +236,13 @@ impl Client {
         }
         let call = Self::result_call(session, node, job, document, expires_at_ms)?;
         let key = call.key.as_deref().unwrap();
-        let _guard = self.claim_pending_send(key)?;
+        let mut guard = self.claim_pending_send(key)?;
         let (workspace, content_key) = self.result_context()?;
         let (_, job_time) = route(node, job)?;
         let now = now_ms();
         let expiry = lockyard_core::proto::rfc3339(expires_at_ms as i64);
-        let pending = if let Some(pending) = self.pending_operation(key) {
-            if now >= job_time.saturating_add(YEAR_MS).saturating_sub(60_000)
-                || pending.method != "PUT"
+        let (pending, replay) = if let Some(pending) = self.pending_operation(key) {
+            if pending.method != "PUT"
                 || pending.path != call.path
                 || pending.request_path != call.path
                 || pending.session != session
@@ -235,7 +255,7 @@ impl Client {
             {
                 return Err(ClientError::OutcomeUnknown(Box::new(pending)));
             }
-            pending
+            (pending, true)
         } else {
             if expires_at_ms <= now
                 || expires_at_ms > job_time.saturating_add(YEAR_MS)
@@ -274,17 +294,37 @@ impl Client {
                 credential_scope: crate::credential_fingerprint(&self.token),
                 request_digest: Some(crate::request_identity(&call)),
                 first_sent_unix_secs: Some(now / 1000),
+                first_sent_server_secs: self.first_send_server_secs(),
+                replay_stopped: false,
+                replay_paused: false,
                 pre_execution_rejected: false,
                 encryption_context: Some(self.encryption_context()),
                 result_expires_at: Some(expiry),
                 result_retry_at: None,
             };
+            if pending.first_sent_server_secs.is_some() {
+                self.repair_before_admission(
+                    &mut guard,
+                    serde_json::to_vec(&pending)
+                        .map_err(protocol::journal_error)?
+                        .len(),
+                    std::time::Duration::from_secs(5),
+                )?;
+            }
             self.retain_pending(pending.clone())?;
-            pending
+            (pending, false)
         };
-        self.send_signed_result(pending)
+        self.send_signed_result(pending, replay, &mut guard)
     }
-    fn send_signed_result(&self, mut pending: PendingWrite) -> Result<(), ClientError> {
+    fn send_signed_result(
+        &self,
+        mut pending: PendingWrite,
+        replay: bool,
+        guard: &mut protocol::PendingSendGuard<'_>,
+    ) -> Result<(), ClientError> {
+        if pending.replay_stopped && !Self::result_permanently_refused(&pending) {
+            return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+        }
         if !Self::result_retry_ready(&pending) {
             return Err(ClientError::from_api(crate::ApiError {
                 status: pending.cause_status.unwrap_or(503),
@@ -299,10 +339,18 @@ impl Client {
         ) {
             // A proven refusal permits fresh discovery at the configured origin.
             // Only the protocol header changes; ciphertext, key, path and expiry stay frozen.
-            self.refresh_protocol(&pending.session)?;
             let previous = pending.clone();
-            pending.protocol = self.result_protocol(&pending.session)?;
+            pending.protocol = guard.exchange(|| {
+                self.refresh_protocol(&pending.session)?;
+                self.result_protocol(&pending.session)
+            })??;
             self.update_pending(&previous, pending.clone())?;
+        }
+        if replay {
+            if !self.can_replay_pending(&pending, guard, None, None)? {
+                return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+            }
+            self.verify_pending_replay_encryption(&pending, guard, None, None)?;
         }
         let request = self
             .result_request("PUT", &pending.path, &pending.session, &pending.protocol)
@@ -311,10 +359,17 @@ impl Client {
                 "Lockyard-Result-Expires-At",
                 pending.result_expires_at.as_deref().unwrap(),
             );
-        let response = self.result_response(
-            request.send_bytes(pending.body.as_ref().unwrap().as_bytes()),
-            &pending.protocol,
-        );
+        let send = || {
+            self.result_response(
+                request.send_bytes(pending.body.as_ref().unwrap().as_bytes()),
+                &pending.protocol,
+            )
+        };
+        let response = if replay {
+            guard.exchange(send)?
+        } else {
+            send()
+        };
         match response {
             Ok(response) if response.status() == 204 => {
                 if !read_bounded(response)?.is_empty() {
@@ -324,6 +379,9 @@ impl Client {
             }
             Ok(_) => Err(self.unknown(pending, "protocol_response_invalid", None)),
             Err(error) => {
+                if self.explicit_expiry(&pending, &error)? {
+                    return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+                }
                 let previous = pending.clone();
                 let mut pending = pending;
                 pending.cause_code = error.code().unwrap_or("outcome_unknown").to_owned();
@@ -350,9 +408,10 @@ impl Client {
     }
     /// The worker respects refusal codes and Retry-After across restarts.
     pub fn result_retry_ready(pending: &PendingWrite) -> bool {
-        pending
-            .result_retry_at
-            .is_none_or(|time| now_ms() / 1000 >= time)
+        !pending.replay_stopped
+            && pending
+                .result_retry_at
+                .is_none_or(|time| now_ms() / 1000 >= time)
             && matches!(
                 (pending.cause_status, pending.cause_code.as_str()),
                 (None, _)
@@ -372,16 +431,6 @@ impl Client {
                     | (Some(400), "protocol_unsupported")
             )
     }
-    pub fn result_replay_expired(pending: &PendingWrite) -> bool {
-        let parts = pending.path.split('/').collect::<Vec<_>>();
-        match parts.as_slice() {
-            ["", "api", "v1", "nodes", node, "jobs", job, "signed-result"] => route(node, job)
-                .is_ok_and(|(_, time)| {
-                    now_ms() >= time.saturating_add(YEAR_MS).saturating_sub(60_000)
-                }),
-            _ => false,
-        }
-    }
     pub fn signed_result_pending(&self, node: &str, job: &str) -> Option<PendingWrite> {
         let (path, _) = route(node, job).ok()?;
         self.pending_operation(&crate::credential_fingerprint(&path))
@@ -390,8 +439,8 @@ impl Client {
     /// document serialization, encryption or expiry generation occurs here. Discovery changes
     /// only after a proven replica refusal.
     pub fn replay_signed_result(&self, key: &str) -> Result<(), ClientError> {
-        let _guard = self.claim_pending_send(key)?;
-        self.send_signed_result(self.result_for_replay(key)?)
+        let mut guard = self.claim_pending_send(key)?;
+        self.send_signed_result(self.result_for_replay(key)?, true, &mut guard)
     }
     /// Explicitly resume a quota-refused operation after budget relief. This only schedules
     /// exact replay: the saved Retry-After still applies, and a durable receipt is still needed
@@ -418,9 +467,7 @@ impl Client {
         let parts = pending.path.split('/').collect::<Vec<_>>();
         let valid = match parts.as_slice() {
             ["", "api", "v1", "nodes", node, "jobs", job, "signed-result"] => {
-                route(node, job).is_ok_and(|(_, timestamp)| {
-                    now_ms() < timestamp.saturating_add(YEAR_MS).saturating_sub(60_000)
-                }) && pending.session == *node
+                route(node, job).is_ok() && pending.session == *node
             }
             _ => false,
         };
@@ -505,5 +552,22 @@ impl Client {
             ));
         }
         Ok(document.into_bytes())
+    }
+}
+
+#[cfg(test)]
+mod survey_nov18 {
+    use super::*;
+
+    #[test]
+    fn survey1118_signed_result_proxy_outage_keeps_unavailable_message() {
+        let (url, worker) = crate::survey_nov18::upstream(503, "<html>maintenance</html>", false);
+        let client = Client::new(&url, "secret".into()).unwrap();
+        let protocol = client.negotiated_protocol("me").unwrap();
+        let result = client.agent.get(&format!("{url}/result")).call();
+        let error = client.result_response(result, &protocol).unwrap_err();
+        assert_eq!(error.code(), Some("unavailable"));
+        assert!(error.to_string().contains("на обслуживании (HTTP 503)"));
+        worker.join().unwrap();
     }
 }

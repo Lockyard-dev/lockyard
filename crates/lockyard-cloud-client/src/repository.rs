@@ -157,6 +157,15 @@ impl<T> RepositoryTransport<T> {
 }
 
 impl<T: Transport> Transport for RepositoryTransport<T> {
+    fn maintain_pending(&self) -> Result<(), ClientError> {
+        self.inner.maintain_pending()
+    }
+
+    fn write_is_parked(&self, call: &Call) -> bool {
+        self.qualified_call(call)
+            .is_ok_and(|qualified| self.inner.write_is_parked(&qualified))
+    }
+
     fn mail_push_v1(&self, session: &str) -> Result<bool, ClientError> {
         self.inner.mail_push_v1(session)
     }

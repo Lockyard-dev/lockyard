@@ -5,7 +5,7 @@
 use crate::{DIR_NAME, Error, Result};
 use serde::Deserialize;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,17 +33,21 @@ impl Config {
         let content = match fs::read_to_string(path) {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self {
-                    mode: Mode::Local,
-                    url: None,
-                    workspace: None,
-                    repository: None,
-                });
+                return Self::with_explicit_cloud(
+                    Self {
+                        mode: Mode::Local,
+                        url: None,
+                        workspace: None,
+                        repository: None,
+                    },
+                    root,
+                );
             }
             Err(error) => return Err(error.into()),
         };
         let config: Self = toml::from_str(&content)
             .map_err(|error| Error::Invalid(format!("invalid .lockyard/config.toml: {error}")))?;
+        let config = Self::with_explicit_cloud(config, root)?;
         if let Some(repository) = config.repository.as_deref() {
             crate::repository::validate_id(repository)?;
         }
@@ -63,15 +67,77 @@ impl Config {
         Ok(config)
     }
 
+    fn with_explicit_cloud(mut config: Self, root: &Path) -> Result<Self> {
+        if std::env::var_os("LOCKYARD_TOKEN_FILE").is_some_and(|p| !p.is_empty()) {
+            config.mode = Mode::Cloud;
+            if let Ok(url) = std::env::var("LOCKYARD_URL")
+                && !url.is_empty()
+            {
+                config.url = Some(url);
+            }
+            if config.url.as_deref().is_none_or(str::is_empty) {
+                // A nested local store must not hide the workspace's cloud endpoint when a
+                // caller explicitly chose a cloud credential. Trust checks still apply.
+                for parent in root.ancestors().skip(1) {
+                    let path = parent.join(DIR_NAME).join("config.toml");
+                    let Ok(text) = fs::read_to_string(path) else {
+                        continue;
+                    };
+                    let Ok(ancestor) = toml::from_str::<Self>(&text) else {
+                        continue;
+                    };
+                    if ancestor.mode == Mode::Cloud
+                        && ancestor.url.as_deref().is_some_and(|url| !url.is_empty())
+                    {
+                        config.url = ancestor.url;
+                        if config.workspace.is_none() {
+                            config.workspace = ancestor.workspace;
+                        }
+                        break;
+                    }
+                }
+            }
+            config.workspace.get_or_insert_with(|| {
+                std::env::var("LOCKYARD_WORKSPACE").unwrap_or_else(|_| "cloud".into())
+            });
+            if config.url.as_deref().is_none_or(str::is_empty) {
+                return Err(Error::Invalid("explicit cloud token needs LOCKYARD_URL or a cloud URL in .lockyard/config.toml".into()));
+            }
+        }
+        Ok(config)
+    }
+
     /// Gets the bearer token from the environment or the named file, never from project config.
     pub fn token() -> Result<String> {
         Self::token_for("")
     }
 
-    /// Resolve cloud access: explicit env, login credentials, default token, then the
-    /// current project's MCP token-file setting. Inline MCP bearer tokens are ignored.
+    /// Resolve cloud access using the environment's session name. Explicit token files
+    /// win, then the matching Claude session's key, then existing agent credential sources.
+    /// Inline MCP bearer tokens are ignored.
     pub fn token_for(url: &str) -> Result<String> {
+        let session = std::env::var("LOCKYARD_AGENT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok())
+            .unwrap_or_default();
+        Self::token_for_session(url, &session)
+    }
+
+    /// CLI and MCP pass their resolved session name through this same selector.
+    pub fn token_for_session(url: &str, session: &str) -> Result<String> {
         let mut searched = Vec::new();
+        if let Some((path, source)) = selected_token_file_for(url, session)? {
+            let token = read_token_file(&path, source)?;
+            if token.trim().is_empty() {
+                return Err(Error::Invalid(format!(
+                    "token file {} is empty",
+                    path.display()
+                )));
+            }
+            return Ok(token.trim().to_string());
+        }
+        searched.push("LOCKYARD_TOKEN_FILE (unset)".into());
         if let Ok(token) = std::env::var("LOCKYARD_TOKEN") {
             searched.push("LOCKYARD_TOKEN".into());
             if !token.trim().is_empty() {
@@ -79,16 +145,6 @@ impl Config {
             }
         } else {
             searched.push("LOCKYARD_TOKEN (unset)".into());
-        }
-        if let Ok(path) = std::env::var("LOCKYARD_TOKEN_FILE") {
-            searched.push(format!("LOCKYARD_TOKEN_FILE={path}"));
-            // Explicit LOCKYARD_TOKEN_FILE may name owner-token; that is a deliberate human choice.
-            let token = read_token_file(Path::new(&path), TokenFileSource::ExplicitEnv)?;
-            if !token.trim().is_empty() {
-                return Ok(token.trim().to_string());
-            }
-        } else {
-            searched.push("LOCKYARD_TOKEN_FILE (unset)".into());
         }
         if !url.is_empty() {
             let creds = crate::credentials::path()
@@ -115,29 +171,229 @@ impl Config {
         } else {
             searched.push("default token file (HOME unset)".into());
         }
-        for (config, token_path) in mcp_token_files(url) {
-            searched.push(format!(
-                "MCP {} -> {}",
-                config.display(),
-                token_path.display()
-            ));
-            if let Ok(token) = read_token_file(&token_path, TokenFileSource::ExplicitEnv)
-                && !token.trim().is_empty()
-            {
-                return Ok(token.trim().to_string());
+        // Project MCP settings can point to any product's key. A downgraded
+        // session or executor can only use its regular agent credential sources.
+        let search_mcp = std::env::var_os("LOCKYARD_PARENT_CLAIM").is_none()
+            && !executor_environment()
+            && !crate::session_key::is_fallback(url, session)?;
+        if search_mcp {
+            for (config, token_path) in mcp_token_files(url) {
+                searched.push(format!(
+                    "MCP {} -> {}",
+                    config.display(),
+                    token_path.display()
+                ));
+                if let Ok(token) = read_token_file(&token_path, TokenFileSource::ExplicitEnv)
+                    && !token.trim().is_empty()
+                {
+                    return Ok(token.trim().to_string());
+                }
             }
         }
+        let mcp_help = if search_mcp {
+            " MCP token-file settings are searched in the project .mcp.json; \
+             for the command line set LOCKYARD_TOKEN_FILE=<path shown below>."
+        } else {
+            ""
+        };
         Err(Error::Invalid(format!(
             "no token for the cloud: run `lockyard cloud login`, or set LOCKYARD_TOKEN \
-             or LOCKYARD_TOKEN_FILE. MCP token-file settings are searched in the project .mcp.json; \
-             for the command line set LOCKYARD_TOKEN_FILE=<path shown below>. \
-             Looked in: {}",
+             or LOCKYARD_TOKEN_FILE.{mcp_help} Looked in: {}",
             searched.join("; ")
         )))
     }
 }
 
-fn default_token_file() -> Option<std::path::PathBuf> {
+/// Diagnostic category only; never contains credential values.
+pub fn token_source(session: &str) -> Result<&'static str> {
+    token_source_for(&std::env::var("LOCKYARD_URL").unwrap_or_default(), session)
+}
+
+pub fn token_source_for(url: &str, session: &str) -> Result<&'static str> {
+    Ok(match selected_token_file_for(url, session)? {
+        Some((_, TokenFileSource::Claude)) => "claude",
+        Some((_, TokenFileSource::ExplicitEnv)) => "явный файл",
+        _ if crate::session_key::is_fallback(url, session)? => "agent (fallback: имя занято)",
+        _ => "agent",
+    })
+}
+
+/// Preserve tokenless daemon access, but never hide an invalid explicitly selected key.
+pub fn optional_session_token(url: &str, session: &str) -> Result<Option<String>> {
+    if selected_token_file_for(url, session)?.is_some()
+        || crate::session_key::is_fallback(url, session)?
+    {
+        Config::token_for_session(url, session).map(Some)
+    } else {
+        Ok(Config::token_for_session(url, session).ok())
+    }
+}
+
+fn selected_token_file(session: &str) -> Result<Option<(PathBuf, TokenFileSource)>> {
+    selected_token_file_in(session, MCP_SESSION.get().map(String::as_str))
+}
+
+fn selected_token_file_in(
+    session: &str,
+    mcp_session: Option<&str>,
+) -> Result<Option<(PathBuf, TokenFileSource)>> {
+    if let Some(path) = std::env::var_os("LOCKYARD_TOKEN_FILE") {
+        return Ok(Some((path.into(), TokenFileSource::ExplicitEnv)));
+    }
+    if claude_session_eligibility(session, mcp_session).is_ok()
+        && let Some(path) = claude_token_file()
+    {
+        match fs::metadata(&path) {
+            Ok(metadata) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.mode() & 0o7777 != 0o600
+                        || metadata.uid() != unsafe { libc::geteuid() }
+                    {
+                        return Err(Error::Invalid(format!(
+                            "Claude token file {} must be owned by this user with mode 0600 (LOCKYARD_CLAUDE_TOKEN_FILE)",
+                            path.display()
+                        )));
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = metadata;
+                return Ok(Some((path, TokenFileSource::Claude)));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::Invalid(format!(
+                    "cannot inspect Claude token file {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn executor_environment() -> bool {
+    std::env::var("FLEX_RUNNER_NESTED").as_deref() == Ok("1")
+        || [
+            "CODEX_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "CODEX_TOOL_CALL_ID",
+            "CURSOR_AGENT",
+        ]
+        .into_iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+fn claude_session_eligibility(
+    session: &str,
+    mcp_session: Option<&str>,
+) -> std::result::Result<(), &'static str> {
+    if std::env::var_os("LOCKYARD_TOKEN_FILE").is_some() {
+        return Err("not selected: explicit LOCKYARD_TOKEN_FILE takes precedence");
+    }
+    if std::env::var_os("LOCKYARD_PARENT_CLAIM").is_some() {
+        return Err("not selected: LOCKYARD_PARENT_CLAIM is set");
+    }
+    if executor_environment() {
+        return Err("not selected: Codex or Cursor executor environment");
+    }
+    let claude = std::env::var_os("CLAUDE_CODE_SESSION_ID");
+    if let Some(mcp_session) = mcp_session {
+        if std::env::var("LOCKYARD_CLAUDE_MCP").as_deref() != Ok("1") {
+            return Err(
+                "not selected: set LOCKYARD_CLAUDE_MCP=1 in Claude Code .mcp.json at mcpServers.lockyard.env",
+            );
+        }
+        if mcp_session != session || !claude_session_uuid(session) {
+            return Err("not selected: MCP agent name must be the resolved session UUID");
+        }
+        let Some(claude) = claude.as_deref() else {
+            return Err("not selected: MCP requires CLAUDE_CODE_SESSION_ID");
+        };
+        if claude != std::ffi::OsStr::new(session)
+            || std::env::var_os("LOCKYARD_AGENT")
+                .is_some_and(|name| !name.is_empty() && name != session)
+        {
+            return Err("not selected: CLAUDE_CODE_SESSION_ID does not match the agent name");
+        }
+    } else {
+        match claude {
+            Some(id) if !id.is_empty() && id == std::ffi::OsStr::new(session) => {}
+            Some(id) if !id.is_empty() => {
+                return Err("not selected: CLAUDE_CODE_SESSION_ID does not match the agent name");
+            }
+            _ => return Err("not selected: CLI requires nonempty CLAUDE_CODE_SESSION_ID"),
+        }
+    }
+    Ok(())
+}
+
+/// Explain CLI or MCP selection using this environment, without disclosing its values.
+/// Doctor can evaluate MCP conditions without changing the current process's channel.
+pub fn claude_key_reason_for(url: &str, session: &str, mcp: bool) -> Result<&'static str> {
+    let mcp_session = mcp.then_some(session);
+    if let Err(reason) = claude_session_eligibility(session, mcp_session) {
+        return Ok(reason);
+    }
+    if crate::session_key::is_fallback(url, session)? {
+        return Ok("not selected: session_name_bound fallback to agent key is active");
+    }
+    Ok(match selected_token_file_in(session, mcp_session) {
+        Ok(Some((_, TokenFileSource::Claude))) => {
+            "selected: session conditions match and Claude key file is private"
+        }
+        Ok(_) => "not selected: Claude key file is missing",
+        Err(_) => {
+            "not selected: Claude key file cannot be read or is not owned by this user with mode 0600"
+        }
+    })
+}
+
+fn selected_token_file_for(url: &str, session: &str) -> Result<Option<(PathBuf, TokenFileSource)>> {
+    // Explicit files always win, including after a previous automatic downgrade.
+    if std::env::var_os("LOCKYARD_TOKEN_FILE").is_none()
+        && crate::session_key::is_fallback(url, session)?
+    {
+        return Ok(None);
+    }
+    selected_token_file(session)
+}
+
+static MCP_SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Mark the MCP channel and capture its resolved name. Claude selection additionally
+/// requires LOCKYARD_CLAUDE_MCP=1; a UUID name alone never selects the Claude key.
+pub fn set_mcp_session(session: &str) {
+    let _ = MCP_SESSION.set(session.to_owned());
+}
+
+fn claude_session_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+}
+
+pub fn claude_token_file() -> Option<PathBuf> {
+    std::env::var_os("LOCKYARD_CLAUDE_TOKEN_FILE")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| default_token_file().map(|p| p.with_file_name("claude.token")))
+}
+
+pub fn default_agent_token() -> Result<Option<String>> {
+    default_token_file()
+        .filter(|path| path.exists())
+        .map(|path| read_token_file(&path, TokenFileSource::DefaultAgent))
+        .transpose()
+}
+
+pub fn default_token_file() -> Option<std::path::PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
         _ => std::path::PathBuf::from(crate::paths::home_dir()?).join(".config"),
@@ -147,6 +403,7 @@ fn default_token_file() -> Option<std::path::PathBuf> {
 
 #[derive(Clone, Copy)]
 enum TokenFileSource {
+    Claude,
     /// `LOCKYARD_TOKEN_FILE` was set by the caller — owner-token is allowed.
     ExplicitEnv,
     /// Conventional agent path, with the same private-file checks as explicit paths.
@@ -154,6 +411,13 @@ enum TokenFileSource {
 }
 
 /// Search only the current project's MCP settings. Never use an inline host secret.
+pub fn session_token_files(url: &str) -> Vec<std::path::PathBuf> {
+    mcp_token_files(url)
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
+}
+
 fn mcp_token_files(url: &str) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
     let Ok(cwd) = std::env::current_dir() else {
         return Vec::new();
@@ -258,6 +522,7 @@ mod tests {
 
     #[test]
     fn absent_config_defaults_to_local_and_cloud_requires_endpoint_fields() {
+        let _guard = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         Store::init(dir.path()).unwrap();
         assert_eq!(Config::load(dir.path()).unwrap().mode, Mode::Local);
@@ -303,6 +568,7 @@ mod tests {
 
     #[test]
     fn config_rejects_credentials() {
+        let _guard = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         Store::init(dir.path()).unwrap();
         fs::write(
@@ -315,6 +581,7 @@ mod tests {
 
     #[test]
     fn project_config_does_not_contain_machine_policy() {
+        let _guard = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         Store::init(dir.path()).unwrap();
         fs::write(

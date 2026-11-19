@@ -196,14 +196,28 @@ Typed catalog schema/manifest artifacts are prepared from EP-07. The concurrent
 cloud generator still needs equivalent additions; cross-repository byte parity
 must be restored before server integration acceptance. See the W4 core report.
 
-W4 round 2 keeps an unknown outbox write queued and reports `outcome_unknown`
-to its waiter. A restarted durable sender can replay only the saved wire body,
-key, path and protocol for the coordination endpoints whose receipt ledger is
-guaranteed for 30 days; replay stops one minute before that boundary. Neither
-replay nor restart resets the original send time. Missing age or original-request
-identity, unsupported endpoints and expired records stay quarantined for receipt
-or domain-state reconciliation. A failed replay cannot prove the first attempt
-failed, including a new authentication or protocol refusal.
+An outbox write with an uncertain outcome retains its original key, body, path
+and protocol. Registry routes with durable deduplication can replay those bytes
+at any age. Coordination replay requires a server-time sample from the first
+send and a fresh server `Date` within the 30-day retention window, with a
+one-minute margin. Signed results also require a server-time sample and use the
+one-year job retention boundary. Legacy rows without a server-time sample stay
+outside blind replay on finite-retention routes.
+
+Records without safe replay remain in private `.unknown` files outside the
+active write budget. `lockyard doctor --repair-pending` reconciles the selected
+server and credential. It works from the original key or checks current state
+via a safe GET where the route supports it. Each record has its own HTTP
+deadline. The journal is unlocked during HTTP, and another pass continues from
+the saved cursor.
+
+For an unresolved drain, the original replica origin must be trusted through
+`lockyard cloud trust`. If the server provides only a replica ID, configure
+`LOCKYARD_DRAIN_REPLICAS` as a JSON object mapping that ID to the trusted
+origin. Use `lockyard doctor --forget-unknown <id> --confirm` or
+`lockyard doctor --forget-unknown --all --confirm` to archive unknown records
+in the selected journal and record the decision in `quarantine.log`. The
+original key stays reserved.
 
 Pending acknowledgement binds the original method, path, session, repository and
 body digest before randomized encryption. A mismatch leaves the recovery record
@@ -217,7 +231,7 @@ W4 round 3 retains the original encrypted bytes after pre-execution rate limits,
 relay backpressure and freeze/drain refusals (EP-10 / ERRORS). Matching calls reuse
 the frozen protocol, path, body and key. A durable refusal marker is cleared before
 each send; uncertainty or a changed encryption context requires reconciliation.
-Older records without an encryption-context binding also stay quarantined.
+Older records without an encryption-context binding remain available for reconciliation.
 Concurrent sends and acknowledgements share exclusive journal ownership. Journal
 preflight therefore precedes discovery: the preflight regression now requires zero
 HTTP requests instead of one discovery request, strengthening its no-send guard.

@@ -3,14 +3,14 @@
 //! Client-side "open mail": asks that still need this agent's reply or ack.
 //!
 //! When the server announces `mail_open_v1`, open mail is `GET /bus/inbox?open=true` (per-reader
-//! handled state, including broadcasts). Otherwise open mail is derived from a peek of
+//! handled state). Personal obligations exclude broadcasts and group addresses in both paths.
+//! Otherwise open mail is derived from a peek of
 //! `GET /bus/inbox?all=…` as in 0.3.10: cloud closes only on shared `status=ack`, local mode still
 //! consults `sent`. A timed-out or failed optional read omits the open list rather than failing
 //! status.
 
 use lockyard_core::Backend;
 use lockyard_core::OpenMail;
-use lockyard_core::bus::BROADCAST;
 use lockyard_core::proto::{InboxQuery, Message, Stamp, parse_rfc3339};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -66,11 +66,11 @@ pub fn open_mail_within(
             .peek_open_inbox_within(me, INBOX_PAGE, now, inbox_budget)
             .ok()?;
         return Some(OpenMailSnapshot {
-            // Still drop shared ack/info rows if a rolled-back server listed them.
+            // Enforce personal reply obligations even if an older server lists other mail.
             items: page
                 .messages
                 .iter()
-                .filter(|message| !is_shared_handled(message))
+                .filter(|message| crate::mail_wait::requires_reply(message, me))
                 .map(to_open)
                 .collect(),
             truncated: page.skipped > 0,
@@ -149,32 +149,11 @@ fn filter_open(messages: &[Message], me: &str, now: i64, replied: &HashSet<i64>)
         .collect()
 }
 
-fn is_shared_handled(message: &Message) -> bool {
-    matches!(message.status.as_deref(), Some("ack") | Some("info"))
-}
-
 fn is_open(message: &Message, me: &str, now: i64, replied: &HashSet<i64>) -> bool {
     if message.from == me {
         return false;
     }
-    let addressed = message.to == me || message.to == BROADCAST;
-    if !addressed {
-        return false;
-    }
-    if replied.contains(&message.id) {
-        return false;
-    }
-    // Shared status: ack/info means handled for every reader until mail_open_v1 is used.
-    if is_shared_handled(message) {
-        return false;
-    }
-    // A stored reply is kind=ask, needs=none, in_reply_to set — not an outstanding ask.
-    let needs = message.needs.as_deref().unwrap_or("none");
-    if message.reply_to.is_some() && needs == "none" && !message.urgent {
-        return false;
-    }
-    let kind = message.kind.as_deref().unwrap_or("ask");
-    if kind != "ask" && needs == "none" && !message.urgent {
+    if !crate::mail_wait::requires_reply(message, me) || replied.contains(&message.id) {
         return false;
     }
     let created = stamp_ms(&message.created_at);
@@ -506,29 +485,81 @@ mod tests {
     }
 
     #[test]
-    fn with_mail_open_v1_the_server_open_list_is_trusted() {
+    fn personal_open_mail_excludes_group_addresses_in_both_server_branches() {
         let now = 1_000_000_i64;
-        // Legacy all-page still contains a broadcast this agent already answered — would stay
-        // "open" under 0.3.10 cloud filtering. The server open page correctly omits it.
-        let answered = ask(1, "bob", "*", "broadcast already answered", now);
-        let pending = ask(2, "bob", "*", "still needs a reply", now);
-        let backend = MailMock {
-            cloud: true,
-            mail_open: true,
-            open_page: Mutex::new(InboxPage {
-                messages: vec![pending.clone()],
+        let mut messages = vec![ask(1, "bob", "alice", "personal", now)];
+        let mut explicit = ask(2, "bob", "alice", "explicit personal address", now);
+        explicit.address = Some("alice".into());
+        messages.push(explicit);
+        for address in ["*", "all", "@claude", "@zone:client", "@path:src", "bob"] {
+            messages.push(ask(3, "bob", address, "group or another reader", now));
+            let mut normalized = ask(4, "bob", "alice", "normalized group", now);
+            normalized.address = Some(address.into());
+            messages.push(normalized);
+        }
+        for mail_open in [false, true] {
+            let page = InboxPage {
+                messages: messages.clone(),
+                skipped: 1,
+            };
+            let backend = MailMock {
+                cloud: true,
+                mail_open,
+                open_page: Mutex::new(page.clone()),
+                all_page: Mutex::new(page),
+                ..MailMock::default()
+            };
+            let snap = open_mail_within(&backend, "alice", now, SENT_BUDGET).expect("open mail");
+            assert_eq!(
+                snap.items.iter().map(|m| m.id).collect::<Vec<_>>(),
+                vec![1, 2],
+                "mail_open={mail_open}"
+            );
+            assert!(snap.truncated);
+            assert_eq!(*backend.last_open.lock().unwrap(), mail_open);
+            assert_eq!(*backend.last_all.lock().unwrap(), !mail_open);
+        }
+    }
+
+    #[test]
+    fn round6_open_mail_counts_only_personal_questions_in_both_server_branches() {
+        let now = 1_000_000;
+        let mut messages = Vec::new();
+        for (id, kind, needs, reply_to, to, urgent) in [
+            (1, "info", "none", None, "alice", false),
+            (2, "ask", "none", Some(9), "alice", false),
+            (3, "ask", "reply", None, "alice", false),
+            (4, "ask", "reply", None, "*", false),
+            (5, "info", "none", None, "*", true),
+            (6, "info", "none", None, "alice", true),
+            (7, "ask", "none", Some(9), "alice", true),
+        ] {
+            let mut mail = ask(id, "bob", to, "hello", now);
+            mail.kind = Some(kind.into());
+            mail.needs = Some(needs.into());
+            mail.reply_to = reply_to;
+            mail.urgent = urgent;
+            messages.push(mail);
+        }
+        for mail_open in [false, true] {
+            let page = InboxPage {
+                messages: messages.clone(),
                 skipped: 0,
-            }),
-            all_page: Mutex::new(InboxPage {
-                messages: vec![answered, pending],
-                skipped: 0,
-            }),
-            ..MailMock::default()
-        };
-        let snap = open_mail_within(&backend, "alice", now, SENT_BUDGET).expect("open mail");
-        assert_eq!(snap.items.iter().map(|m| m.id).collect::<Vec<_>>(), vec![2]);
-        assert!(*backend.last_open.lock().unwrap());
-        assert!(!*backend.last_all.lock().unwrap());
+            };
+            let backend = MailMock {
+                cloud: true,
+                mail_open,
+                open_page: Mutex::new(page.clone()),
+                all_page: Mutex::new(page),
+                ..MailMock::default()
+            };
+            let snap = open_mail_within(&backend, "alice", now, SENT_BUDGET).unwrap();
+            assert_eq!(
+                snap.items.iter().map(|mail| mail.id).collect::<Vec<_>>(),
+                vec![3],
+                "mail_open={mail_open}"
+            );
+        }
     }
 
     #[test]

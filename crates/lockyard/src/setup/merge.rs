@@ -37,13 +37,46 @@ fn render(map: &Map<String, Value>) -> Result<String> {
     Ok(text)
 }
 
-/// The server entry every MCP client gets.
-pub fn server_entry() -> Value {
-    json!({"command": "lockyard", "args": ["mcp"]})
+pub const CLAUDE_MCP_MARKER: &str = "LOCKYARD_CLAUDE_MCP";
+
+pub fn server_entry(claude: bool) -> Value {
+    let mut entry = json!({"command": "lockyard", "args": ["mcp"]});
+    if claude {
+        entry["env"] = json!({CLAUDE_MCP_MARKER: "1"});
+    }
+    entry
 }
 
-/// Adds or refreshes `mcpServers.lockyard`, leaving every other server and key alone.
-pub fn mcp_set(path: &str, current: Option<&str>, entry: &Value) -> Result<String> {
+pub fn mcp_snippet(claude: bool) -> String {
+    serde_json::to_string_pretty(&json!({"mcpServers": {"lockyard": server_entry(claude)}}))
+        .expect("static MCP configuration")
+}
+
+pub fn claude_env_warning(env: &Value) -> Option<&'static str> {
+    if env.get("LOCKYARD_TOKEN_FILE").is_some() {
+        Some(
+            "Explicit LOCKYARD_TOKEN_FILE disables Claude key selection. Setup removes it from this MCP entry. An inherited LOCKYARD_TOKEN_FILE still takes precedence.",
+        )
+    } else if env.get("LOCKYARD_AGENT").is_some() {
+        Some(
+            "Setup removes the pinned LOCKYARD_AGENT from this MCP entry so Claude can use its session identity. An explicit LOCKYARD_TOKEN_FILE disables Claude key selection.",
+        )
+    } else {
+        None
+    }
+}
+
+pub fn clear_managed_env(env: &mut Map<String, Value>, claude: bool) {
+    if claude {
+        env.remove("LOCKYARD_TOKEN_FILE");
+        env.remove("LOCKYARD_AGENT");
+    } else {
+        env.remove(CLAUDE_MCP_MARKER);
+    }
+}
+
+/// Adds or refreshes `mcpServers.lockyard`, preserving user environment variables.
+pub fn mcp_set(path: &str, current: Option<&str>, claude: bool) -> Result<String> {
     let mut map = parse_object(path, current.unwrap_or(""))?;
     let servers = map
         .entry("mcpServers".to_string())
@@ -53,7 +86,20 @@ pub fn mcp_set(path: &str, current: Option<&str>, entry: &Value) -> Result<Strin
             "{path} has an mcpServers that is not an object; Lockyard will not rewrite it"
         )));
     };
-    servers.insert("lockyard".to_string(), entry.clone());
+    let mut entry = server_entry(claude);
+    if let Some(existing) = servers.get("lockyard").and_then(|server| server.get("env")) {
+        let mut env = existing.as_object().cloned().ok_or_else(|| {
+            Error::Invalid(format!("{path} has an invalid Lockyard MCP env object"))
+        })?;
+        clear_managed_env(&mut env, claude);
+        if claude {
+            env.insert(CLAUDE_MCP_MARKER.into(), json!("1"));
+        }
+        if !env.is_empty() {
+            entry["env"] = Value::Object(env);
+        }
+    }
+    servers.insert("lockyard".into(), entry);
     render(&map)
 }
 
@@ -283,6 +329,93 @@ pub fn toml_table_set(current: &str, header: &str, body: &[String]) -> String {
     text
 }
 
+/// Updates Codex's managed command, arguments and marker while keeping its other settings.
+pub fn codex_mcp_set(current: &str, header: &str, body: &[String]) -> Result<String> {
+    use toml_edit::DocumentMut;
+    let mut document: DocumentMut = current.parse().map_err(|_| {
+        Error::Invalid("Codex configuration is not valid TOML; preserving it".into())
+    })?;
+    let Some(servers) = document.get_mut("mcp_servers") else {
+        return Ok(toml_table_set(current, header, body));
+    };
+    let servers = servers
+        .as_table_like_mut()
+        .ok_or_else(|| Error::Invalid("Codex mcp_servers is not a table; preserving it".into()))?;
+    let Some(server) = servers.get_mut("lockyard") else {
+        if document["mcp_servers"].is_inline_table() {
+            let mut entry = toml_edit::InlineTable::new();
+            entry.insert("command", "lockyard".into());
+            entry.insert(
+                "args",
+                ["mcp"].into_iter().collect::<toml_edit::Array>().into(),
+            );
+            document["mcp_servers"]["lockyard"] = toml_edit::value(entry);
+            return Ok(document.to_string());
+        }
+        return Ok(toml_table_set(current, header, body));
+    };
+    let server = server.as_table_like_mut().ok_or_else(|| {
+        Error::Invalid("Codex lockyard MCP entry is not a table; preserving it".into())
+    })?;
+    let settings: DocumentMut = body.join("\n").parse().expect("static MCP configuration");
+    for (name, value) in settings.iter() {
+        if server
+            .get(name)
+            .map(ToString::to_string)
+            .as_deref()
+            .map(str::trim)
+            != Some(value.to_string().trim())
+        {
+            server.insert(name, value.clone());
+        }
+    }
+    clear_codex_marker(server);
+    Ok(document.to_string())
+}
+
+pub fn codex_without_claude_marker(document: &mut toml_edit::DocumentMut) -> bool {
+    document
+        .get_mut("mcp_servers")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .and_then(|servers| servers.get_mut("lockyard"))
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .is_some_and(clear_codex_marker)
+}
+
+fn clear_codex_marker(server: &mut dyn toml_edit::TableLike) -> bool {
+    let removed_env = server
+        .get_mut("env")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .is_some_and(|env| env.remove(CLAUDE_MCP_MARKER).is_some());
+    let removed_forwarded = server
+        .get_mut("env_vars")
+        .and_then(toml_edit::Item::as_array_mut)
+        .is_some_and(|vars| {
+            let before = vars.len();
+            vars.retain(|name| name.as_str() != Some(CLAUDE_MCP_MARKER));
+            vars.len() != before
+        });
+    removed_env || removed_forwarded
+}
+
+pub fn codex_mcp_remove(current: &str, header: &str) -> Result<Option<String>> {
+    if toml_table_present(current, header) && !current.contains(&format!("{header}.")) {
+        return Ok(toml_table_remove(current, header));
+    }
+    let mut document: toml_edit::DocumentMut = current.parse().map_err(|_| {
+        Error::Invalid("Codex configuration is not valid TOML; preserving it".into())
+    })?;
+    let removed = document
+        .get_mut("mcp_servers")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .and_then(|servers| servers.remove("lockyard"));
+    if removed.is_none() {
+        return Ok(Some(current.to_owned()));
+    }
+    let next = document.to_string();
+    Ok((!next.trim().is_empty()).then_some(next))
+}
+
 /// Removes one TOML table. `None` means the file held nothing else and can go.
 pub fn toml_table_remove(current: &str, header: &str) -> Option<String> {
     let Some((start, end)) = toml_table_range(current, header) else {
@@ -312,39 +445,31 @@ mod tests {
     #[test]
     fn an_mcp_entry_joins_other_servers_and_keeps_other_keys() {
         let existing = r#"{"theme":"dark","mcpServers":{"other":{"command":"x"}}}"#;
-        let written = mcp_set("m.json", Some(existing), &server_entry()).unwrap();
+        let written = mcp_set("m.json", Some(existing), false).unwrap();
         let value: Value = serde_json::from_str(&written).unwrap();
         assert_eq!(value["theme"], "dark");
         assert_eq!(value["mcpServers"]["other"]["command"], "x");
         assert_eq!(value["mcpServers"]["lockyard"]["args"][0], "mcp");
         assert!(mcp_present(&written));
         // Writing twice changes nothing more.
-        assert_eq!(
-            mcp_set("m.json", Some(&written), &server_entry()).unwrap(),
-            written
-        );
+        assert_eq!(mcp_set("m.json", Some(&written), false).unwrap(), written);
     }
 
     #[test]
     fn removing_an_mcp_entry_leaves_the_neighbours_and_deletes_an_empty_file() {
-        let shared = mcp_set(
-            "m.json",
-            Some(r#"{"mcpServers":{"other":{}}}"#),
-            &server_entry(),
-        )
-        .unwrap();
+        let shared = mcp_set("m.json", Some(r#"{"mcpServers":{"other":{}}}"#), false).unwrap();
         let left = mcp_remove("m.json", &shared).unwrap().unwrap();
         assert!(!mcp_present(&left));
         assert!(left.contains("other"));
-        let only_ours = mcp_set("m.json", None, &server_entry()).unwrap();
+        let only_ours = mcp_set("m.json", None, false).unwrap();
         assert_eq!(mcp_remove("m.json", &only_ours).unwrap(), None);
     }
 
     #[test]
     fn a_file_that_is_not_an_object_or_not_json_is_refused_rather_than_rewritten() {
-        assert!(mcp_set("m.json", Some("[1,2]"), &server_entry()).is_err());
-        assert!(mcp_set("m.json", Some("{oops"), &server_entry()).is_err());
-        assert!(mcp_set("m.json", Some(r#"{"mcpServers":7}"#), &server_entry()).is_err());
+        assert!(mcp_set("m.json", Some("[1,2]"), false).is_err());
+        assert!(mcp_set("m.json", Some("{oops"), false).is_err());
+        assert!(mcp_set("m.json", Some(r#"{"mcpServers":7}"#), false).is_err());
     }
 
     #[test]

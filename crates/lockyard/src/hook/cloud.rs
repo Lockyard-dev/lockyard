@@ -3,9 +3,9 @@
 use super::{Moment, Port, Tool, Verdict};
 use crate::agent::socket::AgentSocket;
 use crate::agent::wire::{Phase, Request};
-use lockyard_cloud_client::Call;
+use lockyard_cloud_client::{Call, CloudBackend, RepositoryTransport};
 use lockyard_core::proto::{CheckStatus, Event, Message};
-use lockyard_core::{Error, Result};
+use lockyard_core::{Backend, Error, Result};
 use serde_json::json;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -22,18 +22,56 @@ pub struct AgentPort {
     pub repository_confirmed: bool,
     pub attention: Vec<lockyard_core::proto::LostClaim>,
     pub claims: Vec<lockyard_core::proto::Claim>,
+    pub mail_truncated: bool,
 }
 
-/// Connects to the agent. `None` when none is running for this workspace.
-pub fn connect(url: &str, workspace: &str, root: PathBuf, tool: Tool) -> Option<AgentPort> {
-    let socket = AgentSocket::connect(
-        &crate::agent::socket_path_for(url, workspace),
-        url,
-        workspace,
-        SOCKET_TIMEOUT,
-    )?;
+/// Uses a matching-credential agent, or a bounded direct client for this session.
+pub(super) fn connect(
+    url: &str,
+    workspace: &str,
+    session: &str,
+    root: PathBuf,
+    tool: Tool,
+) -> Option<Box<dyn Port>> {
+    let deadline = std::time::Instant::now() + SOCKET_TIMEOUT;
+    let mut route =
+        crate::notifications::route(url, workspace, session, deadline, SOCKET_TIMEOUT).ok()?;
+    if let crate::notifications::Route::Agent(socket) = &route
+        && socket
+            .probe_hook_binding(
+                session,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            )
+            .unwrap_or(false)
+    {
+        route =
+            crate::notifications::route(url, workspace, session, deadline, SOCKET_TIMEOUT).ok()?;
+    }
     let repository = lockyard_core::config::Config::load(&root).ok()?.repository;
-    Some(AgentPort {
+    let socket = match route {
+        crate::notifications::Route::Agent(socket) => socket,
+        crate::notifications::Route::Direct(client) => {
+            let state_dir =
+                crate::notifications::state_dir(url, workspace, &client.credential_id()).ok()?;
+            crate::agent::private_dir(&state_dir).ok()?;
+            let transport = RepositoryTransport::new(
+                crate::notifications::DirectTransport {
+                    client: *client,
+                    deadline,
+                },
+                repository.as_deref(),
+            )
+            .ok()?;
+            return Some(Box::new(DirectPort {
+                backend: CloudBackend::new(transport, session),
+                root,
+                state_dir,
+                tool,
+                mail_truncated: false,
+            }));
+        }
+    };
+    Some(Box::new(AgentPort {
         socket,
         root,
         tool,
@@ -41,7 +79,117 @@ pub fn connect(url: &str, workspace: &str, root: PathBuf, tool: Tool) -> Option<
         repository_confirmed: false,
         attention: Vec::new(),
         claims: Vec::new(),
-    })
+        mail_truncated: false,
+    }))
+}
+
+/// A differently credentialed session cannot use the daemon's mail mirror or its
+/// reservations. Use the same authenticated backend as CLI/MCP with a total hook deadline.
+struct DirectPort {
+    backend: CloudBackend<RepositoryTransport<crate::notifications::DirectTransport>>,
+    root: PathBuf,
+    state_dir: PathBuf,
+    tool: Tool,
+    mail_truncated: bool,
+}
+
+impl Port for DirectPort {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn reminder_dir(&self) -> Option<PathBuf> {
+        Some(self.state_dir.clone())
+    }
+
+    fn check(&mut self, agent: &str, path: &str, now: i64) -> Result<Verdict> {
+        let checks = self.backend.check(agent, &[path.into()], None, now)?;
+        Ok(match checks.into_iter().next() {
+            Some(check) if check.status == CheckStatus::Held => check
+                .holder
+                .map_or(Verdict::Unknown, |holder| Verdict::Held(Box::new(holder))),
+            Some(check) if matches!(check.status, CheckStatus::Free | CheckStatus::Own) => {
+                Verdict::Free
+            }
+            _ => Verdict::Unknown,
+        })
+    }
+
+    fn unread(&mut self, agent: &str) -> Result<Option<i64>> {
+        self.backend.unread(agent).map(Some)
+    }
+
+    fn own_claims(&self, agent: &str, now: i64) -> Vec<lockyard_core::proto::Claim> {
+        self.backend
+            .claims(
+                &lockyard_core::proto::ClaimQuery {
+                    session: Some(agent.into()),
+                    path: None,
+                },
+                now,
+            )
+            .unwrap_or_default()
+    }
+
+    fn peek_mail(&mut self, agent: &str, now: i64) -> Result<Option<Vec<Message>>> {
+        self.backend
+            .peek_inbox(
+                agent,
+                lockyard_core::proto::InboxQuery {
+                    all: false,
+                    limit: 50,
+                },
+                now,
+            )
+            .map(|page| {
+                self.mail_truncated |= page.skipped > 0;
+                Some(page.messages)
+            })
+    }
+
+    fn take_mail(&mut self, agent: &str, limit: usize, now: i64) -> Result<Option<Vec<Message>>> {
+        let page = self.backend.peek_inbox(
+            agent,
+            lockyard_core::proto::InboxQuery {
+                all: false,
+                limit: 50,
+            },
+            now,
+        )?;
+        self.mail_truncated |= page.skipped > 0;
+        // peek_inbox filters seen rows after decoding the full retained server page.
+        let messages: Vec<_> = page.messages.into_iter().take(limit).collect();
+        let ids: Vec<_> = messages.iter().map(|mail| mail.id).collect();
+        let granted =
+            self.backend
+                .inbox_claim(agent, "hook", &ids, super::DELIVERY_LEASE_SECONDS, now)?;
+        Ok(Some(
+            messages
+                .into_iter()
+                .filter(|mail| granted.contains(&mail.id))
+                .collect(),
+        ))
+    }
+
+    fn mail_truncated(&self) -> bool {
+        self.mail_truncated
+    }
+
+    fn mark_seen(&mut self, agent: &str, ids: &[i64], now: i64) -> Result<()> {
+        self.backend.inbox_seen(agent, ids, now).map(|_| ())
+    }
+
+    fn report(&mut self, agent: &str, _moment: Moment, _written: Vec<String>) {
+        let _ = self.backend.heartbeat(
+            agent,
+            &lockyard_core::proto::PresenceBeat {
+                client: self.tool.name().into(),
+                cwd: Some(self.root.to_string_lossy().into()),
+                ..Default::default()
+            },
+            crate::now_ms(),
+        );
+    }
 }
 
 fn failed(error: io::Error) -> Error {
@@ -222,10 +370,15 @@ impl Port for AgentPort {
                 session: agent.into(),
             })
             .map_err(failed)?;
+        self.mail_truncated |= reply.mail_truncated;
         match reply.error {
             Some(error) => Err(error.into()),
             None => Ok(reply.messages),
         }
+    }
+
+    fn mail_truncated(&self) -> bool {
+        self.mail_truncated
     }
 
     fn report(&mut self, agent: &str, moment: Moment, written: Vec<String>) {

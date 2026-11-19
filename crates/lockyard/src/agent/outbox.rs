@@ -125,7 +125,7 @@ impl Outbox {
     /// Queues `call` durably. Returning means it will be sent, even after a crash.
     pub fn append(&self, call: Call) -> io::Result<u64> {
         let mut queue = self.lock();
-        let n = store(&mut queue, call)?;
+        let n = store(&self.dir, &mut queue, call)?;
         self.ready.notify_all();
         Ok(n)
     }
@@ -134,7 +134,7 @@ impl Outbox {
     pub fn append_waiting(&self, call: Call) -> io::Result<(u64, Receiver<Outcome>)> {
         let (sender, receiver) = channel();
         let mut queue = self.lock();
-        let n = store(&mut queue, call)?;
+        let n = store(&self.dir, &mut queue, call)?;
         queue.waiters.insert(n, sender);
         self.ready.notify_all();
         Ok((n, receiver))
@@ -197,6 +197,15 @@ impl Outbox {
 
     /// Removes the head after a final answer and tells whoever waits for it.
     pub fn finish(&self, n: u64, outcome: Outcome) -> io::Result<()> {
+        self.retire(n, outcome, true)
+    }
+
+    /// Drop the active queue entry after the transport durably parks the frozen write.
+    pub fn park_unknown(&self, n: u64, error: ClientError) -> io::Result<()> {
+        self.retire(n, Err(error), false)
+    }
+
+    fn retire(&self, n: u64, outcome: Outcome, log_refusal: bool) -> io::Result<()> {
         let mut queue = self.lock();
         let Some(index) = queue.pending.iter().position(|entry| entry.n == n) else {
             return Ok(());
@@ -230,7 +239,7 @@ impl Outbox {
             Some(waiter) => waiter.send(outcome).err().map(|failed| failed.0),
             None => Some(outcome),
         };
-        if let Some(outcome) = unheard {
+        if log_refusal && let Some(outcome) = unheard {
             log_rejection(&self.dir, &entry, &outcome);
         }
         truncated
@@ -259,7 +268,7 @@ impl Outbox {
     }
 }
 
-fn store(queue: &mut Queue, call: Call) -> io::Result<u64> {
+fn store(dir: &Path, queue: &mut Queue, call: Call) -> io::Result<u64> {
     let entry = Entry {
         n: queue.next,
         call,
@@ -268,7 +277,10 @@ fn store(queue: &mut Queue, call: Call) -> io::Result<u64> {
     line.push(b'\n');
     let size = line.len() as u64;
     if queue.bytes + size > MAX_QUEUE_BYTES {
-        return Err(io::Error::other("the outbox is full"));
+        compact_pending(dir, queue)?;
+        if queue.bytes + size > MAX_QUEUE_BYTES {
+            return Err(io::Error::other("the outbox is full"));
+        }
     }
     let written = queue
         .file
@@ -365,6 +377,32 @@ fn save_cursor(dir: &Path, through: u64) -> io::Result<()> {
     saved
 }
 
+fn compact_pending(dir: &Path, queue: &mut Queue) -> io::Result<()> {
+    let temporary = dir.join(format!(".outbox-{}.tmp", lockyard_cloud_client::ulid()));
+    let result = (|| {
+        let mut file = private_options()
+            .create_new(true)
+            .append(true)
+            .open(&temporary)?;
+        for entry in &queue.pending {
+            serde_json::to_writer(&mut file, entry).map_err(io::Error::other)?;
+            file.write_all(b"\n")?;
+        }
+        sync_file(&file)?;
+        let bytes = file.metadata()?.len();
+        // Keep the existing cursor and done markers until the queue is empty.
+        // Together with the compacted log they still preserve every assigned id.
+        lockyard_core::fsio::rename(&temporary, dir.join(QUEUE_FILE))?;
+        queue.file = file;
+        queue.bytes = bytes;
+        sync_directory(dir)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
 fn compact(dir: &Path, queue: &mut Queue) -> io::Result<()> {
     // Commit the high-water mark before destroying either source of completion IDs.
     // Every interrupted stage then leaves a cursor, log, or marker that prevents reuse.
@@ -448,6 +486,35 @@ mod tests {
     }
 
     const NOW: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn parked_queue_bytes_are_reclaimed_before_admission() {
+        let dir = private_tempdir();
+        let outbox = Outbox::open(dir.path()).unwrap();
+        let a = outbox.append(mail("parked")).unwrap();
+        let b = outbox.append(mail("pending")).unwrap();
+        outbox
+            .park_unknown(
+                a,
+                ClientError::Protocol(lockyard_cloud_client::Problem {
+                    code: "outcome_unknown".into(),
+                    detail: "fixture".into(),
+                    status: None,
+                    details: Value::Null,
+                }),
+            )
+            .unwrap();
+        outbox.lock().bytes = MAX_QUEUE_BYTES;
+        assert_eq!(outbox.append(mail("new")).unwrap(), b + 1);
+        drop(outbox);
+
+        let reopened = Outbox::open(dir.path()).unwrap();
+        assert_eq!(reopened.len(), 2);
+        let entry = reopened.head(NOW).unwrap();
+        assert_eq!(entry.n, b);
+        assert_eq!(body(&entry), "pending");
+        assert_eq!(reopened.rejected(), 0);
+    }
 
     #[test]
     fn entries_survive_a_restart_in_order_with_their_keys() {
