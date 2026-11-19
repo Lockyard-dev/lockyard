@@ -16,7 +16,7 @@
 mod mail_push;
 use super::outbox::Outbox;
 use super::private_dir;
-use super::wire::{AgentStatus, Envelope, Phase, Reply, Request, Source};
+use super::wire::{AgentStatus, CredentialProof, Envelope, Phase, Reply, Request, Source};
 use lockyard_cloud_client::{
     Call, Cancellation, ClientError, CloudBackend, RepositoryTransport, Transport, ulid,
 };
@@ -162,12 +162,22 @@ impl Default for Timing {
     }
 }
 
+/// Product as attested by the server for the service bearer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialProduct {
+    Agent,
+    Claude,
+    Unknown,
+}
+
 /// Where the process lives and what it serves.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub url: String,
     pub workspace: String,
     pub token_id: String,
+    pub credential_proof: Option<CredentialProof>,
+    pub credential_product: CredentialProduct,
     pub socket: PathBuf,
     pub state_root: PathBuf,
     pub timing: Timing,
@@ -443,6 +453,9 @@ fn write_class(call: &Call) -> WriteClass {
     }
 }
 
+type StatusKey = (String, Option<String>);
+type CachedStatus = (Instant, SystemTime, lockyard_core::StatusRead);
+
 struct Shared<T: Transport + 'static> {
     transport: Arc<T>,
     #[cfg(test)]
@@ -471,6 +484,7 @@ struct Shared<T: Transport + 'static> {
     repository_capabilities: Mutex<HashSet<String>>,
     status_reads: Mutex<StatusReads>,
     status_ready: Condvar,
+    status_cache: Mutex<HashMap<StatusKey, CachedStatus>>,
     status_pool_warm: Arc<AtomicBool>,
     /// Sessions whose caller-driven status read is on the network right now. That read fetches
     /// the unread count itself, so upkeep must not send a second inbox read for them.
@@ -630,7 +644,9 @@ fn status_failure(error: Error) -> Reply {
         ]
         .iter()
         .any(|cause| lower.contains(cause));
-    if transport_timeout {
+    if transport_timeout
+        || matches!(&error, Error::Cloud {code, status: Some(502..=504), ..} if code == "unavailable")
+    {
         return Reply::failed(ClientError::Transport(detail));
     }
     Reply::failed(ClientError::Protocol(lockyard_cloud_client::Problem {
@@ -1109,6 +1125,7 @@ impl<T: Transport + 'static> Shared<T> {
             .div_f64(10.0)
             .clamp(Duration::from_millis(25), Duration::from_millis(150));
         let network_budget = left.saturating_sub(reply_reserve);
+        let cache_key = (session.to_owned(), repository.map(str::to_owned));
         match backend.status_read(session, now_ms(), network_budget) {
             Ok(mut status) => {
                 self.observe_status_claims(
@@ -1146,8 +1163,18 @@ impl<T: Transport + 'static> Shared<T> {
                     }
                     status.open_mail = Some(snap.items);
                 }
-                let cached_unread = cached_unread.or_else(|| {
-                    if status.unread.is_some() {
+                let incomplete_unread =
+                    status.freshness["sections"]["unread"]["incomplete"] == true;
+                if incomplete_unread {
+                    // A successful but truncated inbox supersedes an older cached number.
+                    let mut view = self.write_view();
+                    let entry = view.unread.entry(session.to_string()).or_default();
+                    entry.generation += 1;
+                    entry.at = None;
+                    entry.wall_at = None;
+                }
+                let cached_unread = cached_unread.filter(|_| !incomplete_unread).or_else(|| {
+                    if incomplete_unread || status.unread.is_some() {
                         return None;
                     }
                     let view = self.read_view();
@@ -1204,13 +1231,73 @@ impl<T: Transport + 'static> Shared<T> {
                 if (registered_session || registered) && !cancellation.is_cancelled() {
                     self.nudge();
                 }
+                if !cancellation.is_cancelled() {
+                    let mut cache = self
+                        .status_cache
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    if cache.len() >= 64
+                        && !cache.contains_key(&cache_key)
+                        && let Some(key) = cache
+                            .iter()
+                            .min_by_key(|(_, (at, _, _))| *at)
+                            .map(|(key, _)| key.clone())
+                    {
+                        cache.remove(&key);
+                    }
+                    cache.insert(
+                        cache_key,
+                        (Instant::now(), SystemTime::now(), status.clone()),
+                    );
+                }
                 Reply {
                     status_read: Some(status),
                     source: Some(Source::Server),
                     ..Reply::default()
                 }
             }
-            Err(error) => status_failure(error),
+            Err(error) => {
+                let failure = status_failure(error);
+                if !matches!(failure.error, Some(ClientError::Transport(_))) {
+                    return failure;
+                }
+                let cache = self
+                    .status_cache
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let Some((saved, wall_saved, read)) = cache.get(&cache_key) else {
+                    return failure;
+                };
+                let elapsed = saved
+                    .elapsed()
+                    .max(wall_saved.elapsed().unwrap_or_default());
+                let age = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+                let mut status = read.clone();
+                status.freshness["transport"] = json!("agent");
+                status.freshness["source"] = json!("cached");
+                status.freshness["claims_cached"] = json!(true);
+                status.freshness["cache_age_ms"] = json!(age);
+                if let Some(sections) = status.freshness["sections"].as_object_mut() {
+                    for section in sections
+                        .values_mut()
+                        .filter(|section| section["available"] == true)
+                    {
+                        let previous = section["age_ms"].as_u64().unwrap_or(0);
+                        section["source"] = json!("cached");
+                        section["age_ms"] = json!(previous.saturating_add(age));
+                        section["stale"] = json!(true);
+                    }
+                }
+                if let Some(upper) = status.freshness["claims_server_time_upper_ms"].as_i64() {
+                    status.freshness["claims_server_time_upper_ms"] =
+                        json!(upper.saturating_add(i64::try_from(age).unwrap_or(i64::MAX)));
+                }
+                Reply {
+                    status_read: Some(status),
+                    source: Some(Source::View),
+                    ..Reply::default()
+                }
+            }
         }
     }
 
@@ -1779,6 +1866,9 @@ impl<T: Transport + 'static> Shared<T> {
             url: self.config.url.clone(),
             workspace: self.config.workspace.clone(),
             token_id: self.config.token_id.clone(),
+            requires_matching_token: Some(
+                self.config.credential_product != CredentialProduct::Agent,
+            ),
             mail_push_v1: self.mail_protocol.load(Ordering::Acquire) == 1,
             mail_protocol: match self.mail_protocol.load(Ordering::Acquire) {
                 -1 => None,
@@ -1812,7 +1902,33 @@ impl<T: Transport + 'static> Shared<T> {
         }
     }
 
+    fn accepts_credential(
+        &self,
+        expected: Option<&str>,
+        proof: Option<&CredentialProof>,
+        delegated: bool,
+    ) -> bool {
+        if self.config.credential_product != CredentialProduct::Agent {
+            return !delegated
+                && self
+                    .config
+                    .credential_proof
+                    .as_ref()
+                    .is_some_and(|required| proof == Some(required));
+        }
+        expected.is_none_or(|expected| expected == self.config.token_id)
+    }
+
     fn handle(self: &Arc<Self>, envelope: Envelope) -> Reply {
+        if !matches!(envelope.request, Request::Ping)
+            && !self.accepts_credential(
+                envelope.expected_token_id.as_deref(),
+                envelope.credential_proof.as_ref(),
+                envelope.delegated,
+            )
+        {
+            return Reply::failed(ClientError::Invalid("agent credential mismatch".into()));
+        }
         if !matches!(envelope.request, Request::Ping) && envelope.workspace != self.config.workspace
         {
             let text = format!("this agent serves workspace {:?}", self.config.workspace);
@@ -2246,6 +2362,11 @@ impl<T: Transport + 'static> Shared<T> {
     /// One thread keeps the view current, so a slow server delays nothing a hook waits for.
     fn upkeep(&self) {
         while !self.stopped() {
+            if let Err(error) = self.transport.maintain_pending()
+                && error.code() != Some("journal_busy")
+            {
+                eprintln!("lockyard agent: pending journal maintenance: {error}");
+            }
             #[cfg(test)]
             self.upkeep_cycles.fetch_add(1, Ordering::Relaxed);
             let half = self.timing().fresh / 2;
@@ -2322,6 +2443,16 @@ impl<T: Transport + 'static> Shared<T> {
                         .min(MAX_RETRY_AFTER);
                     self.outbox.defer(entry.n, delay);
                 }
+                Err(error)
+                    if error.code() == Some("outcome_unknown")
+                        && self.transport.write_is_parked(&call) =>
+                {
+                    if let Err(error) = self.outbox.park_unknown(entry.n, error) {
+                        eprintln!("lockyard agent: cannot park the outbox entry: {error}");
+                        self.outbox.defer(entry.n, pause);
+                    }
+                    pause = self.timing().retry_min;
+                }
                 Err(error @ ClientError::OutcomeUnknown(_)) => {
                     self.outbox.report_unknown(entry.n, error);
                     self.outbox.defer(entry.n, pause);
@@ -2381,13 +2512,22 @@ fn answer<T: Transport + 'static>(shared: &Arc<Shared<T>>, stream: UnixStream) -
         let reply = match serde_json::from_str::<Envelope>(&line) {
             Ok(Envelope {
                 workspace,
+                expected_token_id,
+                credential_proof,
+                delegated,
                 request:
                     Request::WaitZoneFree {
                         session,
                         path,
                         timeout_ms,
                     },
-            }) if workspace == shared.config.workspace => {
+            }) if workspace == shared.config.workspace
+                && shared.accepts_credential(
+                    expected_token_id.as_deref(),
+                    credential_proof.as_ref(),
+                    delegated,
+                ) =>
+            {
                 reader.get_ref().set_read_timeout(Some(STATUS_PEER_READ))?;
                 let reply = shared.wait_zone_free(&session, &path, timeout_ms, &mut || {
                     let mut byte = [0u8; 1];
@@ -2406,13 +2546,22 @@ fn answer<T: Transport + 'static>(shared: &Arc<Shared<T>>, stream: UnixStream) -
             }
             Ok(Envelope {
                 workspace,
+                expected_token_id,
+                credential_proof,
+                delegated,
                 request:
                     Request::WaitMail {
                         session,
                         since,
                         timeout_ms,
                     },
-            }) if workspace == shared.config.workspace => {
+            }) if workspace == shared.config.workspace
+                && shared.accepts_credential(
+                    expected_token_id.as_deref(),
+                    credential_proof.as_ref(),
+                    delegated,
+                ) =>
+            {
                 reader.get_ref().set_read_timeout(Some(STATUS_PEER_READ))?;
                 let reply = shared.wait_mail(&session, since, timeout_ms, &mut || {
                     let mut byte = [0u8; 1];
@@ -2433,13 +2582,22 @@ fn answer<T: Transport + 'static>(shared: &Arc<Shared<T>>, stream: UnixStream) -
             }
             Ok(Envelope {
                 workspace,
+                expected_token_id,
+                credential_proof,
+                delegated,
                 request:
                     Request::StatusRead {
                         session,
                         repository,
                         deadline_ms,
                     },
-            }) if workspace == shared.config.workspace => {
+            }) if workspace == shared.config.workspace
+                && shared.accepts_credential(
+                    expected_token_id.as_deref(),
+                    credential_proof.as_ref(),
+                    delegated,
+                ) =>
+            {
                 reader.get_ref().set_read_timeout(Some(STATUS_PEER_READ))?;
                 let mut disconnected = false;
                 let reply = shared.status_read_with_peer(
@@ -2614,6 +2772,7 @@ impl<T: Transport + 'static> Daemon<T> {
             session_events: Mutex::new(HashMap::new()),
             repository_capabilities: Mutex::new(HashSet::new()),
             status_reads: Mutex::new(StatusReads::default()),
+            status_cache: Mutex::new(HashMap::new()),
             status_ready: Condvar::new(),
             status_pool_warm: Arc::new(AtomicBool::new(false)),
             status_network_sessions: Mutex::new(HashMap::new()),
@@ -2765,7 +2924,13 @@ impl<T: Transport + 'static> Daemon<T> {
     /// Handles one request without a socket.
     fn handle(&self, request: Request) -> Reply {
         let workspace = self.shared.config.workspace.clone();
-        self.shared.handle(Envelope { workspace, request })
+        self.shared.handle(Envelope {
+            workspace,
+            expected_token_id: None,
+            credential_proof: None,
+            delegated: false,
+            request,
+        })
     }
 }
 
@@ -2873,6 +3038,7 @@ mod tests {
     /// An in-memory server that can go down, hang or be made to refuse.
     #[derive(Default)]
     struct FakeServer {
+        pending_maintenance: AtomicUsize,
         claims: Mutex<Vec<Value>>,
         queue: Mutex<Vec<Value>>,
         requests: Mutex<Vec<Value>>,
@@ -2881,6 +3047,7 @@ mod tests {
         lost_read_gate: Mutex<Option<LostReadGate>>,
         busy_mail_claim_gate: Mutex<Option<LostReadGate>>,
         unread: Mutex<i64>,
+        inbox_override: Mutex<Option<Value>>,
         events: Mutex<Vec<Value>>,
         writes: Mutex<Vec<Call>>,
         down: AtomicBool,
@@ -2972,6 +3139,10 @@ mod tests {
     }
 
     impl Transport for FakeServer {
+        fn maintain_pending(&self) -> Result<(), ClientError> {
+            self.pending_maintenance.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
         fn mail_open_v1(&self, _session: &str) -> Result<bool, ClientError> {
             Ok(self.mail_open_v1.load(Ordering::SeqCst))
         }
@@ -3113,6 +3284,9 @@ mod tests {
                     Ok(json!({"items": []}))
                 }
                 "/api/v1/bus/inbox" => {
+                    if let Some(page) = self.inbox_override.lock().unwrap().clone() {
+                        return Ok(page);
+                    }
                     let unread = *self.unread.lock().unwrap();
                     let messages: Vec<Value> = (1..=unread)
                         .map(|id| json!({"id": id, "body": "hi"}))
@@ -3165,6 +3339,8 @@ mod tests {
             url: "https://example.test".into(),
             workspace: "team".into(),
             token_id: "t".into(),
+            credential_proof: None,
+            credential_product: CredentialProduct::Agent,
             socket: dir.join("run/agent.sock"),
             state_root: dir.join("state"),
             timing,
@@ -4053,6 +4229,9 @@ mod tests {
             "{}",
             serde_json::to_string(&Envelope {
                 workspace: "team".into(),
+                expected_token_id: None,
+                credential_proof: None,
+                delegated: false,
                 request: status_read(session, deadline_ms),
             })
             .unwrap()
@@ -4391,6 +4570,9 @@ mod tests {
             "{}",
             serde_json::to_string(&Envelope {
                 workspace: "team".into(),
+                expected_token_id: None,
+                credential_proof: None,
+                delegated: false,
                 request: Request::Ping
             })
             .unwrap()
@@ -4443,6 +4625,23 @@ mod tests {
             rig.daemon.shared.signal().nudged,
             "a successful live answer starts normal upkeep"
         );
+    }
+
+    #[test]
+    fn mail_status_truncated_snapshot_invalidates_an_older_unread_count() {
+        let mut rig = start_with(timing(), |_| {});
+        rig.daemon.stop_workers();
+        rig.daemon.shared.store_unread("me", 0, 7);
+        rig.daemon.shared.mark_unread_dirty("me");
+        *rig.server.inbox_override.lock().unwrap() = Some(json!({
+            "messages":[{"id":1,"reader_state":"seen","seen_at":123}],"skipped":1
+        }));
+        let reply = rig.daemon.handle(status_read("me", 1000));
+        assert!(reply.error.is_none(), "{:?}", reply.error);
+        let read = reply.status_read.unwrap();
+        assert_eq!(read.unread, None);
+        assert_eq!(read.freshness["sections"]["unread"]["incomplete"], true);
+        assert_eq!(rig.daemon.shared.unread("me").unread, None);
     }
 
     #[test]
@@ -5004,6 +5203,14 @@ mod tests {
             .store(false, Ordering::SeqCst);
         assert!(rig.daemon.handle(probe("web")).error.is_none());
         assert_eq!(rig.server.namespace_probes.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn ly0030_upkeep_maintains_pending_without_client_requests() {
+        let rig = start_with(timing(), |_| {});
+        wait_for("periodic pending maintenance", || {
+            rig.server.pending_maintenance.load(Ordering::SeqCst) >= 2
+        });
     }
 
     #[test]
@@ -5706,15 +5913,20 @@ mod tests {
 
     #[test]
     fn disconnected_write_survives_agent_restart_and_replays_exact_wire_operation() {
-        unknown_wire_operation_survives_restart(false);
+        unknown_wire_operation_survives_restart(false, true);
     }
 
     #[test]
     fn unrecognized_server_error_survives_agent_restart_and_keeps_original_operation() {
-        unknown_wire_operation_survives_restart(true);
+        unknown_wire_operation_survives_restart(true, true);
     }
 
-    fn unknown_wire_operation_survives_restart(initial_server_error: bool) {
+    #[test]
+    fn unanchored_outbox_write_does_not_block_new_mail_from_the_same_session() {
+        unknown_wire_operation_survives_restart(false, false);
+    }
+
+    fn unknown_wire_operation_survives_restart(initial_server_error: bool, anchored: bool) {
         use lockyard_cloud_client::{Client, WorkspaceKey};
         use std::net::TcpListener;
 
@@ -5798,8 +6010,13 @@ mod tests {
                 } else {
                     json!({"claims":[],"queue":[],"requests":[],"lost":[],"messages":[]})
                 }.to_string();
+                let date = if anchored {
+                    "Date: Thu, 12 Nov 2026 10:21:00 GMT\r\n"
+                } else {
+                    ""
+                };
                 let reply = format!(
-                    "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nLockyard-Protocol: 2\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nLockyard-Protocol: 2\r\n{date}Connection: close\r\n\r\n{}",
                     response.len(),
                     response
                 );
@@ -5843,6 +6060,42 @@ mod tests {
             reply.error.as_ref().and_then(ClientError::code),
             Some("outcome_unknown")
         );
+        if !anchored {
+            wait_for("parked write to leave the active outbox", || {
+                daemon.shared.outbox.len() == 0
+            });
+            let pending = client.pending_operation(&key).unwrap();
+            assert!(pending.replay_paused);
+            assert_eq!(daemon.shared.outbox.rejected(), 0);
+            drop(daemon);
+            drop(client);
+
+            let restored = Arc::new(make_client());
+            let again = Daemon::start(config, Arc::clone(&restored)).unwrap();
+            let mut next = call.clone();
+            next.key = Some(ulid());
+            let next_key = next.key.clone().unwrap();
+            let reply = again.handle(Request::Call { call: next });
+            assert_eq!(reply.value.unwrap()["id"], 7);
+            wait_for("new mail to leave the active outbox", || {
+                again.shared.outbox.len() == 0
+            });
+            assert_eq!(restored.pending_operation(&key).unwrap().body, pending.body);
+            assert_eq!(
+                writes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.0.clone())
+                    .collect::<Vec<_>>(),
+                [key, next_key]
+            );
+            assert_eq!(again.shared.outbox.rejected(), 0);
+            drop(again);
+            stop.store(true, Ordering::SeqCst);
+            server.join().unwrap();
+            return;
+        }
         daemon.stop_workers();
         assert_eq!(daemon.shared.outbox.len(), 1, "unknown is still queued");
         assert_eq!(
@@ -6486,6 +6739,9 @@ mod tests {
         let mut stream = UnixStream::connect(&rig.daemon.shared.config.socket).unwrap();
         let envelope = Envelope {
             workspace: "team".into(),
+            expected_token_id: None,
+            credential_proof: None,
+            delegated: false,
             request: Request::Touch {
                 session: "alice".into(),
                 client: "test".into(),
@@ -6525,6 +6781,9 @@ mod tests {
         );
         let wrong = rig.daemon.shared.handle(Envelope {
             workspace: "other".into(),
+            expected_token_id: None,
+            credential_proof: None,
+            delegated: false,
             request: check("me", "src"),
         });
         assert!(matches!(wrong.error, Some(ClientError::Invalid(_))));
@@ -6737,6 +6996,9 @@ mod tests {
         call.deadline_ms = Some(200);
         let env = Envelope {
             workspace: "team".into(),
+            expected_token_id: None,
+            credential_proof: None,
+            delegated: false,
             request: Request::Call { call },
         };
         serde_json::to_writer(&mut writer, &env).unwrap();

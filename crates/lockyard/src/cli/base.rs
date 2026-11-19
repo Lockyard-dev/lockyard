@@ -8,6 +8,9 @@ pub(super) struct Cli {
     /// Name of this agent. Defaults to LOCKYARD_AGENT, then CLAUDE_CODE_SESSION_ID.
     #[arg(long, global = true)]
     pub(super) agent: Option<String>,
+    /// Read the cloud key from this private file; implies cloud mode.
+    #[arg(long, global = true)]
+    pub(super) token_file: Option<PathBuf>,
     /// Print JSON instead of text.
     #[arg(long, global = true)]
     pub(super) json: bool,
@@ -73,7 +76,16 @@ pub(super) enum Command {
     /// Configure agent tools, or inspect a named client's managed integration.
     Setup(SetupArgs),
     /// Check project readiness; optional client or smoke diagnostics are read-only.
+    /// Explain CLI and MCP Claude-key selection without credential values.
     Doctor {
+        /// Reconcile retained writes using their original keys and safe state reads.
+        #[arg(long, conflicts_with_all = ["node_config", "client", "smoke", "forget_unknown"])]
+        repair_pending: bool,
+        /// Archive one unknown operation by id, or all with --all. Requires --confirm.
+        #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["node_config", "client", "smoke"])]
+        forget_unknown: Option<String>,
+        #[arg(long, requires = "forget_unknown")]
+        confirm: bool,
         /// Inspect Linux execution enforcement for this node configuration.
         #[arg(long)]
         node_config: Option<PathBuf>,
@@ -118,6 +130,10 @@ pub(super) enum Command {
         path: Option<String>,
     },
     /// Run the MCP server over standard input and output.
+    /// For a Claude session UUID, enable its key with LOCKYARD_CLAUDE_MCP=1 in
+    /// Claude Code .mcp.json at mcpServers.lockyard.env. Explicit token files and
+    /// LOCKYARD_PARENT_CLAIM disable automatic Claude selection, as does a
+    /// Codex or Cursor environment. CLAUDE_CODE_SESSION_ID must match the agent name.
     Mcp(McpArgs),
 }
 

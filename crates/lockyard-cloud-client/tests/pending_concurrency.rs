@@ -27,10 +27,12 @@ fn survey_wait_call(deadline: u64) -> Call {
 fn survey_prime(server: &Server, journal: &Journal) {
     let mut call = Call::write("me", "POST", "/api/v1/presence".into(), json!({}));
     call.deadline_ms = Some(500);
-    assert_eq!(
-        server.client(journal).call(&call).unwrap_err().code(),
-        Some("rate_limited")
-    );
+    let client = server.client(journal);
+    assert_eq!(client.call(&call).unwrap_err().code(), Some("rate_limited"));
+    // This is only a transport warmup, not an orphan that startup must reconcile.
+    client
+        .resolve_pending(call.key.as_deref().unwrap())
+        .unwrap();
 }
 
 #[test]
@@ -304,7 +306,7 @@ impl Drop for Server {
 fn write_reply(stream: &mut TcpStream, status: u16, value: Value) {
     let body = value.to_string();
     let response = format!(
-        "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nLockyard-Protocol: 2\r\nRetry-After: 2\r\n\r\n{body}",
+        "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nLockyard-Protocol: 2\r\nDate: Thu, 12 Nov 2026 10:21:00 GMT\r\nRetry-After: 2\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();
@@ -390,6 +392,32 @@ fn concurrent_retry(same_client: bool) {
     let key = call.key.as_deref().unwrap();
     let original = seed.pending_operation(key).unwrap();
     assert!(original.pre_execution_rejected);
+    // Attach both contenders while the journal is owned, so the test starts with
+    // a pending refusal rather than letting startup reconcile it first.
+    let scope = std::fs::read_dir(&journal.0)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Mirror the production journal lock: the directory itself on Unix, `.journal.lock` on Windows.
+    #[cfg(unix)]
+    let held = std::fs::File::open(scope).unwrap();
+    #[cfg(not(unix))]
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(scope.join(".journal.lock"))
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+    }
+    #[cfg(not(unix))]
+    held.lock().unwrap();
     drop(seed);
 
     let first_client = Arc::new(server.client(&journal));
@@ -398,6 +426,7 @@ fn concurrent_retry(same_client: bool) {
     } else {
         Arc::new(server.client(&journal))
     };
+    drop(held);
     // The first network operation stays held while the second caller starts. This puts the
     // durable marker in its unknown/in-flight state before the contender inspects it.
     call.deadline_ms = Some(10_000);

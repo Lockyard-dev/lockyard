@@ -74,11 +74,11 @@ impl ToolRegistry {
         let flag = json!({"type":"boolean"});
         let names = json!({"type":"array","items":{"type":"string"}});
         let task_identifier = canonical_task_schema();
-        let ttl_minutes = json!({"type":"integer","minimum":1,"maximum":240,"description":"Lease length in minutes, from 1 through 240."});
+        let ttl_minutes = json!({"type":"integer","minimum":1,"maximum":240,"description":"ttl is an integer number of minutes, from 1 through 240."});
         for wire in [
             tool_def(
                 "start_work",
-                "Claim workspace-root paths (absolute accepted); optional shared sets mode. ttl: minutes. Without hold_reason, idle file claims release after 20 minutes. Accept handover_id or a task.",
+                "Claim workspace-root paths (absolute accepted); optional shared sets mode. ttl: integer minutes. Without hold_reason, idle file claims release after 20 minutes. Accept handover_id or a task.",
                 json!({"paths": names, "note": text, "ttl": ttl_minutes, "shared": flag, "zones": names, "task": task_identifier, "handover_id": int, "meta": {"type":"object"},
                     "hold_reason": {"type":"string","description":"Why the claim must be held while idle; without hold_until, hold until the claim expires."},
                     "hold_until": {"type":"string","format":"date-time","description":"RFC 3339 hold deadline; requires hold_reason."}}),
@@ -86,8 +86,8 @@ impl ToolRegistry {
             ),
             tool_def(
                 "update",
-                "Read mail; to+body sends, reply_to+body replies; urgent wakes; handled closes. Group addresses supported.",
-                json!({"to": {"type":"string","description":"Session, *, all, все, everyone, @claude/@cursor/@codex, @zone:key, or @path:path."}, "body": text, "urgent": flag, "reply_to": {"type":"integer","description":"Reply in this thread; exclusive with to. Server 579d557 does not persist the reply sender label."}, "handled": {"type":"array","items":{"type":"integer","minimum":1},"description":"Close messages for this reader; requires server capability mail_handled_v1, checked before sending; independent of read receipts"}, "peek": flag, "all": flag}),
+                "Read mail; text is body. to+body sends; reply_to+body replies; urgent wakes; handled closes.",
+                json!({"to": {"type":"string","description":"Session, *, all, все, everyone, @claude/@cursor/@codex, @zone:key, or @path:path."}, "body": {"type":"string","description":"Message text; use body, not message."}, "urgent": flag, "reply_to": {"type":"integer","description":"Reply in this thread; exclusive with to. Server 579d557 does not persist the reply sender label."}, "handled": {"type":"array","items":{"type":"integer","minimum":1},"description":"Close messages for this reader; requires server capability mail_handled_v1, checked before sending; independent of read receipts"}, "peek": flag, "all": flag}),
                 &[],
             ),
             tool_def(
@@ -155,6 +155,31 @@ impl ToolRegistry {
         Self { definitions }
     }
 
+    pub(super) fn validate_fields(&self, name: &str, args: &Value) -> Result<()> {
+        if !matches!(name, "update" | "start_work" | "zone_renew") {
+            return Ok(());
+        }
+        let Some(definition) = self.definitions.iter().find(|d| d.wire["name"] == name) else {
+            return Ok(());
+        };
+        let properties = &definition.wire["inputSchema"]["properties"];
+        if let Some(args) = args.as_object() {
+            for key in args.keys() {
+                if properties.get(key).is_none() {
+                    let correct = if name == "update" {
+                        "body for message text"
+                    } else {
+                        "ttl, an integer number of minutes (1-240)"
+                    };
+                    return Err(Error::Invalid(format!(
+                        "unknown field {key}; use {correct}; see the {name} input schema"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn handler(&self, name: &str) -> Option<ToolHandler> {
         self.definitions
             .iter()
@@ -176,10 +201,10 @@ impl ToolRegistry {
             .map(|definition| {
                 let mut wire = definition.wire.clone();
                 if surface == Surface::Compact && wire["name"].as_str().unwrap() == "zone_renew" {
-                    wire["description"] = json!("Renew your claim; ttl: minutes (1-240, default 30); fence is filled from status when owned.");
+                    wire["description"] = json!("Renew own claim; ttl: integer minutes (1-240, default 30); fence is filled from status.");
                     wire["inputSchema"]["properties"]["ttl"] = json!({
                         "type": "integer", "minimum": 1, "maximum": 240, "default": 30,
-                        "description": "Optional lease length in minutes, from 1 through 240; defaults to 30."
+                        "description": "Integer minutes (1-240), default 30."
                     });
                 }
                 wire
@@ -535,8 +560,8 @@ fn primitive_definitions() -> Vec<Value> {
         tool_def("zone_catalog", "Show the zone catalog", json!({}), &[]),
         tool_def(
             "zone_renew",
-            "Renew own claims; ttl is minutes (1-240, default 30); omitted fence is read from your current claims.",
-            json!({"id": int, "ttl": int, "hold_reason": text, "hold_until": text, "fence": int}),
+            "Renew own claims; ttl is an integer number of minutes (1-240, default 30); hold_reason without hold_until holds for 240 minutes from now; omitted fence is read from your current claims.",
+            json!({"id": int, "ttl": {"type":"integer","description":"Integer minutes (1-240), default 30."}, "hold_reason": {"type":"string","description":"Idle hold reason; without hold_until, extend holding to 240 minutes from now."}, "hold_until": text, "fence": int}),
             &[],
         ),
         tool_def(

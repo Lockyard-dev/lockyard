@@ -500,7 +500,7 @@ fn completed_result_publication_uses_saved_bytes_and_durable_receipt() {
             }
             if headers.starts_with("GET /api/v1/protocol ") {
                 let body = serde_json::json!({"selected_protocol":2,"min_protocol":1,"max_protocol":2,"capabilities":["signed_results_v1"]}).to_string();
-                write!(stream,"HTTP/1.1 200 OK\r\nLockyard-Protocol: 2\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                write!(stream,"HTTP/1.1 200 OK\r\nLockyard-Protocol: 2\r\nDate: Thu, 12 Nov 2026 10:21:00 GMT\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
             } else {
                 assert!(headers.starts_with("PUT /api/v1/nodes/worker/jobs/"));
                 let length = headers
@@ -655,7 +655,7 @@ fn expired_result_replay_persists_receipt_before_ack_and_survives_crash() {
                 let body = serde_json::json!({"selected_protocol":2,"min_protocol":1,
                     "max_protocol":2,"capabilities":["signed_results_v1"]})
                 .to_string();
-                write!(stream, "HTTP/1.1 200 OK\r\nLockyard-Protocol: 2\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                write!(stream, "HTTP/1.1 200 OK\r\nLockyard-Protocol: 2\r\nDate: Thu, 12 Nov 2026 10:21:00 GMT\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                 continue;
             }
             assert!(headers.starts_with("PUT /api/v1/nodes/worker/jobs/"));

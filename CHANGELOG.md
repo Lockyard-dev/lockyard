@@ -5,6 +5,28 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.16] - 2026-11-19
+
+- Route mail waits and cloud hooks with the session's selected credential; keep
+  direct long-poll wake cursors separate across credentials, servers and workspaces.
+- Keep operations without replay proof in a private unknown journal outside
+  the active write budget. Reconcile with `doctor --repair-pending` or archive
+  selected records with `doctor --forget-unknown <id|--all> --confirm`.
+- Bind tokenless service access to the authenticated agent credential product.
+  Offline status marks the last available service snapshot with its cache age.
+- Carry Claude session product identity through CLI, MCP and forwarded cloud requests.
+- Require `LOCKYARD_CLAUDE_MCP=1` in Claude Code's `.mcp.json` under
+  `mcpServers.lockyard.env` for automatic MCP Claude-key selection. A resolved session UUID
+  is required; a set `CLAUDE_CODE_SESSION_ID` must match. Explicit token files and parent
+  claims disable it. CLI selection still requires the matching nonempty session variable.
+  Help and doctor explain the marker and selection reasons without credential values;
+  CLI/MCP retain the shared agent-key fallback for `session_name_bound`.
+- Keep MCP status claims and tasks available when the optional mail counter fails;
+  return `unread: null` with `unread_unavailable: true` instead of failing the tool.
+- Protect agent key files with private atomic token output and session recovery guidance.
+- Clarify MCP body/TTL fields, idle release deadlines and hold renewal.
+- Explain sandbox network failures and distinguish upstream maintenance from protocol errors.
+
 ## [0.3.15] - Unreleased
 
 ### Added

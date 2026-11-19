@@ -13,10 +13,10 @@ use serde_json::Value;
 use std::fmt;
 
 /// Reads a JSON null as an empty list: the server stores absent labels as null.
-fn null_is_empty<'de, D: Deserializer<'de>>(
+fn null_is_empty<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
     reader: D,
-) -> std::result::Result<Vec<String>, D::Error> {
-    Ok(Option::<Vec<String>>::deserialize(reader)?.unwrap_or_default())
+) -> std::result::Result<Vec<T>, D::Error> {
+    Ok(Option::<Vec<T>>::deserialize(reader)?.unwrap_or_default())
 }
 
 /// Days from 1970-01-01 to a civil date.
@@ -158,6 +158,13 @@ pub struct Claim {
     pub paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_paths: Vec<String>,
+    /// Compatibility JSON supplied by the server for contended paths and holders.
+    #[serde(
+        default,
+        deserialize_with = "null_is_empty",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub conflicts: Vec<Value>,
     #[serde(default)]
     pub mode: ClaimMode,
     #[serde(default)]
@@ -199,6 +206,49 @@ pub struct Claim {
     /// Dirty paths of other sessions inside this claim.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub foreign_dirty_paths: Vec<DirtyPath>,
+}
+
+impl Claim {
+    /// A partial grant remains usable, but its exclusions must be visible to the caller.
+    pub fn excluded_paths_warning(&self) -> Option<String> {
+        if self.excluded_paths.is_empty() {
+            return None;
+        }
+        let mut warning = format!("Заявка Z-{} создана с исключениями:", self.id);
+        for path in &self.excluded_paths {
+            warning.push_str(&format!("\n- {path}"));
+            let excluded = crate::paths::ZonePath::stored(path.clone());
+            for conflict in &self.conflicts {
+                let matches = ["path", "held_path"]
+                    .iter()
+                    .filter_map(|key| conflict[*key].as_str())
+                    .chain(
+                        conflict["paths"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str),
+                    )
+                    .any(|held| {
+                        crate::paths::ZonePath::stored(held.into()).overlaps_with_case(
+                            &excluded,
+                            self.case_insensitive_paths.unwrap_or(true),
+                        )
+                    });
+                if matches
+                    && let Some(holder) = conflict["session"]
+                        .as_str()
+                        .or_else(|| conflict["agent"].as_str())
+                        .or_else(|| conflict["holder"].as_str())
+                        .filter(|holder| !holder.is_empty())
+                {
+                    warning.push_str(&format!(" (держатель: {holder})"));
+                }
+            }
+        }
+        warning.push_str("\nЭти пути не твои — подожди или напиши держателю.");
+        Some(warning)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]

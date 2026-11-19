@@ -814,7 +814,14 @@ fn cli_status_json_keeps_its_fields_and_does_not_request_lost_claims() {
             // Scripted cloud has no zone_requests → unknown, never an empty array.
             assert!(out.json.get("incoming_requests").is_none(), "{}", out.json);
             assert_eq!(out.json["incoming_requests_unknown"], true);
-            expected.extend(["offers", "work", "freshness", "incoming_requests_unknown"]);
+            // 0.3.16: the category of the selected key (claude / agent / explicit file), never its value.
+            expected.extend([
+                "offers",
+                "work",
+                "freshness",
+                "incoming_requests_unknown",
+                "token_source",
+            ]);
             expected.sort_unstable();
         } else {
             assert!(out.json.get("incoming_requests").is_none(), "{}", out.json);
@@ -1067,7 +1074,7 @@ workspace = "team"
 "#,
     )
     .unwrap();
-    let out = no_cloud_access_output(root)
+    let out = no_cloud_access_output(root, None)
         .unwrap()
         .expect("cloud without token");
     assert_eq!(out.exit, EXIT_NO_CLOUD_ACCESS);

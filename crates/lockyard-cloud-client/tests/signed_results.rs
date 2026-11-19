@@ -103,7 +103,7 @@ fn fixture() -> (String, Arc<Mutex<State>>, std::thread::JoinHandle<()>) {
                     )
                 }
             };
-            write!(stream, "HTTP/1.1 {status} Reply\r\nLockyard-Protocol: 2\r\nContent-Type: {content_type}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+            write!(stream, "HTTP/1.1 {status} Reply\r\nLockyard-Protocol: 2\r\nDate: Thu, 12 Nov 2026 10:21:00 GMT\r\nContent-Type: {content_type}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
             stream.write_all(&response).unwrap();
         }
     });
@@ -144,7 +144,10 @@ fn signed_result_reconnects_after_proven_replica_refusal_with_frozen_bytes() {
         }
         first.replay_signed_result(&pending.key).unwrap();
         let state = state.lock().unwrap();
-        assert_eq!(state.discoveries, 2, "{code} must refresh discovery");
+        assert_eq!(
+            state.discoveries, 3,
+            "{code} must refresh discovery and check the server clock"
+        );
         assert_eq!(state.puts, 2);
         assert_eq!(
             state.stored.as_ref(),
@@ -490,8 +493,7 @@ fn publication_refusal_and_retry_after_survive_restart_without_automatic_resend(
             );
         }
         if code == "credential_revoked" {
-            restored.quarantine_signed_result(&pending.key).unwrap();
-            assert!(restored.pending_operations().is_empty());
+            assert_eq!(restored.pending_operations().len(), 1);
             drop(restored);
             let restored = client(&url, directory.path());
             assert_eq!(
@@ -499,7 +501,7 @@ fn publication_refusal_and_retry_after_survive_restart_without_automatic_resend(
                     .put_signed_result("worker", "worker", &job, DOCUMENT, expiry)
                     .unwrap_err()
                     .code(),
-                Some("outcome_unknown")
+                Some("credential_revoked")
             );
             assert_eq!(state.lock().unwrap().puts, 1);
         }

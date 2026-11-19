@@ -32,6 +32,7 @@ const DEFAULT_TARGET: &str = "code_accepted";
 const DEFAULT_AREA: &str = "general";
 /// The server keeps at most this many unread messages per addressee and refuses a larger page.
 const INBOX_PAGE: usize = 50;
+pub(crate) const UNREAD_TRUNCATED: &str = "unread count unknown: inbox truncated";
 /// The protocol requires a lifetime on every board value.
 const DEFAULT_BOARD_MINUTES: i64 = 24 * 60;
 /// The kind of a message that names none: mail stays seven days, as it does in local mode.
@@ -178,6 +179,10 @@ impl<T: Transport> CloudBackend<T> {
         }
     }
 
+    pub(crate) fn call_cloud(&self, call: &Call) -> std::result::Result<Value, ClientError> {
+        self.transport.call(call)
+    }
+
     pub fn with_zone_stream_allowed(mut self, allowed: bool) -> Self {
         self.zone_stream_allowed = allowed;
         self
@@ -194,7 +199,7 @@ impl<T: Transport> CloudBackend<T> {
         let ms = budget.as_millis().max(1).min(u64::MAX as u128) as u64;
         call.deadline_ms = Some(ms);
         call.attempt_timeout_ms = Some(ms);
-        let rows = checks(self.transport.call(&call)?)?;
+        let rows = checks(self.call_cloud(&call)?)?;
         match rows.as_slice() {
             [row] => match row.status {
                 CheckStatus::Free | CheckStatus::Own => Ok(true),
@@ -270,7 +275,7 @@ impl<T: Transport> CloudBackend<T> {
                 format!("/api/v1/events?after={after}&session={}", encode(agent)),
             );
             call.deadline_ms = Some(left.as_millis().max(1).min(u64::MAX as u128) as u64);
-            let value = self.transport.call(&call)?;
+            let value = self.call_cloud(&call)?;
             let events: Vec<lockyard_core::proto::Event> = list(value, &["events", "items"])?;
             let head = events.iter().map(|event| event.seq).max().unwrap_or(after);
             if head <= after {
@@ -397,7 +402,7 @@ impl<T: Transport> CloudBackend<T> {
             }
             call.attempt_timeout_ms = Some(ms);
         }
-        Ok(self.transport.call(&call)?)
+        Ok(self.call_cloud(&call)?)
     }
 
     fn post(&self, session: &str, path: String, body: &impl Serialize) -> Result<Value> {
@@ -638,7 +643,7 @@ impl<T: Transport> CloudBackend<T> {
         if let Some(key) = &self.write_idempotency_key {
             call.key = Some(key.clone());
         }
-        let result = self.transport.call(&call);
+        let result = self.call_cloud(&call);
         let result = match result {
             Err(ClientError::OutcomeUnknown(_))
                 if call.method == "POST"
@@ -648,7 +653,7 @@ impl<T: Transport> CloudBackend<T> {
                         .as_ref()
                         .is_some_and(|body| body["client_key"].is_string()) =>
             {
-                self.transport.call(&call)
+                self.call_cloud(&call)
             }
             result => result,
         };
@@ -694,12 +699,46 @@ pub(crate) fn inbox_page(value: Value) -> std::result::Result<InboxPage, ClientE
     })
 }
 
+fn selected_inbox_page(mut value: Value, all: bool) -> std::result::Result<InboxPage, ClientError> {
+    // Keep default reads new-only even while talking to a server that still
+    // returns seen mail. Explicit all/open reads preserve the complete selection.
+    if !all {
+        let messages = if value.is_array() {
+            value.as_array_mut()
+        } else if value.get("messages").is_some() {
+            value.get_mut("messages").and_then(Value::as_array_mut)
+        } else {
+            value.get_mut("items").and_then(Value::as_array_mut)
+        };
+        if let Some(messages) = messages {
+            messages.retain(|message| {
+                !matches!(message["reader_state"].as_str(), Some("seen" | "handled"))
+                    && ["seen_at", "acked_at", "replied_at"]
+                        .iter()
+                        .all(|field| message[*field].is_null())
+            });
+        }
+    }
+    inbox_page(value)
+}
+
+/// Exact new-mail count only when all retained rows can be classified.
+pub(crate) fn new_mail_count(value: Value) -> Result<i64> {
+    let page = selected_inbox_page(value, false)?;
+    // Server 2ca693e skips rows before projecting reader marks, including seen mail.
+    // Those omitted rows cannot be classified or paged back through this endpoint.
+    if page.skipped > 0 {
+        return Err(Error::Unavailable(UNREAD_TRUNCATED.into()));
+    }
+    Ok(i64::try_from(page.messages.len()).unwrap_or(i64::MAX))
+}
+
 /// Reads one line of `msg sent` from the server.
 ///
 /// An unknown status is reported as it came rather than being rounded down to `sent`: a sender
 /// deciding whether to nudge is worse off with a confident wrong answer than with a strange one.
 fn receipt_from(value: &Value) -> bus::Receipt {
-    let stamp = |name: &str| value.get(name).and_then(Value::as_i64);
+    let stamp = |name: &str| value[name].as_i64().or_else(|| millis(value, name));
     let status = value.get("status").and_then(Value::as_str).unwrap_or("");
     let reply_to = value
         .get("reply_to")
@@ -712,11 +751,11 @@ fn receipt_from(value: &Value) -> bus::Receipt {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        body: value
-            .get("body")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        body: if status == "failed" {
+            String::new()
+        } else {
+            text(value, "body").to_owned()
+        },
         created_at: stamp("created_at").unwrap_or_default(),
         reply_to,
         status: match status {
@@ -1142,7 +1181,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
         call.long_poll = request
             .queue_wait_seconds
             .is_some_and(|seconds| seconds > 0);
-        let reply = self.transport.call(&call)?;
+        let reply = self.call_cloud(&call)?;
         // Only the POST outcome is evidence. Stored meta and GET snapshots cannot
         // distinguish concurrent same-session reuse from a newly created lease.
         let created = reply.get("created").and_then(Value::as_bool);
@@ -1275,7 +1314,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
         if let (Some(fence), Some(body)) = (fence, call.body.as_mut()) {
             body["fence"] = json!(fence);
         }
-        Ok(checks(self.transport.call(&call)?)?)
+        Ok(checks(self.call_cloud(&call)?)?)
     }
 
     fn queue_add(&mut self, agent: &str, request: &QueueRequest) -> Result<QueueEntry> {
@@ -1515,7 +1554,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
             json!({"catalog":plaintext,"expected_revision":expected_revision}),
         );
         call.key = Some(key.into());
-        Ok(self.transport.call(&call)?)
+        Ok(self.call_cloud(&call)?)
     }
     fn cloud_protocol(&self) -> Result<Value> {
         self.get(&self.session, "/api/v1/protocol".into())
@@ -1523,7 +1562,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
     fn cloud_drain(&mut self, agent: &str, request: &Value, key: &str) -> Result<Value> {
         let mut call = Call::write(agent, "POST", "/api/v1/admin/drain".into(), request.clone());
         call.key = Some(key.into());
-        Ok(self.transport.call(&call)?)
+        Ok(self.call_cloud(&call)?)
     }
     fn cloud_drain_status(&self, id: &str) -> Result<Value> {
         self.get(&self.session, format!("/api/v1/admin/drain/{}", encode(id)))
@@ -1641,8 +1680,9 @@ impl<T: Transport> Backend for CloudBackend<T> {
                 (filter.limit > 0).then(|| filter.limit.min(INBOX_PAGE).to_string()),
             ),
         ]);
-        Ok(inbox_page(
+        Ok(selected_inbox_page(
             self.get(agent, format!("/api/v1/bus/inbox{tail}"))?,
+            filter.all,
         )?)
     }
 
@@ -1660,21 +1700,17 @@ impl<T: Transport> Backend for CloudBackend<T> {
                 (filter.limit > 0).then(|| filter.limit.min(INBOX_PAGE).to_string()),
             ),
         ]);
-        Ok(inbox_page(self.get_with_timeout(
-            agent,
-            format!("/api/v1/bus/inbox{tail}"),
-            Some(timeout),
-        )?)?)
+        Ok(selected_inbox_page(
+            self.get_with_timeout(agent, format!("/api/v1/bus/inbox{tail}"), Some(timeout))?,
+            filter.all,
+        )?)
     }
 
     fn unread(&self, agent: &str) -> Result<i64> {
         if let Some(answer) = self.transport.fast_unread(agent) {
             return answer?.ok_or_else(|| Error::Unavailable("unread count unknown".into()));
         }
-        let page = inbox_page(self.get(agent, "/api/v1/bus/inbox".into())?)?;
-        Ok(i64::try_from(page.messages.len())
-            .unwrap_or(i64::MAX)
-            .saturating_add(page.skipped))
+        new_mail_count(self.get(agent, "/api/v1/bus/inbox".into())?)
     }
 
     fn inbox_seen(&mut self, agent: &str, ids: &[i64], _now: i64) -> Result<usize> {
@@ -1967,7 +2003,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
             .prepare_task_create(&call, spec.client_key.is_some())?;
         body = call.body.clone().expect("task creation body");
         let attempt = || {
-            self.transport.call(&call).and_then(|reply| {
+            self.call_cloud(&call).and_then(|reply| {
                 task_from(&reply).map_err(|error| ClientError::Decode(error.to_string()))
             })
         };
@@ -2361,10 +2397,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
         }
         let mut call = Call::get(&self.session, event_route(request));
         call.long_poll = request.wait_seconds > 0;
-        let value = self.transport.call(&call)?;
-        Ok(EventPage {
-            events: list(value, &["events", "items"])?,
-        })
+        let value = self.call_cloud(&call)?;
+        Ok(crate::decode_events(value)?)
     }
 
     fn export(&self) -> Result<Value> {
@@ -2746,15 +2780,58 @@ mod tests {
     }
 
     #[test]
-    fn claim_reuse_rejects_an_acquisition_receipt_without_owned_full_coverage() {
+    fn claim_reuse_with_hold_preserves_acquisition_conflicts() {
+        let mut receipt = claim_json(8);
+        receipt["excluded_paths"] = json!(["src/private"]);
+        receipt["conflicts"] = json!([{"path":"src/private","session":"bob"}]);
+        receipt["created"] = json!(true);
+        let mut held = receipt.clone();
+        held.as_object_mut().unwrap().remove("conflicts");
+        held["hold_reason"] = json!("build");
+        held["hold_until"] = json!("2099-11-11T21:20:00Z");
+        let (server, mut cloud) = backend(vec![json!([]), receipt, json!({}), json!([held])]);
+        let (claim, created) = lockyard_core::claim_or_reuse_with_hold(
+            &mut cloud,
+            "me",
+            &ClaimRequest {
+                paths: vec!["src".into()],
+                ttl_minutes: 60,
+                ..ClaimRequest::default()
+            },
+            Some("build".into()),
+            Some("2099-11-11T21:20:00Z".into()),
+            0,
+        )
+        .unwrap();
+        assert_eq!(created, Some(true));
+        assert!(
+            claim
+                .excluded_paths_warning()
+                .unwrap()
+                .contains("держатель: bob")
+        );
+        sees(
+            &server,
+            &[
+                ("GET", "/api/v1/zones/claims?session=me"),
+                ("POST", "/api/v1/zones/claims"),
+                ("POST", "/api/v1/zones/claims/8/renew"),
+                ("GET", "/api/v1/zones/claims?session=me"),
+            ],
+        );
+    }
+
+    #[test]
+    fn claim_reuse_rejects_an_acquisition_receipt_with_unexplained_missing_coverage() {
         let mut foreign = claim_json(8);
         foreign["session"] = json!("bob");
-        let mut excluded = claim_json(8);
-        excluded["excluded_paths"] = json!(["src/private"]);
+        let mut missing = claim_json(8);
+        missing["paths"] = json!(["other"]);
+        missing["excluded_paths"] = json!(["src/private"]);
         let mut different_case = claim_json(8);
         different_case["paths"] = json!(["SRC"]);
         different_case["case_insensitive_paths"] = json!(false);
-        for receipt in [foreign, excluded, different_case] {
+        for receipt in [foreign, missing, different_case] {
             let (server, mut cloud) = backend(vec![json!([]), receipt.clone()]);
             let request = ClaimRequest {
                 paths: vec!["src".into()],
@@ -3146,7 +3223,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!((page.messages[0].id, page.skipped), (12, 3));
-        assert_eq!(cloud.unread("me").unwrap(), 4);
+        assert!(matches!(cloud.unread("me"), Err(Error::Unavailable(_))));
         assert_eq!(
             cloud.inbox_claim("me", "hook", &[12, 13], 60, 0).unwrap(),
             [12]
@@ -3178,7 +3255,7 @@ mod tests {
             {"id": 7, "to": "bob", "body": "take src/api", "created_at": 10,
              "status": "replied", "delivered_at": 20, "read_at": 30, "replied_at": 40},
             {"id": 8, "to": "bob", "body": "and this", "created_at": 11, "status": "sent"},
-            {"id": 9, "to": "gone", "body": "", "created_at": 12, "status": "failed"},
+            {"id": 9, "to": "gone", "body": "discard this", "created_at": 12, "status": "failed"},
             {"id": 10, "to": "bob", "body": "?", "created_at": 13, "status": "something new"}
         ]})]);
         let receipts = cloud.sent("me", 20).unwrap();
@@ -3193,12 +3270,87 @@ mod tests {
             ]
         );
         assert_eq!(receipts[0].delivered_at, Some(20));
+        assert_eq!(receipts[0].created_at, 10);
         assert_eq!(receipts[0].read_at, Some(30));
         assert_eq!(receipts[0].replied_at, Some(40));
         assert_eq!(receipts[0].to, "bob");
+        assert!(receipts[2].body.is_empty());
         let seen = server.requests();
         assert_eq!(seen[0].method, "GET");
         assert_eq!(seen[0].path, "/api/v1/bus/sent?limit=20");
+    }
+
+    #[test]
+    fn sent_mail_decodes_rfc3339_receipt_timestamps() {
+        let response = serde_json::from_str(r#"{"messages":[{"id":1042,"to":"bob","body":"reply",
+            "created_at":"2026-11-19T10:21:00.123456+00:00","status":"replied",
+            "delivered_at":"2026-11-19T10:21:01.234+00:00","read_at":"2026-11-19T10:21:02+00:00",
+            "replied_at":"2026-11-19T15:21:03.456+05:00","in_reply_to":42},
+            {"id":1043,"to":"*","body":"broadcast","created_at":"2026-11-19T10:21:02+00:00",
+            "status":"sent","delivered_at":null,"read_at":null,"replied_at":null,"in_reply_to":null}]}"#)
+            .unwrap();
+        let (_server, cloud) = backend(vec![response]);
+        let receipts = cloud.sent("me", 20).unwrap();
+        assert_eq!(receipts[0].created_at, 1_795_083_660_123);
+        assert_eq!(receipts[0].delivered_at, Some(1_795_083_661_234));
+        assert_eq!(receipts[0].read_at, Some(1_795_083_662_000));
+        assert_eq!(receipts[0].replied_at, Some(1_795_083_663_456));
+        assert_eq!(receipts[0].reply_to, Some(42));
+        assert_eq!(receipts[1].created_at, 1_795_083_662_000);
+        assert_eq!(receipts[1].delivered_at, None);
+        assert_eq!(receipts[1].read_at, None);
+        assert_eq!(receipts[1].replied_at, None);
+    }
+
+    #[test]
+    fn sent_mail_decrypts_direct_broadcast_and_labeled_reply_bodies() {
+        const WORKSPACE: &str = "00000000-0000-0000-0000-000000000001";
+        let key = crate::WorkspaceKey::from_entropy([19; 32]);
+        let direct = key.encrypt(WORKSPACE, "body", "direct").unwrap();
+        let broadcast = key.encrypt(WORKSPACE, "body", "broadcast").unwrap();
+        let reply = key
+            .encrypt(
+                WORKSPACE,
+                "body",
+                r#"$lockyard_mail_v1:{"body":"reply","from_client":"sender-chat parent_pid=123"}"#,
+            )
+            .unwrap();
+        let response = json!({"messages": [
+            {"id":1,"to":"bob","body":direct,"created_at":"2026-11-19T10:21:00Z","status":"delivered",
+             "delivered_at":"2026-11-19T10:21:01Z","read_at":null,"replied_at":null,"in_reply_to":null},
+            {"id":2,"to":"*","body":broadcast,"created_at":1795083660000_i64,"status":"sent",
+             "delivered_at":null,"read_at":null,"replied_at":null,"in_reply_to":null},
+            {"id":3,"to":"bob","body":reply,"created_at":"2026-11-19T10:21:00Z","status":"sent",
+             "delivered_at":null,"read_at":null,"replied_at":null,"in_reply_to":42},
+            {"id":4,"to":"gone","body":"","created_at":"2026-11-19T10:21:00Z","status":"failed",
+             "delivered_at":null,"read_at":null,"replied_at":null,"in_reply_to":null}
+        ]});
+        let server = FakeServer::start(vec![
+            Reply::json(200, response.clone()),
+            Reply::json(200, response),
+        ]);
+        for strict in [false, true] {
+            let client = Client::new(&server.url(), "token".into())
+                .unwrap()
+                .with_content_encryption(WORKSPACE, Some(key.clone()), true);
+            let client = if strict {
+                client.require_e2ee_for(WORKSPACE).unwrap()
+            } else {
+                client
+            };
+            let cloud = CloudBackend::new(client, "me");
+            let receipts = cloud.sent("me", 20).unwrap();
+            assert_eq!(
+                receipts
+                    .iter()
+                    .map(|row| row.body.as_str())
+                    .collect::<Vec<_>>(),
+                ["direct", "broadcast", "reply", ""]
+            );
+            assert_eq!(receipts[1].to, "*");
+            assert_eq!(receipts[2].reply_to, Some(42));
+            assert_eq!(receipts[3].status, bus::Delivery::Failed);
+        }
     }
 
     #[test]
@@ -4712,6 +4864,67 @@ mod tests {
             client.mail_open_v1("me").unwrap(),
             "revocations Lockyard-Capabilities must not clear mail_open_v1_observed"
         );
+    }
+
+    #[test]
+    fn unread_is_unknown_when_legacy_skipped_may_contain_seen_mail() {
+        for unseen in [false, true] {
+            let mut messages: Vec<Value> = (1..=50)
+                .map(|id| {
+                    json!({
+                        "id":id,"body":"shown","reader_state":"seen","seen_at":123
+                    })
+                })
+                .collect();
+            if unseen {
+                messages[0] = json!({"id":1,"body":"new","reader_state":"new"});
+            }
+            let (_server, cloud) = backend(vec![json!({"messages":messages,"skipped":1})]);
+            assert!(matches!(cloud.unread("me"), Err(Error::Unavailable(_))));
+        }
+        let (_server, cloud) = backend(vec![json!({"messages":[
+            {"id":1,"reader_state":"seen","seen_at":123}
+        ],"skipped":0})]);
+        assert_eq!(cloud.unread("me").unwrap(), 0);
+    }
+
+    #[test]
+    fn default_inbox_excludes_seen_while_explicit_all_keeps_it() {
+        let body = json!({"messages":[
+            {"id":1,"body":"new","reader_state":"new"},
+            {"id":2,"body":"shown","reader_state":"seen","seen_at":123},
+            {"id":3,"body":"closed","reader_state":"handled"}
+        ],"skipped":0});
+        let server =
+            FakeServer::start(vec![Reply::json(200, body.clone()), Reply::json(200, body)]);
+        let client = Client::new(&server.url(), "fixture".into()).unwrap();
+        let mut cloud = CloudBackend::new(client, "me");
+        let page = cloud
+            .inbox(
+                "me",
+                InboxQuery {
+                    all: false,
+                    limit: 50,
+                },
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            page.messages.iter().map(|mail| mail.id).collect::<Vec<_>>(),
+            vec![1]
+        );
+        let page = cloud
+            .peek_inbox(
+                "me",
+                InboxQuery {
+                    all: true,
+                    limit: 50,
+                },
+                0,
+            )
+            .unwrap();
+        assert_eq!(page.messages.len(), 3);
+        assert!(server.requests()[1].path.contains("all=true"));
     }
 
     #[test]

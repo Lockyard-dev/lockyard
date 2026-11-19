@@ -940,3 +940,30 @@ fn round6_legacy_hook_mail_state_preserves_throttle_and_migrates() {
     let value:Value=serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(value["shown"]["4"],1000);
 }
+
+#[test]
+fn round6_ordinary_hook_priority_retains_delivery_policy() {
+    for (kind, needs, reply_to, to, urgent, shown) in [
+        ("info", "none", None, "me", false, false),
+        ("ask", "none", Some(9), "me", false, true),
+        ("ask", "reply", None, "me", false, true),
+        ("ask", "reply", None, "*", false, false),
+        ("info", "none", None, "*", true, true),
+    ] {
+        let mut mail = letter();
+        mail.kind = Some(kind.into());
+        mail.needs = Some(needs.into());
+        mail.reply_to = reply_to;
+        mail.to = to.into();
+        mail.urgent = urgent;
+        mail.status = Some("open".into());
+        let (inner, _) = recording(Some(1), None);
+        let mut port = PriorityPort {
+            inner, snapshot: vec![mail], fail_seen: false, lost: Vec::new(),
+        };
+        let mut out = Vec::new();
+        deliver_attention(&mut port, "PreToolUse", "me", 1_000, None, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap().contains("M-4"), shown,
+            "kind={kind}, to={to}, urgent={urgent}");
+    }
+}

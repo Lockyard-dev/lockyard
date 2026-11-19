@@ -24,8 +24,10 @@ fn status(
     backend: &mut dyn lockyard_core::Backend,
     agent: Option<&str>,
     now: i64,
+    url: &str,
 ) -> Result<Value> {
-    let unread = agent.map(|name| backend.unread(name)).transpose()?;
+    // Mail count is optional: legacy paging or a failed counter must not hide work.
+    let unread = agent.and_then(|name| backend.unread(name).ok());
     let claims = backend.claims(
         &ClaimQuery {
             session: agent.map(str::to_string),
@@ -71,7 +73,11 @@ fn status(
                 task
             })
             .collect();
-        let mut answer = json!({"unread": unread, "claims": claims, "work": work, "offers": offers, "tasks": tasks, "lost": lost});
+        let source = lockyard_core::config::token_source_for(url, agent.unwrap_or("lockyard-cli"))?;
+        let mut answer = json!({"unread": unread, "claims": claims, "work": work, "offers": offers, "tasks": tasks, "lost": lost, "token_source": source});
+        if agent.is_some() && unread.is_none() {
+            answer["unread_unavailable"] = json!(true);
+        }
         if let Some(snap) = &open_snap {
             answer["open_mail"] = json!(snap.items);
             if snap.truncated {
@@ -93,6 +99,9 @@ fn status(
         })
         .collect();
     let mut answer = json!({"unread": unread, "claims": claims, "tasks": tasks, "lost": lost});
+    if agent.is_some() && unread.is_none() {
+        answer["unread_unavailable"] = json!(true);
+    }
     if let Some(snap) = &open_snap {
         answer["open_mail"] = json!(snap.items);
         if snap.truncated {
@@ -111,6 +120,22 @@ pub(super) fn run_tool(
     surface: Surface,
     after: &mut Option<After>,
 ) -> Result<Value> {
+    if name == "update" && args.get("message").is_some() {
+        return Err(Error::Invalid(
+            "unknown field message; message text belongs in body".into(),
+        ));
+    }
+    if matches!(name, "start_work" | "zone_renew") {
+        for alias in ["ttl_minutes", "ttl_seconds", "duration"] {
+            if args.get(alias).is_some() {
+                return Err(Error::Invalid(format!(
+                    "unknown field {alias}; use ttl, an integer number of minutes (1-240)"
+                )));
+            }
+        }
+        args.ttl()?;
+    }
+    tool_registry().validate_fields(name, args.0)?;
     let handler = tool_registry()
         .handler(name)
         .ok_or_else(|| Error::Invalid(format!("unknown tool {name:?}")))?;
@@ -324,7 +349,15 @@ pub(super) fn run_tool(
             args.text("key")?,
         ),
         "who" => encode(&opened.backend.agents()?),
-        "status" => status(opened.backend.as_mut(), agent, now),
+        "status" => {
+            let config = lockyard_core::config::Config::load(&opened.root)?;
+            status(
+                opened.backend.as_mut(),
+                agent,
+                now,
+                config.url.as_deref().unwrap_or(""),
+            )
+        }
         "zone_claim" => {
             let request = claim_request(&opened, args, cwd)?;
             let claim =
@@ -527,7 +560,10 @@ pub(super) fn run_tool(
             let request = RenewRequest {
                 ttl_minutes: ttl,
                 hold_reason: args.some_text("hold_reason")?,
-                hold_until: args.some_text("hold_until")?,
+                hold_until: args.some_text("hold_until")?.or_else(|| {
+                    args.get("hold_reason")
+                        .map(|_| lockyard_core::proto::rfc3339(now.saturating_add(240 * 60_000)))
+                }),
                 fence: if surface == Surface::Compact && !is_cloud {
                     None
                 } else {

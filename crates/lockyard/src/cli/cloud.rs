@@ -397,19 +397,38 @@ pub(super) fn run_token(
         )
     };
     match command {
-        TokenCommand::Create { name, role, days } => {
+        TokenCommand::Create {
+            name,
+            role,
+            days,
+            output_file,
+        } => {
+            validate_token_output(&output_file)?;
             let request = TokenRequest {
                 name,
                 role,
                 expires_at: rfc3339(now_ms().saturating_add(days.saturating_mul(DAY_MS))),
             };
-            let answer = backend.token_create(agent, &request)?;
-            let raw = answer["raw"].as_str().unwrap_or_default();
-            let text = format!(
-                "{}\nThis token is shown once:\n{raw}",
-                line(&answer["token"])
-            );
-            output(&answer, text)
+            let mut answer = backend.token_create(agent, &request)?;
+            let raw = answer["raw"]
+                .as_str()
+                .filter(|raw| !raw.is_empty())
+                .ok_or_else(|| Error::Protocol("token create response omitted raw".into()))?;
+            validate_token_output(&output_file)?;
+            lockyard_core::fsio::replace(&output_file, raw.as_bytes(), 0o600)?;
+            answer
+                .as_object_mut()
+                .ok_or_else(|| Error::Protocol("invalid token response".into()))?
+                .remove("raw");
+            answer["output_file"] = json!(output_file);
+            output(
+                &answer,
+                format!(
+                    "{}\nkey saved to {}",
+                    line(&answer["token"]),
+                    output_file.display()
+                ),
+            )
         }
         TokenCommand::List => {
             let answer = backend.tokens()?;
@@ -423,4 +442,64 @@ pub(super) fn run_token(
             output(&answer, text)
         }
     }
+}
+
+fn validate_token_output(path: &Path) -> Result<()> {
+    fn resolved(path: &Path) -> std::io::Result<PathBuf> {
+        if path.exists() {
+            return path.canonicalize();
+        }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Ok(parent.canonicalize()?.join(
+            path.file_name()
+                .ok_or_else(|| std::io::Error::other("output file needs a name"))?,
+        ))
+    }
+    let target = resolved(path)?;
+    let mut protected = Vec::new();
+    if let Some(default) = lockyard_core::config::default_token_file() {
+        protected.push(default);
+    }
+    if let Some(claude) = lockyard_core::config::claude_token_file() {
+        protected.push(claude);
+    }
+    if let Some(home) = lockyard_core::paths::home_dir() {
+        protected.push(PathBuf::from(&home).join(".config/lockyard/claude.token"));
+        protected.push(PathBuf::from(home).join(".config/lockyard/token"));
+    }
+    if let Ok(credentials) = lockyard_core::credentials::path() {
+        protected.push(credentials);
+    }
+    if let Some(explicit) = std::env::var_os("LOCKYARD_TOKEN_FILE") {
+        protected.push(PathBuf::from(explicit));
+    }
+    if let Some(root) = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| lockyard_core::paths::find_root(&cwd))
+    {
+        let config = lockyard_core::config::Config::load(&root)?;
+        protected.extend(lockyard_core::config::session_token_files(
+            config.url.as_deref().unwrap_or(""),
+        ));
+    }
+    for protected in protected {
+        if resolved(&protected).is_ok_and(|p| p == target) {
+            return Err(Error::Invalid(
+                "--output-file must not replace the default key or this session's key file".into(),
+            ));
+        }
+        #[cfg(unix)]
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(path), std::fs::metadata(&protected)) {
+            use std::os::unix::fs::MetadataExt;
+            if a.dev() == b.dev() && a.ino() == b.ino() {
+                return Err(Error::Invalid(
+                    "--output-file must not replace this session's key file (alias)".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }

@@ -102,6 +102,9 @@ impl Surface {
 
 /// Reads one JSON-RPC message per line and writes one response for each request.
 pub fn serve(agent: Option<String>, cwd: &Path, surface: Surface) -> io::Result<()> {
+    if let Some(session) = agent.as_deref() {
+        lockyard_core::config::set_mcp_session(session);
+    }
     let _shutdown = crate::shutdown::Guard::new(cwd)?;
     // Reading on a separate thread lets the command finish even if stdin contains only
     // part of a line. A signal may land on any thread, so EINTR alone is insufficient.
@@ -382,7 +385,7 @@ fn call_tool(
                 .and_then(|()| run_tool(name, Args(args), agent, cwd, client, surface, &mut after))
         }
     });
-    let result = match answer {
+    let mut result = match answer {
         Ok(result)
             if [
                 "msg_inbox",
@@ -427,6 +430,20 @@ fn call_tool(
             response
         }
     };
+    if let Some(session) = agent
+        && let Some(warning) = crate::open::session_key_warning(cwd, session)
+    {
+        result["content"]
+            .as_array_mut()
+            .expect("tool content")
+            .push(json!({"type":"text", "text":warning}));
+        if let Some(content) = result
+            .get_mut("structuredContent")
+            .and_then(Value::as_object_mut)
+        {
+            content.insert("session_key_warning".into(), json!(warning));
+        }
+    }
     (result, after)
 }
 

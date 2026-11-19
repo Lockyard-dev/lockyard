@@ -59,6 +59,10 @@ pub(super) fn claim_line(claim: &Claim, clock: Option<i64>) -> String {
         line.push_str("  ");
         line.push_str(&claim.note);
     }
+    if let Some(warning) = claim.excluded_paths_warning() {
+        line.push('\n');
+        line.push_str(&warning);
+    }
     for dirty in &claim.foreign_dirty_paths {
         let path = serde_json::to_string(&dirty.path).unwrap_or_else(|_| "\"?\"".into());
         let owner = dirty

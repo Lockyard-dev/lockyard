@@ -694,7 +694,14 @@ pub fn claim_or_reuse_with_hold(
             })
     })();
     match result {
-        Ok(held) => Ok((held, created)),
+        Ok(mut held) => {
+            // Conflict details may exist only on the acquisition receipt, not
+            // in the stored claim returned after installing the hold.
+            if held.conflicts.is_empty() {
+                held.conflicts = claim.conflicts;
+            }
+            Ok((held, created))
+        }
         Err(error) => {
             if created == Some(true) && (!backend.is_cloud() || (claim.id > 0 && claim.fence > 0)) {
                 let _ = backend.release(
@@ -821,7 +828,9 @@ fn acquire_claim(
         }
     }
     let (claim, created) = backend.claim_with_creation_status(agent, request, now)?;
-    if !claim_covers_request(&claim, agent, request) {
+    // A fresh receipt may explicitly exclude contended paths. That is a partial
+    // grant, not a protocol failure; it must never qualify for full-coverage reuse.
+    if !claim_matches_request(&claim, agent, request, true) {
         return Err(Error::Protocol(
             "claim response did not grant the requested paths to this session".into(),
         ));
@@ -830,18 +839,37 @@ fn acquire_claim(
 }
 
 fn claim_covers_request(claim: &Claim, agent: &str, request: &ClaimRequest) -> bool {
+    claim_matches_request(claim, agent, request, false)
+}
+
+fn claim_matches_request(
+    claim: &Claim,
+    agent: &str,
+    request: &ClaimRequest,
+    allow_exclusions: bool,
+) -> bool {
     let fold_case = claim.case_insensitive_paths.unwrap_or(true);
     claim.session == agent
         && request.mode.is_none_or(|mode| claim.mode == mode)
         && request.paths.iter().all(|requested| {
             let requested = crate::paths::ZonePath::stored(requested.clone());
-            claim.paths.iter().any(|held| {
+            let covered = claim.paths.iter().any(|held| {
                 crate::paths::ZonePath::stored(held.clone())
                     .contains_with_case(&requested, fold_case)
-            }) && !claim.excluded_paths.iter().any(|excluded| {
-                crate::paths::ZonePath::stored(excluded.clone())
-                    .overlaps_with_case(&requested, fold_case)
-            })
+            });
+            if allow_exclusions {
+                covered
+                    || claim.excluded_paths.iter().any(|excluded| {
+                        crate::paths::ZonePath::stored(excluded.clone())
+                            .contains_with_case(&requested, fold_case)
+                    })
+            } else {
+                covered
+                    && !claim.excluded_paths.iter().any(|excluded| {
+                        crate::paths::ZonePath::stored(excluded.clone())
+                            .overlaps_with_case(&requested, fold_case)
+                    })
+            }
         })
 }
 
@@ -854,6 +882,7 @@ fn claim_record(claim: zones::Claim) -> Claim {
         zone: None,
         paths: claim.paths,
         excluded_paths: Vec::new(),
+        conflicts: Vec::new(),
         mode: ClaimMode::Exclusive,
         purpose: Purpose::Work,
         lazy: false,

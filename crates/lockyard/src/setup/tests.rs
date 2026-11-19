@@ -461,3 +461,64 @@ fn discover_puts_claude_settings_in_the_project() {
         Some(dir.path().join(".claude/settings.json"))
     );
 }
+
+#[test]
+fn setup_marker_is_claude_only_and_user_env_survives() {
+    let (_dir, site) = site();
+    for client in ALL {
+        let mcp = client.mcp(&site);
+        let claude = client == Client::Claude;
+        assert_eq!(
+            client.snippet(&site).contains(merge::CLAUDE_MCP_MARKER),
+            claude
+        );
+        if let McpSite::Json(path) = &mcp {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path,
+                json!({"mcpServers":{"lockyard":{"env":{
+                    "USER_ENV":"kept", "LOCKYARD_CLAUDE_MCP":"stale",
+                    "LOCKYARD_TOKEN_FILE":"unused-fixture-path", "LOCKYARD_AGENT":"pinned-fixture"
+                }}}})
+                .to_string(),
+            )
+            .unwrap();
+        }
+        if let McpSite::Toml(path) = &mcp {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path,
+                r#"
+[mcp_servers.lockyard]
+command = "lockyard"
+args = ["mcp"]
+env_vars = ["USER_EXPORTED", "LOCKYARD_CLAUDE_MCP"]
+[mcp_servers.lockyard.env]
+USER_ENV = "kept"
+LOCKYARD_CLAUDE_MCP = "stale"
+"#,
+            )
+            .unwrap();
+        }
+        install(client, &site);
+        install(client, &site);
+        let written = read_text(mcp.path());
+        assert_eq!(written.contains(merge::CLAUDE_MCP_MARKER), claude);
+        if matches!(mcp, McpSite::Toml(_)) {
+            let doc: toml::Value = written.parse().unwrap();
+            let server = &doc["mcp_servers"]["lockyard"];
+            assert_eq!(server["env"]["USER_ENV"].as_str(), Some("kept"));
+            assert_eq!(server["env_vars"][0].as_str(), Some("USER_EXPORTED"));
+        }
+        if matches!(mcp, McpSite::Json(_)) {
+            let value: Value = serde_json::from_str(&written).unwrap();
+            let env = &value["mcpServers"]["lockyard"]["env"];
+            assert_eq!(env["USER_ENV"], "kept");
+            if claude {
+                assert_eq!(env[merge::CLAUDE_MCP_MARKER], "1");
+                assert!(env.get("LOCKYARD_TOKEN_FILE").is_none());
+                assert!(env.get("LOCKYARD_AGENT").is_none());
+            }
+        }
+    }
+}

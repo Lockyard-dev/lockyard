@@ -227,7 +227,11 @@ pub(super) fn run_zone(
                 now,
             )?;
             let text = claim_line(&claim, lease);
-            output(&claim, text)
+            let mut out = output(&claim, text)?;
+            if let Some(warning) = claim.excluded_paths_warning() {
+                out.json["warning"] = json!(warning);
+            }
+            Ok(out)
         }
         ZoneCommand::Wait {
             paths,
@@ -439,6 +443,7 @@ pub(super) fn run_zone(
             let hold_until = match (hold_until, hold_for) {
                 (Some(until), None) => Some(until),
                 (None, Some(minutes)) => Some(hold_until_from_minutes(minutes, now)?),
+                (None, None) if hold_reason.is_some() => Some(hold_until_from_minutes(240, now)?),
                 (None, None) => None,
                 (Some(_), Some(_)) => {
                     return Err(Error::Invalid(

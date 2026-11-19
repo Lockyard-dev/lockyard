@@ -67,6 +67,7 @@ fn an_old_socket_peer_cannot_authorize_a_repository_path_as_free_without_the_cap
         repository_confirmed: false,
         attention: Vec::new(),
         claims: Vec::new(),
+        mail_truncated: false,
     };
     assert_eq!(
         port.check("alice", "src/file", 0).unwrap(),
@@ -489,6 +490,7 @@ fn old_daemon_hook_uses_take_mail_and_zone_wait_uses_checks_without_new_requests
         repository_confirmed: false,
         attention: Vec::new(),
         claims: Vec::new(),
+        mail_truncated: false,
     };
     let mut out = Vec::new();
     deliver_mail(&mut port, "SessionStart", "me", 1, &mut out).unwrap();
@@ -540,7 +542,7 @@ fn round6_cloud_unread_reconciles_accepted_acks_with_unknown_mail_count() {
         }
     });
     let socket=AgentSocket::connect(&socket_path,"http://fixture","team",Duration::from_secs(2)).unwrap();
-    let mut port=cloud::AgentPort {socket,root:dir.path().into(),tool:Tool::Codex,repository:None,repository_confirmed:false,attention:Vec::new(),claims:Vec::new()};
+    let mut port=cloud::AgentPort {socket,root:dir.path().into(),tool:Tool::Codex,repository:None,repository_confirmed:false,attention:Vec::new(),claims:Vec::new(),mail_truncated:false};
     assert_eq!(port.unread("me").unwrap(),None);
     assert!(mail::pending_attention_acks(&state_path).is_empty());
     // connect performs one handshake ping; no additional RPC is needed for cleanup.

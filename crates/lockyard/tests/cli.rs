@@ -891,6 +891,14 @@ fn required_e2ee_cloud_hooks_never_contact_a_legacy_agent() {
             .args(["hook", tool])
             .current_dir(dir.path())
             .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("LOCKYARD_CREDENTIALS", dir.path().join("credentials"))
+            .env("HOME", dir.path())
+            .env_remove("LOCKYARD_TOKEN")
+            .env_remove("LOCKYARD_TOKEN_FILE")
+            .env_remove("LOCKYARD_CLAUDE_TOKEN_FILE")
+            .env_remove("LOCKYARD_PARENT_CLAIM")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
             .env_remove("LOCKYARD_AGENT")
             .env_remove("LOCKYARD_REQUIRE_E2EE")
             .env_remove("LOCKYARD_E2EE_WORKSPACE_ID")
@@ -1003,7 +1011,7 @@ fn required_e2ee_cloud_hooks_never_contact_a_legacy_agent() {
         };
         let mut stream = accept();
         assert_eq!(read_request(&mut stream)["op"], "ping");
-        writeln!(stream, "{}", json!({"status": {"url":"https://example.test", "workspace":"team", "pid":1, "view_fresh":true, "view_age_ms":0, "claims":0, "board":0, "sessions":0, "outbox":0, "coordination_seq":0, "registry_seq":0}})).unwrap();
+        writeln!(stream, "{}", json!({"status": {"url":"https://example.test", "workspace":"team", "pid":1, "requires_matching_token":false, "view_fresh":true, "view_age_ms":0, "claims":0, "board":0, "sessions":0, "outbox":0, "coordination_seq":0, "registry_seq":0}})).unwrap();
         let mut stream = accept();
         assert_eq!(read_request(&mut stream)["op"], "touch");
     });

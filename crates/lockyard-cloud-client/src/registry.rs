@@ -65,7 +65,7 @@ pub(crate) fn search<T: Transport>(
     } else {
         format!("?{}", pairs.join("&"))
     };
-    Ok(backend.transport.call(&Call::get(
+    Ok(backend.call_cloud(&Call::get(
         &backend.session,
         format!("/api/v1/registry/{route}{tail}"),
     ))?)
@@ -77,7 +77,7 @@ pub(crate) fn item_by_id<T: Transport>(
     blockers: bool,
 ) -> Result<Value> {
     let tail = if blockers { "/blockers" } else { "" };
-    Ok(backend.transport.call(&Call::get(
+    Ok(backend.call_cloud(&Call::get(
         &backend.session,
         format!("/api/v1/registry/items/{}{tail}", checked_string_id(id)?),
     ))?)
@@ -101,7 +101,7 @@ pub(crate) fn link_by_id<T: Transport>(
         json!({"kind": kind, "to_item_id": checked_string_id(to)?, "expected_version": version}),
     );
     call.key = Some(key.to_string());
-    Ok(backend.transport.call(&call)?)
+    Ok(backend.call_cloud(&call)?)
 }
 
 fn validate_link(kind: &str, version: i64, key: &str) -> Result<()> {

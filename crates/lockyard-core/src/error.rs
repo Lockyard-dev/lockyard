@@ -112,7 +112,7 @@ impl fmt::Display for Error {
             ),
             Self::Unavailable(text) => write!(
                 f,
-                "cloud unavailable: {text}. Next: check the network, then `lockyard doctor`."
+                "cloud unavailable: {text}. Next: check the network, then `lockyard doctor`; если команда запущена в песочнице без сети — запусти вне песочницы."
             ),
             Self::NeedsCloud(feature) => write!(
                 f,
@@ -188,5 +188,24 @@ mod tests {
         assert!(text.contains("pending journal is busy"));
         assert!(text.contains("wait briefly"));
         assert!(!text.contains("check the network"));
+    }
+}
+
+#[cfg(test)]
+mod survey_nov18 {
+    #[test]
+    fn survey1118_dns_and_refused_connection_explain_sandbox_network() {
+        for cause in ["Dns Failed: resolve dns name", "connection refused"] {
+            let error = super::Error::Unavailable(cause.into());
+            let text = error.to_string();
+            assert_eq!(error.kind(), "unavailable");
+            assert!(text.contains(cause));
+            assert!(
+                text.contains("Next:")
+                    && text.contains(
+                        "если команда запущена в песочнице без сети — запусти вне песочницы"
+                    )
+            );
+        }
     }
 }

@@ -423,16 +423,28 @@ impl World {
 fn tokens(w: &mut World) {
     let root = w.owner.clone();
     let make = |role: &str| {
+        let directory = tempfile::tempdir_in(w.box_a.runtime.path()).unwrap();
+        let output = directory.path().join("issued.key");
         let made = w
             .ly(
                 &root,
                 &[
-                    "cloud", "token", "create", role, "--role", role, "--days", "1",
+                    "cloud",
+                    "token",
+                    "create",
+                    role,
+                    "--role",
+                    role,
+                    "--days",
+                    "1",
+                    "--output-file",
+                    output.to_str().unwrap(),
                 ],
             )
             .ok();
         assert_eq!(made["token"]["role"], role);
-        made["raw"].as_str().expect("the raw token").to_string()
+        assert!(made.get("raw").is_none());
+        fs::read_to_string(output).unwrap()
     };
     let (lead, agent) = (make("lead"), make("agent"));
     let (exporter, importer, dispatcher) = (make("exporter"), make("importer"), make("dispatcher"));
@@ -446,8 +458,21 @@ fn tokens(w: &mut World) {
     assert!(rows.iter().all(|row| row.get("raw").is_none()), "{listed}");
     let lead = w.lead("lead");
     w.ly(&lead, &["cloud", "token", "list"]).refused(1, "");
-    w.ly(&lead, &["cloud", "token", "create", "x", "--role", "agent"])
-        .refused(1, "owner");
+    let denied_output = w.box_a.runtime.path().join("denied.key");
+    w.ly(
+        &lead,
+        &[
+            "cloud",
+            "token",
+            "create",
+            "x",
+            "--role",
+            "agent",
+            "--output-file",
+            denied_output.to_str().unwrap(),
+        ],
+    )
+    .refused(1, "owner");
 
     let victim = Who {
         name: w.name("victim"),
