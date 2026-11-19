@@ -5,7 +5,7 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.3.16 — 2026-11-18
+## [0.3.16] - 2026-11-19
 
 - Route mail waits and cloud hooks with the session's selected credential; keep
   direct long-poll wake cursors separate across credentials, servers and workspaces.

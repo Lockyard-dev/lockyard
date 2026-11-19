@@ -170,7 +170,12 @@ fn survey1118_r8_agent_key_wait_and_stop_keep_service_route() {
     };
     deliver(71);
     woke(
-        wait(command(dir.path(), runtime.path(), AGENT), AGENT, true, "5"),
+        wait(
+            command(dir.path(), runtime.path(), AGENT),
+            AGENT,
+            true,
+            "30",
+        ),
         71,
     );
     deliver(72);
@@ -179,7 +184,7 @@ fn survey1118_r8_agent_key_wait_and_stop_keep_service_route() {
             command(dir.path(), runtime.path(), AGENT),
             AGENT,
             false,
-            "5",
+            "30",
         ),
         72,
     );

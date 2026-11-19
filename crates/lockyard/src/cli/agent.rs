@@ -230,7 +230,6 @@ fn status_snapshot(cwd: &Path) -> Result<agent::service::AgentServiceConfig> {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn status_without_installed_copy_uses_project_target() {

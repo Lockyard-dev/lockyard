@@ -11,6 +11,9 @@ use lockyard_core::Result;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+// A short-lived value on one call path; on Windows the named-pipe socket is larger than a
+// boxed client, and boxing it would only add an allocation per notification wait.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Route {
     Agent(AgentSocket),
     Direct(Box<Client>),
