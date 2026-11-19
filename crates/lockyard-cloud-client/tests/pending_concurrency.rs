@@ -400,7 +400,17 @@ fn concurrent_retry(same_client: bool) {
         .unwrap()
         .unwrap()
         .path();
+    // Mirror the production journal lock: the directory itself on Unix, `.journal.lock` on Windows.
+    #[cfg(unix)]
     let held = std::fs::File::open(scope).unwrap();
+    #[cfg(not(unix))]
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(scope.join(".journal.lock"))
+        .unwrap();
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
