@@ -121,6 +121,11 @@
       "name": "body"
     },
     {
+      "schema": "CoordinationSentReceipt",
+      "property": "body",
+      "name": "body"
+    },
+    {
       "schema": "CoordinationClaim",
       "property": "note",
       "name": "note"

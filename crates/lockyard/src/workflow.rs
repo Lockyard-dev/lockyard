@@ -324,7 +324,10 @@ pub fn run_with_source(
     let config = lockyard_core::config::Config::load(&root)?;
     let credential = if backend.is_cloud() {
         Some(lockyard_cloud_client::credential_fingerprint(
-            &lockyard_core::config::Config::token()?,
+            &lockyard_core::config::Config::token_for_session(
+                config.url.as_deref().unwrap_or(""),
+                agent,
+            )?,
         ))
     } else {
         None

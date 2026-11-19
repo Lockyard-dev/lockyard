@@ -25,10 +25,21 @@ struct Seen {
     body: Value,
     key: Option<String>,
     session: Option<String>,
+    product: Option<String>,
+    token: Option<String>,
 }
 
 #[derive(Default)]
 struct State {
+    api_offline: bool,
+    notification_owners: std::collections::HashMap<String, String>,
+    notification_events: Vec<Value>,
+    notification_seed_race: Option<String>,
+    survey_require_claude_accept: bool,
+    survey_claude_session: Option<String>,
+    survey_default_role: Option<String>,
+    survey_bound_session: Option<String>,
+    survey_agent_bound_session: Option<String>,
     coordination_event_sessions: std::collections::HashSet<String>,
     survey_handled_failure: bool,
     survey_release_failure_id: Option<i64>,
@@ -37,6 +48,11 @@ struct State {
     survey_uncertain_create: bool,
     survey_echo_client_key: bool,
     survey_lose_create_replies: bool,
+    lose_token_create_reply: bool,
+    require_encryption_after_mail: Option<String>,
+    hold_next_mail_response: Option<std::sync::mpsc::Receiver<()>>,
+    mail_repair: Option<MailRepair>,
+    tokens_created: usize,
     survey_lost: Vec<Value>,
     seen: Vec<Seen>,
     claims: Vec<Value>,
@@ -86,6 +102,11 @@ struct State {
     response_bytes: usize,
     request_timings: Vec<(String, Duration)>,
     connections: usize,
+}
+
+struct MailRepair {
+    cursor: PathBuf,
+    deliveries: std::collections::HashMap<String, Value>,
 }
 
 /// HTTP-level impairment model. TCP/TLS setup costs are delayed after accept, so this
@@ -229,8 +250,8 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
         let mut parts = first.split(' ');
         let method = parts.next().unwrap_or_default().to_string();
         let path = parts.next().unwrap_or_default().to_string();
-        let (mut length, mut key, mut session, mut token, mut repository) =
-            (0, None, None, None, None);
+        let (mut length, mut key, mut session, mut token, mut repository, mut product) =
+            (0, None, None, None, None, None);
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
@@ -241,6 +262,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
                     "content-length" => length = value.parse().unwrap_or(0),
                     "idempotency-key" => key = Some(value.to_string()),
                     "x-lockyard-session" => session = Some(value.to_string()),
+                    "x-lockyard-agent-product" => product = Some(value.to_string()),
                     "authorization" => token = Some(value.to_string()),
                     "x-lockyard-repository" => repository = Some(value.to_string()),
                     _ => {}
@@ -291,32 +313,131 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
             // A short long poll keeps the agent's threads moving and its view fresh.
             thread::sleep(Duration::from_millis(30));
         }
-        let (status, answer, capabilities) = {
+        let (status, answer, capabilities, date, hold_mail) = {
             let mut state = state.lock().unwrap();
             if route == "/api/v1/events"
                 && let Some(session) = &session
             {
                 state.coordination_event_sessions.insert(session.clone());
             }
-            if !route.ends_with("/events") {
+            if !route.ends_with("/events") || !state.notification_owners.is_empty() {
                 let record = Seen {
                     method: method.clone(),
                     path: path.clone(),
                     body: body.clone(),
-                    key,
+                    key: key.clone(),
                     session: session.clone(),
+                    product: product.clone(),
+                    token: token.clone(),
                 };
                 state.seen.push(record);
             }
-            let (status, answer) = if token.as_deref() != Some("Bearer test-token") {
+            let (status, answer) = if state.api_offline {
+                (
+                    503,
+                    json!({"error":{"code":"unavailable","message":"offline fixture"}}),
+                )
+            } else if !matches!(
+                token.as_deref(),
+                Some("Bearer test-token" | "Bearer claude-test-token")
+            ) {
                 (
                     401,
                     json!({"error": {"code": "unauthorized", "message": "bad token"}}),
                 )
+            } else if session.as_ref().is_some_and(|session| {
+                state
+                    .notification_owners
+                    .get(session)
+                    .is_some_and(|owner| Some(owner) != token.as_ref())
+            }) || session.is_some()
+                && (state.survey_bound_session.as_ref() == session.as_ref()
+                    || (state.survey_agent_bound_session.as_ref() == session.as_ref()
+                        && token.as_deref() == Some("Bearer claude-test-token")))
+            {
+                (
+                    403,
+                    json!({"error":{"code":"session_name_bound","message":"bound elsewhere"}}),
+                )
+            } else if method == "GET" && route == "/api/v1/registry/actor" {
+                let role = state.survey_default_role.as_deref().unwrap_or("agent");
+                let is_owner = role == "owner";
+                let claude =
+                    role == "agent" && token.as_deref() == Some("Bearer claude-test-token");
+                (
+                    200,
+                    json!({
+                        "identity":format!("token:{:032x}:{}", if claude {2} else {1}, session.as_deref().unwrap_or("alice")),
+                        "role":role,
+                        "is_owner":is_owner,
+                        "can_accept_review":matches!(role, "lead" | "owner") || claude,
+                        "can_relay_owner":is_owner,
+                        "workspace_id":"00000000-0000-0000-0000-000000000001",
+                    }),
+                )
+            } else if state.survey_require_claude_accept
+                && route.ends_with("/transition")
+                && (session.as_deref()
+                    != Some(
+                        state
+                            .survey_claude_session
+                            .as_deref()
+                            .unwrap_or("survey-session"),
+                    )
+                    || token.as_deref() != Some("Bearer claude-test-token"))
+            {
+                (
+                    409,
+                    json!({"error":{"code":"claude_key_required","message":"Claude key required"}}),
+                )
+            } else if method == "POST"
+                && route == "/api/v1/bus/messages"
+                && let Some(repair) = state.mail_repair.as_mut()
+            {
+                let key = key.expect("outbox mail uses an idempotency key");
+                let id = 44 + repair.deliveries.len();
+                let first_mail = repair.deliveries.is_empty();
+                let (receipt, just_committed) = match repair.deliveries.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        (entry.into_mut(), false)
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => (
+                        entry.insert(json!({"id":id,"from_session":"alice","to":body["to"],"body":body["body"]})),
+                        true,
+                    ),
+                };
+                // Lose the first receipt after commit. Withhold it from daemon retries
+                // until doctor has reserved the operation and recorded its repair cursor.
+                if (first_mail && just_committed) || (!just_committed && !repair.cursor.is_file()) {
+                    return;
+                }
+                (200, receipt.clone())
             } else {
                 route_reply(&mut state, &method, &path, &body, session.as_deref())
             };
-            let capabilities = if state.registry_assignee_session
+            if state.lose_token_create_reply
+                && method == "POST"
+                && route == "/api/v1/registry/tokens"
+            {
+                return;
+            }
+            let date = if let Some(key_id) = &state.require_encryption_after_mail {
+                if method == "POST"
+                    && route == "/api/v1/bus/messages"
+                    && state.encryption_key_id.is_none()
+                {
+                    state.encryption_key_id = Some(key_id.clone());
+                    return; // Drop the receipt only after the policy changes.
+                }
+                "Date: Thu, 19 Nov 2026 10:21:00 GMT\r\n"
+            } else if state.mail_repair.is_some() {
+                "Date: Thu, 19 Nov 2026 10:21:00 GMT\r\n"
+            } else {
+                ""
+            };
+            let capabilities = if !state.notification_owners.is_empty() {
+                "Lockyard-Capabilities: mail_push_v1\r\n"
+            } else if state.registry_assignee_session
                 && ((route.starts_with("/api/v1/registry/")
                     && !state.registry_assignee_header_hidden)
                     || (route == "/api/v1/protocol"
@@ -326,8 +447,16 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
             } else {
                 ""
             };
-            (status, answer, capabilities)
+            let hold_mail = if method == "POST" && route == "/api/v1/bus/messages" {
+                state.hold_next_mail_response.take()
+            } else {
+                None
+            };
+            (status, answer, capabilities, date, hold_mail)
         };
+        if let Some(release) = hold_mail {
+            let _ = release.recv_timeout(Duration::from_secs(10));
+        }
         let text = if answer == json!("response lost after commit") {
             "{".into()
         } else {
@@ -345,7 +474,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
             }
         }
         let response = format!(
-            "HTTP/1.1 {status} X\r\nLockyard-Protocol: 2\r\n{capabilities}X-Lockyard-Repository: {}\r\nCache-Control: no-store\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n{text}",
+            "HTTP/1.1 {status} X\r\nLockyard-Protocol: 2\r\n{date}{capabilities}X-Lockyard-Repository: {}\r\nCache-Control: no-store\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n{text}",
             repository.as_deref().unwrap_or("-"),
             text.len(),
             if latency.keep_alive {
@@ -389,8 +518,38 @@ fn route_reply(
 ) -> (u16, Value) {
     let route = path.split('?').next().unwrap_or_default();
     match (method, route) {
+        ("POST", "/api/v1/registry/items/D-1/transition") if state.survey_require_claude_accept => {
+            (
+                200,
+                json!({"id":"D-1","title":"reviewed work","status":"done","version":2}),
+            )
+        }
+        ("POST", "/api/v1/registry/tokens") => {
+            state.tokens_created += 1;
+            (
+                200,
+                json!({"raw":"new-secret-key","token":{"id":"new-id","role":body["role"],"name":body["name"]}}),
+            )
+        }
+        ("POST", _)
+            if route.starts_with("/api/v1/admin/sessions/") && route.ends_with("/release") =>
+        {
+            state.survey_bound_session = None;
+            (200, json!({"released":true}))
+        }
+        ("GET", "/api/v1/presence") if state.survey_default_role.is_some() => (
+            200,
+            json!({"sessions":[{"session":session,"role":state.survey_default_role}]}),
+        ),
+        ("GET", "/api/v1/presence") if !state.notification_owners.is_empty() => {
+            (200, json!({"sessions":[]}))
+        }
+
         ("GET", "/api/v1/protocol") => {
             let mut capabilities = vec!["zone_catalog_v1", "drain_v1"];
+            if !state.notification_owners.is_empty() {
+                capabilities.push("mail_push_v1");
+            }
             if state.survey_soft_zones {
                 capabilities.push("soft_zones_v1");
             }
@@ -717,6 +876,11 @@ fn route_reply(
                     message["status"] = json!("ack");
                 }
             }
+            for id in ids.iter().filter_map(Value::as_i64) {
+                if !state.seen_ids.contains(&id) {
+                    state.seen_ids.push(id);
+                }
+            }
             (200, json!({"handled":ids.len()}))
         }
         ("POST", "/api/v1/registry/items") if state.refuse_registry_create.is_some() => {
@@ -827,14 +991,46 @@ fn route_reply(
                 .inbox
                 .iter()
                 .filter(|message| {
-                    all || message
-                        .get("id")
-                        .and_then(Value::as_i64)
-                        .is_none_or(|id| !state.seen_ids.contains(&id))
+                    state.notification_owners.is_empty()
+                        || message["to"].as_str() == session
+                        || message["to"] == "*"
+                })
+                .filter(|message| {
+                    let seen = message["id"]
+                        .as_i64()
+                        .is_some_and(|id| state.seen_ids.contains(&id));
+                    // 2ca693e retains seen, unhandled questions before applying limit.
+                    all || !seen || (message["needs"] == "reply" && message["status"] != "ack")
                 })
                 .cloned()
+                .map(|mut message| {
+                    if message["id"]
+                        .as_i64()
+                        .is_some_and(|id| state.seen_ids.contains(&id))
+                    {
+                        message["reader_state"] = json!("seen");
+                        message["seen_at"] = json!(123);
+                    }
+                    message
+                })
                 .collect();
-            (200, json!({"messages": messages, "skipped": 0}))
+            let skipped = messages.len().saturating_sub(50);
+            let limit = query_value(path, "limit")
+                .and_then(|limit| limit.parse::<usize>().ok())
+                .unwrap_or(50)
+                .clamp(1, 50);
+            let messages: Vec<_> = messages.into_iter().skip(skipped).take(limit).collect();
+            if state.notification_seed_race.as_deref() == session && session.is_some() {
+                let recipient = state.notification_seed_race.take().unwrap();
+                // Another reader saw the arrival after this snapshot was constructed.
+                state.seen_ids.push(88);
+                state.notification_events.push(
+                    json!({"seq":88,"type":"bus.message","session":recipient,
+                    "payload":{"id":88,"thread_id":88,"from_session":"bob","to":recipient,
+                    "role":"recipient","kind":"info","needs":"none","body":"arrived during seed"}}),
+                );
+            }
+            (200, json!({"messages": messages, "skipped": skipped}))
         }
         ("POST", "/api/v1/bus/inbox/claim") => (200, json!({"claimed": body["ids"]})),
         ("POST", "/api/v1/bus/inbox/seen") => {
@@ -892,7 +1088,30 @@ fn route_reply(
             }));
             (200, reply)
         }
-        _ if route.ends_with("/events") => (200, json!({"events": []})),
+        _ if route == "/api/v1/events" && !state.notification_owners.is_empty() => {
+            if query_value(path, "sessions").is_some() {
+                // Explicitly exercise the daemon's supported JSON long-poll fallback.
+                return (
+                    406,
+                    json!({"error":{"code":"not_acceptable","message":"use JSON polling"}}),
+                );
+            }
+            let after = query_value(path, "after")
+                .and_then(|n| n.parse::<i64>().ok())
+                .unwrap_or(0);
+            let recipient = query_value(path, "session");
+            let events: Vec<_> = state
+                .notification_events
+                .iter()
+                .filter(|event| {
+                    event["seq"].as_i64().unwrap() > after
+                        && event["session"].as_str() == recipient.as_deref()
+                })
+                .cloned()
+                .collect();
+            (200, json!(events))
+        }
+        _ if route.ends_with("/events") => (200, json!([])),
         _ => (200, json!({"id": 1})),
     }
 }
@@ -930,15 +1149,25 @@ fn binary(dir: &Path, runtime: &Path) -> Command {
         .lines()
         .find_map(|line| line.strip_prefix("url = '")?.strip_suffix("'"))
         .unwrap_or_default();
+    // These subprocesses simulate CLI and MCP hosts independently from the test runner.
+    for (name, _) in std::env::vars_os() {
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with("CODEX_") || name_str.starts_with("CURSOR_") {
+            command.env_remove(name);
+        }
+    }
     command
         .current_dir(dir)
         .env("LOCKYARD_URL", url)
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", runtime.join("state"))
         .env("XDG_CONFIG_HOME", runtime.join("config"))
+        .env_remove("LOCKYARD_PARENT_CLAIM")
         .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("LOCKYARD_CLAUDE_MCP")
         .env_remove("LOCKYARD_STATUS_DEADLINE_MS")
-        .env_remove("LOCKYARD_TOKEN_FILE");
+        .env_remove("LOCKYARD_TOKEN_FILE")
+        .env_remove("LOCKYARD_CLAUDE_TOKEN_FILE");
     command
 }
 
@@ -2273,7 +2502,7 @@ fn cloud_status_expired_and_idle_released_claims_are_never_reported_held() {
 }
 
 #[test]
-fn cloud_status_outage_never_uses_the_agents_last_claim_snapshot() {
+fn cloud_status_outage_labels_the_agents_last_claim_snapshot() {
     let server = Server::start();
     server.state.lock().unwrap().claims = vec![json!({
         "id": 71, "session": "alice", "paths": ["src"], "meta": {}, "fence": 1,
@@ -2295,10 +2524,10 @@ fn cloud_status_outage_never_uses_the_agents_last_claim_snapshot() {
     ));
     let started = Instant::now();
     let output = cli(dir.path(), runtime.path(), &["--json", "status"]);
-    assert!(
-        !output.status.success(),
-        "last snapshot accepted during network gap: {output:?}"
-    );
+    let status = json_of(&output);
+    assert_eq!(status["freshness"]["source"], "cached");
+    assert_eq!(status["freshness"]["claims_cached"], true);
+    assert_eq!(status["claims"][0]["id"], 71);
     assert!(started.elapsed() < Duration::from_secs(3));
 }
 
@@ -3501,7 +3730,7 @@ fn hook_check_refuses_unknown_from_the_agent_socket() {
         &["hook", "check", "--path", "src"],
     );
     stop.store(true, Ordering::SeqCst);
-    assert_eq!(peer.join().unwrap(), ["ping", "ping", "check"]);
+    assert_eq!(peer.join().unwrap(), ["ping", "check"]);
     assert!(
         !result.status.success(),
         "unknown agent check allowed an edit: {result:?}"
@@ -3758,12 +3987,22 @@ fn write_agent_service_config(dir: &Path, runtime: &Path) {
 }
 
 fn start_agent_until(dir: &Path, runtime: &Path, wait_for_view: bool) -> Agent {
+    start_agent_until_env(dir, runtime, wait_for_view, &[])
+}
+
+fn start_agent_until_env(
+    dir: &Path,
+    runtime: &Path,
+    wait_for_view: bool,
+    env: &[(&str, &str)],
+) -> Agent {
     if !runtime.join("state/lockyard/agent-config.toml").exists() {
         write_agent_service_config(dir, runtime);
     }
     let child = binary(dir, runtime)
-        .arg("agent")
         .env("LOCKYARD_TOKEN", "test-token")
+        .envs(env.iter().copied())
+        .arg("agent")
         .spawn()
         .unwrap();
     let agent = Agent(child);
@@ -3962,6 +4201,33 @@ fn the_cli_goes_through_a_running_agent_and_needs_no_token() {
             Some("alice")
         );
     }
+}
+
+#[test]
+fn delegated_cli_uses_an_ordinary_agent_with_the_production_actor_dto() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let _agent = start_agent(dir.path(), runtime.path());
+    let delegated_status = || {
+        let output = binary(dir.path(), runtime.path())
+            .args(["--json", "status"])
+            .env("LOCKYARD_AGENT", "alice")
+            .env("LOCKYARD_TOKEN", "test-token")
+            .env("LOCKYARD_PARENT_CLAIM", "1336")
+            .output()
+            .unwrap();
+        json_of(&output)
+    };
+    let warm = delegated_status();
+    assert_eq!(warm["freshness"]["via"], "agent", "{warm}");
+    server.state.lock().unwrap().refuse_claims_get = Some((
+        503,
+        json!({"error":{"code":"unavailable","message":"claims unavailable"}}),
+    ));
+    let status = delegated_status();
+    assert_eq!(status["freshness"]["via"], "agent", "{status}");
+    assert_eq!(status["freshness"]["claims_cached"], true, "{status}");
 }
 
 #[test]
@@ -4490,6 +4756,7 @@ fn open_mail_escapes_controls_in_status() {
 include!("survey_client/mod.rs");
 include!("survey_client/r2.rs");
 include!("survey_client/r4.rs");
+include!("survey_client/r3_i2.rs");
 
 #[test]
 fn task_add_cli_and_mcp_reconcile_two_lost_create_responses_without_duplicates() {
@@ -4746,3 +5013,818 @@ fn manual_agent_root_wins_and_missing_copy_works_without_writing_one() {
 }
 
 include!("rework_client/mod.rs");
+
+#[path = "survey_client/nov18.rs"]
+mod survey_nov18;
+
+#[path = "survey_client/r4_session_key.rs"]
+mod survey_r4_session_key;
+
+#[path = "survey_client/r8_notifications.rs"]
+mod survey_r8_notifications;
+
+#[test]
+fn running_agent_uses_live_encryption_for_the_first_outbox_send() {
+    use lockyard_cloud_client::WorkspaceKey;
+    use std::os::unix::fs::DirBuilderExt;
+    const MAIL: &str = "/api/v1/bus/messages";
+    const WORKSPACE: &str = "00000000-0000-0000-0000-000000000001";
+    const BODY: &str = "queued while encryption was off";
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let key = WorkspaceKey::from_entropy([15; 32]);
+    let keys = runtime.path().join("config/lockyard/keys");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&keys)
+        .unwrap();
+    key.copy_to_private(&keys.join(format!("{WORKSPACE}.key")))
+        .unwrap();
+    let _agent = start_agent(dir.path(), runtime.path());
+    let (release, hold) = std::sync::mpsc::channel();
+    server.state.lock().unwrap().hold_next_mail_response = Some(hold);
+    let send = |body: &str| {
+        binary(dir.path(), runtime.path())
+            .args(["--json", "msg", "send", "bob", body])
+            .env("LOCKYARD_AGENT", "alice")
+            .env_remove("LOCKYARD_TOKEN")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let first = send("hold the outbox");
+    let end = Instant::now() + Duration::from_secs(8);
+    while server.seen("POST", MAIL).is_empty() {
+        assert!(Instant::now() < end, "first mail did not reach the server");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let second = send(BODY);
+    loop {
+        let status = json_of(&cli(
+            dir.path(),
+            runtime.path(),
+            &["--json", "agent", "status"],
+        ));
+        if status["status"]["outbox"] == 2 {
+            break;
+        }
+        assert!(Instant::now() < end, "second mail was not queued: {status}");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(server.seen("POST", MAIL).len(), 1);
+    server.state.lock().unwrap().encryption_key_id = Some(key.key_id());
+    release.send(()).unwrap();
+    for child in [first, second] {
+        let result = child.wait_with_output().unwrap();
+        assert!(result.status.success(), "{result:?}");
+    }
+    while server.seen("POST", MAIL).len() < 2 {
+        assert!(Instant::now() < end, "queued mail did not reach the server");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let writes = server.seen("POST", MAIL);
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].body["body"], "hold the outbox");
+    let ciphertext = writes[1].body["body"].as_str().unwrap();
+    assert!(
+        writes[1].body["from_client"]
+            .as_str()
+            .unwrap()
+            .starts_with("lyml1.")
+    );
+    assert_eq!(key.decrypt(WORKSPACE, "body", ciphertext).unwrap(), BODY);
+}
+
+#[test]
+fn running_agent_attests_live_encryption_before_replaying_mail() {
+    use lockyard_cloud_client::{PendingWrite, WorkspaceKey, credential_fingerprint};
+    const MAIL: &str = "/api/v1/bus/messages";
+    const BODY: &str = "plaintext before policy change";
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let key = WorkspaceKey::from_entropy([15; 32]);
+    server.state.lock().unwrap().require_encryption_after_mail = Some(key.key_id());
+    let _agent = start_agent(dir.path(), runtime.path());
+
+    let _sent = binary(dir.path(), runtime.path())
+        .args(["--json", "msg", "send", "bob", BODY])
+        .env("LOCKYARD_AGENT", "alice")
+        .env_remove("LOCKYARD_TOKEN")
+        .output()
+        .unwrap();
+    let writes = server.seen("POST", MAIL);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].body["body"], BODY);
+    let key = writes[0].key.as_deref().unwrap();
+    let scope = credential_fingerprint(&format!("{}\0test-token", server.url));
+    let path = runtime
+        .path()
+        .join("state/lockyard/pending-writes")
+        .join(scope)
+        .join(format!("{}.unknown", credential_fingerprint(key)));
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = json_of(&cli(
+            dir.path(),
+            runtime.path(),
+            &["--json", "agent", "status"],
+        ));
+        if path.is_file() && status["status"]["outbox"] == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < end,
+            "daemon did not park the replay: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let parked: PendingWrite = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(parked.cause_code, "pending_encryption_mismatch");
+    assert!(parked.first_sent_server_secs.is_some());
+    assert!(parked.replay_paused && !parked.replay_stopped);
+    assert_eq!(
+        server.seen("POST", MAIL).len(),
+        1,
+        "the repeat leaked the saved body"
+    );
+    assert!(
+        server
+            .seen("GET", "/api/v1/workspace/encryption")
+            .iter()
+            .any(|read| {
+                read.session
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("lockyard-pending-policy"))
+            }),
+        "the running daemon did not recheck the policy"
+    );
+}
+
+#[test]
+fn running_agent_finishes_mail_from_doctor_after_encryption_becomes_required() {
+    agent_finishes_mail_from_doctor(true, None);
+}
+
+#[test]
+fn agent_finishes_settled_mail_after_encryption_changes_from_off_to_required() {
+    agent_finishes_mail_from_doctor(false, Some(true));
+}
+
+#[test]
+fn agent_finishes_settled_mail_after_encryption_changes_from_required_to_off() {
+    agent_finishes_mail_from_doctor(true, Some(false));
+}
+
+fn agent_finishes_mail_from_doctor(initial_required: bool, after_repair: Option<bool>) {
+    use lockyard_cloud_client::{WorkspaceKey, credential_fingerprint};
+    use std::os::unix::fs::DirBuilderExt;
+
+    const MAIL: &str = "/api/v1/bus/messages";
+    const WORKSPACE: &str = "00000000-0000-0000-0000-000000000001";
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let key = WorkspaceKey::from_entropy([15; 32]);
+    let keys = runtime.path().join("config/lockyard/keys");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&keys)
+        .unwrap();
+    key.copy_to_private(&keys.join(format!("{WORKSPACE}.key")))
+        .unwrap();
+    let scope = credential_fingerprint(&format!("{}\0test-token", server.url));
+    let journal = runtime
+        .path()
+        .join("state/lockyard/pending-writes")
+        .join(scope);
+    server.state.lock().unwrap().mail_repair = Some(MailRepair {
+        cursor: journal.join(".repair-cursor"),
+        deliveries: Default::default(),
+    });
+    let set_policy = |required: bool| {
+        server.state.lock().unwrap().encryption_key_id = required.then(|| key.key_id());
+    };
+    if after_repair.is_some() {
+        set_policy(initial_required);
+    }
+    let mut agent = Some(start_agent(dir.path(), runtime.path()));
+    set_policy(initial_required);
+
+    let send = |body: &str| {
+        binary(dir.path(), runtime.path())
+            .args(["--json", "msg", "send", "bob", body])
+            .env("LOCKYARD_AGENT", "alice")
+            .env_remove("LOCKYARD_TOKEN")
+            .output()
+            .unwrap()
+    };
+    let lost = send("committed with no response");
+    assert!(!lost.status.success(), "{lost:?}");
+    assert!(
+        String::from_utf8_lossy(&lost.stderr).contains("outcome_unknown"),
+        "{lost:?}"
+    );
+    let first = server.seen("POST", MAIL).into_iter().next().unwrap();
+    let first_key = first.key.as_deref().unwrap();
+    let record = journal.join(format!("{}.settled", credential_fingerprint(first_key)));
+
+    if after_repair.is_some() {
+        // Keep the outbox stopped across repair and the policy change so it cannot
+        // read the receipt before both events have happened.
+        drop(agent.take());
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let repair = binary(dir.path(), runtime.path())
+            .args(["--json", "doctor", "--repair-pending"])
+            .env("LOCKYARD_TOKEN", "test-token")
+            .output()
+            .unwrap();
+        let report = json_of(&repair);
+        if report["pending_repair"]["applied"] == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "doctor could not settle the receipt: {report}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(record.is_file());
+    let posts_before_next = server.seen("POST", MAIL);
+    assert!(
+        posts_before_next.len() >= 2,
+        "doctor must replay the original key"
+    );
+    assert!(
+        posts_before_next
+            .iter()
+            .all(|post| post.key == first.key && post.body == first.body)
+    );
+    let _resumed_agent = after_repair.map(|required| {
+        let settled: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        assert_eq!(settled["consumed"], false);
+        set_policy(required);
+        start_agent(dir.path(), runtime.path())
+    });
+
+    let second = send("next letter");
+    assert!(second.status.success(), "{second:?}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let settled: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        let status = json_of(&cli(
+            dir.path(),
+            runtime.path(),
+            &["--json", "agent", "status"],
+        ));
+        if settled["consumed"] == true && status["status"]["outbox"] == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agent did not complete both letters: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let posts = server.seen("POST", MAIL);
+    assert_eq!(posts.len(), posts_before_next.len() + 1);
+    let second = posts.last().unwrap();
+    assert_ne!(second.key, first.key);
+    assert_eq!(second.session, first.session);
+    let state = server.state.lock().unwrap();
+    let deliveries = &state.mail_repair.as_ref().unwrap().deliveries;
+    assert_eq!(deliveries.len(), 2);
+    for (delivery_key, expected, required) in [
+        (first_key, "committed with no response", initial_required),
+        (
+            second.key.as_deref().unwrap(),
+            "next letter",
+            after_repair.unwrap_or(initial_required),
+        ),
+    ] {
+        let wire_body = deliveries[delivery_key]["body"].as_str().unwrap();
+        if required {
+            assert_eq!(key.decrypt(WORKSPACE, "body", wire_body).unwrap(), expected);
+        } else {
+            assert_eq!(wire_body, expected);
+        }
+    }
+}
+
+#[test]
+fn r14_plaintext_pending_is_never_sent_by_cli_agent_or_doctor_under_e2ee() {
+    use lockyard_cloud_client::{Call, Client, ClientError, Transport};
+    const WORKSPACE: &str = "00000000-0000-0000-0000-000000000001";
+    const PATH: &str = "/api/v1/registry/items";
+
+    for entry in ["cli", "agent", "doctor"] {
+        let server = Server::start();
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        let journal = runtime
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("state/lockyard/pending-writes");
+        let client = Client::new(&server.url, "test-token".into())
+            .unwrap()
+            .with_pending_journal(&journal)
+            .unwrap();
+        let call = Call::write(
+            "alice",
+            "POST",
+            PATH.into(),
+            json!({"title":"plaintext fixture"}),
+        );
+        server.state.lock().unwrap().refuse_registry_create = Some((
+            500,
+            json!({"error":{"code":"unavailable","message":"lost confirmation"}}),
+        ));
+        let Err(ClientError::OutcomeUnknown(pending)) = client.call(&call) else {
+            panic!("fixture must leave a replayable operation");
+        };
+        let mut pending = *pending;
+        pending.first_sent_unix_secs = pending.first_sent_unix_secs.map(|time| time - 120);
+        let scope = journal.join(lockyard_cloud_client::credential_fingerprint(&format!(
+            "{}\0test-token",
+            server.url
+        )));
+        let record = scope.join(format!(
+            "{}.json",
+            lockyard_cloud_client::credential_fingerprint(&pending.key)
+        ));
+        lockyard_core::fsio::replace(&record, &serde_json::to_vec(&pending).unwrap(), 0o600)
+            .unwrap();
+        {
+            let mut state = server.state.lock().unwrap();
+            state.refuse_registry_create = None;
+            state.seen.clear();
+        }
+        required_catalog_fixture(&server, dir.path(), runtime.path());
+
+        let required = [
+            ("LOCKYARD_REQUIRE_E2EE", "1"),
+            ("LOCKYARD_E2EE_WORKSPACE_ID", WORKSPACE),
+        ];
+        let agent = if entry == "agent" {
+            Some(start_agent_until_env(
+                dir.path(),
+                runtime.path(),
+                false,
+                &required,
+            ))
+        } else {
+            let mut command = binary(dir.path(), runtime.path());
+            command
+                .env("LOCKYARD_TOKEN", "test-token")
+                .envs(required)
+                .arg("--json");
+            let out = if entry == "doctor" {
+                command.args(["doctor", "--repair-pending"])
+            } else {
+                command.args(["zone", "list"])
+            }
+            .output()
+            .unwrap();
+            assert!(
+                out.status.success(),
+                "{entry}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if entry == "doctor" {
+                let report = json_of(&out);
+                assert_eq!(report["pending_repair"]["applied"], 0);
+                assert_eq!(report["pending_repair"]["rejected"], 0);
+                assert_eq!(report["pending_repair"]["remaining"], 0);
+                assert_eq!(
+                    report["pending_repair"]["unknown_ids"],
+                    json!([pending.key])
+                );
+            }
+            None
+        };
+
+        let cursor: String =
+            serde_json::from_slice(&std::fs::read(scope.join(".repair-cursor")).unwrap()).unwrap();
+        assert_eq!(
+            cursor, pending.key,
+            "{entry} did not examine the frozen write"
+        );
+        assert!(
+            !server
+                .seen("GET", "/api/v1/workspace/encryption")
+                .is_empty(),
+            "{entry}"
+        );
+        assert!(
+            server.seen("POST", PATH).is_empty(),
+            "{entry} sent the frozen plaintext"
+        );
+        assert!(!record.exists(), "{entry} kept the row active");
+        let unknown = record.with_extension("unknown");
+        let bytes = std::fs::read(&unknown).unwrap();
+        let parked: lockyard_cloud_client::PendingWrite = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parked.cause_code, "pending_encryption_mismatch");
+        assert_eq!(parked.body, pending.body);
+        assert!(parked.replay_paused && !parked.replay_stopped);
+        if entry == "doctor" {
+            let forgotten = binary(dir.path(), runtime.path())
+                .env("LOCKYARD_TOKEN", "test-token")
+                .envs(required)
+                .args([
+                    "--json",
+                    "doctor",
+                    "--forget-unknown",
+                    &pending.key,
+                    "--confirm",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(json_of(&forgotten)["forgotten_unknown"], 1);
+            assert!(!unknown.exists());
+            assert_eq!(
+                std::fs::read(record.with_extension("quarantine")).unwrap(),
+                bytes
+            );
+        }
+        drop(agent);
+    }
+}
+
+#[test]
+fn survey1118_ly0030_doctor_reconciles_pending_online() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let root = runtime
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("state/lockyard/pending-writes");
+    let _client = lockyard_cloud_client::Client::new(&server.url, "test-token".into())
+        .unwrap()
+        .with_pending_journal(&root)
+        .unwrap();
+    let scope =
+        lockyard_cloud_client::credential_fingerprint(&format!("{}\0test-token", server.url));
+    let scoped = root.join(scope);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for i in 0..140 {
+        let key = format!("fixture-{i}");
+        let record = json!({"code":"outcome_unknown","cause_code":"transport","cause_status":null,
+            "protocol":{"selected":2,"capabilities":[]},"method":"POST",
+            "path":if i == 139 {"/api/v1/registry/items"} else {"/api/v1/presence"},
+            "request_path":if i == 139 {"/api/v1/registry/items"} else {"/api/v1/presence"},
+            "body":if i == 139 {r#"{"title":"durable fixture"}"#} else {"{}"},
+            "key":key,"repository":null,"session":"alice","origin":server.url,
+            "credential_scope":lockyard_cloud_client::credential_fingerprint("test-token"),
+            "first_sent_unix_secs":if i == 139 { now } else { now - 31 * 24 * 3600 }});
+        let path = scoped.join(format!(
+            "{}.json",
+            lockyard_cloud_client::credential_fingerprint(&key)
+        ));
+        lockyard_core::fsio::replace(&path, &serde_json::to_vec(&record).unwrap(), 0o600).unwrap();
+    }
+    let out = binary(dir.path(), runtime.path())
+        .env_remove("LOCKYARD_AGENT")
+        .env("LOCKYARD_TOKEN", "test-token")
+        .args(["--json", "doctor", "--repair-pending"])
+        .output()
+        .unwrap();
+    let result = json_of(&out);
+    assert_eq!(result["pending_repair"]["quarantined"], 0, "{result}");
+    assert_eq!(result["pending_repair"]["outcome_unknown"], 139, "{result}");
+    assert_eq!(result["pending_repair"]["remaining"], 0, "{result}");
+    assert_eq!(result["pending_repair"]["applied"], 1, "{result}");
+    assert_eq!(result["network"], true);
+    assert!(!server.state.lock().unwrap().seen.is_empty());
+    assert!(!scoped.join("quarantine.log").exists());
+    assert_eq!(
+        std::fs::read_dir(&scoped)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "json" || ext == "unknown"))
+            .count(),
+        139,
+    );
+}
+
+#[test]
+fn survey1118_ly0030_doctor_offline_requires_network_and_preserves_all_records() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let root = runtime
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("state/lockyard/pending-writes");
+    let _client = lockyard_cloud_client::Client::new(&server.url, "test-token".into())
+        .unwrap()
+        .with_pending_journal(&root)
+        .unwrap();
+    let scope =
+        lockyard_cloud_client::credential_fingerprint(&format!("{}\0test-token", server.url));
+    let scoped = root.join(scope);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for i in 0..140 {
+        let key = format!("fixture-{i}");
+        let record = json!({"code":"outcome_unknown","cause_code":"transport","cause_status":null,
+            "protocol":{"selected":2,"capabilities":[]},"method":"POST",
+            "path":if i == 139 {"/api/v1/registry/items"} else {"/api/v1/presence"},
+            "request_path":if i == 139 {"/api/v1/registry/items"} else {"/api/v1/presence"},
+            "body":if i == 139 {r#"{"title":"durable fixture"}"#} else {"{}"},
+            "key":key,"repository":null,"session":"alice","origin":server.url,
+            "credential_scope":lockyard_cloud_client::credential_fingerprint("test-token"),
+            "first_sent_unix_secs":if i == 139 { now } else { now - 31 * 24 * 3600 }});
+        let path = scoped.join(format!(
+            "{}.json",
+            lockyard_cloud_client::credential_fingerprint(&key)
+        ));
+        lockyard_core::fsio::replace(&path, &serde_json::to_vec(&record).unwrap(), 0o600).unwrap();
+    }
+    server.state.lock().unwrap().api_offline = true;
+    let out = binary(dir.path(), runtime.path())
+        .env_remove("LOCKYARD_AGENT")
+        .env("LOCKYARD_TOKEN", "test-token")
+        .args(["--json", "doctor", "--repair-pending"])
+        .output()
+        .unwrap();
+    let result = json_of(&out);
+    assert_eq!(result["pending_repair"]["quarantined"], 0, "{result}");
+    assert_eq!(result["pending_repair"]["remaining"], 1, "{result}");
+    assert_eq!(result["pending_repair"]["outcome_unknown"], 139, "{result}");
+    assert_eq!(
+        result["pending_repair"]["network_required"], true,
+        "{result}"
+    );
+    assert_eq!(result["network"], false);
+    assert!(!scoped.join("quarantine.log").exists());
+    assert_eq!(
+        std::fs::read_dir(&scoped)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json" || extension == "unknown"))
+            .count(),
+        140
+    );
+}
+
+#[test]
+fn survey1118_r13_doctor_forgets_only_selected_unknown_operations_with_confirmation() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let root = runtime
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("state/lockyard/pending-writes");
+    let _client = lockyard_cloud_client::Client::new(&server.url, "test-token".into())
+        .unwrap()
+        .with_pending_journal(&root)
+        .unwrap();
+    let scoped = root.join(lockyard_cloud_client::credential_fingerprint(&format!(
+        "{}\0test-token",
+        server.url
+    )));
+    let record_path = |key: &str| {
+        scoped.join(format!(
+            "{}.json",
+            lockyard_cloud_client::credential_fingerprint(key)
+        ))
+    };
+    for (key, path) in [
+        ("first", "/api/v1/presence"),
+        ("second", "/api/v1/presence"),
+        ("active", "/api/v1/registry/items"),
+    ] {
+        let record = json!({"code":"outcome_unknown","cause_code":"transport","cause_status":null,
+            "protocol":{"selected":2,"capabilities":[]},"method":"POST","path":path,
+            "request_path":path,"body":"{}","key":key,"repository":null,"session":"alice","origin":server.url,
+            "credential_scope":lockyard_cloud_client::credential_fingerprint("test-token")});
+        lockyard_core::fsio::replace(
+            &record_path(key),
+            &serde_json::to_vec(&record).unwrap(),
+            0o600,
+        )
+        .unwrap();
+    }
+    let run = |args: &[&str]| cli(dir.path(), runtime.path(), args);
+    assert!(
+        !run(&["doctor", "--forget-unknown", "first"])
+            .status
+            .success()
+    );
+    assert!(record_path("first").exists());
+    assert!(!scoped.join("quarantine.log").exists());
+    assert_eq!(
+        json_of(&run(&[
+            "--json",
+            "doctor",
+            "--forget-unknown",
+            "first",
+            "--confirm"
+        ]))["forgotten_unknown"],
+        1
+    );
+    assert!(record_path("first").with_extension("quarantine").exists());
+    assert!(record_path("second").exists());
+    assert_eq!(
+        json_of(&run(&[
+            "--json",
+            "doctor",
+            "--forget-unknown",
+            "--all",
+            "--confirm"
+        ]))["forgotten_unknown"],
+        1
+    );
+    assert!(record_path("second").with_extension("quarantine").exists());
+    assert!(record_path("active").exists());
+    let log = std::fs::read_to_string(scoped.join("quarantine.log")).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("operator_forgot_unknown"))
+            .count(),
+        2
+    );
+    assert!(server.state.lock().unwrap().seen.is_empty());
+}
+
+#[test]
+fn survey1118_ly0030_lost_token_issue_is_never_replayed_by_load_service_or_doctor() {
+    use lockyard_cloud_client::{Call, Client, ClientError, Transport};
+
+    let server = Server::start();
+    server.state.lock().unwrap().lose_token_create_reply = true;
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let journal = runtime
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("state/lockyard/pending-writes");
+    let open = || {
+        Client::new(&server.url, "test-token".into())
+            .unwrap()
+            .with_pending_journal(&journal)
+            .unwrap()
+    };
+    let client = open();
+    let issue = Call::write(
+        "alice",
+        "POST",
+        "/api/v1/registry/tokens".into(),
+        json!({"name":"lost-reply-fixture"}),
+    );
+    let Err(ClientError::OutcomeUnknown(pending)) = client.call(&issue) else {
+        panic!("token issuance did not retain an unknown outcome");
+    };
+    assert_eq!(server.state.lock().unwrap().tokens_created, 1);
+    let key = issue.key.as_deref().unwrap();
+    let scope = journal.join(lockyard_cloud_client::credential_fingerprint(&format!(
+        "{}\0test-token",
+        server.url
+    )));
+    let write_pending = |operation: &lockyard_cloud_client::PendingWrite| {
+        let name = lockyard_cloud_client::credential_fingerprint(&operation.key);
+        lockyard_core::fsio::replace(
+            &scope.join(format!("{name}.json")),
+            &serde_json::to_vec(operation).unwrap(),
+            0o600,
+        )
+        .unwrap();
+    };
+    let mut pending = *pending;
+    pending.first_sent_unix_secs = pending.first_sent_unix_secs.map(|time| time - 120);
+    write_pending(&pending);
+    let restored = open();
+    assert!(restored.pending_operation(key).is_some());
+    assert!(matches!(
+        restored.call(&issue),
+        Err(ClientError::OutcomeUnknown(_))
+    ));
+    assert_eq!(server.state.lock().unwrap().tokens_created, 1);
+
+    let daemon = start_agent_until(dir.path(), runtime.path(), true);
+    // A second journal record added after startup proves the periodic service pass ran.
+    let path = "/api/v1/registry/items/D-1/evidence";
+    let witness = lockyard_cloud_client::PendingWrite {
+        key: lockyard_cloud_client::ulid(),
+        path: path.into(),
+        request_path: path.into(),
+        body: Some(r#"{"evidence":"fixture"}"#.into()),
+        ..pending.clone()
+    };
+    write_pending(&witness);
+    let until = Instant::now() + Duration::from_secs(15);
+    while !server
+        .seen("POST", path)
+        .iter()
+        .any(|request| request.key.as_deref() == Some(&witness.key))
+    {
+        assert!(
+            Instant::now() < until,
+            "daemon did not reconcile the evidence witness"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(server.state.lock().unwrap().tokens_created, 1);
+    drop(daemon);
+
+    let out = binary(dir.path(), runtime.path())
+        .env_remove("LOCKYARD_AGENT")
+        .env("LOCKYARD_TOKEN", "test-token")
+        .args(["--json", "doctor", "--repair-pending"])
+        .output()
+        .unwrap();
+    let report = json_of(&out);
+    assert_eq!(report["pending_repair"]["outcome_unknown"], 1);
+    assert_eq!(report["pending_repair"]["remaining"], 0);
+    assert!(
+        scope
+            .join(format!(
+                "{}.json",
+                lockyard_cloud_client::credential_fingerprint(key)
+            ))
+            .is_file()
+    );
+    assert_eq!(server.state.lock().unwrap().tokens_created, 1);
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("new-secret-key"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("new-secret-key"));
+}
+
+#[test]
+fn survey1118_r12_doctor_repair_respects_revoked_url_trust() {
+    use lockyard_cloud_client::{Call, Client, ClientError, Transport};
+
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let journal = runtime
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("state/lockyard/pending-writes");
+    assert!(
+        cli(dir.path(), runtime.path(), &["cloud", "trust", &server.url])
+            .status
+            .success()
+    );
+    let client = Client::new(&server.url, "test-token".into())
+        .unwrap()
+        .with_pending_journal(&journal)
+        .unwrap();
+    server.state.lock().unwrap().refuse_registry_create = Some((
+        500,
+        json!({"error":{"code":"unavailable","message":"lost confirmation"}}),
+    ));
+    let call = Call::write(
+        "alice",
+        "POST",
+        "/api/v1/registry/items".into(),
+        json!({"title":"pending trust fixture", "client_key":lockyard_cloud_client::ulid()}),
+    );
+    assert!(matches!(
+        client.call(&call),
+        Err(ClientError::OutcomeUnknown(_))
+    ));
+    let scope =
+        lockyard_cloud_client::credential_fingerprint(&format!("{}\0test-token", server.url));
+    let record = lockyard_cloud_client::credential_fingerprint(call.key.as_deref().unwrap());
+    let path = journal.join(scope).join(format!("{record}.json"));
+    let before = std::fs::read(&path).unwrap();
+
+    std::fs::remove_file(runtime.path().join("config/lockyard/trusted-servers")).unwrap();
+    server.state.lock().unwrap().refuse_registry_create = None;
+    let count = server.state.lock().unwrap().seen.len();
+    let out = binary(dir.path(), runtime.path())
+        .env_remove("LOCKYARD_URL")
+        .env("LOCKYARD_TOKEN", "test-token")
+        .args(["--json", "doctor", "--repair-pending"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is not trusted"));
+    assert_eq!(server.state.lock().unwrap().seen.len(), count);
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}

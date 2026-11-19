@@ -3,6 +3,7 @@
 //! Managed client integration and read-only diagnostics. Configuration writes are opt-in;
 //! manifests own individual entries, never a user's whole configuration file.
 
+use crate::setup::merge;
 use lockyard_core::config::{Config, Mode};
 use lockyard_core::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,7 @@ struct Spec {
     path: PathBuf,
     entries: Vec<Entry>,
     toml: bool,
+    json_mcp: Option<crate::setup::Client>,
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -105,13 +107,32 @@ fn canonical_base(path: &Path) -> Result<PathBuf> {
     }
 }
 
+const JSON_MCP_SERVER: [&str; 2] = ["mcpServers", "lockyard"];
+
+fn json_mcp_entries(claude: bool) -> Vec<Entry> {
+    let server = merge::server_entry(claude);
+    let mut entries = vec![
+        entry(
+            &["mcpServers", "lockyard", "command"],
+            server["command"].clone(),
+        ),
+        entry(&["mcpServers", "lockyard", "args"], server["args"].clone()),
+    ];
+    if claude {
+        entries.push(entry(
+            &["mcpServers", "lockyard", "env", merge::CLAUDE_MCP_MARKER],
+            server["env"][merge::CLAUDE_MCP_MARKER].clone(),
+        ));
+    }
+    entries
+}
+
 fn specs(root: &Path, client: &str, home: &Path, codex_home: Option<&Path>) -> Result<Vec<Spec>> {
     let root = if matches!(client, "claude" | "cursor") {
         canonical_base(root)?
     } else {
         root.to_path_buf()
     };
-    let server = json!({"command":"lockyard", "args":["mcp"]});
     match client {
         "claude" => {
             let hooks: Value = serde_json::from_str(crate::hook::SETTINGS)
@@ -129,20 +150,23 @@ fn specs(root: &Path, client: &str, home: &Path, codex_home: Option<&Path>) -> R
             Ok(vec![
                 Spec {
                     path: root.join(".mcp.json"),
-                    entries: vec![entry(&["mcpServers", "lockyard"], server)],
+                    entries: json_mcp_entries(true),
                     toml: false,
+                    json_mcp: Some(crate::setup::Client::Claude),
                 },
                 Spec {
                     path: root.join(".claude/settings.json"),
                     entries,
                     toml: false,
+                    json_mcp: None,
                 },
             ])
         }
         "cursor" => Ok(vec![Spec {
             path: root.join(".cursor/mcp.json"),
-            entries: vec![entry(&["mcpServers", "lockyard"], server)],
+            entries: json_mcp_entries(false),
             toml: false,
+            json_mcp: Some(crate::setup::Client::Cursor),
         }]),
         "codex" => Ok(vec![Spec {
             path: match codex_home {
@@ -155,6 +179,7 @@ fn specs(root: &Path, client: &str, home: &Path, codex_home: Option<&Path>) -> R
                 json!({"command":"lockyard", "args":["mcp"], "env_vars":["LOCKYARD_AGENT", "LOCKYARD_URL", "LOCKYARD_TOKEN_FILE", "LOCKYARD_TOKEN", "LOCKYARD_NODE_CONFIG", "XDG_CONFIG_HOME", "LOCKYARD_REQUIRE_E2EE", "LOCKYARD_E2EE_WORKSPACE_ID"]}),
             )],
             toml: true,
+            json_mcp: None,
         }]),
         _ => Err(invalid("client must be claude, codex or cursor")),
     }
@@ -345,10 +370,54 @@ fn supported_ownership(spec: &Spec, owned: &Manifest) -> bool {
             })
     } else {
         owned.toml_block.is_none()
-            && owned
-                .entries
-                .iter()
-                .all(|entry| spec.entries.contains(entry))
+            && owned.entries.iter().all(|entry| {
+                spec.entries.contains(entry)
+                    || (spec.json_mcp.is_some() && *entry == legacy_json_mcp_entry())
+            })
+    }
+}
+
+fn codex_entry_matches(value: &Value, item: &Entry) -> bool {
+    let Some(existing) = locate(value, &item.path) else {
+        return false;
+    };
+    item.value.as_object().is_some_and(|fields| {
+        fields.iter().all(|(name, wanted)| {
+            if name == "env_vars" {
+                existing[name].as_array().is_some_and(|names| {
+                    wanted
+                        .as_array()
+                        .is_some_and(|expected| expected.iter().all(|name| names.contains(name)))
+                })
+            } else {
+                existing[name] == *wanted
+            }
+        })
+    })
+}
+
+fn legacy_json_mcp_entry() -> Entry {
+    entry(&JSON_MCP_SERVER, merge::server_entry(false))
+}
+
+fn remove_empty_json_mcp(value: &mut Value) {
+    if let Some(server) = value
+        .pointer_mut("/mcpServers/lockyard")
+        .and_then(Value::as_object_mut)
+    {
+        if server
+            .get("env")
+            .and_then(Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            server.remove("env");
+        }
+        if server.is_empty() {
+            value["mcpServers"]
+                .as_object_mut()
+                .expect("MCP servers object")
+                .remove("lockyard");
+        }
     }
 }
 
@@ -374,11 +443,22 @@ fn plan(
     if spec.toml {
         let source = std::str::from_utf8(previous.unwrap_or_default())
             .map_err(|_| invalid("configuration is not UTF-8; preserving it"))?;
-        let parsed: toml::Value = source
+        let mut doc: toml_edit::DocumentMut = source
             .parse()
             .map_err(|_| invalid("configuration is not valid TOML; preserving it"))?;
+        let mut next = if matches!(action, SetupAction::Apply | SetupAction::Preview)
+            && merge::codex_without_claude_marker(&mut doc)
+        {
+            doc.to_string()
+        } else {
+            source.to_owned()
+        };
+        let parsed: toml::Value = next.parse().map_err(|_| invalid("cannot inspect TOML"))?;
         let value = serde_json::to_value(parsed).map_err(|_| invalid("cannot inspect TOML"))?;
-        let present = spec.entries.iter().all(|item| contains(&value, item));
+        let present = spec
+            .entries
+            .iter()
+            .all(|item| codex_entry_matches(&value, item));
         if action == SetupAction::Check {
             return Ok(Planned {
                 bytes: source.as_bytes().to_vec(),
@@ -387,7 +467,6 @@ fn plan(
                 changed: false,
             });
         }
-        let mut next = source.to_string();
         let legacy_versions = legacy_codex_versions();
         if let Some(block) = owned.and_then(|owned| owned.toml_block.as_ref()) {
             // The receipt is persisted before the configuration. A process interrupted during
@@ -401,6 +480,11 @@ fn plan(
                     .map_or(block.as_str(), |(block, _)| *block)
             } else {
                 block.as_str()
+            };
+            let matching_entry = match legacy_versions.iter().find(|(legacy, _)| *legacy == block) {
+                Some((_, entry)) => contains(&value, entry),
+                None if action == SetupAction::Remove => contains(&value, &spec.entries[0]),
+                None => codex_entry_matches(&value, &spec.entries[0]),
             };
             if !next.contains(block)
                 && !next.contains("# BEGIN LOCKYARD MANAGED MCP")
@@ -416,15 +500,7 @@ fn plan(
                     ownership.toml_block = Some(TOML_BLOCK.into());
                     ownership.entries = spec.entries.clone();
                 }
-            } else if next.matches(block).count() != 1
-                || !contains(
-                    &value,
-                    legacy_versions
-                        .iter()
-                        .find(|(legacy, _)| *legacy == block)
-                        .map_or(&spec.entries[0], |(_, entry)| entry),
-                )
-            {
+            } else if next.matches(block).count() != 1 || !matching_entry {
                 return Err(invalid(
                     "managed TOML block changed; preserving configuration",
                 ));
@@ -487,7 +563,43 @@ fn plan(
     let before = value.clone();
     if let Some(owned) = owned {
         for item in &owned.entries {
-            remove_entry(&mut value, item)?;
+            if spec.json_mcp.is_some() && *item == legacy_json_mcp_entry() {
+                // The old receipt owned the server object. Migrate ownership of
+                // command and args, leaving user fields added since installation.
+                for leaf in json_mcp_entries(false) {
+                    remove_entry(&mut value, &leaf)?;
+                }
+            } else if action != SetupAction::Remove
+                && item
+                    .path
+                    .last()
+                    .is_some_and(|key| key == merge::CLAUDE_MCP_MARKER)
+            {
+                if let Some(env) = value
+                    .pointer_mut("/mcpServers/lockyard/env")
+                    .and_then(Value::as_object_mut)
+                {
+                    env.remove(merge::CLAUDE_MCP_MARKER);
+                }
+            } else {
+                remove_entry(&mut value, item)?;
+            }
+        }
+    }
+    if let Some(client) = spec.json_mcp {
+        if action == SetupAction::Remove {
+            if owned.is_some() {
+                remove_empty_json_mcp(&mut value);
+            }
+        } else if let Some(env) = value.pointer_mut("/mcpServers/lockyard/env") {
+            let env = env
+                .as_object_mut()
+                .ok_or_else(|| invalid("Lockyard MCP env must be an object"))?;
+            let claude = client == crate::setup::Client::Claude;
+            merge::clear_managed_env(env, claude);
+            if claude && env.get(merge::CLAUDE_MCP_MARKER).and_then(Value::as_str) != Some("1") {
+                env.remove(merge::CLAUDE_MCP_MARKER);
+            }
         }
     }
     if action != SetupAction::Remove {
@@ -564,9 +676,19 @@ fn execute(spec: &Spec, action: SetupAction) -> Result<Value> {
     let previous = read_optional(&spec.path)?;
     let owned = manifest(&spec.path)?;
     let planned = plan(spec, previous.as_deref(), owned.as_ref(), action)?;
+    let warning = if spec.json_mcp == Some(crate::setup::Client::Claude)
+        && action != SetupAction::Remove
+    {
+        previous
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .and_then(|value| merge::claude_env_warning(&value["mcpServers"]["lockyard"]["env"]))
+    } else {
+        None
+    };
     if action == SetupAction::Check {
         return Ok(
-            json!({"path":spec.path,"status":if planned.present {"present"} else {"missing"},"ok":planned.present,"managed":owned.is_some()}),
+            json!({"path":spec.path,"status":if planned.present {"present"} else {"missing"},"ok":planned.present,"managed":owned.is_some(),"warning":warning}),
         );
     }
     let mut backup = None;
@@ -622,7 +744,7 @@ fn execute(spec: &Spec, action: SetupAction) -> Result<Value> {
         "updated"
     };
     Ok(
-        json!({"path":spec.path,"status":status,"ok":true,"would_change":planned.changed,"backup":backup,
+        json!({"path":spec.path,"status":status,"ok":true,"would_change":planned.changed,"backup":backup,"warning":warning,
         "managed_entries":spec.entries.iter().map(|item|json!({"path":item.path,"operation":if item.append {"append hook if missing"} else {"install server if absent"},"value":item.value})).collect::<Vec<_>>() }),
     )
 }
@@ -730,7 +852,31 @@ pub fn doctor(cwd: &Path, agent: Option<&str>, client: Option<&str>, smoke: bool
                             "The local database must exist. No migration or repair is performed by doctor.",
                         );
                     } else {
-                        cloud_checks(&mut checks, &config);
+                        cloud_checks(&mut checks, &config, identity.as_deref());
+                        match lockyard_core::config::token_source_for(
+                            config.url.as_deref().unwrap_or(""),
+                            identity.as_deref().unwrap_or("lockyard-cli"),
+                        ) {
+                            Ok(source) => check(&mut checks, "selected_key", "ok", source),
+                            Err(error) => {
+                                check(&mut checks, "selected_key", "failed", &error.to_string())
+                            }
+                        }
+                        for (label, mcp) in [("claude_key_cli", false), ("claude_key_mcp", true)] {
+                            match lockyard_core::config::claude_key_reason_for(
+                                config.url.as_deref().unwrap_or(""),
+                                identity.as_deref().unwrap_or("lockyard-cli"),
+                                mcp,
+                            ) {
+                                Ok(reason) => check(&mut checks, label, "ok", reason),
+                                Err(_) => check(
+                                    &mut checks,
+                                    label,
+                                    "failed",
+                                    "Selection state is unavailable.",
+                                ),
+                            }
+                        }
                     }
                 }
             }
@@ -774,7 +920,7 @@ pub fn doctor(cwd: &Path, agent: Option<&str>, client: Option<&str>, smoke: bool
     )
 }
 
-fn cloud_checks(checks: &mut Vec<Value>, config: &Config) {
+fn cloud_checks(checks: &mut Vec<Value>, config: &Config, session: Option<&str>) {
     let (Some(url), Some(workspace)) = (config.url.as_deref(), config.workspace.as_deref()) else {
         return;
     };
@@ -788,7 +934,18 @@ fn cloud_checks(checks: &mut Vec<Value>, config: &Config) {
         },
         "The configured URL must be explicitly trusted before credentials are sent.",
     );
-    let token = Config::token().ok();
+    let token = Config::token_for_session(url, session.unwrap_or("lockyard-cli")).ok();
+    if lockyard_core::config::default_token_file().is_some_and(|path| path.exists()) {
+        // These doctor variants are offline: opaque keys cannot reveal their role.
+        // Always show the storage rule instead of silently accepting a lead/owner key
+        // or adding a remote authorization probe to the offline diagnostic.
+        check(
+            checks,
+            "default_token_role",
+            "warning",
+            "ключ по умолчанию должен быть ключом агента; lead/owner храните отдельно. Роль не проверена: диагностика offline.",
+        );
+    }
     check(
         checks,
         "credential_binding",
@@ -916,6 +1073,9 @@ pub fn text(report: &Value) -> String {
     }
     if let Some(files) = report["files"].as_array() {
         for file in files {
+            if let Some(warning) = file["warning"].as_str() {
+                lines.push(warning.into());
+            }
             lines.push(format!(
                 "{}: {}{}",
                 file["path"].as_str().unwrap_or_default(),
@@ -976,6 +1136,54 @@ mod tests {
         assert_eq!(found["custom"], true);
         assert_eq!(found["mcpServers"]["other"]["command"], "other");
         assert!(found["mcpServers"].get("lockyard").is_none());
+    }
+
+    #[test]
+    fn claude_upgrades_a_whole_entry_receipt_without_claiming_custom_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        fs::write(&path, r#"{"mcpServers":{"lockyard":{"command":"lockyard","args":["mcp"],"env":{"USER_ENV":"kept"}}}}"#).unwrap();
+        let mut receipt = Manifest::empty();
+        receipt.entries = vec![legacy_json_mcp_entry()];
+        fs::write(sidecar(&path), serde_json::to_vec(&receipt).unwrap()).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                setup_at(dir.path(), "claude", SetupAction::Apply, dir.path()).unwrap()["ok"],
+                true
+            );
+            let env = &serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap()["mcpServers"]
+                ["lockyard"]["env"];
+            assert_eq!(env["USER_ENV"], "kept");
+            assert_eq!(env[merge::CLAUDE_MCP_MARKER], "1");
+        }
+        assert_eq!(
+            setup_at(dir.path(), "claude", SetupAction::Remove, dir.path()).unwrap()["ok"],
+            true
+        );
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            value["mcpServers"]["lockyard"],
+            json!({"env":{"USER_ENV":"kept"}})
+        );
+    }
+
+    #[test]
+    fn repeated_managed_codex_setup_keeps_user_env_and_removes_claude_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            setup_at(dir.path(), "codex", SetupAction::Apply, dir.path()).unwrap()["ok"],
+            true
+        );
+        let path = dir.path().join(".codex/config.toml");
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("{original}\n[mcp_servers.lockyard.env]\nUSER_ENV = 'kept'\nLOCKYARD_CLAUDE_MCP = '1'\n")).unwrap();
+        for _ in 0..2 {
+            let report = setup_at(dir.path(), "codex", SetupAction::Apply, dir.path()).unwrap();
+            assert_eq!(report["ok"], true, "{report}");
+            let config = fs::read_to_string(&path).unwrap();
+            assert!(config.contains("USER_ENV = 'kept'"));
+            assert!(!config.contains(merge::CLAUDE_MCP_MARKER));
+        }
     }
 
     #[test]

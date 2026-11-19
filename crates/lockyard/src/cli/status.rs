@@ -100,13 +100,17 @@ fn agent_incoming_requests(root: &Path, session: &str, budget: Duration) -> Inco
     let Ok((url, workspace)) = open::endpoint(&config) else {
         return IncomingFetch::Unknown;
     };
-    let token = Config::token_for(&url).ok();
-    let expected = token.as_deref().map(lockyard_cloud_client::token_id);
+    let Ok(token) = lockyard_core::config::optional_session_token(&url, session) else {
+        return IncomingFetch::Unknown;
+    };
+    let credential = token
+        .as_deref()
+        .map(crate::agent::socket::CallerCredential::from_token);
     let Some(socket) = crate::agent::socket::AgentSocket::connect_status(
         &crate::agent::socket_path_for(&url, &workspace),
         &url,
         &workspace,
-        expected.as_deref(),
+        credential.as_ref(),
         budget.min(Duration::from_millis(100)),
     ) else {
         return IncomingFetch::Unknown;
@@ -197,6 +201,9 @@ fn render_status(
     });
     if let Some(level) = machine_level {
         lines.push(format!("machine: {level}"));
+    }
+    if let Some(age) = read.freshness["cache_age_ms"].as_u64() {
+        lines.push(format!("cached ({age} ms ago)"));
     }
     let unread = agent.and(read.unread);
     if let Some(unread) = unread {
@@ -289,6 +296,22 @@ fn render_status(
         .collect();
     let mut data = json!({"unread": unread, "claims": claims,
         "machine_level": machine_level, "unannounced": unannounced});
+    if cloud
+        && let Ok(config) = lockyard_core::config::Config::load(root)
+        && let Some(url) = config.url.as_deref()
+        && let Some(role) = open::default_token_role(url, Duration::from_millis(300))
+        && matches!(role.as_str(), "lead" | "owner")
+    {
+        data["default_token_role"] = json!(role);
+        lines.push(format!("default key: {role} — нужен ключ агента"));
+    }
+    if cloud {
+        let config = lockyard_core::config::Config::load(root)?;
+        let source =
+            lockyard_core::config::token_source_for(config.url.as_deref().unwrap_or(""), session)?;
+        data["token_source"] = json!(source);
+        lines.push(format!("key: {source}"));
+    }
     attach_incoming(&mut data, &mut lines, incoming_fetch);
     read.tasks.truncate(20);
     lines.push(join(&read.tasks, task_line, "no tasks"));

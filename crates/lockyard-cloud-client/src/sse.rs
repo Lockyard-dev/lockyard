@@ -248,8 +248,8 @@ impl Client {
                 .header("X-Lockyard-Session", session)
                 .header("X-Lockyard-Capabilities", "mail_push_v1")
                 .header("Lockyard-Protocol", protocol.selected.to_string())
-                .header("Last-Event-ID", after.to_string())
-                .send();
+                .header("Last-Event-ID", after.to_string());
+            let pending = pending.send();
             tokio::pin!(pending);
             loop {
                 if interrupt.load(Ordering::Acquire) {

@@ -23,10 +23,22 @@ mod test_support;
 
 pub use backend::{CloudBackend, checks as decode_checks};
 pub use crypto::{CONTENT_FIELDS, FieldRule, WorkspaceKey, route_matches, transform_fields};
-pub use protocol::{NegotiatedProtocol, PendingWrite, Problem, ProtocolRange};
+pub use protocol::{NegotiatedProtocol, PendingRepair, PendingWrite, Problem, ProtocolRange};
 pub use repository::RepositoryTransport;
 
 const ENCRYPTION_PATH: &str = "/api/v1/workspace/encryption";
+
+/// Decode the presence list using the same compatibility projection as CloudBackend.
+pub fn decode_presence(value: Value) -> Result<Vec<lockyard_core::proto::Presence>, ClientError> {
+    backend::list(value, &["sessions", "presence", "items"])
+}
+
+/// Decode both the server's event array and legacy wrapped event lists.
+pub fn decode_events(value: Value) -> Result<lockyard_core::proto::EventPage, ClientError> {
+    Ok(lockyard_core::proto::EventPage {
+        events: backend::list(value, &["events", "items"])?,
+    })
+}
 
 /// Workspace-level content encryption state returned by the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +116,8 @@ pub(crate) fn task_area_error(error: &ApiError) -> Option<String> {
             .unwrap_or("?")
     };
     Some(match error.code.as_str() {
+        "agent_product_conflict" => "Продукт агента конфликтует с привязанным именем сессии (agent_product_conflict); используй своё имя сессии или освободи прежнюю привязку через lockyard cloud release-session <имя>.".into(),
+        "session_name_bound" => "имя сессии закреплено за другим ключом; вероятно, файл ключа по умолчанию подменён; верни ключ агента или освободи имя: lockyard cloud release-session <имя>".into(),
         "task_paths_required" => "Задаче нужны файлы или каталоги, которых она касается. Передай --path <путь> [--path <путь> …] в CLI или paths: [\"репозиторий/файл\"] в MCP, относительно корня рабочего места.".into(),
         "task_paths_span_repositories" => {
             let roots = error.details.get("roots").and_then(Value::as_array)
@@ -175,11 +189,12 @@ impl ClientError {
             Self::Transport(_) | Self::JournalBusy => true,
             Self::Frozen(error) => matches!(
                 error.code.as_str(),
-                "" | "frozen" | "server_draining" | "temporarily_unavailable"
+                "" | "frozen" | "server_draining" | "temporarily_unavailable" | "unavailable"
             ),
             Self::Unauthorized(_) => false,
             Self::Http(error) => {
-                error.code.is_empty() && (error.status >= 500 || (300..400).contains(&error.status))
+                (error.code.is_empty() || error.code == "unavailable")
+                    && (error.status >= 500 || (300..400).contains(&error.status))
             }
             Self::Decode(_) => true,
             _ => false,
@@ -432,9 +447,9 @@ impl Call {
 
     /// True when this call changes server state. Only `zones/check` is a POST that reads.
     pub fn is_write(&self) -> bool {
-        self.method != "GET"
-            && self.method != "HEAD"
-            && !self.path.starts_with("/api/v1/zones/check")
+        !matches!(self.method.as_str(), "GET" | "HEAD")
+            && !(self.method == "POST"
+                && self.path.split('?').next() == Some("/api/v1/zones/check"))
     }
 }
 
@@ -452,6 +467,16 @@ pub(crate) const SOFT_ZONES_V1: &str = "soft_zones_v1";
 
 /// How requests reach the server.
 pub trait Transport: Send + Sync {
+    /// Offline journal retirement and refresh; background services call this periodically.
+    fn maintain_pending(&self) -> Result<(), ClientError> {
+        Ok(())
+    }
+
+    /// The exact operation has durable evidence outside the active replay queue.
+    fn write_is_parked(&self, _call: &Call) -> bool {
+        false
+    }
+
     /// Explicit discovery on background / send paths only, never on status or renew.
     fn mail_push_v1(&self, _session: &str) -> Result<bool, ClientError> {
         Ok(false)
@@ -614,6 +639,14 @@ pub trait Transport: Send + Sync {
 }
 
 impl<T: Transport + ?Sized> Transport for Arc<T> {
+    fn maintain_pending(&self) -> Result<(), ClientError> {
+        (**self).maintain_pending()
+    }
+
+    fn write_is_parked(&self, call: &Call) -> bool {
+        (**self).write_is_parked(call)
+    }
+
     fn mail_push_v1(&self, session: &str) -> Result<bool, ClientError> {
         (**self).mail_push_v1(session)
     }
@@ -722,6 +755,8 @@ impl<T: Transport + ?Sized> Transport for Arc<T> {
 }
 
 /// HTTP transport. The token is passed in by the caller and never stored by this crate.
+type ReplicaResolver = Box<dyn Fn(Option<&str>, Option<&str>) -> Option<String> + Send + Sync>;
+
 pub struct Client {
     base_url: String,
     token: String,
@@ -737,9 +772,12 @@ pub struct Client {
     registry_auto_area_observed: AtomicBool,
     mail_open_v1_observed: AtomicBool,
     pending_journal: Option<std::path::PathBuf>,
+    check_pending_encryption_policy: bool,
+    check_live_write_encryption_policy: bool,
     status_protocol_cache: Option<std::path::PathBuf>,
     catalog_cache_root: Option<std::path::PathBuf>,
     server_clock: std::sync::Mutex<Option<(i64, Instant)>>,
+    trusted_replica: ReplicaResolver,
     http_workers: HttpWorkers,
 }
 
@@ -901,6 +939,69 @@ impl Drop for HttpWorker<'_> {
 }
 
 impl Client {
+    /// Resolve and bind an automatically selected Claude credential before attaching any
+    /// credential-scoped journals or sending writes. Old live sessions may only downgrade.
+    /// Explicit files and ordinary agent credentials never enter this retry path.
+    pub fn for_session(
+        base_url: &str,
+        session: &str,
+        budget: Option<Duration>,
+    ) -> Result<Self, ClientError> {
+        use lockyard_core::config::{Config, token_source_for};
+        let started = Instant::now();
+        let automatic_claude = token_source_for(base_url, session)
+            .map_err(|error| ClientError::Invalid(error.to_string()))?
+            == "claude";
+        let client = Self::new(
+            base_url,
+            Config::token_for_session(base_url, session)
+                .map_err(|error| ClientError::Invalid(error.to_string()))?,
+        )?;
+        if !automatic_claude {
+            return Ok(client);
+        }
+        // Presence is an authenticated session route even on servers with public protocol
+        // discovery. Matching daemon connections defer binding to their first cloud request.
+        let mut probe = Call::get(session, "/api/v1/presence".into());
+        probe.deadline_ms = budget.map(|budget| {
+            budget
+                .saturating_sub(started.elapsed())
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64
+        });
+        match client.call(&probe) {
+            Err(ClientError::Denied(error)) if error.code == "session_name_bound" => {
+                lockyard_core::session_key::remember_fallback(base_url, session)
+                    .map_err(|error| ClientError::Invalid(error.to_string()))?;
+                let agent = Self::new(
+                    base_url,
+                    Config::token_for_session(base_url, session)
+                        .map_err(|error| ClientError::Invalid(error.to_string()))?,
+                )?;
+                probe.deadline_ms = budget.map(|budget| {
+                    budget
+                        .saturating_sub(started.elapsed())
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64
+                });
+                agent.call(&probe)?;
+                Ok(agent)
+            }
+            Err(error) => Err(error),
+            Ok(_) => Ok(client),
+        }
+    }
+
+    /// Fingerprint of the credential fixed for this client's lifetime.
+    pub fn credential_id(&self) -> String {
+        token_id(&self.token)
+    }
+
+    /// Credential verifier for the private local agent socket.
+    pub fn ipc_credential_proof(&self) -> String {
+        ipc_credential_proof(&self.token)
+    }
+
     /// A session name for this machine's own service calls, unique per token (D-3178). The server binds a
     /// session name to the first token that uses it, so a name shared by every token on the machine (agent,
     /// lead, owner, a reissued key) made the second one fail with «already bound to another token».
@@ -962,15 +1063,27 @@ impl Client {
             registry_auto_area_observed: AtomicBool::new(false),
             mail_open_v1_observed: AtomicBool::new(false),
             pending_journal: None,
+            check_pending_encryption_policy: false,
+            check_live_write_encryption_policy: false,
             status_protocol_cache: None,
             catalog_cache_root: None,
             server_clock: std::sync::Mutex::new(None),
+            trusted_replica: Box::new(|_, _| None),
             http_workers: HttpWorkers {
                 limit: usize::MAX,
                 active: Mutex::new(ActiveHttpWorkers::default()),
                 available: Condvar::new(),
             },
         })
+    }
+
+    /// Permit receipt reconciliation with explicitly trusted replica origins.
+    pub fn with_trusted_replica(
+        mut self,
+        resolve: impl Fn(Option<&str>, Option<&str>) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.trusted_replica = Box::new(resolve);
+        self
     }
 
     /// Bound HTTP workers across all callers. A cap of at least three explicitly reserves one
@@ -1118,6 +1231,39 @@ impl Client {
         self,
         setting: WorkspaceEncryption,
     ) -> Result<Self, ClientError> {
+        let (key, required) = self.validate_content_encryption(&setting)?;
+        let mut configured = self.with_content_encryption(&setting.workspace_id, key, required);
+        configured.expected_key_id = setting.key_id;
+        Ok(configured)
+    }
+
+    fn validate_content_encryption(
+        &self,
+        setting: &WorkspaceEncryption,
+    ) -> Result<(Option<WorkspaceKey>, bool), ClientError> {
+        let required = self.validate_encryption_setting(setting)?;
+        let key = WorkspaceKey::load_for_workspace(&setting.workspace_id)
+            .map_err(ClientError::Invalid)?;
+        if self.expected_e2ee_workspace.is_some() && key.is_none() {
+            return Err(ClientError::Invalid(
+                "required node workspace encryption key is unavailable".into(),
+            ));
+        }
+        if required && let (Some(key), Some(expected)) = (&key, setting.key_id.as_deref()) {
+            let actual = key.key_id();
+            if actual != expected {
+                return Err(ClientError::Invalid(format!(
+                    "key id mismatch: local key {actual} does not match workspace key id {expected}"
+                )));
+            }
+        }
+        Ok((key, required))
+    }
+
+    fn validate_encryption_setting(
+        &self,
+        setting: &WorkspaceEncryption,
+    ) -> Result<bool, ClientError> {
         if let Some(expected) = &self.expected_e2ee_workspace
             && expected != &setting.workspace_id
         {
@@ -1132,25 +1278,7 @@ impl Client {
                 "invalid workspace encryption setting values".into(),
             ));
         }
-        let key = WorkspaceKey::load_for_workspace(&setting.workspace_id)
-            .map_err(ClientError::Invalid)?;
-        let required = setting.encryption == "required" || self.expected_e2ee_workspace.is_some();
-        if self.expected_e2ee_workspace.is_some() && key.is_none() {
-            return Err(ClientError::Invalid(
-                "required node workspace encryption key is unavailable".into(),
-            ));
-        }
-        if required && let (Some(key), Some(expected)) = (&key, setting.key_id.as_deref()) {
-            let actual = key.key_id();
-            if actual != expected {
-                return Err(ClientError::Invalid(format!(
-                    "key id mismatch: local key {actual} does not match workspace key id {expected}"
-                )));
-            }
-        }
-        let mut configured = self.with_content_encryption(&setting.workspace_id, key, required);
-        configured.expected_key_id = setting.key_id;
-        Ok(configured)
+        Ok(setting.encryption == "required" || self.expected_e2ee_workspace.is_some())
     }
 
     /// Fetch the server's setting without enabling transformations, for encryption management.
@@ -1202,13 +1330,61 @@ impl Client {
         auto_area_capability: Option<&AtomicBool>,
         first_attempt: bool,
     ) -> Result<Value, Failure> {
+        self.attempt_with_date(
+            call,
+            encoded,
+            remaining,
+            protocol,
+            registry_capability,
+            auto_area_capability,
+            first_attempt,
+            None,
+            None,
+        )
+    }
+
+    fn attempt_frozen(
+        &self,
+        policy: &Client,
+        call: &Call,
+        pending: &PendingWrite,
+        remaining: Option<Duration>,
+        registry_capability: Option<&AtomicBool>,
+        first_attempt: bool,
+    ) -> Result<Value, Failure> {
+        self.attempt_with_date(
+            call,
+            pending.body.as_deref(),
+            remaining,
+            &pending.protocol,
+            registry_capability,
+            None,
+            first_attempt,
+            None,
+            Some((policy, pending)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attempt_with_date(
+        &self,
+        call: &Call,
+        encoded: Option<&str>,
+        remaining: Option<Duration>,
+        protocol: &NegotiatedProtocol,
+        registry_capability: Option<&AtomicBool>,
+        auto_area_capability: Option<&AtomicBool>,
+        first_attempt: bool,
+        response_date: Option<&mut Option<u64>>,
+        frozen: Option<(&Client, &PendingWrite)>,
+    ) -> Result<Value, Failure> {
         let request_started = Instant::now();
         let _worker = self
             .http_workers
             .acquire(call, remaining)
             .map_err(Failure::Final)?;
         call.check_cancelled().map_err(Failure::Final)?;
-        let remaining = remaining.map(|budget| budget.saturating_sub(request_started.elapsed()));
+        let left = || remaining.map(|budget| budget.saturating_sub(request_started.elapsed()));
         let url = format!("{}{}", self.base_url, call.path);
         let client = if call.long_poll {
             &self.poll_agent
@@ -1240,6 +1416,9 @@ impl Client {
                 "User-Agent",
                 concat!("lockyard/", env!("CARGO_PKG_VERSION")),
             );
+        if response_date.is_some() || (call.method == "GET" && call.path == ENCRYPTION_PATH) {
+            request = request.set("Cache-Control", "no-cache");
+        }
         if !protocol.legacy {
             request = request.set("Lockyard-Protocol", &protocol.selected.to_string());
         }
@@ -1260,10 +1439,20 @@ impl Client {
         // fixed connect cap and its OS DNS resolver is not cancellable; process deadlines guard
         // those cases. An attempt override must never extend the caller's overall deadline.
         let attempt_limit = call.attempt_timeout_ms.map(Duration::from_millis);
-        if let Some(limit) = match (remaining, attempt_limit) {
+        let attempt_started = Instant::now();
+        let limit = || match (
+            left(),
+            attempt_limit.map(|budget| budget.saturating_sub(attempt_started.elapsed())),
+        ) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
-        } {
+        };
+        if let Some((policy, pending)) = frozen {
+            policy
+                .attest_frozen_body(self, pending, limit(), call.cancellation.as_ref())
+                .map_err(Failure::BeforeSend)?;
+        }
+        if let Some(limit) = limit() {
             if limit.is_zero() {
                 return Err(Failure::Final(ClientError::Transport(
                     "call deadline elapsed".into(),
@@ -1290,6 +1479,9 @@ impl Client {
             .and_then(|response| response.header("Date"))
             .and_then(http_date_ms)
         {
+            if let Some(date) = response_date {
+                *date = u64::try_from(server_ms / 1000).ok();
+            }
             // Date is rounded to a second. Add a full second and the complete request elapsed
             // time, an upper bound independent of the machine's wall clock and NTP changes.
             let elapsed = i64::try_from(request_started.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -1424,6 +1616,7 @@ impl Client {
                 let retry_after = response
                     .header("Retry-After")
                     .and_then(|value| value.parse::<u64>().ok());
+                let lockyard_response = response.header("Lockyard-Protocol").is_some();
                 let echo = protocol::verify_echo(&response, protocol);
                 let body = response.into_string().unwrap_or_default();
                 // A definitive rejection of a registry create did not create an item, even
@@ -1465,6 +1658,15 @@ impl Client {
                         )));
                     }
                 };
+                if api_error.code == "unavailable" && !protocol::looks_like_lockyard_error(&body) {
+                    if lockyard_response {
+                        return Err(Failure::Final(protocol::local(
+                            "protocol_response_invalid",
+                            "Lockyard error response omitted its envelope",
+                        )));
+                    }
+                    return Err(Failure::Final(ClientError::from_api(api_error)));
+                }
                 if create_rejected
                     && (api_error.code.is_empty()
                         || (echo.is_err()
@@ -1549,6 +1751,7 @@ impl Client {
 }
 
 enum Failure {
+    BeforeSend(ClientError),
     Retry(ClientError),
     Final(ClientError),
 }
@@ -1591,7 +1794,19 @@ fn task_create_missing_legacy_area(call: &Call, error: &ApiError) -> bool {
 }
 
 impl Transport for Client {
+    fn maintain_pending(&self) -> Result<(), ClientError> {
+        self.maintain_pending_journal().map(|_| ())
+    }
+
+    fn write_is_parked(&self, call: &Call) -> bool {
+        self.durable_parked_write(call)
+    }
+
     fn prepare_task_create(&self, call: &Call, explicit_key: bool) -> Result<Call, ClientError> {
+        match self.maintain_pending_journal() {
+            Ok(_) | Err(ClientError::JournalBusy) => {}
+            Err(error) => return Err(error),
+        }
         self.pending_task_create(call, explicit_key)
     }
     fn mail_push_v1(&self, session: &str) -> Result<bool, ClientError> {
@@ -1718,7 +1933,7 @@ impl Transport for Client {
             }
         };
         let Some(pending) = self.pending_operation(key) else {
-            return Ok(());
+            return self.consume_settled(call);
         };
         let Some(request_digest) = pending.request_digest.as_deref() else {
             // Older journals have only encrypted wire bytes. They cannot establish that an
@@ -1858,6 +2073,11 @@ pub fn credential_fingerprint(token: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// Separate the local IPC verifier from fingerprints published in agent status.
+pub fn ipc_credential_proof(token: &str) -> String {
+    credential_fingerprint(&format!("lockyard-agent-ipc-v1\0{token}"))
 }
 
 fn decode_for_call(
@@ -4018,5 +4238,164 @@ mod tests {
     fn query_values_are_encoded() {
         assert_eq!(encode("src/a b"), "src%2Fa%20b");
         assert_eq!(encode("a-b_c.d~"), "a-b_c.d~");
+    }
+}
+
+#[cfg(test)]
+mod survey_nov18 {
+    use super::*;
+    use crate::fake::{FakeServer, Reply};
+    use serde_json::json;
+
+    #[test]
+    fn survey1118_forwarded_calls_do_not_send_product_header() {
+        let server = FakeServer::start(vec![Reply::json(200, json!([]))]);
+        let client = Client::new(&server.url(), "secret".into()).unwrap();
+        let call = Call::get("original-client", "/api/v1/zones/claims".into());
+        let forwarded: Call = serde_json::from_value(serde_json::to_value(call).unwrap()).unwrap();
+        client.call(&forwarded).unwrap();
+        for request in server
+            .discovery_requests()
+            .into_iter()
+            .chain(server.requests())
+        {
+            assert_eq!(
+                request.header("x-lockyard-agent-product"),
+                None,
+                "{request:?}"
+            );
+            assert_eq!(
+                request.header("x-lockyard-session"),
+                Some("original-client")
+            );
+            assert_eq!(request.header("authorization"), Some("Bearer secret"));
+        }
+    }
+
+    #[test]
+    fn survey1118_agent_product_conflict_keeps_code_and_actionable_message() {
+        let error = ClientError::from_api(ApiError::parse(
+            409,
+            r#"{"error":{"code":"agent_product_conflict","message":"conflicting product"}}"#,
+            None,
+        ));
+        let core: CoreError = error.into();
+        assert_eq!(core.kind(), "agent_product_conflict");
+        assert!(core.to_string().contains("Продукт агента"));
+        assert!(core.to_string().contains("release-session"));
+    }
+
+    // A real TCP stub deliberately omits Lockyard headers, as Railway does during maintenance.
+    pub(crate) fn upstream(
+        status: u16,
+        body: &str,
+        lockyard: bool,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let body = body.to_owned();
+        let worker = std::thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let (status, body, echo) = if index == 0 {
+                    (
+                        200,
+                        r#"{"selected_protocol":2,"min_protocol":1,"max_protocol":2,"capabilities":[]}"#,
+                        "Lockyard-Protocol: 2\r\n",
+                    )
+                } else {
+                    (
+                        status,
+                        body.as_str(),
+                        if lockyard {
+                            "Lockyard-Protocol: 2\r\n"
+                        } else {
+                            ""
+                        },
+                    )
+                };
+                write!(stream,"HTTP/1.1 {status} Response\r\n{echo}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        (address, worker)
+    }
+
+    #[test]
+    fn survey1118_proxy_html_empty_and_railway_json_are_unavailable() {
+        for (status, body) in [
+            (502, "<html>Railway error</html>"),
+            (503, ""),
+            (503, r#"{"message":"Application failed to respond"}"#),
+            (
+                502,
+                r#"{"status":"error","code":502,"message":"Application failed to respond"}"#,
+            ),
+            (504, "gateway timeout"),
+        ] {
+            let (url, worker) = upstream(status, body, false);
+            let client = Client::new(&url, "secret".into()).unwrap();
+            let error = client
+                .call(&Call::get("me", "/api/v1/zones/claims".into()))
+                .unwrap_err();
+            assert_eq!(error.code(), Some("unavailable"), "{error}");
+            let core: CoreError = error.into();
+            assert_eq!(core.kind(), "unavailable");
+            assert!(
+                core.to_string().contains(&format!(
+                    "сервер Lockyard недоступен или на обслуживании (HTTP {status})"
+                )),
+                "{core}"
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn survey1118_lockyard_contradiction_and_missing_envelope_remain_protocol_errors() {
+        for (body, lockyard) in [
+            (
+                r#"{"error":{"code":"frozen"},"code":"unavailable","status":503}"#,
+                false,
+            ),
+            (r#"{"error":"bad"}"#, false),
+            ("<html>bad</html>", true),
+        ] {
+            let (url, worker) = upstream(503, body, lockyard);
+            let error = Client::new(&url, "secret".into())
+                .unwrap()
+                .call(&Call::get("me", "/api/v1/zones/claims".into()))
+                .unwrap_err();
+            assert_eq!(error.code(), Some("protocol_response_invalid"), "{error}");
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn survey1118_real_lockyard_unavailable_is_a_valid_envelope() {
+        let (url, worker) = upstream(
+            503,
+            r#"{"error":{"code":"unavailable","message":"planned maintenance"}}"#,
+            true,
+        );
+        let error = Client::new(&url, "secret".into())
+            .unwrap()
+            .call(&Call::get("me", "/api/v1/zones/claims".into()))
+            .unwrap_err();
+        assert_eq!(error.code(), Some("unavailable"));
+        assert!(error.to_string().contains("planned maintenance"));
+        worker.join().unwrap();
     }
 }

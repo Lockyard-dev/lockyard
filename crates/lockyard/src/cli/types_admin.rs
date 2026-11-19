@@ -219,7 +219,7 @@ pub(super) enum EncryptionCommand {
 #[derive(Subcommand)]
 #[command(defer = true)]
 pub(super) enum TokenCommand {
-    /// Create a token. The raw token prints once and cannot be read again.
+    /// Create a token and save its key to a private file.
     Create {
         name: String,
         /// agent, lead, owner, exporter, importer or dispatcher.
@@ -228,6 +228,9 @@ pub(super) enum TokenCommand {
         /// Days until it expires, at most 366.
         #[arg(long, default_value_t = DEFAULT_TOKEN_DAYS)]
         days: i64,
+        /// Atomically save only the raw key in a private 0600 file; omit it from output.
+        #[arg(long)]
+        output_file: PathBuf,
     },
     /// List tokens, never their raw value.
     List,

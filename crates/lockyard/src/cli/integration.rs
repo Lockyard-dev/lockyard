@@ -61,11 +61,7 @@ pub(super) fn run_hook(command: HookCommand, agent: Option<String>, cwd: &Path) 
 }
 
 pub(super) fn setup(client: SetupClient) -> String {
-    let server = r#"{
-  "mcpServers": {
-    "lockyard": { "command": "lockyard", "args": ["mcp"] }
-  }
-}"#;
+    let server = setup::merge::mcp_snippet(matches!(client, SetupClient::Claude));
     let mut sections = match client {
         SetupClient::Claude => vec![
             format!("Add to .claude/settings.json:\n{}", hook::SETTINGS),
@@ -77,7 +73,9 @@ pub(super) fn setup(client: SetupClient) -> String {
         ],
         SetupClient::Cursor => vec![format!("Add to .cursor/mcp.json:\n{server}")],
     };
-    sections.push("Set LOCKYARD_AGENT to a unique name for each agent.".to_string());
+    if !matches!(client, SetupClient::Claude) {
+        sections.push("Set LOCKYARD_AGENT to a unique name for each agent.".to_string());
+    }
     sections.join("\n\n")
 }
 
@@ -160,9 +158,30 @@ pub(super) fn run_setup(args: SetupArgs, cwd: &Path) -> Result<Output> {
     let done = setup::apply(&changes, args.dry_run)?;
     let mut text = setup::describe(&done, args.dry_run);
     if !args.dry_run && !args.uninstall && !done.is_empty() {
-        text.push_str(
-            "\n\nRestart the clients you had open, then set LOCKYARD_AGENT to a unique name for each agent.",
-        );
+        text.push_str("\n\nRestart the clients you had open.");
+        if clients
+            .iter()
+            .any(|client| *client != setup::Client::Claude)
+        {
+            text.push_str(" Set LOCKYARD_AGENT to a unique name for each non-Claude agent.");
+        }
+    }
+    if !args.uninstall {
+        for change in changes
+            .iter()
+            .filter(|change| change.client == setup::Client::Claude && change.part == "mcp")
+        {
+            if let Some(config) = change
+                .before
+                .as_deref()
+                .and_then(|source| serde_json::from_str::<Value>(source).ok())
+                && let Some(warning) =
+                    setup::merge::claude_env_warning(&config["mcpServers"]["lockyard"]["env"])
+            {
+                // Stderr keeps the warning visible in both text and JSON modes.
+                eprintln!("lockyard setup: {warning}");
+            }
+        }
     }
     output(&setup::as_json(&done), text)
 }
@@ -197,7 +216,44 @@ pub(super) fn run_doctor(cwd: &Path, agent: Option<&String>) -> Result<Output> {
 
     let config = Config::load(&root)?;
     if config.mode == Mode::Cloud {
-        findings.push(cloud_finding(&config, name.as_deref()));
+        // The network probe may discover an old session binding. Diagnose the final choice.
+        let cloud = cloud_finding(&config, name.as_deref());
+        findings.push(
+            match lockyard_core::config::token_source_for(
+                config.url.as_deref().unwrap_or(""),
+                name.as_deref().unwrap_or("lockyard-cli"),
+            ) {
+                Ok(source) => setup::Finding::ok_check("selected key", source),
+                Err(error) => setup::Finding::failed("selected key", error.to_string()),
+            },
+        );
+        for (label, mcp) in [("Claude key (CLI)", false), ("Claude key (MCP)", true)] {
+            findings.push(
+                match lockyard_core::config::claude_key_reason_for(
+                    config.url.as_deref().unwrap_or(""),
+                    name.as_deref().unwrap_or("lockyard-cli"),
+                    mcp,
+                ) {
+                    Ok(reason) => setup::Finding::ok_check(label, reason),
+                    Err(_) => setup::Finding::failed(label, "selection state is unavailable"),
+                },
+            );
+        }
+        match config.url.as_deref()
+            .and_then(|url| open::default_token_role(url, Duration::from_millis(500)))
+            .as_deref()
+        {
+            Some("agent") => {}
+            Some(role) => findings.push(setup::Finding::failed(
+                "default token",
+                format!("{role}: ключ по умолчанию должен быть ключом агента"),
+            )),
+            None => findings.push(setup::Finding::ok_check(
+                "default token",
+                "Внимание. Роль не подтверждена. В стандартном файле должен быть ключ агента, lead/owner храните отдельно.",
+            )),
+        }
+        findings.push(cloud);
     } else {
         findings.push(setup::Finding::ok_check(
             "mode",
@@ -258,7 +314,7 @@ pub(super) fn cloud_finding(
         Ok((url, _)) => url,
         Err(error) => return setup::Finding::failed("cloud", error.to_string()),
     };
-    match open::direct_client(&endpoint) {
+    match open::direct_client_for_session(&endpoint, agent.unwrap_or("lockyard-doctor")) {
         Ok(client) => {
             let session = agent.unwrap_or("lockyard-doctor");
             let call = lockyard_cloud_client::Call::get(session, "/api/v1/presence".into());

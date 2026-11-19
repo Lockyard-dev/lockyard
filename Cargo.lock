@@ -1051,7 +1051,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "lockyard"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "clap",
  "libc",
@@ -1066,11 +1066,12 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
 name = "lockyard-cloud-client"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "libc",
  "lockyard-compat",
@@ -1087,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "lockyard-compat"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "libc",
  "lockyard-core",
@@ -1096,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "lockyard-core"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "libc",
  "notify",
@@ -1112,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "lockyard-node"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",

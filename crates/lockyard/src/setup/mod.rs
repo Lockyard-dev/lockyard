@@ -198,7 +198,8 @@ impl Client {
         let shown = mcp.path().display();
         let mut text = match &mcp {
             McpSite::Json(_) => format!(
-                "Add to {shown}:\n{{\n  \"mcpServers\": {{\n    \"lockyard\": {{ \"command\": \"lockyard\", \"args\": [\"mcp\"] }}\n  }}\n}}"
+                "Add to {shown}:\n{}",
+                merge::mcp_snippet(self == Self::Claude)
             ),
             McpSite::Toml(_) => format!(
                 "Add to {shown}:\n[mcp_servers.lockyard]\ncommand = \"lockyard\"\nargs = [\"mcp\"]"
@@ -226,7 +227,9 @@ impl Client {
                 "\n\nCursor does not start this MCP server until you enable lockyard in Settings → MCP (the approval card). Reload without that approval leaves it off. Lockyard cannot approve itself.",
             );
         }
-        text.push_str("\n\nSet LOCKYARD_AGENT to a unique name for each agent.");
+        if self != Self::Claude {
+            text.push_str("\n\nSet LOCKYARD_AGENT to a unique name for each agent.");
+        }
         text
     }
 
@@ -319,26 +322,26 @@ pub fn plan_client(client: Client, site: &Site, uninstall: bool) -> Result<Vec<C
         (McpSite::Json(_), current, false) => Some(merge::mcp_set(
             &shown,
             current.as_deref(),
-            &merge::server_entry(),
+            client == Client::Claude,
         )?),
         (McpSite::Json(_), Some(current), true) => merge::mcp_remove(&shown, current)?,
-        (McpSite::Toml(_), current, false) => Some(merge::toml_table_set(
+        (McpSite::Toml(_), current, false) => Some(merge::codex_mcp_set(
             current.as_deref().unwrap_or(""),
             CODEX_TABLE,
             &codex_body(),
-        )),
-        (McpSite::Toml(_), Some(current), true) => merge::toml_table_remove(current, CODEX_TABLE),
+        )?),
+        (McpSite::Toml(_), Some(current), true) => merge::codex_mcp_remove(current, CODEX_TABLE)?,
     };
     let after = if uninstall {
         match &mcp {
             McpSite::Json(_) => {
                 restore_if_unchanged(mcp.path(), before.as_deref(), after, |original| {
-                    merge::mcp_set(&shown, Some(original), &merge::server_entry())
+                    merge::mcp_set(&shown, Some(original), client == Client::Claude)
                 })?
             }
             McpSite::Toml(_) => {
                 restore_if_unchanged(mcp.path(), before.as_deref(), after, |original| {
-                    Ok(merge::toml_table_set(original, CODEX_TABLE, &codex_body()))
+                    merge::codex_mcp_set(original, CODEX_TABLE, &codex_body())
                 })?
             }
         }

@@ -76,6 +76,7 @@ fn compact_local_status_always_has_an_empty_lost_list() {
 
 struct StatusCloud {
     lost: std::result::Result<Value, ClientError>,
+    unread_unavailable: bool,
 }
 
 impl Transport for StatusCloud {
@@ -83,7 +84,14 @@ impl Transport for StatusCloud {
         assert_eq!(call.method, "GET");
         assert_eq!(call.session, "worker");
         Ok(match call.path.as_str() {
-            "/api/v1/bus/inbox" => json!({"messages": [], "skipped": 3}),
+            "/api/v1/bus/inbox" if self.unread_unavailable => {
+                return Err(ClientError::Transport("counter unavailable".into()));
+            }
+            "/api/v1/bus/inbox" => json!({"messages": [
+                {"id": 1, "from_session": "lead", "to": "worker"},
+                {"id": 2, "from_session": "lead", "to": "worker"},
+                {"id": 3, "from_session": "lead", "to": "worker"}
+            ], "skipped": 0}),
             "/api/v1/bus/inbox?all=true&limit=50" => json!({"messages": [], "skipped": 0}),
             "/api/v1/zones/claims?session=worker" => json!({"claims": [
                 {"id": 11, "session": "worker", "paths": ["src/own"]},
@@ -107,15 +115,23 @@ impl Transport for StatusCloud {
 fn compact_cloud_status_preserves_other_fields_when_lost_is_unavailable() {
     let read_status = |lost| {
         status(
-            &mut CloudBackend::new(StatusCloud { lost }, "worker"),
+            &mut CloudBackend::new(
+                StatusCloud {
+                    lost,
+                    unread_unavailable: false,
+                },
+                "worker",
+            ),
             Some("worker"),
             10_000_000,
+            "",
         )
         .unwrap()
     };
     let mut expected = read_status(Ok(json!({"lost": []})));
     assert_eq!(expected["lost"], json!([]));
     assert_eq!(expected["unread"], 3);
+    assert!(expected.get("unread_unavailable").is_none());
     assert_eq!(expected["claims"][0]["id"], 11);
     assert_eq!(expected["work"][0]["id"], "BT-1");
     assert_eq!(expected["offers"][0]["id"], 12);
@@ -127,4 +143,28 @@ fn compact_cloud_status_preserves_other_fields_when_lost_is_unavailable() {
     ] {
         assert_eq!(read_status(lost), expected);
     }
+}
+
+#[test]
+fn compact_cloud_status_preserves_work_when_optional_unread_is_unavailable() {
+    let answer = status(
+        &mut CloudBackend::new(
+            StatusCloud {
+                lost: Ok(json!({"lost": []})),
+                unread_unavailable: true,
+            },
+            "worker",
+        ),
+        Some("worker"),
+        10_000_000,
+        "",
+    )
+    .unwrap();
+    assert!(answer["unread"].is_null());
+    assert_eq!(answer["unread_unavailable"], true);
+    assert_eq!(answer["claims"][0]["id"], 11);
+    assert_eq!(answer["work"][0]["id"], "BT-1");
+    assert_eq!(answer["offers"][0]["id"], 12);
+    assert_eq!(answer["tasks"][0]["id"], "D-1");
+    assert_eq!(answer["lost"], json!([]));
 }

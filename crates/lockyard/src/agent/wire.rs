@@ -32,7 +32,7 @@ pub enum Phase {
 pub enum Request {
     /// Who are you, and how fresh is your view?
     Ping,
-    /// Hold this connection until actionable unread mail arrives. A new waiter replaces the old.
+    /// Hold this connection until personal or urgent broadcast unread mail arrives. A new waiter replaces the old.
     WaitMail {
         session: String,
         since: i64,
@@ -113,10 +113,27 @@ pub enum Request {
     },
 }
 
+/// The private verifier is never included in Ping responses or debug output.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CredentialProof(pub String);
+
+impl std::fmt::Debug for CredentialProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
 /// A request and the workspace its sender believes it belongs to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     pub workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_token_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_proof: Option<CredentialProof>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delegated: bool,
     #[serde(flatten)]
     pub request: Request,
 }
@@ -156,6 +173,9 @@ pub struct AgentStatus {
     /// Which token the process runs under. See `lockyard_cloud_client::token_id`.
     #[serde(default)]
     pub token_id: String,
+    /// Older services did not declare whether tokenless routing was permitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_matching_token: Option<bool>,
     #[serde(default)]
     pub catalog_expansion_v1: bool,
     /// This agent negotiates claim modes itself and its server confirmed `soft_zones_v1`.
@@ -213,6 +233,8 @@ pub struct Reply {
     pub board_age_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<Message>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mail_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<Vec<lockyard_core::proto::Event>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -234,6 +256,19 @@ impl Reply {
 
 fn wait_mail_timeout() -> u64 {
     6 * 60 * 60 * 1000
+}
+
+impl AgentStatus {
+    pub fn accepts_caller_token(&self, expected: Option<&str>) -> bool {
+        let ordinary_agent = self.requires_matching_token == Some(false);
+        if !ordinary_agent && std::env::var_os("LOCKYARD_PARENT_CLAIM").is_some() {
+            return false;
+        }
+        match expected {
+            Some(expected) => self.token_id == expected,
+            None => ordinary_agent,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +308,9 @@ mod tests {
     fn a_request_is_one_flat_object() {
         let envelope = Envelope {
             workspace: "w".into(),
+            expected_token_id: None,
+            credential_proof: None,
+            delegated: false,
             request: Request::Unread {
                 attention_ack: Vec::new(),
                 attention: false,
@@ -288,6 +326,9 @@ mod tests {
     fn a_zone_snapshot_request_uses_the_additive_socket_shape() {
         let request = Envelope {
             workspace: "w".into(),
+            expected_token_id: None,
+            credential_proof: None,
+            delegated: false,
             request: Request::ZoneSnapshot {
                 session: "s".into(),
             },
@@ -321,6 +362,9 @@ mod tests {
     fn status_request_and_capability_are_additive_for_old_daemons() {
         let request = Envelope {
             workspace: "w".into(),
+            expected_token_id: None,
+            credential_proof: None,
+            delegated: false,
             request: Request::StatusRead {
                 session: "s".into(),
                 repository: Some("api".into()),

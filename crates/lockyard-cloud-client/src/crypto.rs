@@ -10,6 +10,16 @@ const LABEL: &[u8] = b"lockyard-cloud-key-id-v1";
 const WORDS: &str = include_str!("english.txt");
 const PREFIX: &str = "lyenc1.";
 const SESSION_META: &str = "$lockyard_session_v1";
+const MAIL_CONTENT: &str = "$lockyard_mail_v1:";
+const MAIL_SENDER: &str = "lyml1.";
+const MAIL_SENDER_WIRE_LIMIT: usize = 256;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailContent {
+    body: String,
+    from_client: String,
+}
 const FIELDS: &str = include_str!("../content-fields.json");
 const OPENAPI: &str = include_str!("../tests/fixtures/openapi.json");
 #[derive(Debug, Clone)]
@@ -190,6 +200,8 @@ fn parsed() -> Result<&'static (FieldMap, Value), String> {
             for schema in ["CoordinationMessage", "CoordinationMessageWrite"] {
                 schemas[schema]["properties"]["urgent"] = serde_json::json!({"type":"boolean"});
             }
+            // Older schemas omit the separate reply sender field accepted by the server.
+            schemas["CoordinationReplyWrite"]["properties"]["from_client"] = serde_json::json!({"type":"string"});
             for field in ["address", "role", "from_alias"] {
                 schemas["CoordinationMessage"]["properties"][field] = serde_json::json!({"type":["string","null"]});
             }
@@ -198,6 +210,12 @@ fn parsed() -> Result<&'static (FieldMap, Value), String> {
             // mail_push_v1 uses `from` as an alias of the sender session metadata.
             schemas["CoordinationMessage"]["properties"]["from"] = serde_json::json!({"type":"string"});
             schemas["CoordinationMessage"]["properties"]["replied_at"] = serde_json::json!({"type":["string","integer","null"]});
+            // Legacy sent receipts used integer epoch milliseconds.
+            let sent = &mut schemas["CoordinationSentReceipt"]["properties"];
+            sent["created_at"]["type"] = serde_json::json!(["string", "integer"]);
+            for field in ["delivered_at", "read_at", "replied_at"] {
+                sent[field]["type"] = serde_json::json!(["null", "string", "integer"]);
+            }
             for field in map.fields.iter().filter(|field| !field.when.is_empty()) {
                 let properties = api["components"]["schemas"][&field.schema]["properties"]
                     .as_object()
@@ -454,10 +472,41 @@ pub(crate) fn transform_fields_policy_context(
             meta.insert(SESSION_META.into(), Value::String(cipher));
         }
     }
-    if encrypt && normalized.starts_with("/api/v1/bus/messages") {
-        value
-            .as_object_mut()
-            .map(|object| object.remove("from_client"));
+    if encrypt
+        && method == "POST"
+        && (normalized == "/api/v1/bus/messages"
+            || openapi_path_matches("/api/v1/bus/messages/{id}/reply", normalized))
+        && let Some(sender) = value.get("from_client").filter(|sender| !sender.is_null())
+    {
+        let sender = sender.as_str().ok_or("mail sender label must be text")?;
+        let body = value
+            .get("body")
+            .and_then(Value::as_str)
+            .ok_or("mail body must be text")?;
+        let key = key.ok_or("mail content key unavailable")?;
+        let body = if body.starts_with(PREFIX) {
+            key.decrypt(workspace, "body", body)?;
+            body.to_owned()
+        } else {
+            key.encrypt(workspace, "body", body)?
+        };
+        let label = if let Some(payload) = sender.strip_prefix(MAIL_SENDER)
+            && decrypt_mail_sender(key, workspace, &body, payload).is_ok()
+        {
+            sender.to_owned()
+        } else {
+            // Legacy readers decrypt body directly. Bind the separate label to its ciphertext.
+            let label = key.encrypt(workspace, &mail_sender_context(&body), sender)?;
+            // The body already identifies the workspace key. Omit its repeated ID so
+            // a maximum-length CLI/MCP label fits the server's from_client limit.
+            let (_, payload) = label.rsplit_once('.').expect("encrypted envelope");
+            format!("{MAIL_SENDER}{payload}")
+        };
+        if label.len() > MAIL_SENDER_WIRE_LIMIT {
+            return Err("encrypted mail sender label exceeds the server's 256-byte limit".into());
+        }
+        value["body"] = Value::String(body);
+        value["from_client"] = Value::String(label);
     }
     let duplicate_nonces = duplicate_session_meta_nonces(value);
     let mut touched = Vec::new();
@@ -479,6 +528,21 @@ pub(crate) fn transform_fields_policy_context(
         restore_encrypted_session_meta(value, workspace, key, &duplicate_nonces)?;
     }
     Ok(())
+}
+
+fn mail_sender_context(body: &str) -> String {
+    let digest = digest::digest(&digest::SHA256, body.as_bytes());
+    format!("{MAIL_SENDER}{}", base64url(digest.as_ref()))
+}
+
+fn decrypt_mail_sender(
+    key: &WorkspaceKey,
+    workspace: &str,
+    body: &str,
+    payload: &str,
+) -> Result<String, String> {
+    let label = format!("{PREFIX}{}.{payload}", key.key_id());
+    key.decrypt(workspace, &mail_sender_context(body), &label)
 }
 
 fn duplicate_session_meta_nonces(value: &Value) -> std::collections::HashSet<String> {
@@ -868,6 +932,28 @@ fn visit(
     let owner_decision = schema == "RegistryEvidenceDto"
         && v["kind"] == "decision"
         && matches!(v["source"].as_str(), Some("direct_owner" | "relayed_owner"));
+    if !enc && schema == "CoordinationSentReceipt" && v["status"] == "failed" {
+        v["body"] = Value::String(String::new());
+    }
+    let mail_body = if !enc && matches!(schema, "CoordinationMessage" | "CoordinationSentReceipt") {
+        v["body"].as_str().filter(|body| body.starts_with(PREFIX))
+    } else {
+        None
+    };
+    let encrypted_mail = mail_body.is_some();
+    let mail_sender = if schema == "CoordinationMessage"
+        && let Some(body) = mail_body
+    {
+        v["from_client"]
+            .as_str()
+            .and_then(|label| label.strip_prefix(MAIL_SENDER))
+            .map(|payload| {
+                key.and_then(|key| decrypt_mail_sender(key, workspace, body, payload).ok())
+                    .unwrap_or_else(|| "unknown".into())
+            })
+    } else {
+        None
+    };
     // Resolve every conditional against the original object, before decrypting a sibling.
     let content_names = def["properties"]
         .as_object()
@@ -1099,6 +1185,20 @@ fn visit(
                     touched,
                 )?;
             }
+        }
+    }
+    if let Some(sender) = mail_sender {
+        v["from_client"] = Value::String(sender);
+    } else if encrypted_mail
+        && let Some(content) = v
+            .get("body")
+            .and_then(Value::as_str)
+            .and_then(|body| body.strip_prefix(MAIL_CONTENT))
+        && let Ok(content) = serde_json::from_str::<MailContent>(content)
+    {
+        v["body"] = Value::String(content.body);
+        if schema == "CoordinationMessage" {
+            v["from_client"] = Value::String(content.from_client);
         }
     }
     Ok(())
@@ -4355,6 +4455,121 @@ mod tests {
         transform_fields(&mut res, "GET", "/api/v1/bus/inbox", "w", Some(&key), false).unwrap();
         assert_eq!(res["messages"][0]["body"], "hello");
     }
+    #[test]
+    fn encrypted_mail_restores_sender_label_in_inbox_reply_and_push() {
+        let key = WorkspaceKey::from_entropy([9; 32]);
+        let sender = "sender-chat parent_pid=123";
+        let old_body = key
+            .encrypt(
+                "w",
+                "body",
+                &format!(
+                    "{MAIL_CONTENT}{}",
+                    serde_json::json!({"body":"hello", "from_client":sender})
+                ),
+            )
+            .unwrap();
+        for required in [false, true] {
+            for route in ["/api/v1/bus/messages", "/api/v1/bus/messages/42/reply"] {
+                let mut request =
+                    serde_json::json!({"to":"reader", "body":"hello", "from_client":sender});
+                if route.ends_with("/reply") {
+                    request.as_object_mut().unwrap().remove("to");
+                }
+                transform_fields_policy(
+                    &mut request,
+                    "POST",
+                    route,
+                    "w",
+                    Some(&key),
+                    true,
+                    required,
+                )
+                .unwrap();
+                assert!(
+                    request["from_client"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(MAIL_SENDER)
+                );
+                assert!(!request.to_string().contains(sender));
+                assert!(!request.to_string().contains("hello"));
+                for wire in [
+                    serde_json::json!({"id":43, "body":request["body"], "from_client":request["from_client"]}),
+                    serde_json::json!({"id":43, "body":old_body, "from_client":"unknown"}),
+                ] {
+                    for (method, path, mut response, pointer) in [
+                        (
+                            "GET",
+                            "/api/v1/bus/inbox",
+                            serde_json::json!({"messages":[wire.clone()]}),
+                            "/messages/0",
+                        ),
+                        ("POST", route, wire.clone(), ""),
+                        (
+                            "GET",
+                            "/api/v1/bus/threads/43",
+                            serde_json::json!([wire.clone()]),
+                            "/0",
+                        ),
+                        (
+                            "GET",
+                            "/api/v1/events",
+                            serde_json::json!([{"seq":1,"type":"bus.message","payload":wire}]),
+                            "/0/payload",
+                        ),
+                    ] {
+                        transform_fields_policy(
+                            &mut response,
+                            method,
+                            path,
+                            "w",
+                            Some(&key),
+                            false,
+                            required,
+                        )
+                        .unwrap();
+                        let mail = response.pointer(pointer).unwrap();
+                        assert_eq!(mail["body"], "hello");
+                        assert_eq!(mail["from_client"], sender);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encrypted_mail_sender_cannot_be_copied_to_another_message() {
+        let key = WorkspaceKey::from_entropy([9; 32]);
+        let mut request =
+            serde_json::json!({"to":"reader", "body":"hello", "from_client":"sender"});
+        transform_fields(
+            &mut request,
+            "POST",
+            "/api/v1/bus/messages",
+            "w",
+            Some(&key),
+            true,
+        )
+        .unwrap();
+
+        let other_body = key.encrypt("w", "body", "hello").unwrap();
+        let mut inbox = serde_json::json!({"messages":[{
+            "body":other_body, "from_client":request["from_client"],
+        }]});
+        transform_fields(
+            &mut inbox,
+            "GET",
+            "/api/v1/bus/inbox",
+            "w",
+            Some(&key),
+            false,
+        )
+        .unwrap();
+        assert_eq!(inbox["messages"][0]["body"], "hello");
+        assert_eq!(inbox["messages"][0]["from_client"], "unknown");
+    }
+
     #[test]
     fn enabled_encryption_errors_without_key() {
         let mut v = serde_json::json!({"body":"plain"});

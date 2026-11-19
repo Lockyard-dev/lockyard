@@ -65,7 +65,8 @@ fn task_add_schema_lists_every_p0_category_in_description_and_enum() {
                 }
                 "zone_renew" => {
                     assert_eq!(canonical["inputSchema"]["required"], json!([]));
-                    assert_eq!(canonical["inputSchema"]["properties"]["ttl"], json!({"type":"integer"}));
+                    assert_eq!(canonical["inputSchema"]["properties"]["ttl"]["type"], "integer");
+                    assert!(canonical["inputSchema"]["properties"]["ttl"]["description"].as_str().unwrap().to_ascii_lowercase().contains("integer"));
                     assert_eq!(compact["inputSchema"]["required"], json!([]));
                     let ttl = &compact["inputSchema"]["properties"]["ttl"];
                     assert_eq!(ttl["type"], "integer");

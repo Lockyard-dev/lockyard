@@ -2,7 +2,7 @@
 
 //! Picks the one backend of a project from `.lockyard/config.toml`.
 
-use lockyard_cloud_client::{Client, CloudBackend, RepositoryTransport, token_id};
+use lockyard_cloud_client::{Client, CloudBackend, RepositoryTransport};
 use lockyard_core::config::{Config, Mode};
 use lockyard_core::paths::find_root;
 use lockyard_core::{Backend, Error, Result, Store, ZonePath};
@@ -89,6 +89,21 @@ pub(crate) fn trusted_url(url: &str) -> Result<()> {
     Err(Error::Invalid(format!(
         "server {url} is not trusted; run `lockyard cloud trust {url}` before sending a token there"
     )))
+}
+
+/// An optional local JSON map associates replica IDs with their origins. Both
+/// mapped origins and server-supplied URLs must be trusted independently.
+pub(crate) fn trusted_drain_replica(id: Option<&str>, hint: Option<&str>) -> Option<String> {
+    if let Some(url) = hint.filter(|url| trusted_url(url).is_ok()) {
+        return Some(url.to_owned());
+    }
+    let id = id?;
+    let origins = std::env::var("LOCKYARD_DRAIN_REPLICAS").ok()?;
+    let origins: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(&origins).ok()?;
+    origins.into_iter().find_map(|(key, url)| {
+        (key.eq_ignore_ascii_case(id) && trusted_url(&url).is_ok()).then_some(url)
+    })
 }
 
 fn trusted_file() -> Result<PathBuf> {
@@ -192,7 +207,9 @@ pub fn open_zone_wait(cwd: &Path, agent: Option<&str>) -> Result<Opened> {
             return open(cwd, agent);
         }
         let session = agent.unwrap_or(ANONYMOUS);
-        let client = direct_client(&url)?.configure_content_encryption(session)?;
+        let client = direct_client_for_session(&url, session)?
+            .configure_content_encryption(session)?
+            .reconcile_pending_on_startup()?;
         let backend = CloudBackend::new(
             RepositoryTransport::new(client, config.repository.as_deref())?,
             session,
@@ -241,8 +258,11 @@ pub(crate) fn status_read(
         return Ok((root, false, read, open_mail));
     }
     let (url, workspace) = endpoint(&config)?;
-    let token = Config::token_for(&url).ok();
-    let expected_token = token.as_deref().map(token_id);
+    let automatic_claude = lockyard_core::config::token_source_for(&url, session)? == "claude";
+    let token = lockyard_core::config::optional_session_token(&url, session)?;
+    let credential = token
+        .as_deref()
+        .map(crate::agent::socket::CallerCredential::from_token);
     // Preserve the direct-client encryption attestation used by ordinary opens.
     if std::env::var_os("LOCKYARD_REQUIRE_E2EE").is_none()
         && std::env::var_os("LOCKYARD_E2EE_WORKSPACE_ID").is_none()
@@ -253,7 +273,7 @@ pub(crate) fn status_read(
                 &crate::agent::socket_path_for(&url, &workspace),
                 &url,
                 &workspace,
-                expected_token.as_deref(),
+                credential.as_ref(),
                 probe,
             )
         {
@@ -261,6 +281,7 @@ pub(crate) fn status_read(
             // route's existing 1500 ms. At least three quarters remain for ONE cold claims-first
             // fallback; a hung agent never consumes a fixed 1500 ms out of a shortened budget.
             let budget = status_agent_budget(left());
+            let socket = socket.with_auto_claude_fallback(&url, session, automatic_claude);
             match socket.status_read(session, config.repository.as_deref(), budget) {
                 Ok(mut read) => {
                     read.freshness["via"] = serde_json::json!("agent");
@@ -278,6 +299,7 @@ pub(crate) fn status_read(
                     return Ok((root, true, read, open_mail));
                 }
                 Err(lockyard_cloud_client::ClientError::Transport(_)) => {}
+                Err(error) if socket.remember_session_fallback(session, &error)? => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -288,7 +310,7 @@ pub(crate) fn status_read(
         ));
     }
     trusted_url(&url)?;
-    let client = journal_client(Client::new(&url, Config::token_for(&url)?)?)?
+    let client = journal_client(Client::for_session(&url, session, Some(left()))?)?
         .with_status_protocol_cache()
         .configure_content_encryption_with_deadline(session, left())?;
     let backend = CloudBackend::new(
@@ -322,8 +344,9 @@ fn status_agent_budget(left: std::time::Duration) -> std::time::Duration {
 
 fn direct(url: &str, session: &str, repository: Option<&str>) -> Result<Box<dyn Backend>> {
     trusted_url(url)?;
-    let client = journal_client(Client::new(url, Config::token_for(url)?)?)?
-        .configure_content_encryption(session)?;
+    let client = journal_client(Client::for_session(url, session, None)?)?
+        .configure_content_encryption(session)?
+        .reconcile_pending_on_startup()?;
     Ok(Box::new(CloudBackend::new(
         RepositoryTransport::new(client, repository)?,
         session,
@@ -332,6 +355,13 @@ fn direct(url: &str, session: &str, repository: Option<&str>) -> Result<Box<dyn 
 
 /// Freeze wire writes privately before the network so a process restart cannot re-encrypt a pending key.
 pub(crate) fn journal_client(client: Client) -> Result<Client> {
+    Ok(client
+        .with_trusted_replica(trusted_drain_replica)
+        .with_pending_encryption_policy()
+        .load_pending_journal(pending_journal_root()?)?)
+}
+
+pub(crate) fn pending_journal_root() -> Result<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -347,17 +377,21 @@ pub(crate) fn journal_client(client: Client) -> Result<Client> {
     }
     directories.create(&state)?;
     let state = state.canonicalize()?;
-    Ok(client.with_pending_journal(state.join("lockyard/pending-writes"))?)
+    Ok(state.join("lockyard/pending-writes"))
 }
 
 /// A trusted direct client for workspace administration commands.
 pub(crate) fn direct_client(url: &str) -> Result<Client> {
+    direct_client_for_session(url, crate::env_agent().as_deref().unwrap_or(ANONYMOUS))
+}
+
+pub(crate) fn direct_client_for_session(url: &str, session: &str) -> Result<Client> {
     trusted_url(url)?;
-    journal_client(Client::new(url, Config::token_for(url)?)?)
+    journal_client(Client::for_session(url, session, None)?)
 }
 
 fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
-    use crate::agent::socket::AgentSocket;
+    use crate::agent::socket::{AgentSocket, CallerCredential};
     use std::time::Duration;
     /// Long enough for a long poll passed through the agent.
     const CLI_TIMEOUT: Duration = Duration::from_secs(40);
@@ -369,27 +403,59 @@ fn cloud(config: &Config, session: &str) -> Result<Box<dyn Backend>> {
     {
         return direct(&url, session, config.repository.as_deref());
     }
-    let socket = AgentSocket::connect(
+    let automatic_claude = lockyard_core::config::token_source_for(&url, session)? == "claude";
+    let token = lockyard_core::config::optional_session_token(&url, session)?;
+    let credential = token.as_deref().map(CallerCredential::from_token);
+    match AgentSocket::connect_for_credential(
         &crate::agent::socket_path_for(&url, &workspace),
         &url,
         &workspace,
+        credential.as_ref(),
         CLI_TIMEOUT,
-    );
-    let token = Config::token_for(&url).ok();
-    match socket {
-        // An agent running under another token would act with that token's role.
-        Some(socket)
-            if token
-                .as_deref()
-                .is_none_or(|token| socket.token_id().is_ok_and(|id| id == token_id(token))) =>
-        {
-            Ok(Box::new(CloudBackend::new(
-                RepositoryTransport::new(socket, config.repository.as_deref())?,
-                session,
-            )))
-        }
+    ) {
+        Some(socket) => Ok(Box::new(CloudBackend::new(
+            RepositoryTransport::new(
+                socket.with_auto_claude_fallback(&url, session, automatic_claude),
+                config.repository.as_deref(),
+            )?,
+            session,
+        ))),
         _ => direct(&url, session, config.repository.as_deref()),
     }
+}
+
+pub(crate) fn session_key_warning(cwd: &Path, session: &str) -> Option<&'static str> {
+    let root = find_root(cwd)?;
+    let config = Config::load(&root).ok()?;
+    let url = config.url?;
+    lockyard_core::session_key::take_warning(&url, session)
+        .ok()
+        .flatten()
+}
+
+/// The registry actor response is scoped to the authenticated bearer.
+pub(crate) fn credential_actor(
+    client: &Client,
+    budget: std::time::Duration,
+) -> Option<serde_json::Value> {
+    use lockyard_cloud_client::{Call, Transport};
+    let session = client.service_session("lockyard-credential");
+    let mut call = Call::get(&session, "/api/v1/registry/actor".into());
+    call.deadline_ms = Some(u64::try_from(budget.as_millis()).ok()?);
+    client.call(&call).ok()
+}
+
+pub(crate) fn default_token_role(url: &str, budget: std::time::Duration) -> Option<String> {
+    let token = lockyard_core::config::default_agent_token().ok()??;
+    if token.trim().is_empty() || budget.is_zero() {
+        return None;
+    }
+    trusted_url(url).ok()?;
+    let client = Client::new(url, token.trim().to_string()).ok()?;
+    let role = credential_actor(&client, budget)?["role"]
+        .as_str()?
+        .to_ascii_lowercase();
+    matches!(role.as_str(), "agent" | "lead" | "owner" | "importer").then_some(role)
 }
 
 #[cfg(test)]

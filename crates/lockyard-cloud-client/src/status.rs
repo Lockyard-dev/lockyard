@@ -240,6 +240,29 @@ fn section<T>(value: &Observed<T>) -> Value {
     metadata
 }
 
+fn required_status_error(section: &str, error: &Error) -> Error {
+    if let Error::Cloud {
+        code,
+        status: Some(status),
+        details,
+        message,
+    } = error
+        && ((*status == 403 && code == "session_name_bound")
+            || (matches!(*status, 502..=504) && code == "unavailable"))
+    {
+        // The caller can switch credentials only after this exact server refusal.
+        return Error::Cloud {
+            code: code.clone(),
+            status: Some(*status),
+            details: details.clone(),
+            message: message.clone(),
+        };
+    }
+    Error::Unavailable(format!(
+        "status {section} unavailable within deadline: {error}"
+    ))
+}
+
 pub(crate) fn read<T: Transport>(
     backend: &CloudBackend<T>,
     session: &str,
@@ -274,9 +297,7 @@ pub(crate) fn read<T: Transport>(
     if let Some(claims) = &cold_claims
         && let Err(error) = &claims.value
     {
-        return Err(Error::Unavailable(format!(
-            "status claims unavailable within deadline: {error}"
-        )));
+        return Err(required_status_error("claims", error));
     }
     let read_active = || observed(|| assigned(transport, session, "active", deadline, &capability));
     let read_review = || observed(|| assigned(transport, session, "review", deadline, &capability));
@@ -288,10 +309,7 @@ pub(crate) fn read<T: Transport>(
                 return Ok(count);
             }
             let value = request(transport, session, "/api/v1/bus/inbox".into(), deadline)?;
-            let page = crate::backend::inbox_page(value)?;
-            Ok(i64::try_from(page.messages.len())
-                .unwrap_or(i64::MAX)
-                .saturating_add(page.skipped))
+            crate::backend::new_mail_count(value)
         })
     };
     let read_work = || {
@@ -350,7 +368,7 @@ pub(crate) fn read<T: Transport>(
         now.saturating_add(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX))
             .saturating_add(LOCAL_CLOCK_SAFETY_MARGIN_MS)
     });
-    let freshness = json!({
+    let mut freshness = json!({
         "source": "network", "claims_cached": false,
         "claims_server_time_upper_ms": upper,
         "claims_clock_source": if server_clock.is_some() { "http_date" } else { "local_fallback" },
@@ -363,21 +381,22 @@ pub(crate) fn read<T: Transport>(
             "server"
         } else { "client_fallback" },
     });
-    let required = |name: &str, error: Error| {
-        Error::Unavailable(format!(
-            "status {name} unavailable within deadline: {error}"
-        ))
-    };
-    let mut claims = claims.value.map_err(|error| required("claims", error))?;
+    if matches!(&unread.value, Err(Error::Unavailable(reason)) if reason == crate::backend::UNREAD_TRUNCATED)
+    {
+        freshness["sections"]["unread"]["incomplete"] = json!(true);
+    }
+    let mut claims = claims
+        .value
+        .map_err(|error| required_status_error("claims", &error))?;
     expire_claims(&mut claims, upper, session)?;
     let mut tasks = active
         .value
-        .map_err(|error| required("assigned tasks", error))?
+        .map_err(|error| required_status_error("assigned tasks", &error))?
         .tasks;
     tasks.extend(
         review
             .value
-            .map_err(|error| required("assigned tasks", error))?
+            .map_err(|error| required_status_error("assigned tasks", &error))?
             .tasks,
     );
     Ok(StatusRead {
@@ -448,6 +467,7 @@ mod tests {
         premature_followups: AtomicUsize,
         delay: Duration,
         fail_optional: bool,
+        inbox: Option<Value>,
         server_upper: Option<i64>,
         protocol_capability: bool,
         registry_capability: bool,
@@ -512,7 +532,10 @@ mod tests {
                 return if self.fail_optional {
                     Err(ClientError::Transport("mail unavailable".into()))
                 } else {
-                    Ok(json!({"messages": [], "skipped": 0}))
+                    Ok(self
+                        .inbox
+                        .clone()
+                        .unwrap_or_else(|| json!({"messages": [], "skipped": 0})))
                 };
             }
             if call.path == "/api/v1/bus/tasks" {
@@ -568,6 +591,32 @@ mod tests {
     fn claim(expiry: i64) -> Claim {
         serde_json::from_value(json!({"id":1,"session":"me","paths":["src"],"expires_at":expiry}))
             .unwrap()
+    }
+
+    #[test]
+    fn status_legacy_seen_mail_and_skipped_never_produce_a_false_count() {
+        for skipped in [0, 1] {
+            let messages: Vec<_> = (1..=50)
+                .map(|id| {
+                    json!({
+                        "id":id,"reader_state":"seen","seen_at":123
+                    })
+                })
+                .collect();
+            let cloud = CloudBackend::new(
+                Mock {
+                    inbox: Some(json!({"messages":messages,"skipped":skipped})),
+                    ..Mock::default()
+                },
+                "me",
+            );
+            let read = cloud.status_read("me", 0, Duration::from_secs(1)).unwrap();
+            assert_eq!(read.unread, if skipped == 0 { Some(0) } else { None });
+            assert_eq!(
+                read.freshness["sections"]["unread"]["available"],
+                skipped == 0
+            );
+        }
     }
 
     #[test]
@@ -914,7 +963,7 @@ mod tests {
                 if call.path == "/api/v1/bus/inbox" {
                     assert!(call.deadline_ms.unwrap() > 500);
                     std::thread::sleep(Duration::from_millis(600));
-                    return Ok(json!({"messages": [], "skipped": 3}));
+                    return Ok(json!({"messages": [{"id":1},{"id":2},{"id":3}], "skipped": 0}));
                 }
                 self.0.call(call)
             }

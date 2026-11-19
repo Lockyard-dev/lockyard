@@ -3,7 +3,7 @@
 //! Client side of the agent socket. A connection carries one request: connecting costs microseconds, and
 //! nothing can be left half-read for the next caller.
 
-use super::wire::{AgentStatus, Envelope, Reply, Request};
+use super::wire::{AgentStatus, CredentialProof, Envelope, Reply, Request};
 use lockyard_cloud_client::{Call, ClientError, Transport};
 use lockyard_core::proto::PathCheck;
 use serde_json::Value;
@@ -30,12 +30,119 @@ pub struct AgentSocket {
     timeout: Duration,
     prepare_task_create_v1: bool,
     hook_mail_state_dir: Option<PathBuf>,
+    fallback_session: Option<(String, String)>,
+    credential: Option<CallerCredential>,
     #[cfg(windows)]
     state_root: PathBuf,
 }
 
+#[derive(Clone)]
+pub struct CallerCredential {
+    pub id: String,
+    proof: CredentialProof,
+}
+
+impl CallerCredential {
+    pub fn from_token(token: &str) -> Self {
+        Self {
+            id: lockyard_cloud_client::token_id(token),
+            proof: CredentialProof(lockyard_cloud_client::ipc_credential_proof(token)),
+        }
+    }
+
+    pub fn from_client(client: &lockyard_cloud_client::Client) -> Self {
+        Self {
+            id: client.credential_id(),
+            proof: CredentialProof(client.ipc_credential_proof()),
+        }
+    }
+}
+
 impl AgentSocket {
+    /// Bind lazily: local cache reads and outbox writes require no preliminary HTTP request.
+    pub(crate) fn with_auto_claude_fallback(
+        mut self,
+        url: &str,
+        session: &str,
+        automatic: bool,
+    ) -> Self {
+        if automatic {
+            self.fallback_session = Some((url.into(), session.into()));
+        }
+        self
+    }
+
+    pub(crate) fn remember_session_fallback(
+        &self,
+        selected: &str,
+        error: &ClientError,
+    ) -> Result<bool, ClientError> {
+        if error.status() == Some(403)
+            && error.code() == Some("session_name_bound")
+            && let Some((url, session)) = &self.fallback_session
+            && session == selected
+        {
+            lockyard_core::session_key::remember_fallback(url, session)
+                .map_err(|error| ClientError::Invalid(error.to_string()))?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// A cold hook uses the same authenticated binding check and sticky fallback
+    /// as Transport::call. Warm cached mail never needs this network probe.
+    pub(crate) fn probe_hook_binding(
+        &self,
+        session: &str,
+        budget: Duration,
+    ) -> Result<bool, ClientError> {
+        if self.fallback_session.is_none() {
+            return Ok(false);
+        }
+        let cached = self
+            .ask_with_timeout(
+                &Request::PeekMail {
+                    session: session.into(),
+                },
+                budget,
+            )
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        if cached.messages.is_some() {
+            return Ok(false);
+        }
+        let mut call = Call::get(session, "/api/v1/presence".into());
+        call.deadline_ms = Some(budget.as_millis() as u64);
+        call.attempt_timeout_ms = call.deadline_ms;
+        let reply = self
+            .ask_with_timeout(&Request::Call { call }, budget)
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        if let Some(error) = reply.error {
+            return self.remember_session_fallback(session, &error);
+        }
+        Ok(false)
+    }
+
+    fn fallback_client(
+        &self,
+        session: &str,
+    ) -> Result<Option<lockyard_cloud_client::Client>, ClientError> {
+        let Some((url, selected)) = &self.fallback_session else {
+            return Ok(None);
+        };
+        if selected != session
+            || !lockyard_core::session_key::is_fallback(url, session)
+                .map_err(|error| ClientError::Invalid(error.to_string()))?
+        {
+            return Ok(None);
+        }
+        crate::open::direct_client_for_session(url, session)
+            .and_then(|client| Ok(client.configure_content_encryption(session)?))
+            .map(Some)
+            .map_err(|error| ClientError::Invalid(error.to_string()))
+    }
+
     /// Connects to the agent serving `url` and `workspace`. `None` when there is no such process.
+    #[cfg(test)]
     pub fn connect(path: &Path, url: &str, workspace: &str, timeout: Duration) -> Option<Self> {
         let socket = Self {
             path: path.to_path_buf(),
@@ -43,10 +150,33 @@ impl AgentSocket {
             timeout,
             prepare_task_create_v1: false,
             hook_mail_state_dir: None,
+            fallback_session: None,
+            credential: None,
             #[cfg(windows)]
             state_root: super::state_root().ok()?,
         };
-        socket.match_target(url, workspace)
+        socket.match_target(url, workspace, None, false)
+    }
+
+    pub fn connect_for_credential(
+        path: &Path,
+        url: &str,
+        workspace: &str,
+        credential: Option<&CallerCredential>,
+        timeout: Duration,
+    ) -> Option<Self> {
+        Self {
+            path: path.to_path_buf(),
+            workspace: workspace.to_string(),
+            timeout,
+            prepare_task_create_v1: false,
+            hook_mail_state_dir: None,
+            fallback_session: None,
+            credential: None,
+            #[cfg(windows)]
+            state_root: super::state_root().ok()?,
+        }
+        .match_target(url, workspace, credential, true)
     }
 
     /// Probes once, within `timeout`, for a status-capable daemon using this target and, when
@@ -56,7 +186,7 @@ impl AgentSocket {
         path: &Path,
         url: &str,
         workspace: &str,
-        token_id: Option<&str>,
+        credential: Option<&CallerCredential>,
         timeout: Duration,
     ) -> Option<Self> {
         let socket = Self {
@@ -65,18 +195,20 @@ impl AgentSocket {
             timeout,
             prepare_task_create_v1: false,
             hook_mail_state_dir: None,
+            fallback_session: None,
+            credential: credential.cloned(),
             #[cfg(windows)]
             state_root: super::state_root().ok()?,
         };
         let status = socket.ping().ok()?;
         (status.url.trim_end_matches('/') == url.trim_end_matches('/')
             && status.workspace == workspace
-            && token_id.is_none_or(|expected| status.token_id == expected)
+            && status.accepts_caller_token(credential.map(|key| key.id.as_str()))
             && status.status_read_v1
             // The abandoned worker cannot be interrupted inside ureq. With independent
             // credentials, preserve the full direct budget rather than spending 1.5s here.
             // A tokenless caller still needs this authenticated daemon, so keep its route.
-            && !(token_id.is_some() && status.status_read_abandoned == Some(true)))
+            && !(credential.is_some() && status.status_read_abandoned == Some(true)))
         .then_some(socket)
     }
 
@@ -104,8 +236,18 @@ impl AgentSocket {
         })
     }
 
-    fn match_target(mut self, url: &str, workspace: &str) -> Option<Self> {
+    fn match_target(
+        mut self,
+        url: &str,
+        workspace: &str,
+        credential: Option<&CallerCredential>,
+        check_credential: bool,
+    ) -> Option<Self> {
         let status = self.ping().ok()?;
+        if check_credential && !status.accepts_caller_token(credential.map(|key| key.id.as_str())) {
+            return None;
+        }
+        self.credential = credential.cloned();
         self.prepare_task_create_v1 = status.prepare_task_create_v1;
         self.hook_mail_state_dir = status.hook_mail_state_dir;
         (status.url.trim_end_matches('/') == url.trim_end_matches('/')
@@ -127,14 +269,11 @@ impl AgentSocket {
             timeout,
             prepare_task_create_v1: false,
             hook_mail_state_dir: None,
+            fallback_session: None,
+            credential: None,
             state_root: state_root.to_path_buf(),
         }
-        .match_target(url, workspace)
-    }
-
-    /// The token this process runs under. Calls through it carry that token's role, not the caller's.
-    pub fn token_id(&self) -> io::Result<String> {
-        self.ping().map(|status| status.token_id)
+        .match_target(url, workspace, None, false)
     }
 
     pub fn supports_peek_mail(&self) -> bool {
@@ -155,6 +294,8 @@ impl AgentSocket {
             timeout,
             prepare_task_create_v1: false,
             hook_mail_state_dir: None,
+            fallback_session: None,
+            credential: None,
             #[cfg(windows)]
             state_root: super::state_root()?,
         }
@@ -192,8 +333,15 @@ impl AgentSocket {
     }
 
     fn line(&self, request: &Request) -> io::Result<Vec<u8>> {
+        let credential = self
+            .credential
+            .as_ref()
+            .filter(|_| !matches!(request, Request::Ping));
         let envelope = Envelope {
             workspace: self.workspace.clone(),
+            expected_token_id: credential.map(|key| key.id.clone()),
+            credential_proof: credential.map(|key| key.proof.clone()),
+            delegated: std::env::var_os("LOCKYARD_PARENT_CLAIM").is_some(),
             request: request.clone(),
         };
         let mut line = serde_json::to_vec(&envelope).map_err(io::Error::other)?;
@@ -476,6 +624,9 @@ impl Transport for AgentSocket {
             .unwrap_or(false))
     }
     fn call(&self, call: &Call) -> Result<Value, ClientError> {
+        if let Some(client) = self.fallback_client(&call.session)? {
+            return client.call(call);
+        }
         // attempt_timeout_ms also crosses the wire (serialized on Call) so the daemon can bound
         // ureq. Still cap the local socket wait so a stalled agent cannot sit on CLI_TIMEOUT.
         let budget = call
@@ -487,6 +638,11 @@ impl Transport for AgentSocket {
             .ask_with_timeout(&Request::Call { call: call.clone() }, budget)
             .map_err(|error| ClientError::Transport(format!("agent socket: {error}")))?;
         if let Some(error) = reply.error {
+            if self.remember_session_fallback(&call.session, &error)?
+                && let Some(client) = self.fallback_client(&call.session)?
+            {
+                return client.call(call);
+            }
             return Err(error);
         }
         let value = reply.value.unwrap_or(Value::Null);
@@ -505,6 +661,9 @@ impl Transport for AgentSocket {
     }
 
     fn catalog_expand(&self, call: &Call, names: &[String]) -> Result<Vec<String>, ClientError> {
+        if let Some(client) = self.fallback_client(&call.session)? {
+            return client.catalog_expand(call, names);
+        }
         let status = self
             .ping()
             .map_err(|e| ClientError::Transport(e.to_string()))?;
@@ -529,6 +688,12 @@ impl Transport for AgentSocket {
         session: &str,
         paths: &[String],
     ) -> Option<Result<Vec<PathCheck>, ClientError>> {
+        match self.fallback_client(session) {
+            Ok(Some(_)) => return None,
+            Err(error) => return Some(Err(error)),
+            Ok(None) => {}
+        }
+
         let request = Request::Check {
             session: session.to_string(),
             paths: paths.to_vec(),
@@ -543,6 +708,9 @@ impl Transport for AgentSocket {
         true
     }
     fn prepare_task_create(&self, call: &Call, explicit_key: bool) -> Result<Call, ClientError> {
+        if let Some(client) = self.fallback_client(&call.session)? {
+            return client.prepare_task_create(call, explicit_key);
+        }
         if !self.prepare_task_create_v1 {
             return Ok(call.clone());
         }
@@ -585,11 +753,20 @@ impl Transport for AgentSocket {
     }
 
     fn acknowledge_write(&self, call: &Call) -> Result<(), ClientError> {
+        if let Some(client) = self.fallback_client(&call.session)? {
+            return client.acknowledge_write(call);
+        }
         self.ask_for(&Request::AcknowledgeWrite { call: call.clone() })
             .map(|_| ())
     }
 
     fn fast_unread(&self, session: &str) -> Option<Result<Option<i64>, ClientError>> {
+        match self.fallback_client(session) {
+            Ok(Some(_)) => return None,
+            Err(error) => return Some(Err(error)),
+            Ok(None) => {}
+        }
+
         let request = Request::Unread {
             attention_ack: Vec::new(),
             attention: false,
@@ -662,6 +839,8 @@ mod tests {
                     timeout: Duration::from_secs(2),
                     prepare_task_create_v1: false,
                     hook_mail_state_dir: None,
+                    fallback_session: None,
+                    credential: None,
                 };
                 let mut backend = CloudBackend::new(socket, "me");
                 backend
@@ -751,6 +930,8 @@ mod tests {
             timeout: Duration::from_secs(2),
             prepare_task_create_v1: false,
             hook_mail_state_dir: None,
+            fallback_session: None,
+            credential: None,
         }
         .call(&call);
         peer.join().unwrap();
@@ -834,7 +1015,7 @@ mod tests {
                 &dir.path().join("absent.sock"),
                 "https://example.test",
                 "team",
-                Some("token"),
+                Some(&CallerCredential::from_token("token")),
                 Duration::from_millis(100),
             )
             .is_none()
@@ -860,7 +1041,7 @@ mod tests {
                 &path,
                 "https://example.test",
                 "team",
-                Some("token"),
+                Some(&CallerCredential::from_token("token")),
                 Duration::from_millis(30),
             )
             .is_none()
@@ -895,10 +1076,11 @@ mod tests {
                 assert_eq!(request.request, Request::Ping);
                 let mut value = json!({
                     "status": {
-                        "url": "https://example.test/", "workspace": "team", "token_id": token,
+                        "url": "https://example.test/", "workspace": "team", "token_id": lockyard_cloud_client::token_id(token),
                         "pid": 42, "view_fresh": false, "view_age_ms": null,
                         "claims": 0, "board": 0, "sessions": 0, "outbox": 0,
-                        "coordination_seq": 0, "registry_seq": 0
+                        "coordination_seq": 0, "registry_seq": 0,
+                        "requires_matching_token": false
                     }
                 });
                 if supports_status {
@@ -921,7 +1103,7 @@ mod tests {
                     &path,
                     "https://example.test",
                     "team",
-                    expected,
+                    expected.map(CallerCredential::from_token).as_ref(),
                     Duration::from_millis(100),
                 )
                 .is_some(),
@@ -953,6 +1135,8 @@ mod tests {
             timeout: Duration::from_secs(1),
             prepare_task_create_v1: false,
             hook_mail_state_dir: None,
+            fallback_session: None,
+            credential: None,
         };
         let started = Instant::now();
         let error = socket

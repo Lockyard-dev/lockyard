@@ -130,6 +130,20 @@ fn survey_r2_registry_create_replays_exact_client_key_and_retires_journal() {
             .pending_operation(call.key.as_deref().unwrap())
             .is_some()
     );
+    age_pending_journal(&directory, 31);
+    drop(client);
+    let client = server
+        .client()
+        .with_pending_journal(&directory)
+        .unwrap()
+        .with_content_encryption(
+            "fixture-workspace",
+            Some(lockyard_cloud_client::WorkspaceKey::from_entropy([31; 32])),
+            true,
+        );
+    let repair = client.repair_pending().unwrap();
+    assert_eq!(repair.quarantined, 0);
+    assert_eq!(repair.remaining, 0);
     let result = client.call(&call).unwrap();
     assert_eq!(result["id"], "FE-77");
     assert!(client.pending_operations().is_empty());
@@ -148,6 +162,61 @@ fn survey_r2_registry_create_replays_exact_client_key_and_retires_journal() {
         requests[1].header("idempotency-key"),
         requests[2].header("idempotency-key")
     );
+}
+
+fn age_pending_journal(root: &std::path::Path, days: u64) {
+    let first = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - days * 24 * 60 * 60;
+    for scope in std::fs::read_dir(root).unwrap() {
+        for record in std::fs::read_dir(scope.unwrap().path()).unwrap() {
+            let path = record.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let mut pending: Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                pending["first_sent_unix_secs"] = json!(first);
+                lockyard_core::fsio::replace(&path, &serde_json::to_vec(&pending).unwrap(), 0o600)
+                    .unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn survey_r9_frozen_operation_replays_after_31_days_without_quarantine() {
+    let (server, client, call, directory) = refused_encrypted_write(503, "frozen", true);
+    let original = client
+        .pending_operation(call.key.as_deref().unwrap())
+        .unwrap();
+    assert!(original.pre_execution_rejected);
+    age_pending_journal(&directory, 31);
+    drop(client);
+    let restored = server
+        .client()
+        .with_pending_journal(&directory)
+        .unwrap()
+        .with_content_encryption(
+            "fixture-workspace",
+            Some(lockyard_cloud_client::WorkspaceKey::from_entropy([31; 32])),
+            true,
+        );
+    assert_eq!(restored.repair_pending().unwrap().quarantined, 0);
+    assert_eq!(restored.call(&call).unwrap()["id"], "A-1");
+    // Background reconciliation closed the pending entry and kept a receipt for
+    // the outbox; its explicit acknowledgement still follows durable completion.
+    assert!(restored.pending_operations().is_empty());
+    restored.acknowledge_write(&call).unwrap();
+    assert!(restored.pending_operations().is_empty());
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].body, requests[2].body);
+    assert_eq!(
+        requests[1].header("idempotency-key"),
+        requests[2].header("idempotency-key")
+    );
+    std::fs::remove_dir_all(directory).unwrap();
 }
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -170,6 +239,7 @@ impl Request {
     }
 }
 
+#[derive(Clone)]
 struct Reply {
     status: u16,
     body: Value,
@@ -881,11 +951,15 @@ fn explicit_pending_replay_keeps_the_original_protocol_bytes_and_key() {
     let client = server.client();
     let call = write();
     assert!(client.call(&call).is_err());
-    // Unknown ledger retention never authorizes an automatic second write, even when the
-    // application accidentally repeats call(). A caller must reconcile the pending operation.
-    let error = client.call(&call).unwrap_err();
-    assert!(serialized(error).contains("outcome_unknown"));
-    assert_eq!(server.requests().len(), 2);
+    // Registry's ledger has no finite replay window. Reconcile exact bytes/key.
+    assert_eq!(client.call(&call).unwrap()["id"], "A-1");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].body, requests[2].body);
+    assert_eq!(
+        requests[1].header("idempotency-key"),
+        requests[2].header("idempotency-key")
+    );
 }
 
 #[test]
@@ -962,7 +1036,13 @@ fn pending_journal_survives_restart_with_original_wire_bytes() {
         restored.call(&call).unwrap_err().code(),
         Some("outcome_unknown")
     );
-    assert_eq!(server.requests().len(), 2);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].body, requests[2].body);
+    assert_eq!(
+        requests[1].header("idempotency-key"),
+        requests[2].header("idempotency-key")
+    );
     restored.resolve_pending(&key).unwrap();
     assert!(restored.pending_operation(&key).is_none());
     std::fs::remove_dir_all(directory).unwrap();
@@ -1163,11 +1243,14 @@ fn post_send_journal_cleanup_failure_keeps_original_pending_operation() {
         client.call(&call).unwrap_err().code(),
         Some("outcome_unknown")
     );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].body, requests[2].body);
     assert_eq!(
-        server.requests().len(),
-        2,
-        "never reissue after cleanup failure"
+        requests[1].header("idempotency-key"),
+        requests[2].header("idempotency-key")
     );
+    std::fs::set_permissions(&scope, std::fs::Permissions::from_mode(0o700)).unwrap();
     let restored = server.client().with_pending_journal(&directory).unwrap();
     assert_eq!(restored.pending_operation(key).unwrap().body, pending.body);
     assert_eq!(restored.pending_operation(key).unwrap().key, pending.key);
@@ -1230,7 +1313,12 @@ fn malformed_successful_catalog_response_keeps_the_frozen_mutation() {
         Some("2"),
     );
     reply.extra = "X-Lockyard-Repository: -\r\n";
-    let server = Server::start(vec![discovery(2, 1, 2, &["zone_catalog_v1"]), reply]);
+    let server = Server::start(vec![
+        dated_discovery(&["zone_catalog_v1"]),
+        reply.clone(),
+        dated_discovery(&["zone_catalog_v1"]),
+        reply,
+    ]);
     let client = server.client().with_content_encryption(
         "00000000-0000-0000-0000-000000000001",
         Some(lockyard_cloud_client::WorkspaceKey::from_entropy([47; 32])),
@@ -1252,7 +1340,23 @@ fn malformed_successful_catalog_response_keeps_the_frozen_mutation() {
         client.call(&call).unwrap_err().code(),
         Some("outcome_unknown")
     );
-    assert_eq!(server.requests().len(), 2);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        (requests[2].method.as_str(), requests[2].path.as_str()),
+        ("GET", "/api/v1/protocol")
+    );
+    assert_eq!(requests[1].body, requests[3].body);
+    assert_eq!(
+        requests[1].header("idempotency-key"),
+        requests[3].header("idempotency-key")
+    );
+}
+
+fn dated_discovery(capabilities: &[&str]) -> Reply {
+    let mut reply = discovery(2, 1, 2, capabilities);
+    reply.extra = "Date: Thu, 12 Nov 2026 10:21:00 GMT\r\n";
+    reply
 }
 
 #[test]
@@ -1264,8 +1368,9 @@ fn durable_outbox_replay_refusal_cannot_prove_the_original_write_failed() {
         (503, "server_draining"),
     ] {
         let server = Server::start(vec![
-            discovery(2, 1, 2, &[]),
+            dated_discovery(&[]),
             Reply::json(200, json!({"id":7}), None),
+            dated_discovery(&[]),
             problem(status, code, json!({}), Some("2")),
         ]);
         let client = server.client();
@@ -1291,8 +1396,8 @@ fn durable_outbox_replay_refusal_cannot_prove_the_original_write_failed() {
         );
         assert_eq!(
             server.requests().len(),
-            3,
-            "one raw replay, no new discovery/downgrade"
+            4,
+            "one raw replay after a server-clock probe, no downgrade"
         );
         let pending = client
             .pending_operation(call.key.as_deref().unwrap())
@@ -1302,17 +1407,21 @@ fn durable_outbox_replay_refusal_cannot_prove_the_original_write_failed() {
         assert_eq!(pending.protocol, original.protocol);
         assert_eq!(pending.cause_code, code);
         let requests = server.requests();
-        assert_eq!(requests[1].body, requests[2].body);
-        assert_eq!(requests[1].path, requests[2].path);
+        assert_eq!(
+            (requests[2].method.as_str(), requests[2].path.as_str()),
+            ("GET", "/api/v1/protocol")
+        );
+        assert_eq!(requests[1].body, requests[3].body);
+        assert_eq!(requests[1].path, requests[3].path);
         assert_eq!(
             requests[1].header("idempotency-key"),
-            requests[2].header("idempotency-key")
+            requests[3].header("idempotency-key")
         );
     }
 }
 
 #[test]
-fn durable_outbox_replay_without_trusted_age_or_identity_stays_quarantined() {
+fn durable_outbox_without_trusted_age_or_identity_stays_pending_when_offline() {
     for (field, value) in [
         ("first_sent_unix_secs", Value::Null),
         ("first_sent_unix_secs", json!(0)),
@@ -1348,7 +1457,7 @@ fn durable_outbox_replay_without_trusted_age_or_identity_stays_quarantined() {
             .map(|entry| entry.unwrap().path())
             .filter(|path| {
                 path.extension()
-                    .is_some_and(|extension| extension == "json")
+                    .is_some_and(|extension| extension == "json" || extension == "unknown")
             })
             .collect();
         assert_eq!(
@@ -1368,9 +1477,15 @@ fn durable_outbox_replay_without_trusted_age_or_identity_stays_quarantined() {
         assert_eq!(
             server.requests().len(),
             2,
-            "quarantined record must not make a second POST"
+            "legacy row has no server anchor to probe"
         );
-        assert_eq!(restored.pending_operations().len(), 1);
+        let saved = restored
+            .pending_operation(call.key.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(saved.body.as_deref(), record["body"].as_str());
+        assert!(saved.replay_stopped);
+        assert!(file.with_extension("unknown").exists());
+        assert!(!file.with_extension("quarantine").exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
@@ -1496,7 +1611,10 @@ fn durable_outbox_pending_without_required_encryption_context_stays_unknown() {
         restored
             .pending_operation(call.key.as_deref().unwrap())
             .unwrap(),
-        pending
+        lockyard_cloud_client::PendingWrite {
+            replay_stopped: true,
+            ..pending
+        }
     );
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -1770,13 +1888,22 @@ fn pre_execution_retry_seeded_restart_and_uncertainty_sequences() {
                 .unwrap()
                 .pre_execution_rejected
         );
+        let uncertain = restored.pending_operation(key).unwrap();
         drop(restored);
         assert_eq!(
             client().call(&call).unwrap_err().code(),
             Some("outcome_unknown")
         );
+        assert_eq!(
+            client()
+                .pending_operation(key)
+                .unwrap()
+                .first_sent_unix_secs,
+            uncertain.first_sent_unix_secs,
+            "unknown effects must never extend receipt retention"
+        );
         let requests = server.requests();
-        assert_eq!(requests.len(), 18);
+        assert_eq!(requests.len(), 19);
         for retry in &requests[2..] {
             assert_eq!(retry.body, requests[1].body);
             assert_eq!(retry.path, requests[1].path);
@@ -1791,7 +1918,7 @@ fn pre_execution_retry_seeded_restart_and_uncertainty_sequences() {
         }
         assert_eq!(
             *observed.lock().unwrap(),
-            vec![false; 17],
+            vec![false; 18],
             "every send follows a durable unknown marker"
         );
         std::fs::remove_dir_all(directory).unwrap();
@@ -1810,10 +1937,17 @@ fn pre_execution_plaintext_journal_cannot_bypass_new_encryption_policy() {
         ] {
             let mut refusal = problem(429, "rate_limited", json!({}), Some("2"));
             refusal.extra = "Retry-After: 2\r\n";
+            let workspace_key = lockyard_cloud_client::WorkspaceKey::from_entropy([31; 32]);
             let server = Server::start(vec![
                 discovery(2, 1, 2, &[]),
                 refusal,
-                Reply::json(200, json!({"id":"A-1"}), Some("2")),
+                discovery(2, 1, 2, &[]),
+                Reply::json(
+                    200,
+                    json!({"encryption":"required","key_id":workspace_key.key_id(),
+                           "workspace_id":"fixture-workspace"}),
+                    Some("2"),
+                ),
             ]);
             let directory = std::env::temp_dir().canonicalize().unwrap().join(format!(
                 "ly-refusal-encryption-policy-{}",
@@ -1833,11 +1967,7 @@ fn pre_execution_plaintext_journal_cannot_bypass_new_encryption_policy() {
                 restored = restored.require_e2ee_for("fixture-workspace").unwrap();
             }
             let restored = restored
-                .with_content_encryption(
-                    "fixture-workspace",
-                    Some(lockyard_cloud_client::WorkspaceKey::from_entropy([31; 32])),
-                    true,
-                )
+                .with_content_encryption("fixture-workspace", Some(workspace_key), true)
                 .with_pending_journal(&directory)
                 .unwrap();
             assert_eq!(
@@ -1845,20 +1975,26 @@ fn pre_execution_plaintext_journal_cannot_bypass_new_encryption_policy() {
                 Some("outcome_unknown")
             );
             assert_eq!(
-                server.requests().len(),
-                2,
-                "{path}, required={required}: changed encryption policy must quarantine old bytes"
+                server
+                    .requests()
+                    .iter()
+                    .filter(|request| request.method == "POST")
+                    .count(),
+                1,
+                "{path}, required={required}: changed encryption policy must prevent resending old bytes"
             );
             let pending = restored.pending_operation(key).unwrap();
             assert_eq!(pending.body, original.body);
             assert_eq!(pending.key, original.key);
+            assert_eq!(pending.cause_code, "pending_encryption_mismatch");
+            assert!(pending.replay_paused && !pending.replay_stopped);
             std::fs::remove_dir_all(directory).unwrap();
         }
     }
 }
 
 #[test]
-fn pre_execution_protocol_rejection_quarantines_the_original_ciphertext() {
+fn pre_execution_protocol_refusal_reconciles_the_original_ciphertext() {
     let mut refusal = problem(429, "rate_limited", json!({}), Some("2"));
     refusal.extra = "Retry-After: 2\r\n";
     let server = Server::start(vec![
@@ -1881,24 +2017,26 @@ fn pre_execution_protocol_rejection_quarantines_the_original_ciphertext() {
         client.call(&call).unwrap_err().code(),
         Some("protocol_unsupported")
     );
-    assert_eq!(
-        client.call(&call).unwrap_err().code(),
-        Some("outcome_unknown")
-    );
+    assert_eq!(client.call(&call).unwrap()["id"], "A-1");
     let requests = server.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "a terminal refusal cannot authorize fresh encryption under the old key"
+        4,
+        "reconciliation must reuse the original ciphertext and protocol"
     );
     assert_eq!(requests[1].body, requests[2].body);
     assert_eq!(
         requests[1].header("idempotency-key"),
         requests[2].header("idempotency-key")
     );
-    let pending = client.pending_operation(key).unwrap();
-    assert_eq!(pending.body, original.body);
-    assert_eq!(pending.key, original.key);
+    assert!(client.pending_operation(key).is_none());
+    for request in &requests[1..] {
+        assert_eq!(Some(request.body.as_str()), original.body.as_deref());
+        assert_eq!(
+            request.header("idempotency-key"),
+            Some(original.key.as_str())
+        );
+    }
 }
 
 #[test]
