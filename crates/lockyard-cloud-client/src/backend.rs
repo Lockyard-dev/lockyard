@@ -635,26 +635,36 @@ impl<T: Transport> CloudBackend<T> {
     /// then a prefix that must match exactly one area. Never creates an area.
     fn triage_area(&self, agent: &str, selector: &str) -> Result<String> {
         let selector = selector.trim();
+        if selector.is_empty() {
+            return Err(Error::Invalid(
+                "--area is empty; pass an area id, key or prefix".into(),
+            ));
+        }
         let value = self.get(agent, AREAS.into())?;
         let areas: Vec<Value> = list(value, &["areas", "items"])?;
         let active: Vec<&Value> = areas
             .iter()
             .filter(|area| area["is_active"].as_bool().unwrap_or(true))
             .collect();
-        let mut matches: Vec<&Value> = active
-            .iter()
-            .copied()
-            .filter(|area| {
-                text(area, "id").eq_ignore_ascii_case(selector)
-                    || text(area, "key").eq_ignore_ascii_case(selector)
-            })
-            .collect();
+        // Like Guid.TryParse on the server: a GUID selector matches ids only, otherwise keys.
+        let wanted = selector.to_uppercase();
+        let mut matches: Vec<&Value> = match guid_canon(selector) {
+            Some(guid) => active
+                .iter()
+                .copied()
+                .filter(|area| guid_canon(text(area, "id")).as_deref() == Some(guid.as_str()))
+                .collect(),
+            None => active
+                .iter()
+                .copied()
+                .filter(|area| text(area, "key").to_uppercase() == wanted)
+                .collect(),
+        };
         if matches.is_empty() {
-            let wanted = selector.to_ascii_lowercase();
             matches = active
                 .iter()
                 .copied()
-                .filter(|area| text(area, "prefix").to_ascii_lowercase().starts_with(&wanted))
+                .filter(|area| text(area, "prefix").to_uppercase().starts_with(&wanted))
                 .collect();
         }
         match matches.as_slice() {
@@ -697,6 +707,30 @@ impl<T: Transport> CloudBackend<T> {
             error
         })?)
     }
+}
+
+/// Canonical lowercase 32-hex form of a GUID written the ways Guid.TryParse accepts most often:
+/// plain hex, hyphenated, or hyphenated in braces or parentheses. Anything else is not a GUID.
+fn guid_canon(value: &str) -> Option<String> {
+    let value = value.trim();
+    let inner = match (value.chars().next(), value.chars().last()) {
+        (Some('{'), Some('}')) | (Some('('), Some(')')) if value.len() >= 2 => {
+            &value[1..value.len() - 1]
+        }
+        _ => value,
+    };
+    let hex = match inner.len() {
+        32 => inner.to_string(),
+        36 if [8, 13, 18, 23].iter().all(|&i| inner.as_bytes()[i] == b'-') => {
+            inner.replace('-', "")
+        }
+        _ => return None,
+    };
+    // A braced form is only valid with hyphens, like the server's "B" and "P" formats.
+    if inner.len() == 32 && inner.len() != value.len() {
+        return None;
+    }
+    (hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| hex.to_lowercase())
 }
 
 fn query(pairs: &[(&str, Option<String>)]) -> String {
@@ -3887,6 +3921,49 @@ mod tests {
                 &[("GET", "/api/v1/registry/items/D-8"), ("GET", "/api/v1/registry/areas")],
             );
         }
+    }
+
+    #[test]
+    fn triage_refuses_a_blank_area_before_listing_areas() {
+        for selector in ["", "   "] {
+            let (server, mut cloud) = backend(vec![intake_without_area()]);
+            let triage = tasks::TaskTriage { area: Some(selector.into()), ..Default::default() };
+            let error = cloud.triage_task("me", "D-8", &triage).unwrap_err();
+            assert!(matches!(error, Error::Invalid(_)), "{selector:?}");
+            sees(&server, &[("GET", "/api/v1/registry/items/D-8")]);
+        }
+    }
+
+    #[test]
+    fn triage_area_matches_guid_forms_and_keys_like_the_registry() {
+        let areas = json!({"areas": [
+            {"id": AREA_ONE, "key": "платежи", "name": "One", "is_active": true, "prefix": "PAY"},
+            {"id": AREA_TWO, "key": AREA_ONE, "name": "Two", "is_active": true, "prefix": "PLX"}
+        ]});
+        let cases = [
+            ("6F1C2A8E000040008000000000000001", AREA_ONE),
+            ("{6f1c2a8e-0000-4000-8000-000000000001}", AREA_ONE),
+            ("ПЛАТЕЖИ", AREA_ONE),
+            ("PL", AREA_TWO),
+        ];
+        for (selector, expected) in cases {
+            let mut ready = intake_without_area();
+            ready["status"] = json!("ready");
+            let (server, mut cloud) = backend(vec![intake_without_area(), areas.clone(), ready]);
+            let triage = tasks::TaskTriage { area: Some(selector.into()), ..Default::default() };
+            cloud.triage_task("me", "D-8", &triage).unwrap();
+            let seen = sees(
+                &server,
+                &[
+                    ("GET", "/api/v1/registry/items/D-8"),
+                    ("GET", "/api/v1/registry/areas"),
+                    ("POST", "/api/v1/registry/items/D-8/triage"),
+                ],
+            );
+            assert_eq!(seen[2].body["area_id"], expected, "{selector}");
+        }
+        assert_eq!(guid_canon("{6F1C2A8E000040008000000000000001}"), None);
+        assert_eq!(guid_canon("D"), None);
     }
 
     #[test]
