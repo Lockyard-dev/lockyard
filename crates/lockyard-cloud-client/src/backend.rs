@@ -649,9 +649,14 @@ impl<T: Transport> CloudBackend<T> {
             ))
         };
         let guid = guid_canon(selector);
-        if guid.is_none()
-            && (selector.contains(['{', '(']) || selector.to_ascii_lowercase().contains("0x"))
-        {
+        // Guid.TryParse accepts more spellings than the canonical forms (X format, signs inside
+        // groups, ...). Anything outside plain key characters, or carrying a GUID's worth of hex
+        // digits without being canonical, could be read as an id on the server: refuse it.
+        let odd_ascii = selector
+            .chars()
+            .any(|c| c.is_ascii() && !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')));
+        let hex_digits = selector.chars().filter(char::is_ascii_hexdigit).count();
+        if guid.is_none() && (odd_ascii || hex_digits >= 20) {
             return Err(unsure());
         }
         let value = self.get(agent, AREAS.into())?;
@@ -4067,16 +4072,23 @@ mod tests {
                 ],
             );
         }
-        // Guid.TryParse reads the X format; it is refused before areas are listed.
-        let x = "{0x6f1c2a8e,0x0000,0x4000,{0x80,0x00,0x00,0x00,0x00,0x00,0x00,0x01}}";
-        let (server, mut cloud) = backend(vec![intake_without_area()]);
-        let triage = tasks::TaskTriage {
-            area: Some(x.into()),
-            ..Default::default()
-        };
-        let error = cloud.triage_task("me", "D-8", &triage).unwrap_err();
-        assert!(matches!(error, Error::Invalid(_)));
-        sees(&server, &[("GET", "/api/v1/registry/items/D-8")]);
+        // Guid.TryParse reads the X format, signs inside groups and other near-GUID spellings;
+        // they are refused before areas are listed.
+        for odd in [
+            "{0x6f1c2a8e,0x0000,0x4000,{0x80,0x00,0x00,0x00,0x00,0x00,0x00,0x01}}",
+            "6f1c2a8e-+123-4000-8000-000000000001",
+            "6f1c2a8e-0123-4000-8000-00000000001",
+            "key with space",
+        ] {
+            let (server, mut cloud) = backend(vec![intake_without_area()]);
+            let triage = tasks::TaskTriage {
+                area: Some(odd.into()),
+                ..Default::default()
+            };
+            let error = cloud.triage_task("me", "D-8", &triage).unwrap_err();
+            assert!(matches!(error, Error::Invalid(_)), "{odd}");
+            sees(&server, &[("GET", "/api/v1/registry/items/D-8")]);
+        }
     }
 
     #[test]
