@@ -5,6 +5,15 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.17] - 2026-11-24
+
+- Add `lockyard task triage <id>` (cloud mode): moves an intake item to ready. Fields
+  come from flags, then the item, then defaults (code / agent / P2 / code_accepted / none).
+  `--area` takes the hyphenated area id, the exact key or a unique prefix of an active area;
+  any selector the registry could read differently is refused, and an item without an area
+  needs `--area`. The command never creates an area.
+- Update `url` to 2.5.9 (RUSTSEC-2026-0592).
+
 ## [0.3.16] - 2026-11-19
 
 - Route mail waits and cloud hooks with the session's selected credential; keep

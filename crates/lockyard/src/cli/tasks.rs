@@ -52,6 +52,7 @@ pub(super) fn run_task(
             | TaskCommand::Links { id }
             | TaskCommand::Show { id }
             | TaskCommand::Plan { id, .. }
+            | TaskCommand::Triage { id, .. }
             | TaskCommand::Claim { id, .. }
             | TaskCommand::Renew { id, .. }
             | TaskCommand::Release { id, .. }
@@ -226,6 +227,28 @@ pub(super) fn run_task(
                 priority,
                 p0_category,
                 due_at: due,
+            },
+        )?,
+        TaskCommand::Triage {
+            id,
+            kind,
+            actor,
+            area,
+            priority,
+            p0_category,
+            target,
+            verification,
+        } => store.triage_task(
+            &resolve_agent(agent)?,
+            &id,
+            &TaskTriage {
+                kind,
+                actor,
+                area,
+                priority,
+                p0_category,
+                target,
+                verification,
             },
         )?,
         TaskCommand::Claim { id, ttl } => {

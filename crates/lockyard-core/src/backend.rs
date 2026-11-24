@@ -446,6 +446,15 @@ pub trait Backend {
     ) -> Result<tasks::Task> {
         cloud("task plan")
     }
+    /// Moves an intake item to ready with its ready fields.
+    fn triage_task(
+        &mut self,
+        _agent: &str,
+        _id: &str,
+        _triage: &tasks::TaskTriage,
+    ) -> Result<tasks::Task> {
+        cloud("task triage")
+    }
     fn claim_task(&mut self, agent: &str, id: &str, ttl: i64, now: i64) -> Result<tasks::Task>;
     /// A workflow claim result, preserving ownership evidence from the mutation response itself.
     /// Cloud implementations must retain the assignment identity; a later read cannot establish

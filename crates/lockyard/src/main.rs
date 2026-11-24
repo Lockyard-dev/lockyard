@@ -28,7 +28,7 @@ use lockyard_core::proto::{
     SessionActivity, SessionState, Stamp, Stream, TokenRequest, WorkAction, WorkOffer, WorkStep,
     WorkTask, rfc3339,
 };
-use lockyard_core::tasks::{Status, Task, TaskPlan, TaskSpec};
+use lockyard_core::tasks::{Status, Task, TaskPlan, TaskSpec, TaskTriage};
 use lockyard_core::zones::{DEFAULT_TTL_MINUTES, validate_claim_path_count};
 use lockyard_core::{Backend, Error, Result, Store};
 use open::Opened;
