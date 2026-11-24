@@ -631,8 +631,11 @@ impl<T: Transport> CloudBackend<T> {
         }
     }
 
-    /// Resolve a triage area like the registry does: active areas only, exact id or key first,
-    /// then a prefix that must match exactly one area. Never creates an area.
+    /// Resolve a triage area, active areas only: a GUID matches ids, otherwise an exact key, then
+    /// a prefix that must match exactly one area. Never creates an area. Where the registry's
+    /// matching (Guid.TryParse, OrdinalIgnoreCase) could pick a different area than ASCII
+    /// matching, the selector is refused instead of guessed: the UUID sent is the only thing
+    /// the server sees, so a wrong guess would move the task silently.
     fn triage_area(&self, agent: &str, selector: &str) -> Result<String> {
         let selector = selector.trim();
         if selector.is_empty() {
@@ -640,31 +643,62 @@ impl<T: Transport> CloudBackend<T> {
                 "--area is empty; pass an area id, key or prefix".into(),
             ));
         }
+        let unsure = || {
+            Error::Invalid(format!(
+                "area {selector:?} cannot be matched safely; pass the hyphenated area id or the exact key"
+            ))
+        };
+        let guid = guid_canon(selector);
+        if guid.is_none()
+            && (selector.contains(['{', '(']) || selector.to_ascii_lowercase().contains("0x"))
+        {
+            return Err(unsure());
+        }
         let value = self.get(agent, AREAS.into())?;
         let areas: Vec<Value> = list(value, &["areas", "items"])?;
         let active: Vec<&Value> = areas
             .iter()
             .filter(|area| area["is_active"].as_bool().unwrap_or(true))
             .collect();
-        // Like Guid.TryParse on the server: a GUID selector matches ids only, otherwise keys.
-        let wanted = selector.to_uppercase();
-        let mut matches: Vec<&Value> = match guid_canon(selector) {
+        let mut matches: Vec<&Value> = match guid {
             Some(guid) => active
                 .iter()
                 .copied()
                 .filter(|area| guid_canon(text(area, "id")).as_deref() == Some(guid.as_str()))
                 .collect(),
-            None => active
-                .iter()
-                .copied()
-                .filter(|area| text(area, "key").to_uppercase() == wanted)
-                .collect(),
+            None => {
+                // ASCII case folding agrees with OrdinalIgnoreCase only when both sides are ASCII.
+                // A non-ASCII key of the same UTF-16 length could still fold onto the selector
+                // on the server, so it makes the choice unsafe.
+                let width = selector.encode_utf16().count();
+                let unsafe_key = active.iter().any(|area| {
+                    let key = text(area, "key");
+                    key != selector
+                        && !(key.is_ascii() && selector.is_ascii())
+                        && key.encode_utf16().count() == width
+                });
+                if unsafe_key {
+                    return Err(unsure());
+                }
+                active
+                    .iter()
+                    .copied()
+                    .filter(|area| text(area, "key").eq_ignore_ascii_case(selector))
+                    .collect()
+            }
         };
         if matches.is_empty() {
+            if !selector.is_ascii() || active.iter().any(|area| !text(area, "prefix").is_ascii()) {
+                return Err(unsure());
+            }
             matches = active
                 .iter()
                 .copied()
-                .filter(|area| text(area, "prefix").to_uppercase().starts_with(&wanted))
+                .filter(|area| {
+                    let prefix = text(area, "prefix").as_bytes();
+                    prefix.len() >= selector.len()
+                        && prefix[..selector.len()].eq_ignore_ascii_case(selector.as_bytes())
+                })
                 .collect();
         }
         match matches.as_slice() {
@@ -2192,7 +2226,7 @@ impl<T: Transport> Backend for CloudBackend<T> {
             None => {
                 return Err(Error::Invalid(format!(
                     "{id} has no area; pass --area with an area id, key or prefix"
-                )))
+                )));
             }
         };
         let body = json!({
@@ -3897,7 +3931,10 @@ mod tests {
         let mut ready = intake_without_area();
         ready["status"] = json!("ready");
         let (server, mut cloud) = backend(vec![intake_without_area(), legacy_areas(), ready]);
-        let triage = tasks::TaskTriage { area: Some("legacy-two".into()), ..Default::default() };
+        let triage = tasks::TaskTriage {
+            area: Some("legacy-two".into()),
+            ..Default::default()
+        };
         cloud.triage_task("me", "D-8", &triage).unwrap();
         let seen = sees(
             &server,
@@ -3914,11 +3951,20 @@ mod tests {
     fn triage_refuses_an_ambiguous_or_inactive_area_without_writing() {
         for selector in ["D", "OLD"] {
             let (server, mut cloud) = backend(vec![intake_without_area(), legacy_areas()]);
-            let triage = tasks::TaskTriage { area: Some(selector.into()), ..Default::default() };
-            assert!(cloud.triage_task("me", "D-8", &triage).is_err(), "{selector}");
+            let triage = tasks::TaskTriage {
+                area: Some(selector.into()),
+                ..Default::default()
+            };
+            assert!(
+                cloud.triage_task("me", "D-8", &triage).is_err(),
+                "{selector}"
+            );
             sees(
                 &server,
-                &[("GET", "/api/v1/registry/items/D-8"), ("GET", "/api/v1/registry/areas")],
+                &[
+                    ("GET", "/api/v1/registry/items/D-8"),
+                    ("GET", "/api/v1/registry/areas"),
+                ],
             );
         }
     }
@@ -3927,7 +3973,10 @@ mod tests {
     fn triage_refuses_a_blank_area_before_listing_areas() {
         for selector in ["", "   "] {
             let (server, mut cloud) = backend(vec![intake_without_area()]);
-            let triage = tasks::TaskTriage { area: Some(selector.into()), ..Default::default() };
+            let triage = tasks::TaskTriage {
+                area: Some(selector.into()),
+                ..Default::default()
+            };
             let error = cloud.triage_task("me", "D-8", &triage).unwrap_err();
             assert!(matches!(error, Error::Invalid(_)), "{selector:?}");
             sees(&server, &[("GET", "/api/v1/registry/items/D-8")]);
@@ -3943,14 +3992,17 @@ mod tests {
         let cases = [
             ("6F1C2A8E000040008000000000000001", AREA_ONE),
             ("{6f1c2a8e-0000-4000-8000-000000000001}", AREA_ONE),
-            ("ПЛАТЕЖИ", AREA_ONE),
+            ("платежи", AREA_ONE),
             ("PL", AREA_TWO),
         ];
         for (selector, expected) in cases {
             let mut ready = intake_without_area();
             ready["status"] = json!("ready");
             let (server, mut cloud) = backend(vec![intake_without_area(), areas.clone(), ready]);
-            let triage = tasks::TaskTriage { area: Some(selector.into()), ..Default::default() };
+            let triage = tasks::TaskTriage {
+                area: Some(selector.into()),
+                ..Default::default()
+            };
             cloud.triage_task("me", "D-8", &triage).unwrap();
             let seen = sees(
                 &server,
@@ -3967,9 +4019,72 @@ mod tests {
     }
 
     #[test]
+    fn triage_area_keeps_unicode_folding_apart_and_uses_the_prefix_like_the_registry() {
+        // OrdinalIgnoreCase keeps "straße" and "STRASSE" apart, so the prefix decides.
+        let areas = json!({"areas": [
+            {"id": AREA_ONE, "key": "straße", "name": "One", "is_active": true, "prefix": "GER"},
+            {"id": AREA_TWO, "key": "roads", "name": "Two", "is_active": true, "prefix": "STRASSE"}
+        ]});
+        let mut ready = intake_without_area();
+        ready["status"] = json!("ready");
+        let (server, mut cloud) = backend(vec![intake_without_area(), areas, ready]);
+        let triage = tasks::TaskTriage {
+            area: Some("STRASSE".into()),
+            ..Default::default()
+        };
+        cloud.triage_task("me", "D-8", &triage).unwrap();
+        let seen = sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/items/D-8"),
+                ("GET", "/api/v1/registry/areas"),
+                ("POST", "/api/v1/registry/items/D-8/triage"),
+            ],
+        );
+        assert_eq!(seen[2].body["area_id"], AREA_TWO);
+    }
+
+    #[test]
+    fn triage_refuses_selectors_the_registry_could_read_differently() {
+        let areas = json!({"areas": [
+            {"id": AREA_ONE, "key": "платежи", "name": "One", "is_active": true, "prefix": "PAY"},
+            {"id": AREA_TWO, "key": "ſtop", "name": "Two", "is_active": true, "prefix": "STP"}
+        ]});
+        // Upper-case Cyrillic and a long s fold onto keys only on the server.
+        for selector in ["ПЛАТЕЖИ", "STOP"] {
+            let (server, mut cloud) = backend(vec![intake_without_area(), areas.clone()]);
+            let triage = tasks::TaskTriage {
+                area: Some(selector.into()),
+                ..Default::default()
+            };
+            let error = cloud.triage_task("me", "D-8", &triage).unwrap_err();
+            assert!(matches!(error, Error::Invalid(_)), "{selector}");
+            sees(
+                &server,
+                &[
+                    ("GET", "/api/v1/registry/items/D-8"),
+                    ("GET", "/api/v1/registry/areas"),
+                ],
+            );
+        }
+        // Guid.TryParse reads the X format; it is refused before areas are listed.
+        let x = "{0x6f1c2a8e,0x0000,0x4000,{0x80,0x00,0x00,0x00,0x00,0x00,0x00,0x01}}";
+        let (server, mut cloud) = backend(vec![intake_without_area()]);
+        let triage = tasks::TaskTriage {
+            area: Some(x.into()),
+            ..Default::default()
+        };
+        let error = cloud.triage_task("me", "D-8", &triage).unwrap_err();
+        assert!(matches!(error, Error::Invalid(_)));
+        sees(&server, &[("GET", "/api/v1/registry/items/D-8")]);
+    }
+
+    #[test]
     fn triage_never_guesses_or_creates_an_area_and_checks_p0_first() {
         let (server, mut cloud) = backend(vec![intake_without_area()]);
-        let error = cloud.triage_task("me", "D-8", &tasks::TaskTriage::default()).unwrap_err();
+        let error = cloud
+            .triage_task("me", "D-8", &tasks::TaskTriage::default())
+            .unwrap_err();
         assert!(matches!(error, Error::Invalid(_)));
         sees(&server, &[("GET", "/api/v1/registry/items/D-8")]);
 
