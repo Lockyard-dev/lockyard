@@ -2081,6 +2081,58 @@ impl<T: Transport> Backend for CloudBackend<T> {
         task_from(&self.post(agent, format!("{ITEMS}/{}/plan", id), &body)?)
     }
 
+    /// Intake → ready. A flag wins, then the item's own value, then the documented default.
+    /// The area flag accepts a key or prefix; without it the item's area stays.
+    fn triage_task(
+        &mut self,
+        agent: &str,
+        id: &str,
+        triage: &tasks::TaskTriage,
+    ) -> Result<tasks::Task> {
+        let canonical = canonical_sdk_task(id)?;
+        let id = canonical.as_str();
+        let item = self.item(agent, id)?;
+        if item["status"] != "intake" {
+            return Err(Error::Invalid(format!(
+                "{id} is {}, triage works only from intake",
+                item["status"].as_str().unwrap_or("unknown")
+            )));
+        }
+        let pick = |flag: &Option<String>, field: &str, default: &str| -> Value {
+            match flag {
+                Some(value) => json!(value),
+                None if !item[field].is_null() => item[field].clone(),
+                None => json!(default),
+            }
+        };
+        let area_id = match triage.area.as_deref() {
+            Some(area) => json!(self.area_id(agent, Some(area), None, None)?),
+            None if !item["area_id"].is_null() => item["area_id"].clone(),
+            None => json!(self.area_id(agent, None, None, None)?),
+        };
+        let body = json!({
+            "type": pick(&triage.kind, "type", "code"),
+            "actor": pick(&triage.actor, "actor", "agent"),
+            "area_id": area_id,
+            "priority": pick(&triage.priority, "priority", "P2"),
+            "p0_category": triage.p0_category.as_deref().map_or(item["p0_category"].clone(), |p| json!(p)),
+            "due_at": item["due_at"],
+            "revisit_after": item["revisit_after"],
+            "revisit_on": item["revisit_on"],
+            "target": pick(&triage.target, "target", "code_accepted"),
+            "verification": pick(&triage.verification, "verification", "none"),
+            "verify_by": item["verify_by"],
+            "expected_version": item["version"],
+        });
+        if body["priority"] == "P0" && body["p0_category"].is_null() {
+            return Err(Error::Invalid(
+                "P0 requires p0_category: player_money, security_breach, prod_outage, cert_slip"
+                    .into(),
+            ));
+        }
+        task_from(&self.post(agent, format!("{ITEMS}/{}/triage", id), &body)?)
+    }
+
     /// The registry leases an item for two hours, so `ttl` has no meaning here.
     fn claim_task(&mut self, agent: &str, id: &str, _ttl: i64, _now: i64) -> Result<tasks::Task> {
         let canonical = canonical_sdk_task(id)?;
@@ -3708,6 +3760,48 @@ mod tests {
         ));
         assert!(matches!(cloud.registry_import("me", &json!({"items": [{"evidence": [{"value": "1"}, {"value": "2"}, {"value": "3"}, {"value": "4"}, {"value": "5"}]}]})), Err(Error::Invalid(_))));
         assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn triage_fills_ready_fields_from_flags_item_and_defaults() {
+        let mut intake = item("intake", 3);
+        intake["id"] = json!("D-7");
+        intake["type"] = Value::Null;
+        intake["target"] = Value::Null;
+        intake["area_id"] = json!("area-d");
+        let mut ready = intake.clone();
+        ready["status"] = json!("ready");
+        let (server, mut cloud) = backend(vec![intake, ready]);
+        let triage = tasks::TaskTriage {
+            kind: Some("housekeeping".into()),
+            ..tasks::TaskTriage::default()
+        };
+        cloud.triage_task("me", "D-7", &triage).unwrap();
+        let seen = sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/items/D-7"),
+                ("POST", "/api/v1/registry/items/D-7/triage"),
+            ],
+        );
+        let body = &seen[1].body;
+        assert_eq!(body["type"], "housekeeping");
+        assert_eq!(body["actor"], "agent");
+        assert_eq!(body["area_id"], "area-d");
+        assert_eq!(body["priority"], "P1");
+        assert_eq!(body["target"], "code_accepted");
+        assert_eq!(body["verification"], "none");
+        assert_eq!(body["expected_version"], 3);
+    }
+
+    #[test]
+    fn triage_refuses_items_that_left_intake_without_writing() {
+        let (server, mut cloud) = backend(vec![item("ready", 2)]);
+        let error = cloud
+            .triage_task("me", "G-SG-0012", &tasks::TaskTriage::default())
+            .unwrap_err();
+        assert!(matches!(error, Error::Invalid(_)));
+        sees(&server, &[("GET", "/api/v1/registry/items/G-SG-0012")]);
     }
 
     #[test]

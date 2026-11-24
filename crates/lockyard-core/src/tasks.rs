@@ -163,6 +163,19 @@ pub struct TaskPlan {
     pub due_at: Option<String>,
 }
 
+/// An intake verdict: the ready fields a triage sets. Unset fields keep the item's value,
+/// then fall back to the defaults the CLI documents.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskTriage {
+    pub kind: Option<String>,
+    pub actor: Option<String>,
+    pub area: Option<String>,
+    pub priority: Option<String>,
+    pub p0_category: Option<String>,
+    pub target: Option<String>,
+    pub verification: Option<String>,
+}
+
 impl Task {
     fn lease_alive(&self, now: i64) -> bool {
         self.lease_until.is_some_and(|until| until > now)

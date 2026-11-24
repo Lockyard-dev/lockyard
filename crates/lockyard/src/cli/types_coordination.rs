@@ -448,6 +448,27 @@ pub(super) enum TaskCommand {
         #[arg(long)]
         due: Option<String>,
     },
+    /// Move an intake task to ready. Needs cloud mode. A flag wins, then the task's own value,
+    /// then the default: type code, actor agent, priority P2, target code_accepted,
+    /// verification none; the area stays unless --area names a key or prefix.
+    Triage {
+        #[arg(value_parser = task_key)]
+        id: String,
+        #[arg(long = "type", value_parser = lockyard_core::tasks::REGISTRY_TASK_TYPES)]
+        kind: Option<String>,
+        #[arg(long, value_parser = ["agent", "owner", "external"])]
+        actor: Option<String>,
+        #[arg(long)]
+        area: Option<String>,
+        #[arg(long, value_parser = ["P0", "P1", "P2", "P3"])]
+        priority: Option<String>,
+        #[arg(long, value_parser = ["player_money", "security_breach", "prod_outage", "cert_slip"])]
+        p0_category: Option<String>,
+        #[arg(long, value_parser = ["code_accepted", "ci_passed", "merged", "deployed_staging", "deployed_prod", "verified_prod", "owner_decision", "external_confirmation"])]
+        target: Option<String>,
+        #[arg(long, value_parser = ["auto", "owner", "none"])]
+        verification: Option<String>,
+    },
     /// List unfinished tasks.
     List {
         /// Include accepted and cancelled tasks.
