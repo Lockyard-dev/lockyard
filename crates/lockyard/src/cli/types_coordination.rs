@@ -450,7 +450,8 @@ pub(super) enum TaskCommand {
     },
     /// Move an intake task to ready. Needs cloud mode. A flag wins, then the task's own value,
     /// then the default: type code, actor agent, priority P2, target code_accepted,
-    /// verification none; the area stays unless --area names a key or prefix.
+    /// verification none. The area stays unless --area names an active area id, key or unique
+    /// prefix; a task without an area needs --area.
     Triage {
         #[arg(value_parser = task_key)]
         id: String,

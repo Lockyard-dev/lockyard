@@ -631,6 +631,41 @@ impl<T: Transport> CloudBackend<T> {
         }
     }
 
+    /// Resolve a triage area like the registry does: active areas only, exact id or key first,
+    /// then a prefix that must match exactly one area. Never creates an area.
+    fn triage_area(&self, agent: &str, selector: &str) -> Result<String> {
+        let selector = selector.trim();
+        let value = self.get(agent, AREAS.into())?;
+        let areas: Vec<Value> = list(value, &["areas", "items"])?;
+        let active: Vec<&Value> = areas
+            .iter()
+            .filter(|area| area["is_active"].as_bool().unwrap_or(true))
+            .collect();
+        let mut matches: Vec<&Value> = active
+            .iter()
+            .copied()
+            .filter(|area| {
+                text(area, "id").eq_ignore_ascii_case(selector)
+                    || text(area, "key").eq_ignore_ascii_case(selector)
+            })
+            .collect();
+        if matches.is_empty() {
+            let wanted = selector.to_ascii_lowercase();
+            matches = active
+                .iter()
+                .copied()
+                .filter(|area| text(area, "prefix").to_ascii_lowercase().starts_with(&wanted))
+                .collect();
+        }
+        match matches.as_slice() {
+            [] => Err(Error::NotFound(format!("no active area {selector:?}"))),
+            [area] => Ok(text(area, "id").to_string()),
+            _ => Err(Error::Invalid(format!(
+                "area prefix {selector:?} is ambiguous; use the area id or key"
+            ))),
+        }
+    }
+
     fn write(
         &self,
         session: &str,
@@ -2082,7 +2117,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
     }
 
     /// Intake → ready. A flag wins, then the item's own value, then the documented default.
-    /// The area flag accepts a key or prefix; without it the item's area stays.
+    /// The area flag accepts an id, key or unique prefix of an active area; without it the
+    /// item's area stays, and an item without an area is refused instead of guessed.
     fn triage_task(
         &mut self,
         agent: &str,
@@ -2105,17 +2141,32 @@ impl<T: Transport> Backend for CloudBackend<T> {
                 None => json!(default),
             }
         };
+        let priority = pick(&triage.priority, "priority", "P2");
+        let p0_category = triage
+            .p0_category
+            .as_deref()
+            .map_or(item["p0_category"].clone(), |p| json!(p));
+        if priority == "P0" && p0_category.is_null() {
+            return Err(Error::Invalid(
+                "P0 requires p0_category: player_money, security_breach, prod_outage, cert_slip"
+                    .into(),
+            ));
+        }
         let area_id = match triage.area.as_deref() {
-            Some(area) => json!(self.area_id(agent, Some(area), None, None)?),
+            Some(area) => json!(self.triage_area(agent, area)?),
             None if !item["area_id"].is_null() => item["area_id"].clone(),
-            None => json!(self.area_id(agent, None, None, None)?),
+            None => {
+                return Err(Error::Invalid(format!(
+                    "{id} has no area; pass --area with an area id, key or prefix"
+                )))
+            }
         };
         let body = json!({
             "type": pick(&triage.kind, "type", "code"),
             "actor": pick(&triage.actor, "actor", "agent"),
             "area_id": area_id,
-            "priority": pick(&triage.priority, "priority", "P2"),
-            "p0_category": triage.p0_category.as_deref().map_or(item["p0_category"].clone(), |p| json!(p)),
+            "priority": priority,
+            "p0_category": p0_category,
             "due_at": item["due_at"],
             "revisit_after": item["revisit_after"],
             "revisit_on": item["revisit_on"],
@@ -2124,12 +2175,6 @@ impl<T: Transport> Backend for CloudBackend<T> {
             "verify_by": item["verify_by"],
             "expected_version": item["version"],
         });
-        if body["priority"] == "P0" && body["p0_category"].is_null() {
-            return Err(Error::Invalid(
-                "P0 requires p0_category: player_money, security_breach, prod_outage, cert_slip"
-                    .into(),
-            ));
-        }
         task_from(&self.post(agent, format!("{ITEMS}/{}/triage", id), &body)?)
     }
 
@@ -3768,7 +3813,7 @@ mod tests {
         intake["id"] = json!("D-7");
         intake["type"] = Value::Null;
         intake["target"] = Value::Null;
-        intake["area_id"] = json!("area-d");
+        intake["area_id"] = json!(AREA_ONE);
         let mut ready = intake.clone();
         ready["status"] = json!("ready");
         let (server, mut cloud) = backend(vec![intake, ready]);
@@ -3787,11 +3832,79 @@ mod tests {
         let body = &seen[1].body;
         assert_eq!(body["type"], "housekeeping");
         assert_eq!(body["actor"], "agent");
-        assert_eq!(body["area_id"], "area-d");
+        assert_eq!(body["area_id"], AREA_ONE);
         assert_eq!(body["priority"], "P1");
         assert_eq!(body["target"], "code_accepted");
         assert_eq!(body["verification"], "none");
         assert_eq!(body["expected_version"], 3);
+    }
+
+    const AREA_ONE: &str = "6f1c2a8e-0000-4000-8000-000000000001";
+    const AREA_TWO: &str = "6f1c2a8e-0000-4000-8000-000000000002";
+
+    fn legacy_areas() -> Value {
+        json!({"areas": [
+            {"id": AREA_ONE, "key": "legacy-one", "name": "One", "is_active": true, "prefix": "D"},
+            {"id": AREA_TWO, "key": "legacy-two", "name": "Two", "is_active": true, "prefix": "D"},
+            {"id": "6f1c2a8e-0000-4000-8000-000000000003", "key": "old", "name": "Old",
+             "is_active": false, "prefix": "OLD"}
+        ]})
+    }
+
+    fn intake_without_area() -> Value {
+        let mut intake = item("intake", 4);
+        intake["id"] = json!("D-8");
+        intake["area_id"] = Value::Null;
+        intake
+    }
+
+    #[test]
+    fn triage_area_key_beats_a_shared_prefix_and_sends_its_uuid() {
+        let mut ready = intake_without_area();
+        ready["status"] = json!("ready");
+        let (server, mut cloud) = backend(vec![intake_without_area(), legacy_areas(), ready]);
+        let triage = tasks::TaskTriage { area: Some("legacy-two".into()), ..Default::default() };
+        cloud.triage_task("me", "D-8", &triage).unwrap();
+        let seen = sees(
+            &server,
+            &[
+                ("GET", "/api/v1/registry/items/D-8"),
+                ("GET", "/api/v1/registry/areas"),
+                ("POST", "/api/v1/registry/items/D-8/triage"),
+            ],
+        );
+        assert_eq!(seen[2].body["area_id"], AREA_TWO);
+    }
+
+    #[test]
+    fn triage_refuses_an_ambiguous_or_inactive_area_without_writing() {
+        for selector in ["D", "OLD"] {
+            let (server, mut cloud) = backend(vec![intake_without_area(), legacy_areas()]);
+            let triage = tasks::TaskTriage { area: Some(selector.into()), ..Default::default() };
+            assert!(cloud.triage_task("me", "D-8", &triage).is_err(), "{selector}");
+            sees(
+                &server,
+                &[("GET", "/api/v1/registry/items/D-8"), ("GET", "/api/v1/registry/areas")],
+            );
+        }
+    }
+
+    #[test]
+    fn triage_never_guesses_or_creates_an_area_and_checks_p0_first() {
+        let (server, mut cloud) = backend(vec![intake_without_area()]);
+        let error = cloud.triage_task("me", "D-8", &tasks::TaskTriage::default()).unwrap_err();
+        assert!(matches!(error, Error::Invalid(_)));
+        sees(&server, &[("GET", "/api/v1/registry/items/D-8")]);
+
+        let (server, mut cloud) = backend(vec![intake_without_area()]);
+        let triage = tasks::TaskTriage {
+            priority: Some("P0".into()),
+            area: Some("legacy-one".into()),
+            ..Default::default()
+        };
+        let error = cloud.triage_task("me", "D-8", &triage).unwrap_err();
+        assert!(matches!(error, Error::Invalid(_)));
+        sees(&server, &[("GET", "/api/v1/registry/items/D-8")]);
     }
 
     #[test]
