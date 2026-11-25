@@ -3,6 +3,8 @@
 use crate::Call;
 use lockyard_core::{Error, Result, ZonePath, paths::find_root};
 use serde_json::{Value, json};
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -52,6 +54,70 @@ fn toplevel(path: &Path) -> Option<PathBuf> {
     .ok()
 }
 
+fn ignores_case(directory: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    if let Ok(directory) = std::ffi::CString::new(directory.as_os_str().as_encoded_bytes()) {
+        // SAFETY: the path is NUL-terminated and lives for the duration of the call.
+        match unsafe { libc::pathconf(directory.as_ptr(), libc::_PC_CASE_SENSITIVE) } {
+            0 => return true,
+            1 => return false,
+            _ => {}
+        }
+    }
+
+    // A lookup of an unlisted spelling of an existing name proves case is ignored.
+    let Ok(entries) = directory.read_dir() else {
+        return false;
+    };
+    let Ok(names) = entries
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<HashSet<_>>>()
+    else {
+        return false;
+    };
+    names.iter().filter_map(|name| name.to_str()).any(|name| {
+        let mut alternate = name.to_ascii_uppercase();
+        if alternate == name {
+            alternate.make_ascii_lowercase();
+        }
+        alternate != name
+            && !names.contains(OsStr::new(&alternate))
+            && directory.join(alternate).symlink_metadata().is_ok()
+    })
+}
+
+fn gitlink_contains_path(repo: &Path, gitlink: &[u8], relative: &[u8]) -> bool {
+    if relative
+        .strip_prefix(gitlink)
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(b"/"))
+    {
+        return true;
+    }
+
+    let (Ok(gitlink), Ok(relative)) = (std::str::from_utf8(gitlink), std::str::from_utf8(relative))
+    else {
+        return false;
+    };
+    if !ZonePath::stored(gitlink.to_owned()).contains(&ZonePath::stored(relative.to_owned())) {
+        return false;
+    }
+
+    let mut parent = repo.to_path_buf();
+    // An uninitialized gitlink may be absent, so ask the closest existing parent about lookup.
+    for (indexed, requested) in gitlink.split('/').zip(relative.split('/')) {
+        if indexed != requested
+            && !parent
+                .ancestors()
+                .find(|path| path.is_dir())
+                .is_some_and(ignores_case)
+        {
+            return false;
+        }
+        parent.push(requested);
+    }
+    true
+}
+
 fn checkout_contains_path(repo: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(repo) else {
         return false;
@@ -60,22 +126,25 @@ fn checkout_contains_path(repo: &Path, path: &Path) -> bool {
         return true;
     };
     // Query from the first component so the index also reports gitlink ancestors.
+    // Git's icase pathspec only folds ASCII. For other names, inspect the entire index.
+    let mut command = git(repo);
+    command.args(["ls-files", "--stage", "-z", "--"]);
+    if first.as_os_str().as_encoded_bytes().is_ascii() {
+        let mut pathspec = OsString::from(":(icase,literal)");
+        pathspec.push(first.as_os_str());
+        command.arg(pathspec);
+    }
     let relative = relative.as_os_str().as_encoded_bytes();
-    git(repo)
-        .args(["--literal-pathspecs", "ls-files", "--stage", "-z", "--"])
-        .arg(first.as_os_str())
-        .output()
-        .is_ok_and(|output| {
-            output.status.success()
-                && !output.stdout.split(|&byte| byte == 0).any(|entry| {
-                    entry.starts_with(b"160000 ")
-                        && entry
-                            .splitn(2, |&byte| byte == b'\t')
-                            .nth(1)
-                            .and_then(|gitlink| relative.strip_prefix(gitlink))
-                            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(b"/"))
-                })
-        })
+    command.output().is_ok_and(|output| {
+        output.status.success()
+            && !output.stdout.split(|&byte| byte == 0).any(|entry| {
+                entry.starts_with(b"160000 ")
+                    && entry
+                        .splitn(2, |&byte| byte == b'\t')
+                        .nth(1)
+                        .is_some_and(|gitlink| gitlink_contains_path(repo, gitlink, relative))
+            })
+    })
 }
 
 // Task paths are workspace-relative, including when invoked from another checkout in it.
