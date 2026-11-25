@@ -1,5 +1,6 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
+use crate::Call;
 use lockyard_core::{Error, Result, ZonePath, paths::find_root};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -20,13 +21,14 @@ pub fn commit_names_file(value: &str) -> bool {
 
 fn git(directory: &Path) -> Command {
     let mut git = Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"GIT_") {
+            git.env_remove(name);
+        }
+    }
     git.arg("-C")
         .arg(directory)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_ALLOW_PROTOCOL", "");
     git
@@ -82,37 +84,60 @@ pub(crate) fn full_commit_sha(repository: Option<&Path>, value: &str) -> Option<
     if revision.len() > 40 {
         return None;
     }
-    let output = git(repository?)
-        .args(["rev-parse", "--verify", &format!("{revision}^{{commit}}")])
+    local_commit_oid(repository?, revision).filter(|sha| sha.len() == 40)
+}
+
+fn local_commit_oid(repository: &Path, revision: &str) -> Option<String> {
+    let output = git(repository)
+        .args(["rev-parse", &format!("--disambiguate={revision}")])
         .output()
         .ok()?;
-    let sha = std::str::from_utf8(&output.stdout).ok()?.trim();
-    (output.status.success() && sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| sha.to_ascii_lowercase())
+    if !output.status.success() {
+        return None;
+    }
+    let mut candidates = std::str::from_utf8(&output.stdout).ok()?.lines();
+    let sha = candidates.next()?;
+    if candidates.next().is_some()
+        || !matches!(sha.len(), 40 | 64)
+        || !sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let object = git(repository)
+        .args(["cat-file", "-t", sha])
+        .output()
+        .ok()?;
+    (object.status.success() && object.stdout == b"commit\n").then(|| sha.to_ascii_lowercase())
 }
 
 /// A revision missing locally may name a commit the server can still verify.
 pub(crate) fn refuse_if_file_missing(repo: &Path, value: &str) -> Result<()> {
-    let Some((revision, path)) = value.split_once(':') else {
+    let Some((input_revision, path)) = value.split_once(':') else {
+        return Ok(());
+    };
+    let Some(revision) = local_commit_oid(repo, input_revision) else {
         return Ok(());
     };
     if git(repo)
-        .args(["cat-file", "-e", &format!("{revision}^{{commit}}")])
+        .args(["cat-file", "-e", &format!("{revision}:{path}")])
         .output()
-        .is_ok_and(|output| output.status.success())
-        && git(repo)
-            .args(["cat-file", "-e", &format!("{revision}:{path}")])
-            .output()
-            .is_ok_and(|output| !output.status.success())
+        .is_ok_and(|output| !output.status.success())
     {
         return Err(Error::Invalid(format!(
-            "file {path} is not in revision {revision}"
+            "file {path} is not in revision {input_revision}"
         )));
     }
     Ok(())
 }
 
-pub(crate) fn warn_if_sha_missing(route: &str, body: &Value, response: &mut Value) {
+pub(crate) fn warn_if_sha_missing(call: &Call, encryption_enabled: bool, response: &mut Value) {
+    let Some(body) = &call.body else {
+        return;
+    };
+    if !encryption_enabled || call.method != "POST" {
+        return;
+    }
+    let route = call.path.split('?').next().unwrap_or(&call.path);
     let missing_sha = |entry: &Value| {
         entry["kind"] == "commit"
             && entry["commit_sha"].is_null()
@@ -122,11 +147,29 @@ pub(crate) fn warn_if_sha_missing(route: &str, body: &Value, response: &mut Valu
         Some("") => body["evidence"]
             .as_array()
             .is_some_and(|entries| entries.iter().any(missing_sha)),
+        Some("/batch-transition") => {
+            if missing_sha(&body["evidence"])
+                && let Some(results) = response.get_mut("results").and_then(Value::as_array_mut)
+            {
+                for result in results {
+                    if let Some(item) = result.get_mut("item") {
+                        add_missing_sha_warning(item);
+                    }
+                }
+            }
+            return;
+        }
         Some(item) if item.ends_with("/evidence") => missing_sha(body),
         Some(item) if item.ends_with("/transition") => missing_sha(&body["evidence"]),
         _ => false,
     };
-    if missing && response.is_object() {
+    if missing {
+        add_missing_sha_warning(response);
+    }
+}
+
+fn add_missing_sha_warning(response: &mut Value) {
+    if response.is_object() {
         let warning = json!(
             "Не удалось развернуть SHA коммита. Приёмка в шифрованном workspace откажет. Пересдайте задачу с полным 40-символьным SHA."
         );

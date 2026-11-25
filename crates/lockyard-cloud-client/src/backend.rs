@@ -2393,7 +2393,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
         }
         let mut results = Vec::with_capacity(ids.len());
         let mut pending = Vec::new();
-        let mut targets = Vec::new();
+        let mut paths = Vec::new();
+        let mut all_ci = true;
         for id in ids {
             match self.task(id) {
                 Ok(task)
@@ -2405,7 +2406,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
                     results.push(json!({"id": id, "changed": false, "error": null, "item": task}));
                 }
                 Ok(task) => {
-                    targets.push(task.target);
+                    all_ci &= task.target.as_deref() == Some("ci_passed");
+                    paths.extend(task.paths);
                     pending.push(id.clone());
                 }
                 Err(error) => results.push(
@@ -2416,27 +2418,17 @@ impl<T: Transport> Backend for CloudBackend<T> {
         if pending.is_empty() {
             return Ok(json!({"results": results}));
         }
-        let evidence_kind = if targets
-            .iter()
-            .all(|target| target.as_deref() == Some("ci_passed"))
-        {
-            "ci_run"
-        } else {
-            "commit"
-        };
+        let target = if all_ci { "ci_passed" } else { DEFAULT_TARGET };
+        let repository = evidence_repository(evidence, &paths);
+        let mut shared_evidence =
+            evidence_body(agent, target, evidence, now, repository.as_deref());
+        shared_evidence["expected_version"] = Value::Null;
         let payload = json!({
             "ids": pending,
             "to": "done",
             "resolution": "completed",
             "reason": reason_or(evidence, "owner decision"),
-            "evidence": {
-                "kind": evidence_kind,
-                "environment": "local",
-                "value": evidence,
-                "observed_at": rfc3339(now),
-                "verifier": agent,
-                "expected_version": null
-            }
+            "evidence": shared_evidence,
         });
         let response = self.post(agent, format!("{ITEMS}/batch-transition"), &payload)?;
         results.extend(

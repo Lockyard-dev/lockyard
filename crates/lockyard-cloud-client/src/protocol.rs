@@ -1214,16 +1214,15 @@ impl Client {
                             .is_some_and(crate::commit_names_file)
                         && let Some(current) = current.as_object_mut()
                     {
-                        // Git resolution may change between invocations, including an upgrade
-                        // from a client that never sent this metadata. Retry the original body.
+                        // Match the original digest with the journal's clear metadata,
+                        // since Git resolution may change between invocations.
                         match original.get("commit_sha") {
-                            Some(sha) if !current.contains_key("commit_sha") => {
+                            Some(sha) => {
                                 current.insert("commit_sha".into(), sha.clone());
                             }
                             None => {
                                 current.remove("commit_sha");
                             }
-                            _ => {}
                         }
                     }
                 }
@@ -2175,12 +2174,11 @@ impl Client {
                         }
                         return Err(content_error(message));
                     }
-                    if encryption_enabled
-                        && call.method == "POST"
-                        && let Some(body) = &call.body
-                    {
-                        crate::commit_evidence::warn_if_sha_missing(route, body, &mut value);
-                    }
+                    crate::commit_evidence::warn_if_sha_missing(
+                        call,
+                        encryption_enabled,
+                        &mut value,
+                    );
                     if let Err(error) = self.finish_catalog_call(call, &mut value) {
                         if let Some(pending) = pending {
                             if !journal_owned {
@@ -2487,9 +2485,17 @@ impl Client {
         value: &mut Value,
         encryption: Option<&maintenance::ReplayEncryption>,
     ) -> Result<(), ClientError> {
-        let (workspace, held) = match encryption {
-            Some(encryption) => (encryption.workspace.as_deref(), encryption.key.clone()),
-            None => (self.workspace.as_deref(), self.resolved_content_key()?),
+        let (workspace, held, enabled) = match encryption {
+            Some(encryption) => (
+                encryption.workspace.as_deref(),
+                encryption.key.clone(),
+                encryption.enabled,
+            ),
+            None => (
+                self.workspace.as_deref(),
+                self.resolved_content_key()?,
+                self.encryption_enabled,
+            ),
         };
         if let Some(workspace) = workspace
             && let Err(message) = crate::crypto::transform_fields_policy(
@@ -2509,6 +2515,7 @@ impl Client {
             };
             return Err(self.unknown(pending.clone(), cause, None));
         }
+        crate::commit_evidence::warn_if_sha_missing(call, enabled, value);
         if let Err(error) = self.finish_catalog_call(call, value) {
             let cause = error
                 .code()
