@@ -8,6 +8,7 @@
 mod backend;
 pub mod catalog;
 mod catalog_client;
+mod commit_evidence;
 mod crypto;
 pub mod device;
 pub mod sse;
@@ -22,6 +23,7 @@ mod status;
 mod test_support;
 
 pub use backend::{CloudBackend, checks as decode_checks};
+pub use commit_evidence::commit_names_file;
 pub use crypto::{CONTENT_FIELDS, FieldRule, WorkspaceKey, route_matches, transform_fields};
 pub use protocol::{NegotiatedProtocol, PendingRepair, PendingWrite, Problem, ProtocolRange};
 pub use repository::RepositoryTransport;
@@ -125,6 +127,10 @@ pub(crate) fn task_area_error(error: &ApiError) -> Option<String> {
                 .filter(|roots| !roots.is_empty()).unwrap_or_else(|| "не указаны сервером".into());
             format!("Пути задачи относятся к нескольким репозиториям: {roots}; заведи по одной задаче на репозиторий (create one task per repository).")
         }
+        "commit_not_in_dev" => "Коммит не входит в историю ветки dev (commit_not_in_dev). Запушьте его в dev репозитория задачи и пересдайте задачу.".into(),
+        "commit_outside_task_repository" => "Коммит указан для другого репозитория (commit_outside_task_repository). Пересдайте задачу с коммитом из её репозитория.".into(),
+        "commit_evidence_invalid" => "Некорректное доказательство коммита (commit_evidence_invalid). Пересдайте задачу с evidence в формате <полный SHA>:<путь к файлу в коммите>.".into(),
+        "commit_reachability_unknown" => "Сервер не смог проверить, входит ли коммит в историю dev (commit_reachability_unknown). Проверьте доступ сервера к репозиторию. Если evidence шифруется, пересдайте задачу с полным SHA, затем повторите приёмку.".into(),
         "area_mismatch" => format!("Указанная область не соответствует файлам задачи. Область по путям: {}. Убери --area / area или укажи эту область.", detail("derived")),
         "area_closed" => "Эта область закрыта для новых задач. Укажи пути файлов задачи и используй открытую область.".into(),
         "area_template_conflict" => format!("Не удалось автоматически создать область для {}: ключ или префикс {} уже занят областью {}. Ведущий должен явно добавить корень репозитория в подходящую область.", detail("root"), detail("prefix"), detail("existing_area")),

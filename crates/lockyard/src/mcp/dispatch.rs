@@ -214,7 +214,7 @@ pub(super) fn run_tool(
                     now,
                 )?),
                 "submit" => {
-                    let evidence = executor_evidence(args.text("evidence")?);
+                    let evidence = executor_evidence(args.text("evidence")?, is_cloud);
                     encode(&backend.submit_task(
                         me()?,
                         &args.task_key_for(is_cloud)?,
@@ -856,7 +856,7 @@ pub(super) fn run_tool(
             )
         }
         "task_submit" => {
-            let evidence = executor_evidence(args.text("evidence")?);
+            let evidence = executor_evidence(args.text("evidence")?, is_cloud);
             encode(&opened.backend.submit_task(
                 me()?,
                 &args.task_key_for(is_cloud)?,

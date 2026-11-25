@@ -331,6 +331,10 @@
       "property": "lease_active"
     },
     {
+      "schema": "RegistryItemDto",
+      "property": "warnings"
+    },
+    {
       "schema": "RegistryOwnerCloseRequest",
       "property": "expected_version"
     },

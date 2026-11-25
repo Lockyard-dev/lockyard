@@ -1208,6 +1208,24 @@ impl Client {
             ) {
                 for (current, original) in current.iter_mut().zip(original) {
                     current["observed_at"] = original["observed_at"].clone();
+                    if current["kind"] == "commit"
+                        && current["value"]
+                            .as_str()
+                            .is_some_and(crate::commit_names_file)
+                        && let Some(current) = current.as_object_mut()
+                    {
+                        // Git resolution may change between invocations, including an upgrade
+                        // from a client that never sent this metadata. Retry the original body.
+                        match original.get("commit_sha") {
+                            Some(sha) if !current.contains_key("commit_sha") => {
+                                current.insert("commit_sha".into(), sha.clone());
+                            }
+                            None => {
+                                current.remove("commit_sha");
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             // The digest binds caller plaintext before encryption; never compare ciphertext
@@ -2157,6 +2175,12 @@ impl Client {
                         }
                         return Err(content_error(message));
                     }
+                    if encryption_enabled
+                        && call.method == "POST"
+                        && let Some(body) = &call.body
+                    {
+                        crate::commit_evidence::warn_if_sha_missing(route, body, &mut value);
+                    }
                     if let Err(error) = self.finish_catalog_call(call, &mut value) {
                         if let Some(pending) = pending {
                             if !journal_owned {
@@ -2826,7 +2850,7 @@ mod pending_completion_tests {
             "alice",
             "POST",
             "/api/v1/registry/items".into(),
-            json!({"client_key":"original-logical-key", "title":"same title", "body":"same body", "paths":["src"], "evidence":[{"value":"commit", "observed_at":"old timestamp"}]}),
+            json!({"client_key":"original-logical-key", "title":"same title", "body":"same body", "paths":["src"], "evidence":[{"kind":"commit", "value":"abcdef0:src/file", "observed_at":"old timestamp"}]}),
         );
         let mut operation = pending(&client, original.key.as_deref().unwrap());
         operation.method = original.method.clone();
@@ -2851,6 +2875,8 @@ mod pending_completion_tests {
         repeat.key = Some("fresh-http-key".into());
         repeat.body.as_mut().unwrap()["client_key"] = json!("fresh-logical-key");
         repeat.body.as_mut().unwrap()["evidence"][0]["observed_at"] = json!("new timestamp");
+        repeat.body.as_mut().unwrap()["evidence"][0]["commit_sha"] =
+            json!("abcdef0123456789abcdef0123456789abcdef01");
         assert_eq!(
             client.pending_task_create(&repeat, false).unwrap(),
             original

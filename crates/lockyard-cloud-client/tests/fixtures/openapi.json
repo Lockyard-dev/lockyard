@@ -58947,6 +58947,12 @@
             "items": {
               "$ref": "#/components/schemas/RegistryLinkDto"
             }
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
