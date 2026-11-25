@@ -1,7 +1,10 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
 use crate::Call;
-use lockyard_core::{Error, Result, ZonePath, paths::find_root};
+use lockyard_core::{
+    Error, Result, ZonePath,
+    paths::{find_root, fold_path_component},
+};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -62,10 +65,10 @@ fn gitlink_contains_path(gitlink: &[u8], relative: &Path) -> bool {
         if indexed == requested.as_encoded_bytes() {
             return true;
         }
-        // A case variant may resolve to this gitlink. Avoid using the parent checkout in either case.
+        // Unicode spelling and case variants may resolve to this gitlink.
         match (std::str::from_utf8(indexed), requested.to_str()) {
             (Ok(indexed), Some(requested)) => {
-                indexed.to_uppercase().to_lowercase() == requested.to_uppercase().to_lowercase()
+                fold_path_component(indexed) == fold_path_component(requested)
             }
             _ => false,
         }

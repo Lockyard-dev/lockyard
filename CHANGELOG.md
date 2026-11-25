@@ -7,8 +7,9 @@ All notable changes to Lockyard are recorded here. The format follows
 
 ## [0.3.19] - 2026-11-26
 
-- Match gitlink path components case-insensitively with Unicode casing on every filesystem. A task
-  path behind an uninitialised submodule leaves the short SHA unresolved and warns in encrypted workspaces.
+- Match gitlink path components using Unicode NFC normalization and case folding on every filesystem.
+  A task path behind an uninitialised submodule leaves the short SHA unresolved and warns in encrypted
+  workspaces.
 
 ## [0.3.18] - 2026-11-25
 

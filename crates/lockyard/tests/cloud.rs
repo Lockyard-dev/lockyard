@@ -1517,15 +1517,20 @@ fn encrypted_registry_submission_accepts_a_promised_blob_missing_locally() {
 
 #[test]
 fn encrypted_registry_submission_omits_sha_for_uninitialized_submodule_with_different_case() {
-    assert_encrypted_submission_omits_sha_behind_gitlink("Nested");
+    assert_encrypted_submission_omits_sha_behind_gitlink("Nested", "nested");
 }
 
 #[test]
 fn encrypted_registry_submission_omits_sha_for_uninitialized_submodule_with_unicode_case() {
-    assert_encrypted_submission_omits_sha_behind_gitlink("neſted");
+    assert_encrypted_submission_omits_sha_behind_gitlink("neſted", "nested");
 }
 
-fn assert_encrypted_submission_omits_sha_behind_gitlink(gitlink: &str) {
+#[test]
+fn encrypted_registry_submission_omits_sha_for_gitlink_with_decomposed_unicode() {
+    assert_encrypted_submission_omits_sha_behind_gitlink("CAFE\u{0301}", "café");
+}
+
+fn assert_encrypted_submission_omits_sha_behind_gitlink(gitlink: &str, task_component: &str) {
     let server = Server::start();
     let dir = cloud_project(&server);
     let runtime = tempfile::tempdir().unwrap();
@@ -1535,15 +1540,24 @@ fn assert_encrypted_submission_omits_sha_behind_gitlink(gitlink: &str) {
     git_evidence_fixture(
         &checkout,
         &[
+            "-c",
+            "core.precomposeunicode=false",
             "update-index",
             "--add",
             "--cacheinfo",
             &format!("160000,{parent_sha},{gitlink}"),
         ],
     );
-    assert!(!checkout.join("nested").exists());
+    let index = git_evidence_fixture(&checkout, &["ls-files", "--stage", "-z"]);
+    let gitlink_entry = format!("160000 {parent_sha} 0\t{gitlink}");
+    assert!(
+        index
+            .split_terminator('\0')
+            .any(|entry| entry == gitlink_entry)
+    );
+    assert!(!checkout.join(task_component).exists());
     server.state.lock().unwrap().registry_items[0]["paths"] =
-        json!(["checkout/nested/src/file.txt"]);
+        json!([format!("checkout/{task_component}/src/file.txt")]);
 
     let evidence = format!("{}:src/file.txt", &parent_sha[..12]);
     let response = cli(
