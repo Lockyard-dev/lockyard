@@ -5,6 +5,22 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.18] - 2026-11-25
+
+- Show the registry's submit warnings: single and batch submissions keep `warnings`, the CLI prints
+  each on stderr as `warning: …`, `--json` and MCP `tasks(action=submit)` / `finish_work` return them.
+- Send the full 40-hex `commit_sha` in clear with `<sha>:<path>` commit evidence, so an encrypted
+  workspace can check that the commit is reachable from `dev`. A short SHA is resolved offline in the
+  task's checkout through the object database only (exactly one commit, all `GIT_*` variables
+  removed, no replace objects, no lazy fetch); a path behind an uninitialised submodule gives no
+  checkout. Without a resolved SHA an encrypted submission warns that acceptance will be refused.
+  Batch acceptance sends it too; a retried create keeps its original key and body.
+- Refuse "file is not in revision" locally only when `git ls-tree` proves the path is absent, so a
+  partial clone with a missing blob no longer blocks a valid submission.
+- Explain the acceptance refusals `commit_not_in_dev`, `commit_outside_task_repository`,
+  `commit_evidence_invalid` and `commit_reachability_unknown` with a next step.
+- Send cloud commit evidence as `<sha>:<path>` without the "On behalf of" prefix.
+
 ## [0.3.17] - 2026-11-24
 
 - Add `lockyard task triage <id>` (cloud mode): moves an intake item to ready. Fields
