@@ -2211,16 +2211,30 @@ mod tests {
 
     #[test]
     fn status_http_workers_are_globally_capped_and_wait_inside_deadline() {
-        let workers = HttpWorkers {
+        let workers = Arc::new(HttpWorkers {
             limit: 2,
             active: Mutex::new(ActiveHttpWorkers::default()),
             available: Condvar::new(),
-        };
+        });
         let call = Call::get("me", "/api/v1/bus/tasks".into());
         let first = workers.acquire(&call, None).unwrap();
         let second = workers.acquire(&call, None).unwrap();
-        let start = Instant::now();
-        let error = match workers.acquire(&call, Some(Duration::from_millis(30))) {
+        let deadline = Duration::from_millis(30);
+        let waiting_workers = Arc::clone(&workers);
+        let waiting_call = call.clone();
+        let (completed, completion) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let start = Instant::now();
+            let result = waiting_workers.acquire(&waiting_call, Some(deadline));
+            let elapsed = start.elapsed();
+            let _ = completed.send((result.map(drop), elapsed));
+        });
+        // Leave room for scheduling delays and fail even if acquisition never returns.
+        let (result, elapsed) = completion
+            .recv_timeout(Duration::from_secs(2))
+            .expect("HTTP worker acquisition did not finish within 2 seconds");
+        waiter.join().unwrap();
+        let error = match result {
             Ok(_) => panic!("must wait for an HTTP worker"),
             Err(error) => error,
         };
@@ -2229,7 +2243,10 @@ mod tests {
                 .to_string()
                 .contains("deadline elapsed waiting for an HTTP worker")
         );
-        assert!(start.elapsed() < Duration::from_millis(150));
+        assert!(
+            elapsed >= deadline,
+            "HTTP worker acquisition returned after {elapsed:?}, before the {deadline:?} deadline"
+        );
         drop(first);
         drop(second);
         let active = AtomicU64::new(0);
