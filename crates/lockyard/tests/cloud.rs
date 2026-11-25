@@ -1517,15 +1517,20 @@ fn encrypted_registry_submission_accepts_a_promised_blob_missing_locally() {
 
 #[test]
 fn encrypted_registry_submission_omits_sha_for_uninitialized_submodule_with_different_case() {
+    assert_encrypted_submission_omits_sha_behind_gitlink("Nested");
+}
+
+#[test]
+fn encrypted_registry_submission_omits_sha_for_uninitialized_submodule_with_unicode_case() {
+    assert_encrypted_submission_omits_sha_behind_gitlink("neſted");
+}
+
+fn assert_encrypted_submission_omits_sha_behind_gitlink(gitlink: &str) {
     let server = Server::start();
     let dir = cloud_project(&server);
     let runtime = tempfile::tempdir().unwrap();
     let (parent_sha, _) = encrypted_commit_evidence_fixture(&server, dir.path(), runtime.path());
     let checkout = dir.path().join("checkout");
-    if !checkout.join("SRC").is_dir() {
-        eprintln!("skipping: the test checkout is on a case-sensitive filesystem");
-        return;
-    }
 
     git_evidence_fixture(
         &checkout,
@@ -1533,10 +1538,10 @@ fn encrypted_registry_submission_omits_sha_for_uninitialized_submodule_with_diff
             "update-index",
             "--add",
             "--cacheinfo",
-            &format!("160000,{parent_sha},Nested"),
+            &format!("160000,{parent_sha},{gitlink}"),
         ],
     );
-    assert!(!checkout.join("Nested").exists());
+    assert!(!checkout.join("nested").exists());
     server.state.lock().unwrap().registry_items[0]["paths"] =
         json!(["checkout/nested/src/file.txt"]);
 
@@ -1551,7 +1556,7 @@ fn encrypted_registry_submission_omits_sha_for_uninitialized_submodule_with_diff
     let requests = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
     assert!(
         requests[0].body.get("commit_sha").is_none(),
-        "expanded a short SHA in the parent repository for an uninitialized submodule with different path case"
+        "expanded a short SHA in the parent repository behind gitlink {gitlink}"
     );
     assert!(
         result["warnings"][0]

@@ -7,10 +7,8 @@ All notable changes to Lockyard are recorded here. The format follows
 
 ## [0.3.19] - 2026-11-26
 
-- On a case-insensitive filesystem a task path that differs from an uninitialised submodule's gitlink
-  only by case no longer picks the parent checkout, so a short SHA is never expanded in the parent
-  repository; a case-sensitive filesystem still requires the exact spelling.
-- The HTTP worker deadline test tolerates a loaded runner.
+- Match gitlink path components case-insensitively with Unicode casing on every filesystem. A task
+  path behind an uninitialised submodule leaves the short SHA unresolved and warns in encrypted workspaces.
 
 ## [0.3.18] - 2026-11-25
 

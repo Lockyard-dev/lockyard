@@ -3,8 +3,6 @@
 use crate::Call;
 use lockyard_core::{Error, Result, ZonePath, paths::find_root};
 use serde_json::{Value, json};
-use std::collections::HashSet;
-use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -54,97 +52,47 @@ fn toplevel(path: &Path) -> Option<PathBuf> {
     .ok()
 }
 
-fn ignores_case(directory: &Path) -> bool {
-    #[cfg(target_os = "macos")]
-    if let Ok(directory) = std::ffi::CString::new(directory.as_os_str().as_encoded_bytes()) {
-        // SAFETY: the path is NUL-terminated and lives for the duration of the call.
-        match unsafe { libc::pathconf(directory.as_ptr(), libc::_PC_CASE_SENSITIVE) } {
-            0 => return true,
-            1 => return false,
-            _ => {}
-        }
-    }
-
-    // A lookup of an unlisted spelling of an existing name proves case is ignored.
-    let Ok(entries) = directory.read_dir() else {
-        return false;
-    };
-    let Ok(names) = entries
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<std::io::Result<HashSet<_>>>()
-    else {
-        return false;
-    };
-    names.iter().filter_map(|name| name.to_str()).any(|name| {
-        let mut alternate = name.to_ascii_uppercase();
-        if alternate == name {
-            alternate.make_ascii_lowercase();
-        }
-        alternate != name
-            && !names.contains(OsStr::new(&alternate))
-            && directory.join(alternate).symlink_metadata().is_ok()
-    })
-}
-
-fn gitlink_contains_path(repo: &Path, gitlink: &[u8], relative: &[u8]) -> bool {
-    if relative
-        .strip_prefix(gitlink)
-        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(b"/"))
-    {
-        return true;
-    }
-
-    let (Ok(gitlink), Ok(relative)) = (std::str::from_utf8(gitlink), std::str::from_utf8(relative))
-    else {
-        return false;
-    };
-    if !ZonePath::stored(gitlink.to_owned()).contains(&ZonePath::stored(relative.to_owned())) {
-        return false;
-    }
-
-    let mut parent = repo.to_path_buf();
-    // An uninitialized gitlink may be absent, so ask the closest existing parent about lookup.
-    for (indexed, requested) in gitlink.split('/').zip(relative.split('/')) {
-        if indexed != requested
-            && !parent
-                .ancestors()
-                .find(|path| path.is_dir())
-                .is_some_and(ignores_case)
-        {
+fn gitlink_contains_path(gitlink: &[u8], relative: &Path) -> bool {
+    // Git uses `/` in the index. Path iteration handles native separators, including Windows `\`.
+    let mut requested = relative.iter();
+    gitlink.split(|&byte| byte == b'/').all(|indexed| {
+        let Some(requested) = requested.next() else {
             return false;
+        };
+        if indexed == requested.as_encoded_bytes() {
+            return true;
         }
-        parent.push(requested);
-    }
-    true
+        // A case variant may resolve to this gitlink. Avoid using the parent checkout in either case.
+        match (std::str::from_utf8(indexed), requested.to_str()) {
+            (Ok(indexed), Some(requested)) => {
+                indexed.to_uppercase().to_lowercase() == requested.to_uppercase().to_lowercase()
+            }
+            _ => false,
+        }
+    })
 }
 
 fn checkout_contains_path(repo: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(repo) else {
         return false;
     };
-    let Some(first) = relative.components().next() else {
+    if relative.as_os_str().is_empty() {
         return true;
-    };
-    // Query from the first component so the index also reports gitlink ancestors.
-    // Git's icase pathspec only folds ASCII. For other names, inspect the entire index.
-    let mut command = git(repo);
-    command.args(["ls-files", "--stage", "-z", "--"]);
-    if first.as_os_str().as_encoded_bytes().is_ascii() {
-        let mut pathspec = OsString::from(":(icase,literal)");
-        pathspec.push(first.as_os_str());
-        command.arg(pathspec);
     }
-    let relative = relative.as_os_str().as_encoded_bytes();
-    command.output().is_ok_and(|output| {
-        output.status.success()
-            && !output.stdout.split(|&byte| byte == 0).any(|entry| {
-                entry.starts_with(b"160000 ")
-                    && entry
-                        .splitn(2, |&byte| byte == b'\t')
-                        .nth(1)
-                        .is_some_and(|gitlink| gitlink_contains_path(repo, gitlink, relative))
-            })
-    })
+    // Scan all index entries so Git's pathspec matching cannot exclude Unicode case variants.
+    git(repo)
+        .args(["ls-files", "--stage", "-z"])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && !output.stdout.split(|&byte| byte == 0).any(|entry| {
+                    entry.starts_with(b"160000 ")
+                        && entry
+                            .splitn(2, |&byte| byte == b'\t')
+                            .nth(1)
+                            .is_some_and(|gitlink| gitlink_contains_path(gitlink, relative))
+                })
+        })
 }
 
 // Task paths are workspace-relative, including when invoked from another checkout in it.
@@ -290,6 +238,26 @@ fn add_missing_sha_warning(response: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gitlink_matches_only_complete_path_components() {
+        let gitlink = b"vendor/Nested";
+        assert!(gitlink_contains_path(gitlink, Path::new("vendor/nested")));
+        assert!(gitlink_contains_path(
+            gitlink,
+            Path::new("vendor/nested/src/file")
+        ));
+        assert!(!gitlink_contains_path(gitlink, Path::new("vendor")));
+        assert!(!gitlink_contains_path(
+            gitlink,
+            Path::new("vendor/nested-sibling/src/file")
+        ));
+        #[cfg(windows)]
+        assert!(gitlink_contains_path(
+            gitlink,
+            Path::new(r"vendor\nested\src\file")
+        ));
+    }
 
     #[test]
     fn encrypted_response_schema_accepts_single_and_batch_warnings_as_clear_metadata() {
