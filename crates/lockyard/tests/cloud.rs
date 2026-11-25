@@ -1333,6 +1333,8 @@ fn git_evidence_fixture(checkout: &Path, args: &[&str]) -> String {
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_AUTHOR_NAME", "Fixture")
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
         .env("GIT_COMMITTER_NAME", "Fixture")
@@ -1461,6 +1463,136 @@ fn encrypted_registry_submission_resolves_task_sha_and_warns_when_unavailable() 
     let evidence = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
     assert_eq!(evidence[2].body["value"], missing_evidence);
     assert!(evidence[2].body.get("commit_sha").is_none());
+}
+
+#[test]
+fn encrypted_registry_submission_accepts_a_promised_blob_missing_locally() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let (sha, _) = encrypted_commit_evidence_fixture(&server, dir.path(), runtime.path());
+    let source = dir.path().join("checkout");
+    git_evidence_fixture(&source, &["update-ref", "HEAD", &sha]);
+    git_evidence_fixture(&source, &["config", "uploadpack.allowFilter", "true"]);
+    git_evidence_fixture(
+        dir.path(),
+        &[
+            "clone",
+            "--no-local",
+            "--no-checkout",
+            "--filter=blob:none",
+            "checkout",
+            "partial",
+        ],
+    );
+    let partial = dir.path().join("partial");
+    let blob = git_evidence_fixture(&source, &["rev-parse", "HEAD:src/file.txt"]);
+    assert_eq!(
+        git_evidence_fixture(&partial, &["config", "--get", "remote.origin.promisor"]),
+        "true"
+    );
+    let assert_blob_missing = || {
+        let objects = git_evidence_fixture(
+            &partial,
+            &["rev-list", "--objects", "--missing=print", "HEAD"],
+        );
+        assert!(objects.lines().any(|line| line == format!("?{blob}")));
+    };
+    assert_blob_missing();
+    server.state.lock().unwrap().registry_items[0]["paths"] = json!(["partial/src/file.txt"]);
+
+    let evidence = format!("{}:src/file.txt", &sha[..12]);
+    let response = cli(
+        dir.path(),
+        runtime.path(),
+        &["--json", "task", "submit", "D-1", "--evidence", &evidence],
+    );
+    let result = json_of(&response);
+    assert_eq!(result["status"], "review");
+    assert!(result.get("warnings").is_none());
+    let requests = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
+    assert_eq!(requests[0].body["commit_sha"], sha);
+    assert_blob_missing();
+}
+
+#[test]
+fn encrypted_registry_submission_resolves_sha_only_in_the_submodule_checkout() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let (parent_sha, _) = encrypted_commit_evidence_fixture(&server, dir.path(), runtime.path());
+    let checkout = dir.path().join("checkout");
+    let source = tempfile::tempdir().unwrap();
+    git_evidence_fixture(
+        source.path(),
+        &["init", "--template=", "--object-format=sha1"],
+    );
+    std::fs::create_dir(source.path().join("src")).unwrap();
+    std::fs::write(source.path().join("src/file.txt"), "submodule fixture").unwrap();
+    git_evidence_fixture(source.path(), &["add", "src/file.txt"]);
+    let tree = git_evidence_fixture(source.path(), &["write-tree"]);
+    let submodule_sha =
+        git_evidence_fixture(source.path(), &["commit-tree", &tree, "-m", "Nested"]);
+    git_evidence_fixture(source.path(), &["update-ref", "HEAD", &submodule_sha]);
+
+    let git = |args: &[&str]| git_evidence_fixture(&checkout, args);
+    git(&[
+        "config",
+        "-f",
+        ".gitmodules",
+        "submodule.nested.path",
+        "nested",
+    ]);
+    git(&[
+        "config",
+        "-f",
+        ".gitmodules",
+        "submodule.nested.url",
+        source.path().to_str().unwrap(),
+    ]);
+    git(&["add", ".gitmodules"]);
+    git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{submodule_sha},nested"),
+    ]);
+    std::fs::create_dir(checkout.join("nested")).unwrap();
+    server.state.lock().unwrap().registry_items[0]["paths"] =
+        json!(["checkout/nested/src/file.txt"]);
+
+    let submit = |sha: &str| {
+        let evidence = format!("{}:src/file.txt", &sha[..12]);
+        cli(
+            dir.path(),
+            runtime.path(),
+            &["--json", "task", "submit", "D-1", "--evidence", &evidence],
+        )
+    };
+    let response = submit(&parent_sha);
+    let result = json_of(&response);
+    assert_eq!(result["status"], "review");
+    let requests = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
+    assert!(
+        requests[0].body.get("commit_sha").is_none(),
+        "expanded a short SHA in the parent repository for an uninitialized submodule"
+    );
+    assert!(
+        result["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("Не удалось развернуть SHA")
+    );
+    assert!(
+        String::from_utf8_lossy(&response.stderr).contains("warning: Не удалось развернуть SHA")
+    );
+
+    git(&["submodule", "update", "--init", "--", "nested"]);
+    let result = json_of(&submit(&submodule_sha));
+    assert_eq!(result["status"], "review");
+    assert!(result.get("warnings").is_none());
+    let requests = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
+    assert_eq!(requests[1].body["commit_sha"], submodule_sha);
 }
 
 #[test]

@@ -52,6 +52,32 @@ fn toplevel(path: &Path) -> Option<PathBuf> {
     .ok()
 }
 
+fn checkout_contains_path(repo: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(repo) else {
+        return false;
+    };
+    let Some(first) = relative.components().next() else {
+        return true;
+    };
+    // Query from the first component so the index also reports gitlink ancestors.
+    let relative = relative.as_os_str().as_encoded_bytes();
+    git(repo)
+        .args(["--literal-pathspecs", "ls-files", "--stage", "-z", "--"])
+        .arg(first.as_os_str())
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && !output.stdout.split(|&byte| byte == 0).any(|entry| {
+                    entry.starts_with(b"160000 ")
+                        && entry
+                            .splitn(2, |&byte| byte == b'\t')
+                            .nth(1)
+                            .and_then(|gitlink| relative.strip_prefix(gitlink))
+                            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(b"/"))
+                })
+        })
+}
+
 // Task paths are workspace-relative, including when invoked from another checkout in it.
 pub(crate) fn task_repository(
     cwd: &Path,
@@ -65,7 +91,8 @@ pub(crate) fn task_repository(
     let root = workspace.as_deref()?;
     let mut repositories = paths.map(|path| {
         let relative = ZonePath::resolve(root, root, path.as_ref()).ok()??;
-        toplevel(&root.join(relative.as_str())).filter(|repo| repo.starts_with(root))
+        let path = root.join(relative.as_str());
+        toplevel(&path).filter(|repo| repo.starts_with(root) && checkout_contains_path(repo, &path))
     });
     let first = repositories.next()??;
     repositories
@@ -110,7 +137,7 @@ fn local_commit_oid(repository: &Path, revision: &str) -> Option<String> {
     (object.status.success() && object.stdout == b"commit\n").then(|| sha.to_ascii_lowercase())
 }
 
-/// A revision missing locally may name a commit the server can still verify.
+/// Refuse only when the local commit tree proves the path is absent.
 pub(crate) fn refuse_if_file_missing(repo: &Path, value: &str) -> Result<()> {
     let Some((input_revision, path)) = value.split_once(':') else {
         return Ok(());
@@ -119,9 +146,19 @@ pub(crate) fn refuse_if_file_missing(repo: &Path, value: &str) -> Result<()> {
         return Ok(());
     };
     if git(repo)
-        .args(["cat-file", "-e", &format!("{revision}:{path}")])
+        .args([
+            "--literal-pathspecs",
+            "ls-tree",
+            "--name-only",
+            "-z",
+            &revision,
+            "--",
+            path,
+        ])
         .output()
-        .is_ok_and(|output| !output.status.success())
+        .is_ok_and(|output| {
+            output.status.success() && output.stdout.is_empty() && output.stderr.is_empty()
+        })
     {
         return Err(Error::Invalid(format!(
             "file {path} is not in revision {input_revision}"
