@@ -351,12 +351,15 @@ pub(super) fn run_composite_steps(
                 let evidence = args.some_text("evidence")?.ok_or_else(|| {
                     Error::Invalid("finishing a task needs evidence of the work".into())
                 })?;
-                let evidence = executor_evidence(&evidence);
-                answer["task"] = step(
+                let submitted = step(
                     "task_submit",
                     json!({"id": id, "evidence": evidence}),
                     after,
                 )?;
+                if let Some(warnings) = submitted.get("warnings") {
+                    answer["warnings"] = warnings.clone();
+                }
+                answer["task"] = submitted;
             }
             let mut freed = Vec::new();
             let mut failed = Vec::new();

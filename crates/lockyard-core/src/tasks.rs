@@ -107,6 +107,9 @@ pub struct Task {
     pub links: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registry_evidence: Vec<serde_json::Value>,
+    /// Diagnostics carried by a cloud task transition response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
 }
 
 /// A new task. Local mode supports the default `general` area; the remaining registry fields belong
@@ -541,6 +544,7 @@ fn read_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         raw_status: None,
         links: Vec::new(),
         registry_evidence: Vec::new(),
+        warnings: None,
     })
 }
 

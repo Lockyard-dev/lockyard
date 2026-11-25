@@ -9,7 +9,7 @@ const RECONCILE_BUDGET: Duration = Duration::from_secs(2);
 pub(super) const ENCRYPTION_MISMATCH: &str = "pending_encryption_mismatch";
 
 pub(crate) struct ReplayEncryption {
-    enabled: bool,
+    pub(super) enabled: bool,
     pub(super) workspace: Option<String>,
     pub(super) key: Option<crate::WorkspaceKey>,
 }
@@ -1843,6 +1843,53 @@ mod tests {
     }
 
     #[test]
+    fn recovered_commit_evidence_warns_only_for_encrypted_requests() {
+        let server = Server::new();
+        let root = tempfile::tempdir().unwrap();
+        let key = crate::WorkspaceKey::from_entropy([19; 32]);
+        let evidence = "abcdef0:src/file";
+        for enabled in [true, false] {
+            let client = server.client(root.path()).with_content_encryption(
+                ENCRYPTION_WORKSPACE,
+                Some(key.clone()),
+                !enabled,
+            );
+            let mut row = pending(&client, &format!("settled-evidence-{enabled}"), false);
+            row.body = Some(json!({"kind":"commit","value":evidence}).to_string());
+            let call = call_for(&row);
+            row.request_digest = Some(crate::request_identity(&call));
+            row.encryption_context = Some(client.encryption_context_for(
+                Some(ENCRYPTION_WORKSPACE),
+                Some(&key.key_id()),
+                enabled,
+            ));
+            if enabled {
+                let ciphertext = key
+                    .encrypt(ENCRYPTION_WORKSPACE, "value", evidence)
+                    .unwrap();
+                row.body = Some(json!({"kind":"commit","value":ciphertext}).to_string());
+            }
+            let receipt = SettledWrite {
+                pending: row.clone(),
+                value: Some(json!({"id":"FE-1","status":"review"})),
+                error: None,
+                consumed: false,
+                encryption: None,
+            };
+            let path = journal_path(client.pending_journal.as_ref().unwrap(), &row.key);
+            lockyard_core::fsio::replace(
+                &path.with_extension("settled"),
+                &serde_json::to_vec(&receipt).unwrap(),
+                0o600,
+            )
+            .unwrap();
+            let response = client.call(&call).unwrap();
+            assert_eq!(response.get("warnings").is_some(), enabled);
+        }
+        assert!(server.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn ly0030_reconciled_create_reuses_client_key_until_caller_consumes_receipt() {
         let server = Server::new();
         let root = tempfile::tempdir().unwrap();
@@ -1852,7 +1899,16 @@ mod tests {
             "fixture",
             "POST",
             "/api/v1/registry/items".into(),
-            json!({"title":"work","client_key":crate::ulid()}),
+            json!({
+                "title":"work",
+                "client_key":crate::ulid(),
+                "evidence":[{
+                    "kind":"commit",
+                    "value":"abcdef0:src/file",
+                    "observed_at":"old timestamp",
+                    "commit_sha":"abcdef0123456789abcdef0123456789abcdef01"
+                }]
+            }),
         );
         call.key = Some(record.key.clone());
         record.path = call.path.clone();
@@ -1864,8 +1920,10 @@ mod tests {
         let mut candidate = call.clone();
         candidate.key = Some(crate::ulid());
         candidate.body.as_mut().unwrap()["client_key"] = json!(crate::ulid());
+        candidate.body.as_mut().unwrap()["evidence"][0]["commit_sha"] =
+            json!("abcdef0987654321abcdef0987654321abcdef09");
         let recovered = restored.pending_task_create(&candidate, false).unwrap();
-        assert_eq!(recovered.key, call.key);
+        assert_eq!(recovered.key, call.key, "retry chose a different HTTP key");
         assert_eq!(recovered.body, call.body);
         assert_eq!(restored.call(&recovered).unwrap()["saved"], true);
         // A subsequent intentional create with the same title uses its own key.
@@ -1873,7 +1931,10 @@ mod tests {
             restored.pending_task_create(&candidate, false).unwrap().key,
             candidate.key
         );
-        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1, call.key.unwrap());
+        assert_eq!(requests[0].2, call.body.unwrap().to_string());
     }
 
     #[test]

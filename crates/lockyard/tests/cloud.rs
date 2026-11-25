@@ -76,6 +76,8 @@ struct State {
     ignore_renew_hold: bool,
     refuse_release: Option<(u16, Value)>,
     refuse_registry_claim: bool,
+    registry_submit_reply: Option<Value>,
+    refuse_registry_accept: Option<(u16, Value)>,
     refuse_registry_create: Option<(u16, Value)>,
     refuse_registry_get: Option<(u16, Value)>,
     refuse_filtered_registry_once: Option<(u16, Value)>,
@@ -518,6 +520,25 @@ fn route_reply(
 ) -> (u16, Value) {
     let route = path.split('?').next().unwrap_or_default();
     match (method, route) {
+        ("POST", "/api/v1/registry/items/D-1/evidence")
+            if state.registry_submit_reply.is_some() =>
+        {
+            (200, json!({"id":"D-1","status":"active","version":2}))
+        }
+        ("POST", "/api/v1/registry/items/D-1/transition")
+            if body["to"] == "review" && state.registry_submit_reply.is_some() =>
+        {
+            (200, state.registry_submit_reply.clone().unwrap())
+        }
+        ("POST", "/api/v1/registry/items/batch-transition") => (
+            200,
+            json!({"results":[{"id":"D-1","changed":true,"item":{"id":"D-1","status":"done"}}]}),
+        ),
+        ("POST", "/api/v1/registry/items/D-1/transition")
+            if body["to"] == "done" && state.refuse_registry_accept.is_some() =>
+        {
+            state.refuse_registry_accept.clone().unwrap()
+        }
         ("POST", "/api/v1/registry/items/D-1/transition") if state.survey_require_claude_accept => {
             (
                 200,
@@ -1235,6 +1256,503 @@ fn json_of(result: &Output) -> Value {
         String::from_utf8_lossy(&result.stderr)
     );
     serde_json::from_slice(&result.stdout).unwrap()
+}
+
+#[test]
+fn registry_submit_reports_warnings_in_cli_and_mcp() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let warnings = json!(["check the dev branch", "check the repository"]);
+    {
+        let mut state = server.state.lock().unwrap();
+        state.registry_items =
+            vec![json!({"id":"D-1","status":"active","target":"ci_passed","version":1})];
+        state.registry_submit_reply =
+            Some(json!({"id":"D-1","status":"review","version":3,"warnings":warnings}));
+    }
+    let cli_args = ["task", "submit", "D-1", "--evidence", "CI run 5"];
+    let plain = cli(dir.path(), runtime.path(), &cli_args);
+    assert!(plain.status.success(), "{:?}", plain.stderr);
+    let stderr = String::from_utf8(plain.stderr).unwrap();
+    let actual: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.starts_with("warning:"))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            "warning: check the dev branch",
+            "warning: check the repository"
+        ]
+    );
+
+    let machine = cli(
+        dir.path(),
+        runtime.path(),
+        &[&["--json"], cli_args.as_slice()].concat(),
+    );
+    assert_eq!(json_of(&machine)["warnings"], warnings);
+
+    let answers = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "compact",
+        &[
+            (
+                "tasks",
+                json!({"action":"submit","id":"D-1","evidence":"CI run 5"}),
+            ),
+            ("finish_work", json!({"task":"D-1","evidence":"CI run 5"})),
+        ],
+    );
+    for answer in answers {
+        assert_eq!(
+            answer["structuredContent"]["warnings"], warnings,
+            "{answer}"
+        );
+    }
+
+    server.state.lock().unwrap().registry_submit_reply =
+        Some(json!({"id":"D-1","status":"review","version":3}));
+    let old_server = cli(
+        dir.path(),
+        runtime.path(),
+        &[&["--json"], cli_args.as_slice()].concat(),
+    );
+    assert!(json_of(&old_server).get("warnings").is_none());
+    assert!(!String::from_utf8_lossy(&old_server.stderr).contains("warning:"));
+}
+
+const COMMIT_EVIDENCE_WORKSPACE: &str = "00000000-0000-0000-0000-000000000001";
+
+fn git_evidence_fixture(checkout: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(checkout)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_AUTHOR_NAME", "Fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{args:?}: {:?}", output.stderr);
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn encrypted_commit_evidence_fixture(
+    server: &Server,
+    root: &Path,
+    runtime: &Path,
+) -> (String, lockyard_cloud_client::WorkspaceKey) {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let checkout = root.join("checkout");
+    std::fs::create_dir_all(checkout.join("src")).unwrap();
+    let git = |args: &[&str]| git_evidence_fixture(&checkout, args);
+    git(&["init", "--template=", "--object-format=sha1"]);
+    std::fs::write(checkout.join("src/file.txt"), "fixture").unwrap();
+    git(&["add", "src/file.txt"]);
+    let tree = git(&["write-tree"]);
+    let sha = git(&["commit-tree", &tree, "-m", "Fixture"]);
+    let key = lockyard_cloud_client::WorkspaceKey::from_entropy([47; 32]);
+    let keys = runtime.join("config/lockyard/keys");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&keys)
+        .unwrap();
+    key.copy_to_private(&keys.join(format!("{COMMIT_EVIDENCE_WORKSPACE}.key")))
+        .unwrap();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.encryption_key_id = Some(key.key_id());
+        state.registry_items = vec![
+            json!({"id":"D-1","status":"active","target":"code_accepted","version":1,"paths":["checkout/src/file.txt"]}),
+        ];
+        state.registry_submit_reply = Some(json!({"id":"D-1","status":"review","version":3}));
+    }
+    (sha, key)
+}
+
+#[test]
+fn encrypted_registry_submission_resolves_task_sha_and_warns_when_unavailable() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let (sha, key) = encrypted_commit_evidence_fixture(&server, dir.path(), runtime.path());
+    let caller = dir.path().join("caller");
+    std::fs::create_dir(&caller).unwrap();
+    let short_evidence = format!("{}:src/file.txt", &sha[..12]);
+    let missing_evidence = "000000000000:src/file.txt";
+    let finished = mcp_calls_env(
+        &caller,
+        runtime.path(),
+        "compact",
+        &[(
+            "finish_work",
+            json!({"task":"D-1","evidence":short_evidence}),
+        )],
+        &[("LOCKYARD_ON_BEHALF", "lead-task")],
+    );
+    let result = &finished[0]["structuredContent"];
+    assert_eq!(result["task"]["status"], "review", "{finished:?}");
+    assert!(result.get("warnings").is_none());
+
+    let missing = cli(
+        &caller,
+        runtime.path(),
+        &[
+            "--json",
+            "task",
+            "submit",
+            "D-1",
+            "--evidence",
+            missing_evidence,
+        ],
+    );
+    let result = json_of(&missing);
+    assert_eq!(result["status"], "review");
+    assert!(
+        result["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("Приёмка в шифрованном workspace откажет")
+    );
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("warning: Не удалось развернуть SHA")
+    );
+
+    let evidence = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
+    assert_eq!(evidence.len(), 2);
+    assert_eq!(evidence[0].body["commit_sha"], sha);
+    assert!(evidence[1].body.get("commit_sha").is_none());
+    for (request, original) in evidence
+        .iter()
+        .zip([short_evidence.as_str(), missing_evidence])
+    {
+        let value = request.body["value"].as_str().unwrap();
+        assert!(value.starts_with("lyenc1."));
+        assert_eq!(
+            key.decrypt(COMMIT_EVIDENCE_WORKSPACE, "value", value)
+                .unwrap(),
+            original
+        );
+    }
+
+    server.state.lock().unwrap().encryption_key_id = None;
+    let plaintext = cli(
+        &caller,
+        runtime.path(),
+        &[
+            "--json",
+            "task",
+            "submit",
+            "D-1",
+            "--evidence",
+            missing_evidence,
+        ],
+    );
+    assert!(json_of(&plaintext).get("warnings").is_none());
+    let evidence = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
+    assert_eq!(evidence[2].body["value"], missing_evidence);
+    assert!(evidence[2].body.get("commit_sha").is_none());
+}
+
+#[test]
+fn encrypted_registry_submission_accepts_a_promised_blob_missing_locally() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let (sha, _) = encrypted_commit_evidence_fixture(&server, dir.path(), runtime.path());
+    let source = dir.path().join("checkout");
+    git_evidence_fixture(&source, &["update-ref", "HEAD", &sha]);
+    git_evidence_fixture(&source, &["config", "uploadpack.allowFilter", "true"]);
+    git_evidence_fixture(
+        dir.path(),
+        &[
+            "clone",
+            "--no-local",
+            "--no-checkout",
+            "--filter=blob:none",
+            "checkout",
+            "partial",
+        ],
+    );
+    let partial = dir.path().join("partial");
+    let blob = git_evidence_fixture(&source, &["rev-parse", "HEAD:src/file.txt"]);
+    assert_eq!(
+        git_evidence_fixture(&partial, &["config", "--get", "remote.origin.promisor"]),
+        "true"
+    );
+    let assert_blob_missing = || {
+        let objects = git_evidence_fixture(
+            &partial,
+            &["rev-list", "--objects", "--missing=print", "HEAD"],
+        );
+        assert!(objects.lines().any(|line| line == format!("?{blob}")));
+    };
+    assert_blob_missing();
+    server.state.lock().unwrap().registry_items[0]["paths"] = json!(["partial/src/file.txt"]);
+
+    let evidence = format!("{}:src/file.txt", &sha[..12]);
+    let response = cli(
+        dir.path(),
+        runtime.path(),
+        &["--json", "task", "submit", "D-1", "--evidence", &evidence],
+    );
+    let result = json_of(&response);
+    assert_eq!(result["status"], "review");
+    assert!(result.get("warnings").is_none());
+    let requests = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
+    assert_eq!(requests[0].body["commit_sha"], sha);
+    assert_blob_missing();
+}
+
+#[test]
+fn encrypted_registry_submission_resolves_sha_only_in_the_submodule_checkout() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let (parent_sha, _) = encrypted_commit_evidence_fixture(&server, dir.path(), runtime.path());
+    let checkout = dir.path().join("checkout");
+    let source = tempfile::tempdir().unwrap();
+    git_evidence_fixture(
+        source.path(),
+        &["init", "--template=", "--object-format=sha1"],
+    );
+    std::fs::create_dir(source.path().join("src")).unwrap();
+    std::fs::write(source.path().join("src/file.txt"), "submodule fixture").unwrap();
+    git_evidence_fixture(source.path(), &["add", "src/file.txt"]);
+    let tree = git_evidence_fixture(source.path(), &["write-tree"]);
+    let submodule_sha =
+        git_evidence_fixture(source.path(), &["commit-tree", &tree, "-m", "Nested"]);
+    git_evidence_fixture(source.path(), &["update-ref", "HEAD", &submodule_sha]);
+
+    let git = |args: &[&str]| git_evidence_fixture(&checkout, args);
+    git(&[
+        "config",
+        "-f",
+        ".gitmodules",
+        "submodule.nested.path",
+        "nested",
+    ]);
+    git(&[
+        "config",
+        "-f",
+        ".gitmodules",
+        "submodule.nested.url",
+        source.path().to_str().unwrap(),
+    ]);
+    git(&["add", ".gitmodules"]);
+    git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{submodule_sha},nested"),
+    ]);
+    std::fs::create_dir(checkout.join("nested")).unwrap();
+    server.state.lock().unwrap().registry_items[0]["paths"] =
+        json!(["checkout/nested/src/file.txt"]);
+
+    let submit = |sha: &str| {
+        let evidence = format!("{}:src/file.txt", &sha[..12]);
+        cli(
+            dir.path(),
+            runtime.path(),
+            &["--json", "task", "submit", "D-1", "--evidence", &evidence],
+        )
+    };
+    let response = submit(&parent_sha);
+    let result = json_of(&response);
+    assert_eq!(result["status"], "review");
+    let requests = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
+    assert!(
+        requests[0].body.get("commit_sha").is_none(),
+        "expanded a short SHA in the parent repository for an uninitialized submodule"
+    );
+    assert!(
+        result["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("Не удалось развернуть SHA")
+    );
+    assert!(
+        String::from_utf8_lossy(&response.stderr).contains("warning: Не удалось развернуть SHA")
+    );
+
+    git(&["submodule", "update", "--init", "--", "nested"]);
+    let result = json_of(&submit(&submodule_sha));
+    assert_eq!(result["status"], "review");
+    assert!(result.get("warnings").is_none());
+    let requests = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
+    assert_eq!(requests[1].body["commit_sha"], submodule_sha);
+}
+
+#[test]
+fn encrypted_registry_submission_uses_object_prefix_over_same_named_branch() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let (sha, _) = encrypted_commit_evidence_fixture(&server, dir.path(), runtime.path());
+    let checkout = dir.path().join("checkout");
+    let git = |args: &[&str]| git_evidence_fixture(&checkout, args);
+    let tree = git(&["write-tree"]);
+    let other_sha = git(&["commit-tree", &tree, "-m", "Other fixture"]);
+    let prefix = &sha[..12];
+    git(&["branch", prefix, &other_sha]);
+
+    let evidence = format!("{prefix}:src/file.txt");
+    let response = cli(
+        dir.path(),
+        runtime.path(),
+        &["--json", "task", "submit", "D-1", "--evidence", &evidence],
+    );
+    assert_eq!(json_of(&response)["status"], "review");
+    let requests = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
+    assert_eq!(
+        requests[0].body["commit_sha"], sha,
+        "object prefix was shadowed by a branch"
+    );
+}
+
+#[test]
+fn encrypted_registry_submission_ignores_git_ceiling_directories() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let (sha, _) = encrypted_commit_evidence_fixture(&server, dir.path(), runtime.path());
+    let checkout = dir.path().join("checkout").canonicalize().unwrap();
+    let evidence = format!("{}:src/file.txt", &sha[..12]);
+    let response = mcp_calls_env(
+        dir.path(),
+        runtime.path(),
+        "compact",
+        &[("finish_work", json!({"task":"D-1","evidence":evidence}))],
+        &[("GIT_CEILING_DIRECTORIES", checkout.to_str().unwrap())],
+    );
+    assert_eq!(response[0]["structuredContent"]["task"]["status"], "review");
+    let requests = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
+    assert_eq!(
+        requests[0].body["commit_sha"], sha,
+        "Git ceiling hid the task checkout"
+    );
+}
+
+#[test]
+fn encrypted_registry_bulk_close_sends_open_commit_sha_and_encrypted_value() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let (sha, key) = encrypted_commit_evidence_fixture(&server, dir.path(), runtime.path());
+    let evidence = format!("{}:src/file.txt", &sha[..12]);
+    let response = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "compact",
+        &[("task_bulk", json!({"ids":["D-1"],"evidence":evidence}))],
+    );
+    assert_eq!(
+        response[0]["structuredContent"]["results"][0]["changed"], true,
+        "{response:?}"
+    );
+    let requests = server.seen("POST", "/api/v1/registry/items/batch-transition");
+    assert_eq!(
+        requests[0].body["evidence"]["commit_sha"], sha,
+        "batch omitted the open commit SHA"
+    );
+    let value = requests[0].body["evidence"]["value"].as_str().unwrap();
+    assert!(value.starts_with("lyenc1."));
+    assert_eq!(
+        key.decrypt(COMMIT_EVIDENCE_WORKSPACE, "value", value)
+            .unwrap(),
+        evidence
+    );
+
+    let response = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "compact",
+        &[(
+            "task_bulk",
+            json!({"ids":["D-1"],"evidence":"000000000000:src/file.txt"}),
+        )],
+    );
+    let item = &response[0]["structuredContent"]["results"][0]["item"];
+    assert!(
+        item["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("Не удалось развернуть SHA")
+    );
+    let requests = server.seen("POST", "/api/v1/registry/items/batch-transition");
+    assert!(requests[1].body["evidence"].get("commit_sha").is_none());
+}
+
+#[test]
+fn registry_accept_explains_all_commit_refusals_in_cli_and_mcp() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    server.state.lock().unwrap().registry_items =
+        vec![json!({"id":"D-1","status":"review","version":1})];
+    for (status, code, explanation, hint) in [
+        (
+            422,
+            "commit_not_in_dev",
+            "Коммит не входит в историю ветки dev",
+            "Запушьте",
+        ),
+        (
+            422,
+            "commit_outside_task_repository",
+            "Коммит указан для другого репозитория",
+            "Пересдайте",
+        ),
+        (
+            422,
+            "commit_evidence_invalid",
+            "Некорректное доказательство коммита",
+            "<полный SHA>:<путь к файлу в коммите>",
+        ),
+        (
+            503,
+            "commit_reachability_unknown",
+            "Сервер не смог проверить",
+            "повторите приёмку",
+        ),
+    ] {
+        server.state.lock().unwrap().refuse_registry_accept = Some((
+            status,
+            json!({"error":{"code":code,"message":"generic refusal"}}),
+        ));
+        let plain = cli(dir.path(), runtime.path(), &["task", "accept", "D-1"]);
+        assert!(!plain.status.success());
+        let stderr = String::from_utf8(plain.stderr).unwrap();
+        assert!(
+            stderr.contains(code) && stderr.contains(explanation) && stderr.contains(hint),
+            "{stderr}"
+        );
+
+        let answers = mcp_calls(
+            dir.path(),
+            runtime.path(),
+            "compact",
+            &[("tasks", json!({"action":"accept","id":"D-1"}))],
+        );
+        let result = &answers[0];
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["code"], code);
+        assert_eq!(result["structuredContent"]["status"], status);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(explanation) && text.contains(hint), "{text}");
+    }
 }
 
 fn mcp_calls(dir: &Path, runtime: &Path, surface: &str, calls: &[(&str, Value)]) -> Vec<Value> {

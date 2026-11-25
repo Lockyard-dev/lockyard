@@ -1208,6 +1208,23 @@ impl Client {
             ) {
                 for (current, original) in current.iter_mut().zip(original) {
                     current["observed_at"] = original["observed_at"].clone();
+                    if current["kind"] == "commit"
+                        && current["value"]
+                            .as_str()
+                            .is_some_and(crate::commit_names_file)
+                        && let Some(current) = current.as_object_mut()
+                    {
+                        // Match the original digest with the journal's clear metadata,
+                        // since Git resolution may change between invocations.
+                        match original.get("commit_sha") {
+                            Some(sha) => {
+                                current.insert("commit_sha".into(), sha.clone());
+                            }
+                            None => {
+                                current.remove("commit_sha");
+                            }
+                        }
+                    }
                 }
             }
             // The digest binds caller plaintext before encryption; never compare ciphertext
@@ -2157,6 +2174,11 @@ impl Client {
                         }
                         return Err(content_error(message));
                     }
+                    crate::commit_evidence::warn_if_sha_missing(
+                        call,
+                        encryption_enabled,
+                        &mut value,
+                    );
                     if let Err(error) = self.finish_catalog_call(call, &mut value) {
                         if let Some(pending) = pending {
                             if !journal_owned {
@@ -2463,9 +2485,17 @@ impl Client {
         value: &mut Value,
         encryption: Option<&maintenance::ReplayEncryption>,
     ) -> Result<(), ClientError> {
-        let (workspace, held) = match encryption {
-            Some(encryption) => (encryption.workspace.as_deref(), encryption.key.clone()),
-            None => (self.workspace.as_deref(), self.resolved_content_key()?),
+        let (workspace, held, enabled) = match encryption {
+            Some(encryption) => (
+                encryption.workspace.as_deref(),
+                encryption.key.clone(),
+                encryption.enabled,
+            ),
+            None => (
+                self.workspace.as_deref(),
+                self.resolved_content_key()?,
+                self.encryption_enabled,
+            ),
         };
         if let Some(workspace) = workspace
             && let Err(message) = crate::crypto::transform_fields_policy(
@@ -2485,6 +2515,7 @@ impl Client {
             };
             return Err(self.unknown(pending.clone(), cause, None));
         }
+        crate::commit_evidence::warn_if_sha_missing(call, enabled, value);
         if let Err(error) = self.finish_catalog_call(call, value) {
             let cause = error
                 .code()
@@ -2826,7 +2857,7 @@ mod pending_completion_tests {
             "alice",
             "POST",
             "/api/v1/registry/items".into(),
-            json!({"client_key":"original-logical-key", "title":"same title", "body":"same body", "paths":["src"], "evidence":[{"value":"commit", "observed_at":"old timestamp"}]}),
+            json!({"client_key":"original-logical-key", "title":"same title", "body":"same body", "paths":["src"], "evidence":[{"kind":"commit", "value":"abcdef0:src/file", "observed_at":"old timestamp"}]}),
         );
         let mut operation = pending(&client, original.key.as_deref().unwrap());
         operation.method = original.method.clone();
@@ -2851,6 +2882,8 @@ mod pending_completion_tests {
         repeat.key = Some("fresh-http-key".into());
         repeat.body.as_mut().unwrap()["client_key"] = json!("fresh-logical-key");
         repeat.body.as_mut().unwrap()["evidence"][0]["observed_at"] = json!("new timestamp");
+        repeat.body.as_mut().unwrap()["evidence"][0]["commit_sha"] =
+            json!("abcdef0123456789abcdef0123456789abcdef01");
         assert_eq!(
             client.pending_task_create(&repeat, false).unwrap(),
             original

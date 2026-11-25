@@ -280,6 +280,9 @@ pub(super) fn run_task(
             store.cancel_task(&resolve_agent(agent)?, &id, &note, now)?
         }
     };
+    for warning in changed.warnings.iter().flatten() {
+        eprintln!("warning: {}", escape_controls(warning));
+    }
     output(&changed, task_line(&changed))
 }
 

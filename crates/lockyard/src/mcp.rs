@@ -63,7 +63,10 @@ fn validate_handover_claim(id: i64, claims: &[lockyard_core::proto::Claim]) -> R
     }
 }
 
-fn executor_evidence(evidence: &str) -> String {
+fn executor_evidence(evidence: &str, cloud: bool) -> String {
+    if cloud && lockyard_cloud_client::commit_names_file(evidence) {
+        return evidence.to_string();
+    }
     match std::env::var("LOCKYARD_ON_BEHALF") {
         Ok(lead_task) if !lead_task.trim().is_empty() => {
             format!("On behalf of {}: {evidence}", lead_task.trim())

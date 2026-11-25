@@ -5,6 +5,9 @@
 //! The protocol names the fields of a record but not the envelope of a response, so a list reads
 //! either as a bare array or under its plural name, and a record either bare or under its singular name.
 
+use crate::commit_evidence::{
+    commit_names_file, full_commit_sha, refuse_if_file_missing, task_repository,
+};
 use crate::{Call, ClientError, MAX_POLL_WAIT_SECONDS, Transport, encode, ulid};
 use lockyard_core::proto::{
     AccessAnswer, AccessRecord, AccessRequest, ActivityRequest, AgentSeen, BoardEntry, BoardWrite,
@@ -18,6 +21,7 @@ use lockyard_core::{Backend, Error, Result, bus, tasks};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 
 const ITEMS: &str = "/api/v1/registry/items";
 const TOKENS: &str = "/api/v1/registry/tokens";
@@ -950,66 +954,28 @@ fn validate_title(value: &str) -> Result<()> {
     Ok(())
 }
 
-/// `<7-64 hex>:<relative/path>`. A bare object id is not a file in that commit.
-fn commit_names_file(value: &str) -> bool {
-    let Some((revision, path)) = value.split_once(':') else {
-        return false;
-    };
-    if !(7..=64).contains(&revision.len()) || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return false;
-    }
-    if path.is_empty() || path.starts_with('/') || path.ends_with('/') || path.contains('\\') {
-        return false;
-    }
-    path.split('/')
-        .all(|part| !part.is_empty() && part != "." && part != "..")
-}
-
-fn require_commit_file(target: &str, value: &str) -> Result<()> {
+fn require_commit_file(target: &str, value: &str, repository: Option<&Path>) -> Result<()> {
     if target != "ci_passed" && !commit_names_file(value) {
         return Err(Error::Invalid(
             "commit evidence must name a file in git as <rev>:<path>".into(),
         ));
     }
     if commit_names_file(value)
-        && let Ok(cwd) = std::env::current_dir()
+        && let Some(repo) = repository
     {
-        refuse_if_file_missing(&cwd, value)?;
+        refuse_if_file_missing(repo, value)?;
     }
     Ok(())
 }
 
-/// When `revision` is an object in the git repository that contains `repo`, the path must be in
-/// that tree. A revision this repository does not have is not judged: the server has no checkout,
-/// and the proof may name another repository.
-pub(crate) fn refuse_if_file_missing(repo: &std::path::Path, value: &str) -> Result<()> {
-    let Some((revision, path)) = value.split_once(':') else {
-        return Ok(());
-    };
-    let object = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["cat-file", "-e", &format!("{revision}^{{commit}}")])
-        .output();
-    let Ok(object) = object else {
-        return Ok(());
-    };
-    if !object.status.success() {
-        return Ok(());
+fn evidence_repository(
+    value: &str,
+    paths: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Option<PathBuf> {
+    if !commit_names_file(value) {
+        return None;
     }
-    let file = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["cat-file", "-e", &format!("{revision}:{path}")])
-        .status();
-    match file {
-        Ok(status) if status.success() => Ok(()),
-        Ok(_) => Err(Error::Invalid(format!(
-            "file {path} is not in revision {revision}"
-        ))),
-        Err(_) => Ok(()),
-    }
+    task_repository(&std::env::current_dir().ok()?, paths)
 }
 
 fn validate_evidence(values: &[String]) -> Result<()> {
@@ -1076,14 +1042,34 @@ fn reason_or<'a>(reason: &'a str, fallback: &'a str) -> &'a str {
 }
 
 /// Evidence for a code or CI target. A deploy target also needs a probe, which `task` does not record.
-fn evidence_body(agent: &str, target: &str, value: &str, now: i64) -> Value {
-    json!({
+fn evidence_body(
+    agent: &str,
+    target: &str,
+    value: &str,
+    now: i64,
+    repository: Option<&Path>,
+) -> Value {
+    let mut body = json!({
         "kind": if target == "ci_passed" { "ci_run" } else { "commit" },
         "environment": "local",
         "value": value,
         "observed_at": rfc3339(now),
         "verifier": agent,
-    })
+    });
+    if target != "ci_passed"
+        && let Some(sha) = full_commit_sha(repository, value)
+    {
+        body["commit_sha"] = json!(sha);
+    }
+    body
+}
+
+fn item_paths(item: &Value) -> impl Iterator<Item = &str> {
+    item["paths"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
 }
 
 fn task_status(status: &str) -> tasks::Status {
@@ -1167,14 +1153,10 @@ pub(crate) fn task_from(item: &Value) -> Result<tasks::Task> {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default(),
-        paths: item
-            .get("paths")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect(),
+        paths: item_paths(item).map(str::to_string).collect(),
+        warnings: item
+            .get("warnings")
+            .and_then(|warnings| serde_json::from_value(warnings.clone()).ok()),
     })
 }
 
@@ -2046,16 +2028,23 @@ impl<T: Transport> Backend for CloudBackend<T> {
                 "task target {target:?} needs evidence this client cannot provide; use code_accepted or ci_passed"
             )));
         }
-        if target != "ci_passed"
-            && let Some(value) = spec.evidence.as_deref()
-        {
-            require_commit_file(target, value)?;
-        }
         let evidence: Vec<Value> = spec
             .evidence
             .iter()
-            .map(|value| evidence_body(author, target, value, now))
-            .collect();
+            .map(|value| {
+                let repository = evidence_repository(value, &spec.paths);
+                if target != "ci_passed" {
+                    require_commit_file(target, value, repository.as_deref())?;
+                }
+                Ok(evidence_body(
+                    author,
+                    target,
+                    value,
+                    now,
+                    repository.as_deref(),
+                ))
+            })
+            .collect::<Result<_>>()?;
         let auto_area = self.registry_auto_area()?;
         if auto_area && spec.paths.is_empty() {
             return Err(Error::Invalid(
@@ -2312,13 +2301,20 @@ impl<T: Transport> Backend for CloudBackend<T> {
         validate_evidence(&[evidence.to_string()])?;
         let item = self.item(agent, id)?;
         let target = item["target"].as_str().unwrap_or(DEFAULT_TARGET);
-        require_commit_file(target, evidence)?;
-        let body = evidence_body(agent, target, evidence, now);
-        let proved = self.item_step(agent, id, "evidence", body, &item);
-        proved?;
+        let repository = evidence_repository(evidence, item_paths(&item));
+        require_commit_file(target, evidence, repository.as_deref())?;
+        let body = evidence_body(agent, target, evidence, now, repository.as_deref());
+        let proved = self.item_step(agent, id, "evidence", body, &item)?;
         let item = self.item(agent, id)?;
         let body = json!({"to": "review", "reason": "submitted for review"});
-        self.item_step(agent, id, "transition", body, &item)
+        let mut submitted = self.item_step(agent, id, "transition", body, &item)?;
+        if let Some(warnings) = proved.warnings.filter(|warnings| !warnings.is_empty()) {
+            submitted
+                .warnings
+                .get_or_insert_with(Vec::new)
+                .extend(warnings);
+        }
+        Ok(submitted)
     }
 
     fn accept_task(&mut self, agent: &str, id: &str, note: &str, _now: i64) -> Result<tasks::Task> {
@@ -2364,8 +2360,9 @@ impl<T: Transport> Backend for CloudBackend<T> {
                 ));
             }
             let target = item["target"].as_str().unwrap_or(DEFAULT_TARGET);
-            require_commit_file(target, evidence)?;
-            body["evidence"] = evidence_body(agent, target, evidence, now);
+            let repository = evidence_repository(evidence, item_paths(&item));
+            require_commit_file(target, evidence, repository.as_deref())?;
+            body["evidence"] = evidence_body(agent, target, evidence, now, repository.as_deref());
         }
         self.item_step(agent, id, "transition", body, &item)
     }
@@ -2396,7 +2393,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
         }
         let mut results = Vec::with_capacity(ids.len());
         let mut pending = Vec::new();
-        let mut targets = Vec::new();
+        let mut paths = Vec::new();
+        let mut all_ci = true;
         for id in ids {
             match self.task(id) {
                 Ok(task)
@@ -2408,7 +2406,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
                     results.push(json!({"id": id, "changed": false, "error": null, "item": task}));
                 }
                 Ok(task) => {
-                    targets.push(task.target);
+                    all_ci &= task.target.as_deref() == Some("ci_passed");
+                    paths.extend(task.paths);
                     pending.push(id.clone());
                 }
                 Err(error) => results.push(
@@ -2419,27 +2418,17 @@ impl<T: Transport> Backend for CloudBackend<T> {
         if pending.is_empty() {
             return Ok(json!({"results": results}));
         }
-        let evidence_kind = if targets
-            .iter()
-            .all(|target| target.as_deref() == Some("ci_passed"))
-        {
-            "ci_run"
-        } else {
-            "commit"
-        };
+        let target = if all_ci { "ci_passed" } else { DEFAULT_TARGET };
+        let repository = evidence_repository(evidence, &paths);
+        let mut shared_evidence =
+            evidence_body(agent, target, evidence, now, repository.as_deref());
+        shared_evidence["expected_version"] = Value::Null;
         let payload = json!({
             "ids": pending,
             "to": "done",
             "resolution": "completed",
             "reason": reason_or(evidence, "owner decision"),
-            "evidence": {
-                "kind": evidence_kind,
-                "environment": "local",
-                "value": evidence,
-                "observed_at": rfc3339(now),
-                "verifier": agent,
-                "expected_version": null
-            }
+            "evidence": shared_evidence,
         });
         let response = self.post(agent, format!("{ITEMS}/batch-transition"), &payload)?;
         results.extend(
@@ -4391,11 +4380,19 @@ mod tests {
         let (server, mut cloud) = backend(vec![
             item("ready", 1),
             item("ready", 1),
-            json!({"results": [{"id": "FE-1", "changed": true}, {"id": "FE-2", "changed": true}]}),
+            json!({"results": [
+                {"id": "FE-1", "changed": true, "item": {"id": "FE-1", "warnings": ["first", "second"]}},
+                {"id": "FE-2", "changed": true, "item": {"id": "FE-2"}}
+            ]}),
         ]);
-        cloud
+        let result = cloud
             .batch_close_tasks("me", &["FE-1".into(), "FE-2".into()], "owner decision", 0)
             .unwrap();
+        assert_eq!(
+            result["results"][0]["item"]["warnings"],
+            json!(["first", "second"])
+        );
+        assert!(result["results"][1]["item"].get("warnings").is_none());
         let seen = sees(
             &server,
             &[
@@ -4686,7 +4683,8 @@ mod tests {
             item("active", 4),
             item("review", 5),
         ]);
-        cloud.submit_task("me", "G-SG-0012", "run 5", 0).unwrap();
+        let submitted = cloud.submit_task("me", "G-SG-0012", "run 5", 0).unwrap();
+        assert!(submitted.warnings.is_none());
         let seen = sees(
             &server,
             &[
@@ -4702,6 +4700,22 @@ mod tests {
             seen[3].body,
             json!({"to": "review", "reason": "submitted for review", "expected_version": 4})
         );
+    }
+
+    #[test]
+    fn submission_keeps_the_transition_warnings_as_sent() {
+        for warnings in [json!(["check dev", "check the repo"]), json!([])] {
+            let mut reviewed = item("review", 5);
+            reviewed["warnings"] = warnings.clone();
+            let (_server, mut cloud) = backend(vec![
+                item("active", 3),
+                item("active", 4),
+                item("active", 4),
+                reviewed,
+            ]);
+            let result = cloud.submit_task("me", "G-SG-0012", "run 5", 0).unwrap();
+            assert_eq!(json!(result)["warnings"], warnings);
+        }
     }
 
     #[test]
