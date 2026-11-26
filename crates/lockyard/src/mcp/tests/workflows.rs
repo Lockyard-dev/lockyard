@@ -105,6 +105,35 @@
     }
 
     #[test]
+    fn start_work_forwards_task_lease_ttl_with_and_without_paths() {
+        for with_paths in [false, true] {
+            let dir = project();
+            let added = call(&dir, "lead", "task_add", json!({"title": "ttl regression"}));
+            let id = &added["structuredContent"]["id"];
+            assert!(id.is_string(), "{added}");
+            let mut args = json!({"task": id});
+            if with_paths {
+                args["paths"] = json!(["src"]);
+            }
+            for ttl in [0, 241] {
+                args["ttl"] = json!(ttl);
+                let result = compact_call(&dir, "worker", "start_work", args.clone());
+                assert_eq!(result["isError"], true, "start_work accepted ttl {ttl}: {result}");
+                assert_eq!(text(&result), "ttl must be 1 to 240 minutes");
+            }
+            let shown = compact_call(&dir, "worker", "tasks", json!({"action": "show", "id": id}));
+            assert_eq!(shown["structuredContent"]["task"]["status"], "open");
+            args["ttl"] = json!(1);
+            let result = compact_call(&dir, "worker", "start_work", args);
+            assert_eq!(result["isError"], false, "{}", text(&result));
+            let lease = &result["structuredContent"]["task"];
+            let until = lease["lease_until"].as_i64().unwrap();
+            let updated = lease["updated_at"].as_i64().unwrap();
+            assert_eq!(until - updated, 60_000, "{lease}");
+        }
+    }
+
+    #[test]
     fn compact_renewal_validates_optional_fence_and_bounds_ttl_in_minutes() {
         let dir = project();
         for (arguments, expected) in [
@@ -443,9 +472,16 @@
                 continue;
             }
             let name = tool["name"].as_str().unwrap();
-            for args in [json!({"ttl_seconds": 60}), json!({"ttl": "10m"})] {
+            for args in [
+                json!({"ttl_seconds": 60}), json!({"ttl": "10m"}),
+                json!({"ttl": 0}), json!({"ttl": 241}),
+            ] {
                 let error = tool_registry().validate_fields(name, &args).unwrap_err();
-                assert!(error.to_string().contains("minutes"), "{name}: {error}");
+                let message = error.to_string();
+                assert!(
+                    ["minutes", "1", "240"].iter().all(|part| message.contains(part)),
+                    "{name}: {error}"
+                );
             }
         }
     }

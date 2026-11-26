@@ -64,7 +64,7 @@ pub(super) enum ZoneCommand {
         #[arg(long, default_value = "")]
         note: String,
         /// Minutes the entry stays in line, 1 to 480.
-        #[arg(long, default_value_t = DEFAULT_QUEUE_MINUTES)]
+        #[arg(long, default_value_t = DEFAULT_QUEUE_MINUTES, value_name = "MINUTES", value_parser = parse_queue_minutes)]
         ttl: i64,
         #[command(flatten)]
         style: ClaimStyle,
@@ -688,4 +688,12 @@ pub(super) enum MailCommand {
         #[arg(long, default_value_t = 21600)]
         timeout: u64,
     },
+}
+
+fn parse_queue_minutes(value: &str) -> std::result::Result<i64, String> {
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|ttl| (1..=480).contains(ttl))
+        .ok_or_else(|| "queue ttl must be 1 to 480 minutes".into())
 }

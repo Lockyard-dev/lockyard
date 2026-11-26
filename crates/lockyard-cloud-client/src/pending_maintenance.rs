@@ -8,12 +8,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const RECONCILE_BUDGET: Duration = Duration::from_secs(2);
 pub(super) const ENCRYPTION_MISMATCH: &str = "pending_encryption_mismatch";
 
-pub(crate) struct ReplayEncryption {
-    pub(super) enabled: bool,
-    pub(super) workspace: Option<String>,
-    pub(super) key: Option<crate::WorkspaceKey>,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Recovery {
     Durable,
@@ -480,18 +474,19 @@ impl Client {
     }
 
     pub fn repair_pending(&self) -> Result<PendingRepair, ClientError> {
-        self.repair_pending_with_age(0, RECONCILE_BUDGET, true)
+        self.repair_pending_with_age(0, RECONCILE_BUDGET, true, None)
     }
 
     pub(crate) fn maintain_pending_journal(&self) -> Result<PendingRepair, ClientError> {
-        self.repair_pending_with_age(60, RECONCILE_BUDGET, false)
+        self.repair_pending_with_age(60, RECONCILE_BUDGET, false, None)
     }
 
     pub(super) fn repair_pending_for_capacity(
         &self,
-        budget: Duration,
+        deadline: Instant,
     ) -> Result<PendingRepair, ClientError> {
-        self.repair_pending_with_age(0, budget, false)
+        let budget = deadline.saturating_duration_since(Instant::now());
+        self.repair_pending_with_age(0, budget, false, Some(deadline))
     }
 
     fn repair_pending_with_age(
@@ -499,6 +494,7 @@ impl Client {
         minimum_age: u64,
         pass_budget: Duration,
         explicit_repair: bool,
+        admission_deadline: Option<Instant>,
     ) -> Result<PendingRepair, ClientError> {
         let Some(directory) = &self.pending_journal else {
             return Ok(PendingRepair::default());
@@ -561,7 +557,14 @@ impl Client {
             let policy = self.live_replay_encryption(self, pass_budget, None);
             report.network_required = policy.as_ref().err().is_some_and(connection_unavailable);
         }
+        let admission_left = || {
+            admission_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        };
         for pending in rows {
+            // Avoid starting a row in the last scheduling slice of foreground admission.
+            if admission_left().is_some_and(|left| left < Duration::from_millis(25)) {
+                break;
+            }
             if pending.replay_paused && pending.replay_stopped {
                 continue;
             }
@@ -589,7 +592,10 @@ impl Client {
             };
             // Contention on the shared journal says nothing about this row.
             // Wait for a concurrent scan to finish before examining the key.
-            guard.wait_for_journal()?;
+            guard.wait_for_journal_with_budget(
+                admission_left().unwrap_or(crate::MAX_RETRY_WAIT),
+                None,
+            )?;
             if !self.pending_snapshot_matches(directory, &pending)? {
                 continue;
             }
@@ -624,13 +630,18 @@ impl Client {
             // replica retry. A concurrent writer can use the journal for any other key.
             guard.release_journal()?;
             let started = Instant::now();
-            let left = || RECONCILE_BUDGET.saturating_sub(started.elapsed());
+            let left = || {
+                let row_budget = RECONCILE_BUDGET.saturating_sub(started.elapsed());
+                admission_left().map_or(row_budget, |remaining| remaining.min(row_budget))
+            };
             let mut window_status = decision;
             let mut observed = false;
             let refused = pending.pre_execution_rejected;
             let mut incompatible_encryption = false;
             let mut receipt_encryption = None;
-            let result = if let Recovery::ReadState(route) = recovery {
+            let result = if left().is_zero() {
+                None
+            } else if let Recovery::ReadState(route) = recovery {
                 let read = Call::get(&pending.session, route.into());
                 match self.attempt_observed(
                     &read,
@@ -676,7 +687,10 @@ impl Client {
                                 receipt_encryption = Some(context);
                             }
                             if refused {
-                                guard.wait_for_journal()?;
+                                guard.wait_for_journal_with_budget(
+                                    admission_left().unwrap_or(crate::MAX_RETRY_WAIT),
+                                    None,
+                                )?;
                                 let previous = pending.clone();
                                 pending.pre_execution_rejected = false;
                                 self.update_pending(&previous, pending.clone())?;
@@ -702,7 +716,10 @@ impl Client {
             let excess = started.elapsed().saturating_sub(Duration::from_millis(250));
             uncharged += excess;
             slow_rows += usize::from(!excess.is_zero());
-            guard.wait_for_journal()?;
+            guard.wait_for_journal_with_budget(
+                admission_left().unwrap_or(crate::MAX_RETRY_WAIT),
+                None,
+            )?;
             if !self.pending_snapshot_matches(directory, &pending)? {
                 continue;
             }
@@ -800,7 +817,7 @@ impl Client {
         guard: &mut PendingSendGuard<'_>,
         budget: Option<Duration>,
         cancellation: Option<&crate::Cancellation>,
-    ) -> Result<ReplayEncryption, ClientError> {
+    ) -> Result<ContentEncryption, ClientError> {
         match guard.exchange_with_budget(budget, cancellation, || {
             self.check_replay_encryption(
                 self,
@@ -815,7 +832,7 @@ impl Client {
         }
     }
 
-    pub(super) fn live_replay_encryption(
+    pub(crate) fn live_replay_encryption(
         &self,
         server: &Client,
         budget: Duration,
@@ -830,13 +847,23 @@ impl Client {
             call.cancellation = cancellation.cloned();
             match crate::Transport::call(server, &call) {
                 Ok(value) => {
-                    return serde_json::from_value(value)
-                        .map(Some)
-                        .map_err(|error| ClientError::Decode(error.to_string()));
+                    let setting: WorkspaceEncryption = serde_json::from_value(value)
+                        .map_err(|error| ClientError::Decode(error.to_string()))?;
+                    self.validate_encryption_setting(&setting)?;
+                    if self.check_live_write_encryption_policy && std::ptr::eq(self, server) {
+                        *self
+                            .live_encryption
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(setting.clone());
+                    }
+                    return Ok(Some(setting));
                 }
                 // Only an unconfigured legacy client can fall back when the endpoint is absent.
                 Err(ClientError::NotFound(_))
-                    if self.workspace.is_none() && self.expected_e2ee_workspace.is_none() => {}
+                    if self.workspace.is_none()
+                        && self.expected_e2ee_workspace.is_none()
+                        && self.live_encryption_setting().is_none() => {}
                 Err(error) => return Err(error),
             }
         }
@@ -873,7 +900,7 @@ impl Client {
         pending: &PendingWrite,
         budget: Duration,
         cancellation: Option<&crate::Cancellation>,
-    ) -> Result<Option<ReplayEncryption>, ClientError> {
+    ) -> Result<Option<ContentEncryption>, ClientError> {
         let frozen = pending.encryption_context.as_deref();
         let encryption =
             if let Some(setting) = self.live_replay_encryption(server, budget, cancellation)? {
@@ -895,13 +922,13 @@ impl Client {
                     return Ok(None);
                 }
                 let (key, _) = self.validate_content_encryption(&setting)?;
-                ReplayEncryption {
+                ContentEncryption {
                     enabled: required,
                     workspace: Some(setting.workspace_id),
                     key,
                 }
             } else {
-                ReplayEncryption {
+                ContentEncryption {
                     enabled: self.encryption_enabled,
                     workspace: self.workspace.clone(),
                     key: self.content_key.clone(),
@@ -1154,7 +1181,7 @@ impl Client {
         &self,
         frozen: Option<&str>,
         recorded: Option<ReceiptEncryption>,
-    ) -> Option<ReplayEncryption> {
+    ) -> Option<ContentEncryption> {
         if let Some(context) = recorded {
             if !context.matches(self, frozen) {
                 return None;
@@ -1163,7 +1190,7 @@ impl Client {
                 self.local_receipt_keys(context.workspace.as_deref())
                     .find(|key| key.key_id() == id)
             });
-            return (!context.enabled || key.is_some()).then_some(ReplayEncryption {
+            return (!context.enabled || key.is_some()).then_some(ContentEncryption {
                 enabled: context.enabled,
                 workspace: context.workspace,
                 key,
@@ -1173,13 +1200,17 @@ impl Client {
         // Older receipts only have the fingerprint. Try both modes with the local
         // workspace and keys, and use only the combination that matches the operation.
         let frozen = frozen?;
-        for workspace in [None, self.workspace.as_deref()] {
+        let live = self.live_encryption_setting();
+        for workspace in [None, self.workspace.as_deref()].into_iter().chain(
+            live.as_ref()
+                .map(|setting| Some(setting.workspace_id.as_str())),
+        ) {
             for key in std::iter::once(None).chain(self.local_receipt_keys(workspace).map(Some)) {
                 let key_id = key.as_ref().map(crate::WorkspaceKey::key_id);
                 if let Some(enabled) = [false, true].into_iter().find(|&enabled| {
                     frozen == self.encryption_context_for(workspace, key_id.as_deref(), enabled)
                 }) {
-                    return Some(ReplayEncryption {
+                    return Some(ContentEncryption {
                         enabled,
                         workspace: workspace.map(str::to_owned),
                         key,
@@ -1190,7 +1221,12 @@ impl Client {
         None
     }
 
-    pub(super) fn settled_response(&self, call: &Call) -> Result<Option<Value>, ClientError> {
+    pub(super) fn settled_response(
+        &self,
+        call: &Call,
+        guard: &mut PendingSendGuard<'_>,
+        remaining: &dyn Fn() -> Option<Duration>,
+    ) -> Result<Option<Value>, ClientError> {
         let Some(key) = &call.key else {
             return Ok(None);
         };
@@ -1203,9 +1239,29 @@ impl Client {
         {
             return Err(ClientError::OutcomeUnknown(Box::new(pending)));
         }
-        let Some(encryption) =
-            self.settled_encryption(pending.encryption_context.as_deref(), settled.encryption)
-        else {
+        let frozen = pending.encryption_context.as_deref();
+        let legacy_receipt = settled.encryption.is_none();
+        let mut encryption = self.settled_encryption(frozen, settled.encryption);
+        if encryption.is_none()
+            && legacy_receipt
+            && frozen.is_some()
+            && self.check_live_write_encryption_policy
+        {
+            // Old receipts carry only a fingerprint. If the agent started without
+            // a workspace, one live lookup can identify the key to verify it with.
+            let budget = remaining();
+            let policy = guard.exchange_with_budget(budget, call.cancellation.as_ref(), || {
+                self.live_replay_encryption(
+                    self,
+                    budget.unwrap_or(RECONCILE_BUDGET).min(RECONCILE_BUDGET),
+                    call.cancellation.as_ref(),
+                )
+            })?;
+            if matches!(policy, Ok(Some(_))) {
+                encryption = self.settled_encryption(frozen, None);
+            }
+        }
+        let Some(encryption) = encryption else {
             return Err(ClientError::OutcomeUnknown(Box::new(pending)));
         };
         if let Some(error) = settled.error {
@@ -1685,6 +1741,55 @@ mod tests {
         assert!(server.requests.lock().unwrap().is_empty());
     }
 
+    #[test]
+    fn offline_started_client_can_read_an_older_encrypted_receipt() {
+        let server = Server::new();
+        let root = tempfile::tempdir().unwrap();
+        let client = server
+            .client(root.path())
+            .with_live_write_encryption_policy();
+        let key = crate::WorkspaceKey::from_entropy([29; 32]);
+        key.store_for_workspace(ENCRYPTION_WORKSPACE).unwrap();
+        *server.encryption_key_id.lock().unwrap() = Some(key.key_id());
+
+        let mut row = pending(&client, "legacy-encrypted", false);
+        row.path = "/api/v1/bus/messages".into();
+        row.request_path = row.path.clone();
+        row.body = Some(json!({"to":"bob","body":"hello"}).to_string());
+        let call = call_for(&row);
+        row.request_digest = Some(crate::request_identity(&call));
+        row.encryption_context = Some(client.encryption_context_for(
+            Some(ENCRYPTION_WORKSPACE),
+            Some(&key.key_id()),
+            true,
+        ));
+        let body = key.encrypt(ENCRYPTION_WORKSPACE, "body", "hello").unwrap();
+        let receipt = SettledWrite {
+            pending: row,
+            value: Some(json!({"id":42,"to":"bob","from_session":"fixture","body":body})),
+            error: None,
+            consumed: false,
+            encryption: None,
+        };
+        let path = journal_path(
+            client.pending_journal.as_ref().unwrap(),
+            &receipt.pending.key,
+        )
+        .with_extension("settled");
+        lockyard_core::fsio::replace(&path, &serde_json::to_vec(&receipt).unwrap(), 0o600).unwrap();
+
+        let recovered = client.call(&call);
+        std::fs::remove_file(crate::WorkspaceKey::storage_path(ENCRYPTION_WORKSPACE).unwrap())
+            .unwrap();
+        assert_eq!(recovered.unwrap()["body"], "hello");
+        let seen = server.requests.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|(path, _, _)| path == crate::ENCRYPTION_PATH)
+        );
+        assert!(seen.iter().all(|(_, key, _)| key.is_empty()), "{seen:?}");
+    }
+
     fn drain(client: &Client) -> PendingRepair {
         let end = Instant::now() + Duration::from_secs(20);
         let mut result = PendingRepair::default();
@@ -1988,6 +2093,45 @@ mod tests {
         assert_eq!(server.requests.lock().unwrap().len(), 141);
     }
     #[test]
+    fn admission_reconciliation_respects_the_call_deadline() {
+        let server = Server::new();
+        let root = tempfile::tempdir().unwrap();
+        let client = server.client(root.path());
+        let date = "Thu, 12 Nov 2026 10:21:00 GMT";
+        *server.date.lock().unwrap() = Some(date);
+        let mut claim = pending(&client, "a-queued", false);
+        claim.path = "/api/v1/zones/claims".into();
+        claim.request_path = claim.path.clone();
+        claim.body = Some(json!({"paths":["src"],"queue_wait_seconds":30}).to_string());
+        claim.first_sent_server_secs = Some(crate::http_date_ms(date).unwrap() as u64 / 1000);
+        save(&client, &claim);
+        for index in 0..MAX_PENDING {
+            save(&client, &pending(&client, &format!("old-{index}"), true));
+        }
+        let mut call = Call::write(
+            "fixture",
+            "POST",
+            "/api/v1/registry/items".into(),
+            json!({"title":"new"}),
+        );
+        call.deadline_ms = Some(500);
+        let started = Instant::now();
+        assert!(client.call(&call).is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(1_100),
+            "admission reconcile exceeded the original call deadline: {:?}",
+            started.elapsed()
+        );
+        let requests = server.requests.lock().unwrap();
+        let writes: Vec<_> = requests
+            .iter()
+            .filter(|(_, key, _)| !key.is_empty())
+            .collect();
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        assert_eq!(writes[0].1, "a-queued");
+    }
+
+    #[test]
     fn ly0030_network_unavailable_preserves_bytes_and_reports_repair() {
         let server = Server::new();
         server.offline.store(true, Ordering::SeqCst);
@@ -2240,7 +2384,7 @@ mod tests {
             save(&client, &row);
         }
         let report = client
-            .repair_pending_for_capacity(Duration::from_secs(10))
+            .repair_pending_for_capacity(Instant::now() + Duration::from_secs(10))
             .unwrap();
         assert_eq!(report.applied, MAX_PENDING - 1);
         assert_eq!(
@@ -2324,7 +2468,7 @@ mod tests {
         std::thread::scope(|scope| {
             let repair = scope.spawn(|| {
                 client
-                    .repair_pending_for_capacity(Duration::from_millis(50))
+                    .repair_pending_with_age(0, Duration::from_millis(50), false, None)
                     .unwrap()
             });
             let limit = Instant::now() + Duration::from_secs(3);
@@ -2354,7 +2498,7 @@ mod tests {
         assert!(client.settled_write("c-next").unwrap().is_none());
         assert_eq!(
             client
-                .repair_pending_for_capacity(Duration::ZERO)
+                .repair_pending_with_age(0, Duration::ZERO, false, None)
                 .unwrap()
                 .applied,
             1

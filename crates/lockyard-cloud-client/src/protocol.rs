@@ -1,7 +1,10 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
 //! HTTP generation negotiation is independent of RPC frames and package versions.
-use crate::{ApiError, Call, Cancellation, Client, ClientError, Failure, WorkspaceEncryption};
+use crate::{
+    ApiError, Call, Cancellation, Client, ClientError, ContentEncryption, Failure,
+    WorkspaceEncryption,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -304,10 +307,10 @@ pub(crate) struct PendingSendGuard<'a> {
     state: &'a std::sync::Mutex<ProtocolState>,
     key: String,
     /// Directory whose flock serializes journal writes across processes. Held only while
-    /// mutating the journal or a short non-poll send — never for the whole long poll.
+    /// mutating the journal. HTTP and retry waits keep only the per-key lock.
     journal_dir: Option<&'a Path>,
     journal: Option<PendingFileLock>,
-    /// Per-key ownership survives releasing the shared journal during a long poll.
+    /// Per-key ownership survives releasing the shared journal during network work or backoff.
     operation: Option<PendingFileLock>,
 }
 
@@ -401,10 +404,6 @@ impl PendingSendGuard<'_> {
         Ok(result)
     }
 
-    fn wait_for_journal(&mut self) -> Result<(), ClientError> {
-        self.wait_for_journal_with_budget(crate::MAX_RETRY_WAIT, None)
-    }
-
     fn wait_for_journal_with_budget(
         &mut self,
         budget: Duration,
@@ -451,7 +450,7 @@ impl PendingSendGuard<'_> {
         Ok(PendingFileLock(lock))
     }
 
-    /// Re-take the flock before journal cleanup after a long poll. Retries inside `budget`.
+    /// Re-take the flock before mutating the journal. Retries inside `budget`.
     pub(crate) fn reacquire_journal(
         &mut self,
         budget: Duration,
@@ -1138,7 +1137,7 @@ impl Client {
         self
     }
 
-    /// Prepare and attest new wire bodies for a long-lived client.
+    /// Prepare and attest new wire bodies, and discover the read context for a long-lived client.
     pub fn with_live_write_encryption_policy(mut self) -> Self {
         self.check_live_write_encryption_policy = true;
         self.with_pending_encryption_policy()
@@ -1476,7 +1475,8 @@ impl Client {
         let left = || budget.saturating_sub(started.elapsed());
         loop {
             guard.release_journal()?;
-            let repair = self.repair_pending_for_capacity(left().min(Duration::from_secs(2)));
+            let repair = self
+                .repair_pending_for_capacity(Instant::now() + left().min(Duration::from_secs(2)));
             if matches!(repair, Err(ClientError::JournalBusy)) {
                 std::thread::sleep(left().min(Duration::from_millis(25)));
             }
@@ -1579,18 +1579,14 @@ impl Client {
 
     /// Resolve the current generation without performing any write or changing origin.
     pub fn negotiated_protocol(&self, session: &str) -> Result<NegotiatedProtocol, ClientError> {
-        self.discover(session, None, None)
+        self.discover(session, None, None, false)
     }
 
     pub(crate) fn refresh_protocol(
         &self,
         session: &str,
     ) -> Result<NegotiatedProtocol, ClientError> {
-        self.protocol_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cached = None;
-        self.discover(session, None, None)
+        self.discover(session, None, None, true)
     }
 
     fn discover(
@@ -1598,17 +1594,30 @@ impl Client {
         session: &str,
         remaining: Option<Duration>,
         cancellation: Option<&Cancellation>,
+        refresh: bool,
     ) -> Result<NegotiatedProtocol, ClientError> {
         let started = Instant::now();
-        // Discovery is shared by concurrent status workers. Waiting for another thread's
-        // discovery is part of this caller's deadline, including a long unrelated request.
-        let mut state = if remaining.is_some() || cancellation.is_some() {
+        let cached = || {
+            self.protocol_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cached
+                .as_ref()
+                .filter(|cached| cached.obtained.elapsed() < CACHE_TTL)
+                .map(|cached| cached.value.clone())
+        };
+        if !refresh && let Some(value) = cached() {
+            return Ok(value);
+        }
+        // Serialize discovery without holding the pending journal state mutex over HTTP.
+        // A sibling can still use a fresh cached protocol while a forced refresh is in flight.
+        let _discovery = if remaining.is_some() || cancellation.is_some() {
             loop {
                 if let Some(cancellation) = cancellation {
                     cancellation.check()?;
                 }
-                match self.protocol_state.try_lock() {
-                    Ok(state) => break state,
+                match self.protocol_discovery.try_lock() {
+                    Ok(lock) => break lock,
                     Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
                     Err(std::sync::TryLockError::WouldBlock) => {
                         let left = remaining
@@ -1624,14 +1633,12 @@ impl Client {
                 }
             }
         } else {
-            self.protocol_state
+            self.protocol_discovery
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         };
-        if let Some(cached) = &state.cached
-            && cached.obtained.elapsed() < CACHE_TTL
-        {
-            return Ok(cached.value.clone());
+        if !refresh && let Some(value) = cached() {
+            return Ok(value);
         }
         let mut call = Call::get(session, DISCOVERY.into());
         call.cancellation = cancellation.cloned();
@@ -1672,7 +1679,10 @@ impl Client {
                         result.capabilities.insert(crate::MAIL_OPEN_V1.into());
                     }
                     self.save_status_protocol_hint(&result);
-                    state.cached = Some(CachedProtocol {
+                    self.protocol_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .cached = Some(CachedProtocol {
                         value: result.clone(),
                         obtained: Instant::now(),
                     });
@@ -1752,7 +1762,10 @@ impl Client {
                             "legacy encryption policy values are invalid",
                         ));
                     }
-                    state.cached = Some(CachedProtocol {
+                    self.protocol_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .cached = Some(CachedProtocol {
                         value: legacy.clone(),
                         obtained: Instant::now(),
                     });
@@ -1767,12 +1780,15 @@ impl Client {
         ))
     }
 
-    fn feature_gate(&self, call: &Call, protocol: &NegotiatedProtocol) -> Result<(), ClientError> {
+    fn feature_gate(
+        &self,
+        call: &Call,
+        protocol: &NegotiatedProtocol,
+        encryption_enabled: bool,
+    ) -> Result<(), ClientError> {
         let route = call.path.split('?').next().unwrap_or(&call.path);
         let required = if route == "/api/v1/zones/catalog"
-            && (call.is_write()
-                || self.encryption_enabled
-                || self.expected_e2ee_workspace.is_some())
+            && (call.is_write() || encryption_enabled || self.expected_e2ee_workspace.is_some())
         {
             Some(("zone_catalog_v1", 2))
         } else if route == "/api/v1/revocations" || route.starts_with("/api/v1/revocations/") {
@@ -1925,7 +1941,9 @@ impl Client {
         } else {
             None
         };
-        if let Some(value) = self.settled_response(call)? {
+        if let Some(guard) = send_guard.as_mut()
+            && let Some(value) = self.settled_response(call, guard, &remaining)?
+        {
             return Ok(value);
         }
         if let Some(key) = &call.key
@@ -1960,52 +1978,90 @@ impl Client {
             crate::crypto::validate_required_route(&call.method, &call.path)
                 .map_err(ClientError::Invalid)?;
         }
+        // Initial discovery and policy lookup may block. Reserve the operation key,
+        // then give other writers access to the journal until this call has wire bytes.
+        if let Some(guard) = send_guard.as_mut() {
+            guard.release_journal()?;
+        }
         let request_digest = crate::request_identity(call);
-        let mut protocol =
-            match self.discover(&call.session, remaining(), call.cancellation.as_ref()) {
-                Ok(protocol) => protocol,
-                Err(error @ ClientError::Transport(_)) => {
+        let mut protocol = match self.discover(
+            &call.session,
+            remaining(),
+            call.cancellation.as_ref(),
+            false,
+        ) {
+            Ok(protocol) => protocol,
+            Err(error @ ClientError::Transport(_)) => {
+                if let Some(cached) = self.catalog_offline_call(call)? {
+                    return Ok(cached);
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        // A logical call, including one restored from the daemon's outbox, gets
+        // its first wire body under the live policy before it enters the HTTP journal.
+        let live_write =
+            self.check_live_write_encryption_policy && call.is_write() && call.body.is_some();
+        let policy_read = call.method == "GET" && route == crate::ENCRYPTION_PATH;
+        let current = (!live_write && !policy_read).then(|| self.current_content_encryption());
+        let live = if live_write
+            || (self.check_live_write_encryption_policy
+                && !policy_read
+                && (self.live_encryption_setting().is_none()
+                    || matches!(route, "/api/v1/zones/catalog" | "/api/v1/events")
+                    || current.as_ref().is_some_and(Result::is_err)))
+        {
+            match self.live_replay_encryption(
+                self,
+                remaining()
+                    .unwrap_or(crate::MAX_RETRY_WAIT)
+                    .min(Duration::from_secs(2)),
+                call.cancellation.as_ref(),
+            ) {
+                Ok(setting) => setting,
+                Err(error @ ClientError::Transport(_)) if !call.is_write() => {
                     if let Some(cached) = self.catalog_offline_call(call)? {
                         return Ok(cached);
                     }
                     return Err(error);
                 }
                 Err(error) => return Err(error),
-            };
-        self.feature_gate(call, &protocol)?;
-        // A logical call, including one restored from the daemon's outbox, gets
-        // its first wire body under the live policy before it enters the HTTP journal.
-        let live_write =
-            self.check_live_write_encryption_policy && call.is_write() && call.body.is_some();
-        let live = if live_write {
-            self.live_replay_encryption(
-                self,
-                remaining()
-                    .unwrap_or(crate::MAX_RETRY_WAIT)
-                    .min(Duration::from_secs(2)),
-                call.cancellation.as_ref(),
-            )?
+            }
         } else {
             None
         };
-        // Share the request's content context with response decryption.
-        let (workspace, content_key, encryption_enabled, encryption_context) =
-            if let Some(setting) = &live {
-                let (key, enabled) = self.validate_content_encryption(setting)?;
-                let key_id = key.as_ref().map(crate::WorkspaceKey::key_id);
-                let workspace = Some(setting.workspace_id.as_str());
-                let context = self.encryption_context_for(workspace, key_id.as_deref(), enabled);
-                (workspace, key, enabled, context)
-            } else {
-                (
-                    self.workspace.as_deref(),
-                    self.resolved_content_key()?,
-                    self.encryption_enabled,
-                    self.encryption_context(),
-                )
-            };
+        // Snapshot one workspace and key for preparation and response verification.
+        let encryption = if policy_read {
+            ContentEncryption {
+                workspace: None,
+                key: None,
+                enabled: false,
+            }
+        } else if let Some(setting) = live {
+            // The policy GET may have had to renegotiate before it completed.
+            protocol = self.discover(
+                &call.session,
+                remaining(),
+                call.cancellation.as_ref(),
+                false,
+            )?;
+            self.content_encryption_from(setting)?
+        } else {
+            current.unwrap_or_else(|| self.current_content_encryption())?
+        };
+        let workspace = encryption.workspace.as_deref();
+        let content_key = encryption.key.as_ref();
+        let encryption_enabled = encryption.enabled;
+        self.feature_gate(call, &protocol, encryption_enabled)?;
+        let key_id = content_key.map(crate::WorkspaceKey::key_id);
+        let encryption_context = if live_write {
+            self.encryption_context_for(workspace, key_id.as_deref(), encryption_enabled)
+        } else {
+            self.encryption_context()
+        };
         // Seal the catalog with the same live workspace and key used to verify its reply.
-        let prepared = self.prepare_catalog_call(call, workspace, content_key.as_ref())?;
+        let prepared = self.prepare_catalog_call(call, workspace, content_key)?;
         let call = &prepared;
         let mut body = call.body.clone();
         // 579d557 requires mode. Only LC-0019 servers advertising this capability
@@ -2043,7 +2099,7 @@ impl Client {
                 &call.method,
                 &call.path,
                 workspace,
-                content_key.as_ref(),
+                content_key,
                 encryption_enabled,
                 self.expected_e2ee_workspace.is_some(),
                 Some(&identity_context),
@@ -2102,40 +2158,39 @@ impl Client {
                 result_retry_at: None,
             });
             if let Some(pending) = &pending {
+                let guard = send_guard.as_mut().expect("write guard");
+                guard.reacquire_journal(remaining().unwrap_or(crate::MAX_RETRY_WAIT), |pause| {
+                    call.wait(pause)
+                })?;
                 if let Some(previous) = refused_pending.take() {
                     self.verify_pending_replay_encryption(
                         &previous,
-                        send_guard.as_mut().expect("write guard"),
+                        guard,
                         remaining(),
                         call.cancellation.as_ref(),
                     )?;
                     self.update_pending(&previous, pending.clone())?;
                 } else {
-                    if maintenance::uses_replay_budget(pending)
-                        && let Some(guard) = send_guard.as_mut()
-                    {
+                    if maintenance::uses_replay_budget(pending) {
                         self.repair_before_admission(
                             guard,
                             serde_json::to_vec(pending).map_err(journal_error)?.len(),
                             remaining().unwrap_or(crate::MAX_RETRY_WAIT),
                         )?;
                     }
+                    if remaining().is_some_and(|limit| limit.is_zero()) {
+                        return Err(ClientError::Transport("call deadline elapsed".into()));
+                    }
                     self.retain_pending(pending.clone())?;
                     if attempt > 1 {
                         self.verify_pending_replay_encryption(
                             pending,
-                            send_guard.as_mut().expect("write guard"),
+                            guard,
                             remaining(),
                             call.cancellation.as_ref(),
                         )?;
                     }
                 }
-            }
-            // zone wait / long poll can sit on the server for tens of seconds; holding the
-            // local write journal that whole time deadlocks sibling release / finish_work.
-            if call.long_poll
-                && let Some(guard) = send_guard.as_mut()
-            {
                 guard.release_journal()?;
             }
             let result = match &pending {
@@ -2159,20 +2214,26 @@ impl Client {
             };
             let failure = match result {
                 Ok(mut value) => {
-                    let journal_owned = !call.long_poll
-                        || send_guard.as_mut().is_none_or(|guard| {
-                            guard
-                                .reacquire_journal(
-                                    remaining().unwrap_or(crate::MAX_RETRY_WAIT),
-                                    |pause| call.wait(pause),
-                                )
-                                .is_ok()
-                        });
+                    let journal_owned = match &mut send_guard {
+                        Some(guard) => match guard.reacquire_journal(
+                            remaining().unwrap_or(crate::MAX_RETRY_WAIT),
+                            |pause| call.wait(pause),
+                        ) {
+                            Ok(()) => true,
+                            Err(error) if call.long_poll || journal_busy(&error) => false,
+                            Err(_) => {
+                                return Err(ClientError::OutcomeUnknown(Box::new(
+                                    pending.expect("write pending record"),
+                                )));
+                            }
+                        },
+                        None => true,
+                    };
                     // Authenticate/decrypt the response before releasing its recovery record.
                     let event_page = call.method == "GET"
                         && call.path.split('?').next() == Some("/api/v1/events");
                     if event_page {
-                        self.decode_json_events(&mut value)?;
+                        self.decode_json_events(&mut value, &encryption)?;
                     }
                     if !event_page
                         && let Some(workspace) = workspace
@@ -2181,7 +2242,7 @@ impl Client {
                             &call.method,
                             &call.path,
                             workspace,
-                            content_key.as_ref(),
+                            content_key,
                             false,
                             self.expected_e2ee_workspace.is_some(),
                         )
@@ -2204,9 +2265,13 @@ impl Client {
                         encryption_enabled,
                         &mut value,
                     );
-                    if let Err(error) =
-                        self.finish_catalog_call(call, &mut value, workspace, content_key.as_ref())
-                    {
+                    if let Err(error) = self.finish_catalog_call(
+                        call,
+                        &mut value,
+                        workspace,
+                        content_key,
+                        encryption_enabled,
+                    ) {
                         if let Some(pending) = pending {
                             if !journal_owned {
                                 return Err(ClientError::OutcomeUnknown(Box::new(pending)));
@@ -2227,19 +2292,16 @@ impl Client {
                             return Ok(value);
                         }
                         if let Err(error) = self.resolve_pending(&pending.key) {
-                            if call.long_poll {
-                                self.complete_pending_later(&pending);
-                                return Ok(value);
+                            if !call.long_poll {
+                                return Err(error);
                             }
-                            return Err(error);
+                            self.complete_pending_later(&pending);
                         }
                     }
                     return Ok(value);
                 }
                 Err(failure) => {
-                    if call.long_poll
-                        && let Some(guard) = send_guard.as_mut()
-                    {
+                    if let Some(guard) = send_guard.as_mut() {
                         let budget = remaining().unwrap_or(crate::MAX_RETRY_WAIT);
                         if guard
                             .reacquire_journal(budget, |pause| call.wait(pause))
@@ -2332,11 +2394,11 @@ impl Client {
             {
                 replica_changed = true;
                 self.invalidate_status_protocol_hint();
-                self.protocol_state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .cached = None;
-                protocol = self.discover(&call.session, remaining(), call.cancellation.as_ref())?;
+                if let Some(guard) = send_guard.as_mut() {
+                    guard.release_journal()?;
+                }
+                protocol =
+                    self.discover(&call.session, remaining(), call.cancellation.as_ref(), true)?;
                 if call.path.contains("&assignee_session=")
                     && let Some(capability) = registry_capability
                     && !protocol
@@ -2346,7 +2408,7 @@ impl Client {
                     capability.store(false, std::sync::atomic::Ordering::Relaxed);
                     return Err(error);
                 }
-                self.feature_gate(call, &protocol)?;
+                self.feature_gate(call, &protocol, encryption_enabled)?;
                 continue;
             }
             let temporary = error
@@ -2374,17 +2436,12 @@ impl Client {
                 return Err(error);
             }
             let wait = crate::retry_wait(&error, delay);
-            if let Some(guard) = send_guard.as_mut().filter(|_| refused_pending.is_some()) {
-                // The refusal is durable. Keep ownership of this key while siblings use
-                // the shared journal, then take the journal back to update the same row.
+            if let Some(guard) = send_guard.as_mut() {
+                // The refusal or removal is durable. The next iteration retakes the
+                // journal under the same deadline to update or insert the pending row.
                 guard.release_journal()?;
-                call.wait(wait)?;
-                guard.reacquire_journal(remaining().unwrap_or(crate::MAX_RETRY_WAIT), |pause| {
-                    call.wait(pause)
-                })?;
-            } else {
-                call.wait(wait)?;
             }
+            call.wait(wait)?;
             delay *= 2;
         }
         Err(local(
@@ -2522,7 +2579,7 @@ impl Client {
         call: &Call,
         pending: &PendingWrite,
         value: &mut Value,
-        encryption: Option<&maintenance::ReplayEncryption>,
+        encryption: Option<&ContentEncryption>,
     ) -> Result<(), ClientError> {
         let (workspace, held, enabled) = match encryption {
             Some(encryption) => (
@@ -2555,7 +2612,8 @@ impl Client {
             return Err(self.unknown(pending.clone(), cause, None));
         }
         crate::commit_evidence::warn_if_sha_missing(call, enabled, value);
-        if let Err(error) = self.finish_catalog_call(call, value, workspace, held.as_ref()) {
+        if let Err(error) = self.finish_catalog_call(call, value, workspace, held.as_ref(), enabled)
+        {
             let cause = error
                 .code()
                 .unwrap_or("catalog_authentication_failed")

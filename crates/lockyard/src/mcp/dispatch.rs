@@ -386,7 +386,7 @@ pub(super) fn run_tool(
             let request = QueueRequest {
                 paths,
                 note: args.optional_text("note")?.to_string(),
-                ttl_minutes: args.some_int("ttl")?.unwrap_or(DEFAULT_QUEUE_MINUTES),
+                ttl_minutes: args.optional_ttl()?.unwrap_or(DEFAULT_QUEUE_MINUTES),
                 mode: args.mode()?,
                 purpose: args.purpose()?,
                 zones,
@@ -543,12 +543,8 @@ pub(super) fn run_tool(
             let fence = args.some_int("fence")?;
             let agent = me()?;
             let id = args.optional_id()?;
-            let ttl = args.ttl()?;
-            if !(1..=240).contains(&ttl) {
-                return Err(Error::Invalid("ttl must be 1 to 240 minutes".into()));
-            }
             let request = RenewRequest {
-                ttl_minutes: ttl,
+                ttl_minutes: args.ttl()?,
                 hold_reason: args.some_text("hold_reason")?,
                 hold_until: args.some_text("hold_until")?.or_else(|| {
                     args.get("hold_reason")
@@ -893,7 +889,7 @@ pub(super) fn run_tool(
                 key: args.text("key")?.to_string(),
                 value: args.text("value")?.to_string(),
                 zone: args.some_text("zone")?,
-                ttl_minutes: args.some_int("ttl")?,
+                ttl_minutes: args.optional_ttl()?,
             };
             encode(
                 &opened
@@ -1026,7 +1022,7 @@ pub(super) fn send_mail(
         zone: args.some_text("zone")?,
         re: args.some_text("re")?,
         key: args.some_text("key")?,
-        ttl_minutes: args.some_int("ttl")?,
+        ttl_minutes: args.optional_ttl()?,
     };
     let mut message = backend.send(agent, &request, crate::now_ms())?;
     message.body = escape_bidi_controls(&message.body);

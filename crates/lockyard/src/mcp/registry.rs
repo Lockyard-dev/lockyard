@@ -9,6 +9,13 @@ pub(super) fn tool_def(
     required: &[&str],
 ) -> Value {
     let mut description = description.to_string();
+    if let Some(ttl) = properties.get_mut("ttl") {
+        ttl["minimum"] = json!(1);
+        ttl["maximum"] = json!(240);
+        if ttl.get("description").is_none() {
+            ttl["description"] = json!("Integer minutes (1-240).");
+        }
+    }
     if let Some(shared) = properties.get_mut("shared") {
         shared["description"] = json!(
             "Omit for the server default (soft_zones_v1: shared file/folder claims, exclusive hosts; older servers: exclusive). true allows overlapping shared claims; dirty files remain exclusive. false reserves paths exclusively for migrations, contracts or hosts. Use shared:false in MCP or --exclusive in CLI."
@@ -111,7 +118,7 @@ impl ToolRegistry {
             tool_def(
                 "tasks",
                 "Compact registry workflow: list, show, claim, submit, accept, reject, block, unblock, or cancel tasks.",
-                json!({"action": text, "id": task_identifier, "area": text, "prefix": text, "evidence": text, "reason": text, "note": text, "status": text}),
+                json!({"action": text, "id": task_identifier, "area": text, "prefix": text, "evidence": text, "reason": text, "note": text, "status": text, "ttl": {"type":"integer","description":"Lease in integer minutes (1-240) for the claim action."}}),
                 &["action"],
             ),
             tool_def(
@@ -164,13 +171,11 @@ impl ToolRegistry {
             for alias in ["ttl_minutes", "ttl_seconds", "duration"] {
                 if args.get(alias).is_some() {
                     return Err(Error::Invalid(format!(
-                        "unknown field {alias}; use ttl, an integer number of minutes"
+                        "unknown field {alias}; use ttl, an integer number of minutes (1-240)"
                     )));
                 }
             }
-            Args(args)
-                .some_int("ttl")
-                .map_err(|_| wrong_type("ttl", "an integer number of minutes"))?;
+            Args(args).optional_ttl()?;
         }
         if !matches!(name, "update" | "start_work" | "zone_renew") {
             return Ok(());

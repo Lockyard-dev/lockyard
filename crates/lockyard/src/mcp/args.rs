@@ -116,11 +116,22 @@ impl<'a> Args<'a> {
             .transpose()
     }
 
+    pub(super) fn optional_ttl(self) -> Result<Option<i64>> {
+        self.get("ttl")
+            .map(|value| {
+                let ttl = value
+                    .as_i64()
+                    .ok_or_else(|| wrong_type("ttl", "an integer number of minutes (1-240)"))?;
+                if !(1..=240).contains(&ttl) {
+                    return Err(Error::Invalid("ttl must be 1 to 240 minutes".into()));
+                }
+                Ok(ttl)
+            })
+            .transpose()
+    }
+
     pub(super) fn ttl(self) -> Result<i64> {
-        self.get("ttl").map_or(Ok(DEFAULT_TTL_MINUTES), |_| {
-            self.int("ttl")
-                .map_err(|_| wrong_type("ttl", "an integer number of minutes (1-240)"))
-        })
+        Ok(self.optional_ttl()?.unwrap_or(DEFAULT_TTL_MINUTES))
     }
 
     pub(super) fn strings(self, key: &str) -> Result<Vec<String>> {
@@ -313,9 +324,6 @@ pub(super) fn claim_paths(
 
 pub(super) fn claim_request(opened: &Opened, args: Args<'_>, cwd: &Path) -> Result<ClaimRequest> {
     let ttl = args.ttl()?;
-    if !(1..=240).contains(&ttl) {
-        return Err(Error::Invalid("ttl must be 1 to 240 minutes".into()));
-    }
     let (paths, zones) = claim_paths(opened, args, cwd)?;
     // Session label lives in claim meta when the backend stores it (cloud). Local SQLite
     // refuses meta — neighbours still see the agent id from the claim session field.

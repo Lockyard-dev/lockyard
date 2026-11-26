@@ -5094,7 +5094,7 @@ fn required_agent_named_catalog_preserves_strict_expansion_errors() {
 }
 
 #[test]
-fn offline_started_agent_catalog_put_works_after_cloud_key_create() {
+fn offline_started_agent_catalog_put_and_get_work_after_cloud_key_create() {
     use lockyard_cloud_client::{Call, ipc_credential_proof};
     use std::os::unix::net::UnixStream;
 
@@ -5152,6 +5152,34 @@ fn offline_started_agent_catalog_put_works_after_cloud_key_create() {
             .unwrap()
             .starts_with("lyenc1.")
     );
+    let read = cli(dir.path(), runtime.path(), &["--json", "zone", "catalog"]);
+    assert!(
+        read.status.success(),
+        "offline-started agent catalog read failed: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let catalog = json_of(&read);
+    assert_eq!(catalog["zones"]["private-zone"], json!(["src"]));
+}
+
+#[test]
+fn offline_started_agent_expands_encrypted_zones_on_its_first_catalog_read() {
+    let server = Server::start();
+    server.state.lock().unwrap().api_offline = true;
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let _agent = start_agent_until(dir.path(), runtime.path(), false);
+    required_catalog_fixture(&server, dir.path(), runtime.path());
+    server.state.lock().unwrap().api_offline = false;
+
+    let claimed = cli(
+        dir.path(),
+        runtime.path(),
+        &["--json", "zone", "claim", "--zone", "code"],
+    );
+    let claim = json_of(&claimed);
+    assert!(claim["paths"].as_array().unwrap().contains(&json!("src")));
+    assert_eq!(server.seen("GET", "/api/v1/zones/catalog").len(), 1);
 }
 
 #[test]

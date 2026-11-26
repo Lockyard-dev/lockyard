@@ -7,10 +7,10 @@ All notable changes to Lockyard are recorded here. The format follows
 
 ## [0.3.20] - 2026-11-26
 
-- Keep pending HTTP replays within the original call deadline after waiting for the journal (LY-0057).
-- Let an offline-started agent publish a catalog using live workspace settings and a newly created or imported key (LY-0058).
-- Release the shared write journal during Retry-After backoff while keeping the operation key reserved (LY-0059).
-- Reject incorrect TTL field names on MCP tools that accept `ttl` and explain that the value is in minutes (LY-0060).
+- Keep pending HTTP replay and admission-time reconciliation within the original call deadline (LY-0057).
+- Let an offline-started agent read and publish encrypted catalogs using live workspace settings and a newly created or imported key (LY-0058).
+- Release the shared write journal during HTTP requests, protocol discovery and retry backoff while keeping the operation key reserved (LY-0059).
+- Reject incorrect MCP TTL field names, validate 1–240 minutes, and forward the requested TTL to task and zone claims in `start_work` (LY-0060).
 
 - Use Unicode D145 canonical caseless matching via `caseless` for case-insensitive zone and gitlink
   comparisons. This fixes Greek path aliases behind uninitialised submodules (LOCAL-0100).

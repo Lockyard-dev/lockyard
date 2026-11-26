@@ -40,10 +40,17 @@ pub(super) fn run_composite_steps(
     match name {
         "start_work" => {
             let paths = args.strings("paths")?;
+            let zones = args.strings("zones")?;
+            let ttl = args.optional_ttl()?;
             let hold_reason = args.some_text("hold_reason")?;
             let hold_until = args.some_text("hold_until")?;
             lockyard_core::validate_hold(hold_reason.as_deref(), hold_until.as_deref())?;
             if let Some(id) = args.some_int("handover_id")? {
+                if ttl.is_some() {
+                    return Err(Error::Invalid(
+                        "an accepted handover keeps its lease; use zone_renew to change ttl".into(),
+                    ));
+                }
                 if hold_reason.is_some() {
                     return Err(Error::Invalid(
                         "a hold needs paths or zones; renew an accepted handover with zone_renew"
@@ -54,15 +61,18 @@ pub(super) fn run_composite_steps(
             }
             // Reject malformed task arguments before creating any lease.
             let task = args.some_task_id("task")?;
-            if args.get("task").is_some() && paths.is_empty() && args.strings("zones")?.is_empty() {
+            if let Some(id) = &task
+                && paths.is_empty()
+                && zones.is_empty()
+            {
                 if hold_reason.is_some() {
                     return Err(Error::Invalid("a hold needs a path or zone claim".into()));
                 }
                 // A registry task claim does not need a path claim.
-                let id = task.expect("checked above");
-                return Ok(json!({"task": step("task_claim", json!({"id": id}), after)?}));
+                return Ok(
+                    json!({"task": step("task_claim", json!({"id": id, "ttl": ttl}), after)?}),
+                );
             }
-            let zones = args.strings("zones")?;
             if paths.is_empty() && zones.is_empty() {
                 return Err(Error::Invalid(
                     "start_work needs paths or zones (or handover_id to accept an offer)".into(),
@@ -71,7 +81,7 @@ pub(super) fn run_composite_steps(
             let mut arguments = json!({
                 "paths": paths,
                 "note": args.optional_text("note")?,
-                "ttl": args.get("ttl").cloned(),
+                "ttl": ttl,
                 "zones": zones,
                 "meta": args.get("meta").cloned(),
             });
@@ -129,7 +139,7 @@ pub(super) fn run_composite_steps(
                 }
             }
             if let Some(id) = task {
-                match step("task_claim", json!({"id": id}), after) {
+                match step("task_claim", json!({"id": id, "ttl": ttl}), after) {
                     Ok(task) => answer["task"] = task,
                     Err(failure) => {
                         if let Some((id, fence)) = rollback {

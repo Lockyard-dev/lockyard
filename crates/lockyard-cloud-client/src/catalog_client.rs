@@ -59,17 +59,12 @@ impl Client {
             return Err(local("catalog_invalid"));
         }
         let value = crate::Transport::call(self, call)?;
-        if self.encryption_enabled
-            || self.expected_e2ee_workspace.is_some()
-            || value.get("format").is_some()
-        {
-            let workspace = self
+        if value.get("format").is_some() {
+            let encryption = self.current_content_encryption()?;
+            let (workspace, key) = encryption
                 .workspace
                 .as_deref()
-                .ok_or_else(|| local("catalog_key_unavailable"))?;
-            let held = self.resolved_content_key()?;
-            let key = held
-                .as_ref()
+                .zip(encryption.key.as_ref())
                 .ok_or_else(|| local("catalog_key_unavailable"))?;
             let repository = call.repository.as_deref().unwrap_or_default();
             return self
@@ -156,12 +151,13 @@ impl Client {
         value: &mut Value,
         workspace: Option<&str>,
         key: Option<&WorkspaceKey>,
+        encryption_enabled: bool,
     ) -> Result<(), ClientError> {
         if !catalog_call(call) {
             return Ok(());
         }
         if value.get("format").is_none()
-            && !self.encryption_enabled
+            && !encryption_enabled
             && self.expected_e2ee_workspace.is_none()
             && call.method == "GET"
         {
@@ -188,16 +184,15 @@ impl Client {
         if !catalog_call(call) || call.method != "GET" {
             return Ok(None);
         }
-        let held = self.resolved_content_key()?;
-        if held.is_none() && self.expected_e2ee_workspace.is_none() && !self.encryption_enabled {
+        let encryption = self.current_content_encryption()?;
+        if encryption.key.is_none() && self.expected_e2ee_workspace.is_none() && !encryption.enabled
+        {
             return Ok(None);
         }
-        let workspace = self
+        let (workspace, key) = encryption
             .workspace
             .as_deref()
-            .ok_or_else(|| local("catalog_key_unavailable"))?;
-        let key = held
-            .as_ref()
+            .zip(encryption.key.as_ref())
             .ok_or_else(|| local("catalog_key_unavailable"))?;
         let repository = call.repository.as_deref().unwrap_or_default();
         self.catalog_store(workspace, repository)?
