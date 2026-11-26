@@ -374,18 +374,17 @@ impl View {
 }
 
 fn covers(claim: &Claim, path: &ZonePath) -> bool {
-    let fold = claim
+    let fold_case = claim
         .case_insensitive_paths
         .unwrap_or(cfg!(any(target_os = "macos", windows)));
-    let inside = |list: &[String]| {
-        list.iter()
-            .any(|held| ZonePath::stored(held.clone()).overlaps_with_case(path, fold))
-    };
-    let excluded = claim.excluded_paths.iter().any(|gap| {
-        let gap = ZonePath::stored(gap.clone());
-        gap.overlaps_with_case(path, fold) && gap.as_str().len() <= path.as_str().len()
-    });
-    inside(&claim.paths) && !excluded
+    claim
+        .paths
+        .iter()
+        .any(|held| ZonePath::stored(held.clone()).overlaps_with_case(path, fold_case))
+        && !claim
+            .excluded_paths
+            .iter()
+            .any(|gap| ZonePath::stored(gap.clone()).contains_with_case(path, fold_case))
 }
 
 #[derive(Default)]
@@ -5063,6 +5062,27 @@ mod tests {
             CheckStatus::Held,
             "no shared claim of mine covers it"
         );
+    }
+
+    #[test]
+    fn cache_recognizes_a_decomposed_exclusion_for_a_composed_path() {
+        let view = View {
+            claims: vec![
+                serde_json::from_value(json!({
+                    "id": 1,
+                    "session": "bob",
+                    "paths": ["src"],
+                    "excluded_paths": ["src/cafe\u{0301}"],
+                    "case_insensitive_paths": false,
+                }))
+                .unwrap(),
+            ],
+            ..View::default()
+        };
+        let status = |path: &str| view.check_path("alice", path).status;
+        assert_eq!(status("src/café"), CheckStatus::Free);
+        assert_eq!(status("src/café/file"), CheckStatus::Free);
+        assert_eq!(status("src"), CheckStatus::Held);
     }
 
     #[test]

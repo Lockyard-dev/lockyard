@@ -312,12 +312,15 @@ fn inspect(
 }
 
 fn covers(claim: &lockyard_core::proto::Claim, path: &ZonePath) -> bool {
-    let overlaps = |held: &String| ZonePath::stored(held.clone()).overlaps(path);
-    let excluded = claim.excluded_paths.iter().any(|gap| {
-        let gap = ZonePath::stored(gap.clone());
-        gap.overlaps(path) && gap.as_str().len() <= path.as_str().len()
-    });
-    claim.paths.iter().any(overlaps) && !excluded
+    let fold_case = claim.case_insensitive_paths.unwrap_or(true);
+    claim
+        .paths
+        .iter()
+        .any(|held| ZonePath::stored(held.clone()).overlaps_with_case(path, fold_case))
+        && !claim
+            .excluded_paths
+            .iter()
+            .any(|gap| ZonePath::stored(gap.clone()).contains_with_case(path, fold_case))
 }
 
 /// The fallback for dropped events: files under a claim modified since the claim began.
@@ -678,6 +681,38 @@ mod tests {
         claim.excluded_paths = vec!["src/a.rs".into()];
         assert!(!covers(&claim, &ZonePath::stored("src/a.rs".into())));
         assert!(covers(&claim, &ZonePath::stored("src/b.rs".into())));
+    }
+
+    #[test]
+    fn monitor_uses_case_policy_for_unicode_exclusions() {
+        let mut claim: lockyard_core::proto::Claim = serde_json::from_value(json!({
+            "id": 1,
+            "paths": ["src"],
+            "excluded_paths": ["src/ſ"],
+            "case_insensitive_paths": true,
+        }))
+        .unwrap();
+        let path = ZonePath::stored("src/s".into());
+        assert!(!covers(&claim, &path), "D145 matches the exclusion");
+        claim.case_insensitive_paths = Some(false);
+        assert!(
+            covers(&claim, &path),
+            "case-sensitive exclusion is distinct"
+        );
+    }
+
+    #[test]
+    fn monitor_uses_case_policy_for_held_paths() {
+        let mut claim: lockyard_core::proto::Claim = serde_json::from_value(json!({
+            "id": 1,
+            "paths": ["src/ſ"],
+            "case_insensitive_paths": false,
+        }))
+        .unwrap();
+        let path = ZonePath::stored("src/s".into());
+        assert!(!covers(&claim, &path), "case-sensitive claim is distinct");
+        claim.case_insensitive_paths = Some(true);
+        assert!(covers(&claim, &path), "D145 matches the held path");
     }
 
     #[test]

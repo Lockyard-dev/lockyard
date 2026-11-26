@@ -10,6 +10,8 @@ All notable changes to Lockyard are recorded here. The format follows
 - Use Unicode D145 canonical caseless matching via `caseless` for case-insensitive zone and gitlink
   comparisons. This fixes Greek path aliases behind uninitialised submodules (LOCAL-0100).
   The server is moving to the same rule under LOCAL-0105.
+- Respect the claim's path case policy in the monitor and honor Unicode-equivalent exclusions in
+  the monitor and agent daemon (LOCAL-0100).
 
 ## [0.3.19] - 2026-11-26
 
