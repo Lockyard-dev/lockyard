@@ -21,7 +21,7 @@ use lockyard_core::proto::{DirtyPath, InboxQuery, Message, SendRequest};
 use lockyard_core::watch::{Backend as WatchBackend, Tick, Watcher};
 use lockyard_core::{Backend, Error, Result, Store, ZonePath, outside, watch};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -40,7 +40,7 @@ pub struct Settings {
     pub reconcile: Duration,
     pub mail: bool,
     pub zones: bool,
-    /// Stop as soon as anything has been reported.
+    /// Stop after the first mail or unannounced write.
     pub once: bool,
     /// Stop after this long, whatever happened.
     pub timeout: Option<Duration>,
@@ -56,6 +56,7 @@ pub struct Summary {
     pub unannounced: usize,
     pub rounds: usize,
     pub backend: Option<&'static str>,
+    pub rescan_incomplete: bool,
 }
 
 /// Everything the monitor needs from the outside world, so a test can supply it.
@@ -122,7 +123,9 @@ pub fn run(settings: &Settings, ports: &mut Ports<'_>, out: &mut dyn Write) -> R
         }
         if settings.zones {
             let paths = std::mem::take(&mut pending);
-            summary.unannounced += inspect(settings, ports, paths, reconcile, now, out)?;
+            let inspection = inspect(settings, ports, paths, reconcile, now, out)?;
+            summary.unannounced += inspection.unannounced;
+            summary.rescan_incomplete |= inspection.rescan_incomplete;
         }
         if reconcile {
             let _ = outside::compact(&settings.root, now - outside::ANNOUNCE_WINDOW_MS);
@@ -220,6 +223,12 @@ fn deliver(
     Ok(shown.len())
 }
 
+#[derive(Default)]
+struct Inspection {
+    unannounced: usize,
+    rescan_incomplete: bool,
+}
+
 /// Judges changed paths against the claims, and reports the ones nobody announced.
 fn inspect(
     settings: &Settings,
@@ -228,41 +237,51 @@ fn inspect(
     reconcile: bool,
     now: i64,
     out: &mut dyn Write,
-) -> Result<usize> {
+) -> Result<Inspection> {
     let claims = ports
         .backend
         .claims(&lockyard_core::proto::ClaimQuery::default(), now)?;
     if claims.is_empty() {
-        return Ok(0);
+        return Ok(Inspection::default());
     }
-    let (rescanned, aliases_truncated) = if reconcile {
+    let scan = if reconcile {
         // The file system may have dropped events, so check modification times too.
         rescan(&settings.root, &claims, now)
     } else {
-        (Vec::new(), false)
+        ScanResult::default()
     };
-    if aliases_truncated {
-        let message = "monitor rescan exhausted the Unicode alias lookup budget; some equivalent paths may have been skipped";
+    let mut inspection = Inspection {
+        rescan_incomplete: !scan.incomplete.is_empty(),
+        ..Inspection::default()
+    };
+    let limits = [
+        (ScanLimits::ALIASES, "Unicode alias lookup budget"),
+        (ScanLimits::ENTRIES, "directory entry budget"),
+        (ScanLimits::DEPTH, "directory depth limit"),
+    ];
+    for (limit, label) in limits {
+        if !scan.incomplete.iter().any(|zone| zone.limits & limit != 0) {
+            continue;
+        }
+        let message = format!("monitor rescan coverage is incomplete after reaching the {label}");
+        eprintln!("warning: {message}");
         if settings.json {
             writeln!(out, "{}", json!({"event": "warning", "message": message}))?;
-        } else {
-            writeln!(out, "! {message}")?;
         }
-        out.flush()?;
     }
     let mut paths: Vec<_> = changed
         .into_iter()
-        .chain(rescanned)
+        .chain(scan.paths)
         .map(|path| nfc_path(&path))
         .collect();
     paths.sort();
     paths.dedup();
-    if paths.is_empty() {
-        return Ok(0);
-    }
-    let announced = outside::announcements(&settings.root, now - outside::ANNOUNCE_WINDOW_MS)?;
+    let announced = if paths.is_empty() {
+        Vec::new()
+    } else {
+        outside::announcements(&settings.root, now - outside::ANNOUNCE_WINDOW_MS)?
+    };
     let mut dirty: HashMap<String, Vec<DirtyPath>> = HashMap::new();
-    let mut found = 0;
     for path in paths {
         let zone = ZonePath::stored(path.clone());
         let Some(claim) = claims.iter().find(|claim| claim.covers(&zone)) else {
@@ -281,7 +300,7 @@ fn inspect(
         if outside::was_announced(&announced, &path, now) {
             continue;
         }
-        found += 1;
+        inspection.unannounced += 1;
         let record = ports
             .store
             .record_unannounced(&path, &claim.session, claim.id, now)?;
@@ -315,44 +334,110 @@ fn inspect(
         }
     }
     out.flush()?;
-    for (session, paths) in dirty {
+    for (session, paths) in &dirty {
         // Local mode has no dirty tracking; the call says so and there is nothing to report.
-        if let Err(error) = ports.backend.dirty_report(&session, &paths)
+        if let Err(error) = ports.backend.dirty_report(session, paths)
             && !matches!(error, Error::NeedsCloud(_))
         {
             writeln!(out, "! could not report dirty paths: {error}")?;
         }
     }
-    Ok(found)
+    if ports.backend.is_cloud() {
+        let mut reported = HashSet::new();
+        for zone in scan.incomplete {
+            let session = &zone.claim.session;
+            let held = ZonePath::stored(nfc_path(zone.held));
+            if !zone.claim.covers(&held)
+                || dirty
+                    .get(session)
+                    .is_some_and(|paths| paths.iter().any(|path| path.path == held.as_str()))
+                || !reported.insert((session, held.as_str().to_owned()))
+            {
+                continue;
+            }
+            // This scope may contain writes the monitor could not see. Send it separately so
+            // a rejected scope cannot prevent confirmed writes from being reported.
+            let paths = [DirtyPath {
+                path: held.as_str().to_owned(),
+                owner_session: Some(session.clone()),
+                reason: Some(
+                    "possible unobserved writes during an incomplete monitor rescan".into(),
+                ),
+                task_id: None,
+            }];
+            if let Err(error) = ports.backend.dirty_report(session, &paths) {
+                eprintln!(
+                    "warning: could not report incomplete rescan for {}: {error}",
+                    held.as_str()
+                );
+            }
+        }
+    }
+    Ok(inspection)
 }
 
 /// The fallback for dropped events: recently modified files under the active claims.
-fn rescan(root: &Path, claims: &[lockyard_core::proto::Claim], now: i64) -> (Vec<String>, bool) {
+fn rescan<'a>(root: &Path, claims: &'a [lockyard_core::proto::Claim], now: i64) -> ScanResult<'a> {
     let since = now - i64::try_from(RESCAN_WINDOW.as_millis()).unwrap_or(i64::MAX);
     let mut scan = Rescan {
         root,
         since,
-        remaining: RESCAN_ENTRIES,
+        remaining: 0,
         alias_remaining: RESCAN_ALIAS_ENTRIES,
-        aliases_truncated: false,
+        limits: 0,
         alias_listings: HashMap::new(),
         found: Vec::new(),
     };
-    'claims: for claim in claims {
-        for held in &claim.paths {
-            if scan.remaining == 0 {
-                break 'claims;
-            }
-            scan.remaining -= 1;
-            if held != "." {
-                let components: Vec<_> = held.split('/').collect();
-                scan.walk_aliases(root, &components, claim.folds_path_case());
-            } else {
-                scan.walk(&root.join(held), 0);
-            }
+    let mut result = ScanResult::default();
+    let mut zones_left: usize = claims.iter().map(|claim| claim.paths.len()).sum();
+    let mut remaining = RESCAN_ENTRIES;
+    for (claim, held) in claims
+        .iter()
+        .flat_map(|claim| claim.paths.iter().map(move |held| (claim, held)))
+    {
+        // Reserve an equal share for later zones, passing unused entries forward. Resolve
+        // every zone root even if there are more zones than directory entries in the budget.
+        let budget = remaining.div_ceil(zones_left);
+        zones_left -= 1;
+        scan.remaining = budget;
+        scan.limits = 0;
+        if held == "." {
+            scan.walk(root, 0);
+        } else {
+            let components: Vec<_> = held.split('/').collect();
+            scan.walk_aliases(root, &components, claim.folds_path_case());
+        }
+        remaining -= budget - scan.remaining;
+        if scan.limits != 0 {
+            result.incomplete.push(IncompleteZone {
+                claim,
+                held,
+                limits: scan.limits,
+            });
         }
     }
-    (scan.found, scan.aliases_truncated)
+    result.paths = scan.found;
+    result
+}
+
+#[derive(Default)]
+struct ScanResult<'a> {
+    paths: Vec<String>,
+    incomplete: Vec<IncompleteZone<'a>>,
+}
+
+struct IncompleteZone<'a> {
+    claim: &'a lockyard_core::proto::Claim,
+    held: &'a str,
+    limits: u8,
+}
+
+struct ScanLimits;
+
+impl ScanLimits {
+    const ENTRIES: u8 = 1;
+    const ALIASES: u8 = 2;
+    const DEPTH: u8 = 4;
 }
 
 /// How far back a rescan looks. Longer than the reconcile interval, so nothing falls between rounds.
@@ -376,10 +461,6 @@ impl AliasDirectory {
         let mut listing = Self::default();
         // Do not follow an intermediate symlink while resolving aliases.
         if !at.symlink_metadata().is_ok_and(|data| data.is_dir()) {
-            return listing;
-        }
-        if *remaining == 0 {
-            listing.truncated = true;
             return listing;
         }
         let Ok(entries) = std::fs::read_dir(at) else {
@@ -415,7 +496,7 @@ struct Rescan<'a> {
     since: i64,
     remaining: usize,
     alias_remaining: usize,
-    aliases_truncated: bool,
+    limits: u8,
     // Share each physical parent listing across both comparison policies.
     alias_listings: HashMap<PathBuf, AliasDirectory>,
     found: Vec<String>,
@@ -442,7 +523,7 @@ impl Rescan<'_> {
         .cloned()
         .unwrap_or_default();
         if listing.truncated {
-            self.aliases_truncated = true;
+            self.limits |= ScanLimits::ALIASES;
             // Keep walking the literal spelling even when enumerating aliases is capped.
             let literal = at.join(component);
             if Path::new(component)
@@ -466,14 +547,16 @@ impl Rescan<'_> {
             return;
         };
         if data.is_dir() {
-            if depth == RESCAN_DEPTH || self.remaining == 0 {
-                return;
-            }
             let Ok(entries) = std::fs::read_dir(at) else {
                 return;
             };
             for entry in entries {
+                if depth == RESCAN_DEPTH {
+                    self.limits |= ScanLimits::DEPTH;
+                    break;
+                }
                 if self.remaining == 0 {
+                    self.limits |= ScanLimits::ENTRIES;
                     break;
                 }
                 self.remaining -= 1;
@@ -628,7 +711,7 @@ mod tests {
             &mut out,
         )
         .unwrap();
-        assert_eq!(found, 1);
+        assert_eq!(found.unannounced, 1);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("src/surprise.rs"), "{text}");
         assert!(!text.contains("src/known.rs"), "{text}");
@@ -703,7 +786,7 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(found, 0);
+        assert_eq!(found.unannounced, 0);
         assert!(project.store().unannounced(0).unwrap().is_empty());
     }
 
@@ -742,10 +825,131 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(found, 1);
+        assert_eq!(found.unannounced, 1);
+        assert!(!found.rescan_incomplete);
         assert_eq!(
             project.store().unannounced(0).unwrap()[0].path,
             "src/late.rs"
+        );
+    }
+
+    #[test]
+    fn local_0100_r8_rescan_finds_late_zone_after_large_stale_zone() {
+        let project = Project::new();
+        let root = project.root();
+        let stale = root.join("aaa-stale");
+        std::fs::create_dir(&stale).unwrap();
+        let times = std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH);
+        for index in 0..=RESCAN_ENTRIES {
+            std::fs::File::create(stale.join(format!("{index}.rs")))
+                .unwrap()
+                .set_times(times)
+                .unwrap();
+        }
+        std::fs::create_dir(root.join("zzz-live")).unwrap();
+        std::fs::write(root.join("zzz-live/changed.rs"), "changed").unwrap();
+        let now = crate::now_ms();
+        let mut backend = project.store();
+        Backend::touch_agent(&mut backend, "alice", now).unwrap();
+        backend
+            .claim(
+                "alice",
+                &[
+                    ZonePath::stored("aaa-stale".into()),
+                    ZonePath::stored("zzz-live".into()),
+                ],
+                "",
+                30,
+                now,
+            )
+            .unwrap();
+        let mut ports = Ports {
+            backend: &mut backend,
+            store: project.store(),
+            now: &now_is(now),
+        };
+        let mut out = Vec::new();
+        let mut settings = settings(&root, "alice");
+        settings.mail = false;
+        settings.json = true;
+        let _guard = lockyard_core::test_env_lock();
+        unsafe { std::env::set_var("LOCKYARD_WATCH", "off") };
+        let summary = run(&settings, &mut ports, &mut out);
+        unsafe { std::env::remove_var("LOCKYARD_WATCH") };
+        let summary = summary.unwrap();
+        assert_eq!(
+            summary.unannounced, 1,
+            "the large stale zone must not starve zzz-live/changed.rs"
+        );
+        assert!(summary.rescan_incomplete);
+        assert_eq!(
+            ports.store.unannounced(0).unwrap()[0].path,
+            "zzz-live/changed.rs"
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("directory entry budget"), "{out}");
+    }
+
+    #[test]
+    fn an_incomplete_cloud_rescan_reports_the_unchecked_scope_separately() {
+        use lockyard_cloud_client::{Call, ClientError, CloudBackend, Transport};
+        use serde_json::Value;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RecordingCloud(Mutex<Vec<Value>>);
+
+        impl Transport for &RecordingCloud {
+            fn call(&self, call: &Call) -> std::result::Result<Value, ClientError> {
+                match call.path.as_str() {
+                    "/api/v1/zones/claims" => Ok(json!([
+                        {"id": 1, "session": "alice", "paths": ["src", "live"]}
+                    ])),
+                    "/api/v1/zones/dirty" => {
+                        assert_eq!(call.session, "alice");
+                        self.0.lock().unwrap().push(call.body.clone().unwrap());
+                        Ok(json!({"stored": 1}))
+                    }
+                    path => panic!("unexpected cloud call: {path}"),
+                }
+            }
+        }
+
+        let project = Project::new();
+        let root = project.root();
+        let mut deep = root.join("src");
+        for _ in 0..RESCAN_DEPTH {
+            deep.push("nested");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("unchecked.rs"), "possibly changed").unwrap();
+        std::fs::create_dir(root.join("live")).unwrap();
+        std::fs::write(root.join("live/checked.rs"), "changed").unwrap();
+        let cloud = RecordingCloud::default();
+        let mut backend = CloudBackend::new(&cloud, "alice");
+        let mut ports = Ports {
+            backend: &mut backend,
+            store: project.store(),
+            now: &now_is(1),
+        };
+        let mut settings = settings(&root, "alice");
+        settings.json = true;
+        let mut out = Vec::new();
+        let inspection = inspect(&settings, &mut ports, Vec::new(), true, 1, &mut out).unwrap();
+        assert_eq!(inspection.unannounced, 1);
+        assert!(inspection.rescan_incomplete);
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("directory depth limit")
+        );
+        let reports = cloud.0.lock().unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0]["paths"][0]["path"], "live/checked.rs");
+        assert_eq!(reports[1]["paths"][0]["path"], "src");
+        assert_eq!(
+            reports[1]["paths"][0]["reason"],
+            "possible unobserved writes during an incomplete monitor rescan"
         );
     }
 
@@ -767,21 +971,21 @@ mod tests {
             "id": 1, "paths": ["src/straße"], "case_insensitive_paths": true
         }))
         .unwrap();
-        let (mut found, truncated) = rescan(root, std::slice::from_ref(&claim), 0);
-        assert!(!truncated);
-        found.sort();
+        let mut scan = rescan(root, std::slice::from_ref(&claim), 0);
+        assert!(scan.incomplete.is_empty());
+        scan.paths.sort();
         let other = if distinct {
             "src/straße/other.rs"
         } else {
             "src/STRASSE/other.rs"
         };
-        assert_eq!(found, ["src/STRASSE/file.rs", other]);
+        assert_eq!(scan.paths, ["src/STRASSE/file.rs", other]);
         if distinct {
             claim.case_insensitive_paths = Some(false);
-            assert_eq!(
-                rescan(root, &[claim], 0),
-                (vec!["src/straße/other.rs".into()], false)
-            );
+            let claims = [claim];
+            let scan = rescan(root, &claims, 0);
+            assert_eq!(scan.paths, ["src/straße/other.rs"]);
+            assert!(scan.incomplete.is_empty());
         }
     }
 
@@ -806,10 +1010,10 @@ mod tests {
             "id": 1, "paths": [format!("src/{held}")], "case_insensitive_paths": false
         }))
         .unwrap();
-        assert_eq!(
-            rescan(root, &[claim], 0),
-            (vec![format!("src/{on_disk}/changed.rs")], false)
-        );
+        let claims = [claim];
+        let scan = rescan(root, &claims, 0);
+        assert_eq!(scan.paths, [format!("src/{on_disk}/changed.rs")]);
+        assert!(scan.incomplete.is_empty());
     }
 
     #[test]
@@ -874,13 +1078,13 @@ mod tests {
             since: 0,
             remaining: 1,
             alias_remaining: 0,
-            aliases_truncated: false,
+            limits: 0,
             alias_listings: HashMap::new(),
             found: Vec::new(),
         };
         scan.walk_aliases(root, &["missing"], true);
         scan.walk_aliases(root, &["src"], false);
-        assert!(scan.aliases_truncated);
+        assert_eq!(scan.limits, ScanLimits::ALIASES);
         assert_eq!(
             scan.alias_listings.len(),
             1,
@@ -916,7 +1120,10 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(found, 0, "the NFC announcement covers the rescanned file");
+        assert_eq!(
+            found.unannounced, 0,
+            "the NFC announcement covers the rescanned file"
+        );
     }
 
     #[test]
@@ -1029,7 +1236,7 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(found, 0);
+        assert_eq!(found.unannounced, 0);
     }
 
     /// Send → visible under the event watcher. Records the number so RESULT.md can cite it.

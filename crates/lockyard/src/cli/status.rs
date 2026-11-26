@@ -380,11 +380,16 @@ pub(super) fn run_monitor(
         String::new()
     } else {
         format!(
-            "monitor stopped: {} mail, {} outside writes, {} rounds ({})",
+            "monitor stopped: {} mail, {} outside writes, {} rounds ({}){}",
             summary.delivered,
             summary.unannounced,
             summary.rounds,
-            summary.backend.unwrap_or("off")
+            summary.backend.unwrap_or("off"),
+            if summary.rescan_incomplete {
+                ", rescan incomplete"
+            } else {
+                ""
+            },
         )
     };
     output(
@@ -393,6 +398,7 @@ pub(super) fn run_monitor(
             "unannounced": summary.unannounced,
             "rounds": summary.rounds,
             "backend": summary.backend,
+            "rescan_incomplete": summary.rescan_incomplete,
         }),
         text,
     )

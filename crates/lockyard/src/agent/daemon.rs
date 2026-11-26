@@ -20,6 +20,7 @@ use super::wire::{AgentStatus, CredentialProof, Envelope, Phase, Reply, Request,
 use lockyard_cloud_client::{
     Call, Cancellation, ClientError, CloudBackend, RepositoryTransport, Transport, ulid,
 };
+use lockyard_core::paths::nfc_path;
 use lockyard_core::proto::{
     AccessRecord, ActivityRequest, BoardEntry, CheckStatus, Claim, ClaimMode, ClaimQuery,
     DirtyPath, EventPage, EventQuery, InboxQuery, LostClaim, Message, PathCheck, PresenceBeat,
@@ -1613,6 +1614,8 @@ impl<T: Transport + 'static> Shared<T> {
 
     /// Collects written paths per claim. [`Shared::flush_activity`] sends them, spaced per claim.
     fn note_writes(&self, session: &str, paths: Vec<String>) {
+        // Wire clients can supply NFD. Keep the case of the actual write in both reports.
+        let paths: Vec<_> = paths.into_iter().map(|path| nfc_path(&path)).collect();
         let matches: Vec<(i64, String)> = {
             let view = self.read_view();
             let own = view.claims.iter().filter(|claim| claim.session == session);
@@ -6612,11 +6615,17 @@ mod tests {
             phase: Phase::Post,
             write_paths: vec![path.into()],
         };
-        for path in ["src/a", "src/b", "src/c", "elsewhere"] {
+        for path in [
+            "src/cafe\u{301}",
+            "src/café",
+            "src/straße",
+            "src/STRASSE",
+            "elsewhere",
+        ] {
             rig.daemon.handle(write(path));
         }
         for _ in 0..10 {
-            rig.daemon.handle(write("src/a"));
+            rig.daemon.handle(write("src/cafe\u{301}"));
         }
         wait_for("dirty path reporting", || {
             rig.server.writes_to("/zones/dirty").len() >= 3
@@ -6627,7 +6636,18 @@ mod tests {
             3,
             "unclaimed and repeated paths are not reported twice"
         );
-        assert_eq!(dirty[0].body.as_ref().unwrap()["paths"][0]["path"], "src/a");
+        assert_eq!(
+            dirty[0].body.as_ref().unwrap()["paths"][0]["path"],
+            "src/café"
+        );
+        assert_eq!(
+            dirty[1].body.as_ref().unwrap()["paths"][0]["path"],
+            "src/straße"
+        );
+        assert_eq!(
+            dirty[2].body.as_ref().unwrap()["paths"][0]["path"],
+            "src/STRASSE"
+        );
         assert_eq!(
             dirty[0].body.as_ref().unwrap()["paths"][0]["owner_session"],
             "me"
@@ -6649,21 +6669,24 @@ mod tests {
         };
         wait_for("the later batches", || {
             rig.server.writes_to("/activity").len() >= 2
-                && later().contains("src/b")
-                && later().contains("src/c")
+                && later().contains("src/straße")
+                && later().contains("src/STRASSE")
         });
         let batches = rig.server.writes_to("/activity");
-        assert_eq!(batches[0].body.as_ref().unwrap()["paths"], json!(["src/a"]));
+        assert_eq!(
+            batches[0].body.as_ref().unwrap()["paths"],
+            json!(["src/café"])
+        );
         assert_eq!(batches.len(), 2, "pending writes form one later batch");
         let mut paths: Vec<String> =
             serde_json::from_value(batches[1].body.as_ref().unwrap()["paths"].clone()).unwrap();
         paths.sort();
-        assert_eq!(paths, ["src/a", "src/b", "src/c"]);
+        assert_eq!(paths, ["src/STRASSE", "src/café", "src/straße"]);
         assert!(batches.iter().all(|batch| batch.session == "me"));
         assert!(!later().contains("elsewhere"), "{}", later());
-        // Activity keeps counting repeated writes of src/a, which only the dirty report folds.
+        // Activity records the next batch even when the dirty path was already reported.
         let before = batches.len();
-        rig.daemon.handle(write("src/a"));
+        rig.daemon.handle(write("src/cafe\u{301}"));
         flush_due();
         wait_for("the next activity batch", || {
             rig.server.writes_to("/activity").len() == before + 1
@@ -6674,7 +6697,7 @@ mod tests {
                 .body
                 .as_ref()
                 .unwrap()["paths"],
-            json!(["src/a"])
+            json!(["src/café"])
         );
     }
 

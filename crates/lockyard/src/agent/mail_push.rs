@@ -13,7 +13,7 @@ pub(super) struct PushState {
     status_claims: HashMap<(String, Option<String>), HashSet<i64>>,
     local_zone_mutations: HashMap<(String, i64), Vec<LocalZoneMutation>>,
     next_zone_mutation: u64,
-    // Pending acquisitions still need the case policy or a successful /lost snapshot.
+    // Pending acquisitions still need coverage, the case policy or a successful /lost snapshot.
     seen_claims: HashMap<String, HashMap<i64, Option<Acquisition>>>,
     // Receipt times control alert expiry independently of loss ordering.
     zone_alert_times: HashMap<(String, i64), Instant>,
@@ -49,29 +49,41 @@ impl PushState {
         id: i64,
         fold_case: Option<bool>,
         acquired_at: Option<i64>,
+        coverage_known: bool,
         wait_for_lost: bool,
     ) -> Option<Acquisition> {
         let acquisition = Acquisition {
             observed_at: self.now(),
             acquired_at: acquired_at.unwrap_or_else(now_ms),
+            coverage_known,
             waiting_for_lost: wait_for_lost,
         };
         let seen = self.seen_claims.entry(session.into()).or_default();
         match seen.entry(id) {
             Entry::Vacant(entry) => {
-                entry.insert((fold_case.is_none() || wait_for_lost).then_some(acquisition));
-                Some(acquisition)
+                entry.insert(
+                    (!coverage_known || fold_case.is_none() || wait_for_lost)
+                        .then_some(acquisition),
+                );
+                coverage_known.then_some(acquisition)
             }
-            // Receiving the policy later keeps the original acquisition time.
+            // Completing the acquisition details keeps the original acquisition time.
             Entry::Occupied(mut entry) => {
                 let pending = entry.get_mut().as_mut()?;
                 pending.waiting_for_lost |= wait_for_lost;
+                if !coverage_known {
+                    return None;
+                }
+                let coverage_arrived = !pending.coverage_known;
+                pending.coverage_known = true;
                 if wait_for_lost {
                     Some(*pending)
-                } else if pending.waiting_for_lost || fold_case.is_none() {
+                } else if pending.waiting_for_lost {
                     None
-                } else {
+                } else if fold_case.is_some() {
                     entry.get_mut().take()
+                } else {
+                    coverage_arrived.then_some(*pending)
                 }
             }
         }
@@ -135,6 +147,7 @@ struct LocalZoneMutation {
 struct Acquisition {
     observed_at: Instant,
     acquired_at: i64,
+    coverage_known: bool,
     waiting_for_lost: bool,
 }
 
@@ -435,21 +448,27 @@ impl<T: Transport + 'static> Shared<T> {
                         .field("case_insensitive_paths")
                         .and_then(Value::as_bool);
                     let acquired_at = event_stamp(event).as_ref().and_then(stamp_millis);
-                    if let Some(acquisition) =
-                        push.record_acquisition(session, id, fold_case, acquired_at, false)
-                    {
-                        let read_paths = |key| {
-                            event
-                                .field(key)
-                                .cloned()
-                                .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
-                                .unwrap_or_default()
-                        };
+                    let read_paths = |key| {
+                        event
+                            .field(key)
+                            .cloned()
+                            .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+                    };
+                    let coverage = read_paths("paths").zip(read_paths("excluded_paths"));
+                    let acquisition = push.record_acquisition(
+                        session,
+                        id,
+                        fold_case,
+                        acquired_at,
+                        coverage.is_some(),
+                        false,
+                    );
+                    if let (Some(acquisition), Some((paths, excluded))) = (acquisition, coverage) {
                         push.clear_reclaimed_alerts(
                             session,
                             id,
-                            &read_paths("paths"),
-                            &read_paths("excluded_paths"),
+                            &paths,
+                            &excluded,
                             fold_case,
                             acquisition,
                         );
@@ -614,6 +633,7 @@ impl<T: Transport + 'static> Shared<T> {
                         claim.id,
                         claim.case_insensitive_paths,
                         acquired_at,
+                        true,
                         !missing.is_empty(),
                     )
                     .map(|acquisition| (claim, acquisition))
@@ -2798,11 +2818,58 @@ mod tests {
             claimed.payload["paths"] = json!([path]);
             if let Some(excluded) = excluded {
                 claimed.payload["excluded_paths"] = json!([excluded]);
+            } else {
+                claimed.payload["excluded_paths"] = json!([]);
             }
             claimed.payload["case_insensitive_paths"] = json!(true);
             shared.push_event(claimed);
             assert_eq!(shared.zone_alerts("alice").len(), remaining, "{path}");
         }
+    }
+
+    #[test]
+    fn local_0100_r8_sse_without_exclusions_preserves_loss() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let backend = lockyard_cloud_client::CloudBackend::new(
+            Client::new(&rig.server.url(), "test-token".into()).unwrap(),
+            "alice",
+        );
+        let mut lost = round4_zone(1, "zone.lost", 42, 2, None);
+        lost.payload["paths"] = json!(["src/private/file.rs"]);
+        shared.push_event(lost);
+        let mut claimed = round4_zone(2, "zone.claimed", 43, 3, None);
+        claimed.payload["reason"] = json!("claimed");
+        claimed.payload["paths"] = json!(["src"]);
+        claimed.payload["case_insensitive_paths"] = json!(false);
+        shared.push_event(claimed);
+        assert_eq!(
+            shared.zone_alerts("alice").len(),
+            1,
+            "SSE omitted excluded_paths"
+        );
+
+        let claim = serde_json::from_value(json!({
+            "id": 43, "session": "alice", "paths": ["src"],
+            "excluded_paths": ["src/private"], "case_insensitive_paths": false,
+        }))
+        .unwrap();
+        shared.observe_status_claims("alice", None, &[claim], &backend, Duration::ZERO);
+        let alerts = shared.zone_alerts("alice");
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].claim_id, 42);
+
+        let mut complete = round4_zone(3, "zone.claimed", 44, 4, None);
+        complete.payload["reason"] = json!("claimed");
+        complete.payload["case_insensitive_paths"] = json!(false);
+        shared.push_event(complete.clone());
+        assert_eq!(shared.zone_alerts("alice").len(), 1);
+        complete.seq += 1;
+        complete.payload["excluded_paths"] = json!([]);
+        shared.push_event(complete);
+        assert!(shared.zone_alerts("alice").is_empty());
     }
 
     #[test]
@@ -2996,6 +3063,7 @@ mod tests {
         let mut claimed = round4_zone(44, "zone.claimed", 44, 3, None);
         claimed.payload["reason"] = json!("claimed");
         claimed.payload["paths"] = json!([".lockyard-repository/api/src/STRASSE"]);
+        claimed.payload["excluded_paths"] = json!([]);
         claimed.payload["case_insensitive_paths"] = json!(true);
         shared.push_event(claimed);
         let alerts = shared.zone_alerts("alice");
@@ -3076,6 +3144,7 @@ mod tests {
             let mut claimed = round4_zone(seq, "zone.claimed", 42 + seq, 3, None);
             claimed.payload["reason"] = json!("claimed");
             claimed.payload["paths"] = json!(["src/s"]);
+            claimed.payload["excluded_paths"] = json!([]);
             if let Some(policy) = policy {
                 claimed.payload["case_insensitive_paths"] = json!(policy);
             }
@@ -3126,6 +3195,7 @@ mod tests {
         assert_eq!(shared.push.lock().unwrap().zone_alerts["alice"].len(), 1);
         let mut fresh = round4_zone(7, "zone.claimed", 44, 8, None);
         fresh.payload["reason"] = json!("claimed");
+        fresh.payload["excluded_paths"] = json!([]);
         shared.push_event(fresh);
         assert!(shared.take_zone_alerts("alice").is_empty());
     }
@@ -3423,6 +3493,7 @@ mod tests {
         shared.push_event(round4_zone(2, "zone.released", 43, 3, Some("bob")));
         let mut claimed = round4_zone(3, "zone.claimed", 44, 4, None);
         claimed.payload["reason"] = json!("claimed");
+        claimed.payload["excluded_paths"] = json!([]);
         shared.push_event(claimed);
         assert!(shared.take_zone_alerts("alice").is_empty());
         assert!(
@@ -3445,6 +3516,7 @@ mod tests {
         shared.push_event(round4_zone(1, "zone.released", 42, 2, Some("bob")));
         let mut claim = round4_zone(2, "zone.claimed", 43, 3, None);
         claim.payload["reason"] = json!("claimed");
+        claim.payload["excluded_paths"] = json!([]);
         shared.push_event(claim);
         assert!(shared.take_zone_alerts("alice").is_empty());
     }

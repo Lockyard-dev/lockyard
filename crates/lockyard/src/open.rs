@@ -487,9 +487,22 @@ mod tests {
                 r"platform\src\login.rs".into(),
                 "./platform/src/../src//login.rs".into(),
                 root.join("platform/new.rs").to_str().unwrap().into(),
+                "platform/cafe\u{301}".into(),
+                "platform/café".into(),
+                "platform/straße".into(),
+                "platform/STRASSE".into(),
             ])
             .unwrap();
-        assert_eq!(paths, vec!["platform/new.rs", "platform/src/login.rs"]);
+        assert_eq!(
+            paths,
+            [
+                "platform/STRASSE",
+                "platform/café",
+                "platform/new.rs",
+                "platform/src/login.rs",
+                "platform/straße"
+            ]
+        );
         assert!(opened.task_paths(&["../outside.rs".into()]).is_err());
         assert!(opened.task_paths(&[String::new()]).is_err());
         assert!(opened.task_paths(&vec!["platform/x".into(); 65]).is_err());

@@ -32,6 +32,10 @@ All notable changes to Lockyard are recorded here. The format follows
   Reuse each parent listing during D145 alias lookups, with a separate budget and an explicit
   monitor warning when it runs out. Write and match monitor journal paths in NFC, and order
   losses from `/lost` by the server timestamp when it is present (LOCAL-0129).
+- Share the monitor rescan entry budget across held paths, warn when coverage is incomplete and
+  report potentially dirty zones in cloud mode. Keep loss alerts until a status snapshot or an SSE
+  event with explicit exclusions confirms coverage. Normalize agent activity and dirty reports to
+  NFC while preserving each write's case (LOCAL-0135).
 
 ## [0.3.19] - 2026-11-26
 

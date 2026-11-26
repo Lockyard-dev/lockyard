@@ -138,6 +138,7 @@ impl Watcher {
                 break;
             }
         }
+        // Keep distinct on-disk spellings until consumers apply their path comparison policy.
         paths.sort();
         paths.dedup();
         paths
@@ -277,6 +278,15 @@ mod tests {
             panic!("expected a change, got {tick:?}");
         };
         assert!(paths.len() > 1, "a burst should coalesce: {paths:?}");
+    }
+
+    #[test]
+    fn coalescing_keeps_distinct_physical_unicode_spellings() {
+        let (watcher, _source) = no_event_source(Duration::from_secs(600));
+        let paths = ["STRASSE", "cafe\u{301}", "café", "straße"].map(PathBuf::from);
+        let mut burst = paths.to_vec();
+        burst.extend(paths.iter().cloned());
+        assert_eq!(watcher.coalesce(burst), paths);
     }
 
     #[test]
