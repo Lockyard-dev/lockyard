@@ -22,7 +22,8 @@ use lockyard_core::watch::{Backend as WatchBackend, Tick, Watcher};
 use lockyard_core::{Backend, Error, Result, Store, ZonePath, outside, watch};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
-use std::io::{ErrorKind, IsTerminal, Read, Write};
+use std::io::{ErrorKind, IsTerminal, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -127,9 +128,6 @@ pub fn run(settings: &Settings, ports: &mut Ports<'_>, out: &mut dyn Write) -> R
             let inspection = inspect(settings, ports, paths, reconcile, now, out)?;
             summary.unannounced += inspection.unannounced;
             summary.rescan_incomplete |= inspection.rescan_incomplete;
-            if reconcile {
-                save_rescan_status(&settings.root, inspection.rescan_incomplete);
-            }
         }
         if reconcile {
             let _ = outside::compact(&settings.root, now - outside::ANNOUNCE_WINDOW_MS);
@@ -147,29 +145,43 @@ fn rescan_status_path(root: &Path) -> PathBuf {
 
 /// Completeness of the last finished reconcile tick, when a monitor has recorded one.
 pub(crate) fn read_rescan_status(root: &Path) -> Option<bool> {
+    read_rescan_state(root).map(|state| state.incomplete)
+}
+
+// First listing error per claim ID and NFC held path.
+type ListingFailures = BTreeMap<i64, BTreeMap<String, i64>>;
+
+#[derive(Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RescanState {
+    incomplete: bool,
+    listing_failures: ListingFailures,
+}
+
+fn read_rescan_state(root: &Path) -> Option<RescanState> {
     let path = rescan_status_path(root);
     if !path.symlink_metadata().ok()?.is_file() {
         return None;
     }
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(2)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    match bytes.as_slice() {
-        b"0" => Some(false),
-        b"1" => Some(true),
-        _ => None,
+    match std::fs::read(path).ok()?.as_slice() {
+        b"0" => Some(RescanState::default()),
+        b"1" => Some(RescanState {
+            incomplete: true,
+            ..RescanState::default()
+        }),
+        bytes => serde_json::from_slice(bytes).ok(),
     }
 }
 
-fn save_rescan_status(root: &Path, incomplete: bool) {
-    if read_rescan_status(root) == Some(incomplete) {
+fn save_rescan_state(root: &Path, previous: Option<&RescanState>, state: RescanState) {
+    if previous == Some(&state) {
         return;
     }
-    let bytes = if incomplete { b"1" } else { b"0" };
-    if let Err(error) = lockyard_core::fsio::replace(&rescan_status_path(root), bytes, 0o600) {
+    let bytes = if state.listing_failures.is_empty() {
+        vec![if state.incomplete { b'1' } else { b'0' }]
+    } else {
+        serde_json::to_vec(&state).expect("rescan state is serializable")
+    };
+    if let Err(error) = lockyard_core::fsio::replace(&rescan_status_path(root), &bytes, 0o600) {
         eprintln!("warning: could not save monitor rescan status: {error}");
     }
 }
@@ -278,12 +290,25 @@ fn inspect(
     let claims = ports
         .backend
         .claims(&lockyard_core::proto::ClaimQuery::default(), now)?;
+    let previous = if reconcile {
+        read_rescan_state(&settings.root)
+    } else {
+        None
+    };
     if claims.is_empty() {
+        if reconcile {
+            save_rescan_state(&settings.root, previous.as_ref(), RescanState::default());
+        }
         return Ok(Inspection::default());
     }
     let scan = if reconcile {
         // The file system may have dropped events, so check modification times too.
-        rescan(&settings.root, &claims, now)
+        rescan(
+            &settings.root,
+            &claims,
+            now,
+            previous.as_ref().map(|state| &state.listing_failures),
+        )
     } else {
         ScanResult::default()
     };
@@ -388,11 +413,26 @@ fn inspect(
             writeln!(out, "! could not report dirty paths: {error}")?;
         }
     }
+    if reconcile {
+        save_rescan_state(
+            &settings.root,
+            previous.as_ref(),
+            RescanState {
+                incomplete: inspection.rescan_incomplete,
+                listing_failures: scan.listing_failures,
+            },
+        );
+    }
     Ok(inspection)
 }
 
 /// The fallback for dropped events: recently modified files under the active claims.
-fn rescan<'a>(root: &Path, claims: &'a [lockyard_core::proto::Claim], now: i64) -> ScanResult<'a> {
+fn rescan<'a>(
+    root: &Path,
+    claims: &'a [lockyard_core::proto::Claim],
+    now: i64,
+    listing_failures: Option<&ListingFailures>,
+) -> ScanResult<'a> {
     let since = now - i64::try_from(RESCAN_WINDOW.as_millis()).unwrap_or(i64::MAX);
     let mut scan = Rescan {
         root,
@@ -402,6 +442,7 @@ fn rescan<'a>(root: &Path, claims: &'a [lockyard_core::proto::Claim], now: i64) 
         issues: 0,
         alias_listings: HashMap::new(),
         found: Vec::new(),
+        recovery: None,
     };
     let mut result = ScanResult::default();
     let mut zones_left: usize = claims.iter().map(|claim| claim.paths.len()).sum();
@@ -416,6 +457,14 @@ fn rescan<'a>(root: &Path, claims: &'a [lockyard_core::proto::Claim], now: i64) 
         zones_left -= 1;
         scan.remaining = budget;
         scan.issues = 0;
+        let path = nfc_path(held);
+        let first_failure = listing_failures
+            .and_then(|failures| failures.get(&claim.id))
+            .and_then(|paths| paths.get(&path))
+            .copied();
+        scan.recovery = first_failure
+            .filter(|at| *at < since)
+            .map(|at| (at, Vec::new()));
         if held == "." {
             scan.walk(root, 0);
         } else {
@@ -423,10 +472,24 @@ fn rescan<'a>(root: &Path, claims: &'a [lockyard_core::proto::Claim], now: i64) 
             scan.walk_aliases(root, &components, claim.folds_path_case());
         }
         remaining -= budget - scan.remaining;
-        if scan.issues != 0 {
+        if scan.issues == 0 {
+            if let Some((_, recovered)) = scan.recovery.take() {
+                scan.found.extend(recovered);
+            }
+        } else {
+            // A limited scan still cannot finish recovery. Keep the original time.
+            if let Some(first_failure) =
+                first_failure.or_else(|| (scan.issues & ScanIssues::LISTING != 0).then_some(now))
+            {
+                result
+                    .listing_failures
+                    .entry(claim.id)
+                    .or_default()
+                    .insert(path.clone(), first_failure);
+            }
             *result
                 .incomplete
-                .entry((claim.session.as_str(), nfc_path(held)))
+                .entry((claim.session.as_str(), path))
                 .or_default() |= scan.issues;
         }
     }
@@ -439,6 +502,7 @@ struct ScanResult<'a> {
     paths: Vec<String>,
     // One warning per session and NFC path in this rescan, preserving case.
     incomplete: BTreeMap<(&'a str, String), u8>,
+    listing_failures: ListingFailures,
 }
 
 struct ScanIssues;
@@ -470,6 +534,23 @@ fn list_directory(at: &Path, issues: &mut u8) -> Option<std::fs::ReadDir> {
     }
 }
 
+fn take_directory_entry(
+    entry: std::io::Result<std::fs::DirEntry>,
+    remaining: &mut usize,
+    issues: &mut u8,
+    budget_issue: u8,
+) -> ControlFlow<(), Option<std::fs::DirEntry>> {
+    if entry.is_err() {
+        *issues |= ScanIssues::LISTING;
+    }
+    if *remaining == 0 {
+        *issues |= budget_issue;
+        return ControlFlow::Break(());
+    }
+    *remaining -= 1;
+    ControlFlow::Continue(entry.ok())
+}
+
 #[derive(Default)]
 struct AliasDirectory {
     by_nfc: HashMap<String, Vec<PathBuf>>,
@@ -488,13 +569,12 @@ impl AliasDirectory {
             return listing;
         };
         for entry in entries {
-            if *remaining == 0 {
-                listing.issues |= ScanIssues::ALIASES;
+            let ControlFlow::Continue(entry) =
+                take_directory_entry(entry, remaining, &mut listing.issues, ScanIssues::ALIASES)
+            else {
                 break;
-            }
-            *remaining -= 1;
-            let Ok(entry) = entry else {
-                listing.issues |= ScanIssues::LISTING;
+            };
+            let Some(entry) = entry else {
                 continue;
             };
             if let Some(name) = entry.file_name().to_str() {
@@ -524,6 +604,8 @@ struct Rescan<'a> {
     // Share each physical parent listing across both comparison policies.
     alias_listings: HashMap<PathBuf, AliasDirectory>,
     found: Vec<String>,
+    // Older writes are emitted once the held path has been scanned completely.
+    recovery: Option<(i64, Vec<String>)>,
 }
 
 impl Rescan<'_> {
@@ -566,15 +648,20 @@ impl Rescan<'_> {
             for entry in entries {
                 if depth == RESCAN_DEPTH {
                     self.issues |= ScanIssues::DEPTH;
+                    if entry.is_err() {
+                        self.issues |= ScanIssues::LISTING;
+                    }
                     break;
                 }
-                if self.remaining == 0 {
-                    self.issues |= ScanIssues::ENTRIES;
+                let ControlFlow::Continue(entry) = take_directory_entry(
+                    entry,
+                    &mut self.remaining,
+                    &mut self.issues,
+                    ScanIssues::ENTRIES,
+                ) else {
                     break;
-                }
-                self.remaining -= 1;
-                let Ok(entry) = entry else {
-                    self.issues |= ScanIssues::LISTING;
+                };
+                let Some(entry) = entry else {
                     continue;
                 };
                 self.walk(&entry.path(), depth + 1);
@@ -584,19 +671,27 @@ impl Rescan<'_> {
         if !data.is_file() {
             return;
         }
-        let modified = data
+        let Some(modified) = data
             .modified()
             .ok()
             .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-            .and_then(|since_epoch| i64::try_from(since_epoch.as_millis()).ok());
-        if modified.is_none_or(|at| at < self.since) {
+            .and_then(|since_epoch| i64::try_from(since_epoch.as_millis()).ok())
+        else {
             return;
-        }
+        };
+        let found = if modified >= self.since {
+            &mut self.found
+        } else if let Some((since, recovered)) = &mut self.recovery
+            && modified >= *since
+        {
+            recovered
+        } else {
+            return;
+        };
         if let Ok(relative) = at.strip_prefix(self.root)
             && let Some(text) = relative.to_str()
         {
-            self.found
-                .push(text.replace(std::path::MAIN_SEPARATOR, "/"));
+            found.push(text.replace(std::path::MAIN_SEPARATOR, "/"));
         }
     }
 }
@@ -993,14 +1088,31 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_0100_r10_unreadable_listing_marks_rescan_incomplete() {
+        unreadable_listing_recovers_writes(1_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_0100_r11_listing_recovers_writes_older_than_rescan_window() {
+        unreadable_listing_recovers_writes(66_000);
+    }
+
+    #[cfg(unix)]
+    fn unreadable_listing_recovers_writes(elapsed: i64) {
         use std::os::unix::fs::PermissionsExt;
 
         let project = Project::new();
         let root = project.root();
         let parents = [root.join("src"), root.join("tree")];
+        let now = crate::now_ms();
+        let mtime = |offset: i64| {
+            std::time::UNIX_EPOCH + Duration::from_millis((now + offset).try_into().unwrap())
+        };
         for parent in &parents {
             std::fs::create_dir(parent).unwrap();
-            std::fs::write(parent.join("checked.rs"), "changed").unwrap();
+            let unchanged = std::fs::File::create(parent.join("unchanged.rs")).unwrap();
+            unchanged.set_modified(mtime(-120_000)).unwrap();
+            std::fs::write(parent.join("checked.rs"), "before").unwrap();
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o311)).unwrap();
         }
         let cloud = RecordingCloud {
@@ -1008,7 +1120,6 @@ mod tests {
             reports: Default::default(),
         };
         let mut backend = lockyard_cloud_client::CloudBackend::new(&cloud, "alice");
-        let now = crate::now_ms();
         let mut ports = Ports {
             backend: &mut backend,
             store: project.store(),
@@ -1026,6 +1137,21 @@ mod tests {
         let mut out = Vec::new();
         let inspection = inspect(&settings, &mut ports, Vec::new(), true, now, &mut out);
         for parent in &parents {
+            let mut file = std::fs::File::create(parent.join("checked.rs")).unwrap();
+            file.write_all(b"changed while listing was denied").unwrap();
+            file.set_modified(mtime(1_000)).unwrap();
+        }
+        let repeated = (elapsed > 60_000).then(|| {
+            inspect(
+                &settings,
+                &mut ports,
+                Vec::new(),
+                true,
+                now + elapsed - 1_000,
+                &mut Vec::new(),
+            )
+        });
+        for parent in &parents {
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         if !unreadable.into_iter().all(|denied| denied) {
@@ -1039,6 +1165,12 @@ mod tests {
             "unreadable listings must mark the rescan incomplete"
         );
         assert_eq!(inspection.unannounced, 0);
+        if let Some(repeated) = repeated {
+            let repeated = repeated.unwrap();
+            assert!(repeated.rescan_incomplete);
+            assert_eq!(repeated.unannounced, 0);
+        }
+        assert_eq!(read_rescan_status(&root), Some(true));
         assert!(cloud.reports.lock().unwrap().is_empty());
         let warnings: Vec<serde_json::Value> = serde_json::Deserializer::from_slice(&out)
             .into_iter()
@@ -1057,15 +1189,42 @@ mod tests {
         }
 
         out.clear();
-        let inspection = inspect(&settings, &mut ports, Vec::new(), true, now, &mut out).unwrap();
+        let inspection = inspect(
+            &settings,
+            &mut ports,
+            Vec::new(),
+            true,
+            now + elapsed,
+            &mut out,
+        )
+        .unwrap();
         assert!(!inspection.rescan_incomplete);
-        assert_eq!(inspection.unannounced, 2);
+        assert_eq!(read_rescan_status(&root), Some(false));
+        assert_eq!(
+            inspection.unannounced, 2,
+            "recover both writes after listing access returns"
+        );
         let reports = cloud.reports.lock().unwrap();
         assert_eq!(reports.len(), 1);
         let paths = reports[0]["paths"].as_array().unwrap();
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0]["path"], "src/checked.rs");
         assert_eq!(paths[1]["path"], "tree/checked.rs");
+    }
+
+    #[test]
+    fn local_0100_r11_listing_error_at_entry_budget_boundary() {
+        for budget_issue in [ScanIssues::ALIASES, ScanIssues::ENTRIES] {
+            let mut issues = 0;
+            let entry = Err(std::io::Error::from(ErrorKind::PermissionDenied));
+            let _ = take_directory_entry(entry, &mut 0, &mut issues, budget_issue);
+            assert_ne!(
+                issues & ScanIssues::LISTING,
+                0,
+                "listing error lost at budget boundary (budget issue {budget_issue})"
+            );
+            assert_eq!(issues & budget_issue, budget_issue);
+        }
     }
 
     #[test]
@@ -1086,6 +1245,7 @@ mod tests {
             issues: 0,
             alias_listings: HashMap::new(),
             found: Vec::new(),
+            recovery: None,
         };
         scan.walk_aliases(&parent, &[requested], false);
         assert_eq!(scan.issues, ScanIssues::ALIASES);
@@ -1130,7 +1290,7 @@ mod tests {
             make_claim(2, "bob", &["src/café"], false),
         ];
         assert_eq!(
-            rescan(root, &claims, 0).incomplete,
+            rescan(root, &claims, 0, None).incomplete,
             BTreeMap::from([
                 (("alice", "src/café".into()), ScanIssues::DEPTH),
                 (("alice", "SRC/CAFÉ".into()), ScanIssues::DEPTH),
@@ -1157,7 +1317,7 @@ mod tests {
             "id": 1, "paths": ["src/straße"], "case_insensitive_paths": true
         }))
         .unwrap();
-        let mut scan = rescan(root, std::slice::from_ref(&claim), 0);
+        let mut scan = rescan(root, std::slice::from_ref(&claim), 0, None);
         assert!(scan.incomplete.is_empty());
         scan.paths.sort();
         let other = if distinct {
@@ -1169,7 +1329,7 @@ mod tests {
         if distinct {
             claim.case_insensitive_paths = Some(false);
             let claims = [claim];
-            let scan = rescan(root, &claims, 0);
+            let scan = rescan(root, &claims, 0, None);
             assert_eq!(scan.paths, ["src/straße/other.rs"]);
             assert!(scan.incomplete.is_empty());
         }
@@ -1197,7 +1357,7 @@ mod tests {
         }))
         .unwrap();
         let claims = [claim];
-        let scan = rescan(root, &claims, 0);
+        let scan = rescan(root, &claims, 0, None);
         assert_eq!(scan.paths, [format!("src/{on_disk}/changed.rs")]);
         assert!(scan.incomplete.is_empty());
     }
@@ -1269,6 +1429,7 @@ mod tests {
             issues: 0,
             alias_listings: HashMap::from([(root.to_path_buf(), listing)]),
             found: Vec::new(),
+            recovery: None,
         };
         scan.walk_aliases(root, &["missing"], true);
         scan.walk_aliases(root, &["src"], false);

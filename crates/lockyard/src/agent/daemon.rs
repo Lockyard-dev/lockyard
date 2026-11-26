@@ -1120,9 +1120,11 @@ impl<T: Transport + 'static> Shared<T> {
             .clamp(Duration::from_millis(25), Duration::from_millis(150));
         let network_budget = left.saturating_sub(reply_reserve);
         let cache_key = (session.to_owned(), repository.map(str::to_owned));
+        let snapshot_started = Instant::now();
         match backend.status_read(session, now_ms(), network_budget) {
             Ok(mut status) => {
                 self.observe_status_claims(
+                    snapshot_started,
                     session,
                     repository,
                     &status.claims,
@@ -3839,6 +3841,7 @@ mod tests {
         let claim: Claim =
             serde_json::from_value(json!({"id":42,"session":"alice","paths":["src"]})).unwrap();
         rig.daemon.shared.observe_status_claims(
+            Instant::now(),
             "alice",
             None,
             &[claim],
@@ -3849,6 +3852,7 @@ mod tests {
             json!({"claim_id":42,"session":"alice","paths":["src"],"reason":"expired","lost_at":1000000}),
         ];
         rig.daemon.shared.observe_status_claims(
+            Instant::now(),
             "alice",
             None,
             &[],

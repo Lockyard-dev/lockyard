@@ -42,6 +42,9 @@ All notable changes to Lockyard are recorded here. The format follows
 - Warn when a directory listing fails and mark the monitor rescan incomplete. Report dirty paths
   only for observed changes. Recheck remaining claim coverage on status after a partial takeover
   preserves the claim ID (LOCAL-0135).
+- Require a status snapshot started after the latest loss or narrowing before using that claim
+  to clear earlier loss alerts. After a listing failure, rescan from the first failed round once
+  coverage returns, and report listing errors even at the entry budget limit (LOCAL-0143).
 
 ## [0.3.19] - 2026-11-26
 
