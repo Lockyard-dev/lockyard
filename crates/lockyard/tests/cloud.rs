@@ -1635,7 +1635,7 @@ fn encrypted_registry_submission_resolves_sha_only_in_the_submodule_checkout() {
     ]);
     std::fs::create_dir(checkout.join("nested")).unwrap();
     server.state.lock().unwrap().registry_items[0]["paths"] =
-        json!(["checkout/nested/src/file.txt"]);
+        json!(["checkout/src/file.txt", "checkout/nested/src/file.txt"]);
 
     let submit = |sha: &str| {
         let evidence = format!("{}:src/file.txt", &sha[..12]);
@@ -1664,11 +1664,24 @@ fn encrypted_registry_submission_resolves_sha_only_in_the_submodule_checkout() {
     );
 
     git(&["submodule", "update", "--init", "--", "nested"]);
+    server.state.lock().unwrap().registry_items[0]["paths"] =
+        json!(["checkout/nested/src/file.txt", "checkout/nested/src"]);
     let result = json_of(&submit(&submodule_sha));
     assert_eq!(result["status"], "review");
     assert!(result.get("warnings").is_none());
     let requests = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
     assert_eq!(requests[1].body["commit_sha"], submodule_sha);
+
+    server.state.lock().unwrap().registry_items[0]["paths"] =
+        json!(["checkout/nested/src/file.txt", "checkout/src/file.txt"]);
+    let result = json_of(&submit(&submodule_sha));
+    assert_eq!(result["status"], "review");
+    assert!(result["warnings"].is_array());
+    let requests = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
+    assert!(
+        requests[2].body.get("commit_sha").is_none(),
+        "expanded a short SHA for paths in different initialized repositories"
+    );
 }
 
 #[test]

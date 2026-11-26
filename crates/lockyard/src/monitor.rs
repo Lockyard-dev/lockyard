@@ -21,8 +21,8 @@ use lockyard_core::proto::{DirtyPath, InboxQuery, Message, SendRequest};
 use lockyard_core::watch::{Backend as WatchBackend, Tick, Watcher};
 use lockyard_core::{Backend, Error, Result, Store, ZonePath, outside, watch};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
-use std::io::{IsTerminal, Write};
+use std::collections::{BTreeMap, HashMap};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,7 @@ const MAIL_PER_ROUND: usize = 20;
 const DELIVERY_LEASE_SECONDS: i64 = 60;
 /// Unannounced-write records older than this are forgotten.
 const KEEP_RECORDS_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+const RESCAN_STATUS_FILE: &str = "monitor-rescan-status";
 
 /// What the monitor was asked to do.
 pub struct Settings {
@@ -126,6 +127,9 @@ pub fn run(settings: &Settings, ports: &mut Ports<'_>, out: &mut dyn Write) -> R
             let inspection = inspect(settings, ports, paths, reconcile, now, out)?;
             summary.unannounced += inspection.unannounced;
             summary.rescan_incomplete |= inspection.rescan_incomplete;
+            if reconcile {
+                save_rescan_status(&settings.root, inspection.rescan_incomplete);
+            }
         }
         if reconcile {
             let _ = outside::compact(&settings.root, now - outside::ANNOUNCE_WINDOW_MS);
@@ -134,6 +138,39 @@ pub fn run(settings: &Settings, ports: &mut Ports<'_>, out: &mut dyn Write) -> R
         if settings.once && (summary.delivered > 0 || summary.unannounced > 0) {
             return Ok(summary);
         }
+    }
+}
+
+fn rescan_status_path(root: &Path) -> PathBuf {
+    root.join(lockyard_core::DIR_NAME).join(RESCAN_STATUS_FILE)
+}
+
+/// Completeness of the last finished reconcile tick, when a monitor has recorded one.
+pub(crate) fn read_rescan_status(root: &Path) -> Option<bool> {
+    let path = rescan_status_path(root);
+    if !path.symlink_metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(2)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    match bytes.as_slice() {
+        b"0" => Some(false),
+        b"1" => Some(true),
+        _ => None,
+    }
+}
+
+fn save_rescan_status(root: &Path, incomplete: bool) {
+    if read_rescan_status(root) == Some(incomplete) {
+        return;
+    }
+    let bytes = if incomplete { b"1" } else { b"0" };
+    if let Err(error) = lockyard_core::fsio::replace(&rescan_status_path(root), bytes, 0o600) {
+        eprintln!("warning: could not save monitor rescan status: {error}");
     }
 }
 
@@ -259,14 +296,22 @@ fn inspect(
         (ScanLimits::ENTRIES, "directory entry budget"),
         (ScanLimits::DEPTH, "directory depth limit"),
     ];
-    for (limit, label) in limits {
-        if !scan.incomplete.iter().any(|zone| zone.limits & limit != 0) {
-            continue;
-        }
-        let message = format!("monitor rescan coverage is incomplete after reaching the {label}");
+    for ((session, path), reached) in scan.incomplete {
+        let reasons = limits
+            .iter()
+            .filter_map(|(limit, label)| (reached & limit != 0).then_some(*label))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!(
+            "monitor rescan coverage is incomplete for {path:?} (session {session:?}) after reaching the {reasons}"
+        );
         eprintln!("warning: {message}");
         if settings.json {
-            writeln!(out, "{}", json!({"event": "warning", "message": message}))?;
+            writeln!(
+                out,
+                "{}",
+                json!({"event": "warning", "message": message, "session": session, "path": path})
+            )?;
         }
     }
     let mut paths: Vec<_> = changed
@@ -342,37 +387,6 @@ fn inspect(
             writeln!(out, "! could not report dirty paths: {error}")?;
         }
     }
-    if ports.backend.is_cloud() {
-        let mut reported = HashSet::new();
-        for zone in scan.incomplete {
-            let session = &zone.claim.session;
-            let held = ZonePath::stored(nfc_path(zone.held));
-            if !zone.claim.covers(&held)
-                || dirty
-                    .get(session)
-                    .is_some_and(|paths| paths.iter().any(|path| path.path == held.as_str()))
-                || !reported.insert((session, held.as_str().to_owned()))
-            {
-                continue;
-            }
-            // This scope may contain writes the monitor could not see. Send it separately so
-            // a rejected scope cannot prevent confirmed writes from being reported.
-            let paths = [DirtyPath {
-                path: held.as_str().to_owned(),
-                owner_session: Some(session.clone()),
-                reason: Some(
-                    "possible unobserved writes during an incomplete monitor rescan".into(),
-                ),
-                task_id: None,
-            }];
-            if let Err(error) = ports.backend.dirty_report(session, &paths) {
-                eprintln!(
-                    "warning: could not report incomplete rescan for {}: {error}",
-                    held.as_str()
-                );
-            }
-        }
-    }
     Ok(inspection)
 }
 
@@ -409,11 +423,10 @@ fn rescan<'a>(root: &Path, claims: &'a [lockyard_core::proto::Claim], now: i64) 
         }
         remaining -= budget - scan.remaining;
         if scan.limits != 0 {
-            result.incomplete.push(IncompleteZone {
-                claim,
-                held,
-                limits: scan.limits,
-            });
+            *result
+                .incomplete
+                .entry((claim.session.as_str(), nfc_path(held)))
+                .or_default() |= scan.limits;
         }
     }
     result.paths = scan.found;
@@ -423,13 +436,8 @@ fn rescan<'a>(root: &Path, claims: &'a [lockyard_core::proto::Claim], now: i64) 
 #[derive(Default)]
 struct ScanResult<'a> {
     paths: Vec<String>,
-    incomplete: Vec<IncompleteZone<'a>>,
-}
-
-struct IncompleteZone<'a> {
-    claim: &'a lockyard_core::proto::Claim,
-    held: &'a str,
-    limits: u8,
+    // One warning per session and NFC path in this rescan, preserving case.
+    incomplete: BTreeMap<(&'a str, String), u8>,
 }
 
 struct ScanLimits;
@@ -515,7 +523,7 @@ impl Rescan<'_> {
             .alias_listings
             .entry(at.to_path_buf())
             .or_insert_with(|| AliasDirectory::read(at, &mut self.alias_remaining));
-        let mut matches = if fold_case {
+        let matches = if fold_case {
             listing.by_d145.get(&fold_path_component(component))
         } else {
             listing.by_nfc.get(&nfc_path(component))
@@ -524,15 +532,6 @@ impl Rescan<'_> {
         .unwrap_or_default();
         if listing.truncated {
             self.limits |= ScanLimits::ALIASES;
-            // Keep walking the literal spelling even when enumerating aliases is capped.
-            let literal = at.join(component);
-            if Path::new(component)
-                .file_name()
-                .is_some_and(|name| name == *component)
-                && !matches.contains(&literal)
-            {
-                matches.push(literal);
-            }
         }
         for child in matches {
             self.walk_aliases(&child, rest, fold_case);
@@ -891,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn an_incomplete_cloud_rescan_reports_the_unchecked_scope_separately() {
+    fn local_0100_r9_incomplete_cloud_rescan_reports_only_observed_writes() {
         use lockyard_cloud_client::{Call, ClientError, CloudBackend, Transport};
         use serde_json::Value;
         use std::sync::Mutex;
@@ -922,34 +921,119 @@ mod tests {
             deep.push("nested");
         }
         std::fs::create_dir_all(&deep).unwrap();
-        std::fs::write(deep.join("unchecked.rs"), "possibly changed").unwrap();
-        std::fs::create_dir(root.join("live")).unwrap();
-        std::fs::write(root.join("live/checked.rs"), "changed").unwrap();
+        let old_file = std::fs::File::create(deep.join("unchecked.rs")).unwrap();
+        old_file
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+        let now = crate::now_ms();
         let cloud = RecordingCloud::default();
         let mut backend = CloudBackend::new(&cloud, "alice");
         let mut ports = Ports {
             backend: &mut backend,
             store: project.store(),
-            now: &now_is(1),
+            now: &now_is(now),
         };
         let mut settings = settings(&root, "alice");
         settings.json = true;
         let mut out = Vec::new();
-        let inspection = inspect(&settings, &mut ports, Vec::new(), true, 1, &mut out).unwrap();
-        assert_eq!(inspection.unannounced, 1);
+        let inspection = inspect(&settings, &mut ports, Vec::new(), true, now, &mut out).unwrap();
+        assert_eq!(inspection.unannounced, 0);
         assert!(inspection.rescan_incomplete);
+        let warning: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(warning["event"], "warning");
         assert!(
-            String::from_utf8(out)
+            warning["message"]
+                .as_str()
                 .unwrap()
                 .contains("directory depth limit")
         );
-        let reports = cloud.0.lock().unwrap();
-        assert_eq!(reports.len(), 2);
-        assert_eq!(reports[0]["paths"][0]["path"], "live/checked.rs");
-        assert_eq!(reports[1]["paths"][0]["path"], "src");
         assert_eq!(
-            reports[1]["paths"][0]["reason"],
-            "possible unobserved writes during an incomplete monitor rescan"
+            cloud.0.lock().unwrap().len(),
+            0,
+            "an unchanged tree with an incomplete scan must not produce a dirty report"
+        );
+        assert_eq!(warning["session"], "alice");
+        assert_eq!(warning["path"], "src");
+
+        std::fs::create_dir(root.join("live")).unwrap();
+        std::fs::write(root.join("live/checked.rs"), "changed").unwrap();
+        let inspection = inspect(&settings, &mut ports, Vec::new(), true, now, &mut out).unwrap();
+        assert_eq!(inspection.unannounced, 1);
+        assert!(inspection.rescan_incomplete);
+        let reports = cloud.0.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0]["paths"].as_array().unwrap().len(), 1);
+        assert_eq!(reports[0]["paths"][0]["path"], "live/checked.rs");
+    }
+
+    #[test]
+    fn local_0100_r9_alias_budget_does_not_trust_an_unlisted_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let parent = root.join("src");
+        std::fs::create_dir_all(parent.join("a")).unwrap();
+        std::fs::write(parent.join("a/changed.rs"), "changed").unwrap();
+        // Exercise case-mismatched lookup on a case-insensitive volume. On a case-sensitive
+        // volume, an existing exact spelling still proves that an unlisted literal is skipped.
+        let requested = if parent.join("A").is_dir() { "A" } else { "a" };
+        let mut scan = Rescan {
+            root,
+            since: 0,
+            remaining: RESCAN_ENTRIES,
+            alias_remaining: 0,
+            limits: 0,
+            alias_listings: HashMap::new(),
+            found: Vec::new(),
+        };
+        scan.walk_aliases(&parent, &[requested], false);
+        assert_eq!(scan.limits, ScanLimits::ALIASES);
+        assert_eq!(
+            scan.found,
+            Vec::<String>::new(),
+            "the exhausted alias budget must not turn an unlisted literal into a covered write"
+        );
+
+        scan.alias_listings.clear();
+        scan.alias_remaining = 1;
+        scan.limits = 0;
+        scan.walk_aliases(&parent, &["A"], false);
+        assert!(scan.found.is_empty());
+        scan.walk_aliases(&parent, &["A"], true);
+        assert_eq!(scan.found, ["src/a/changed.rs"]);
+        assert_eq!(scan.limits, 0);
+    }
+
+    #[test]
+    fn local_0100_r9_rescan_deduplicates_incomplete_zones_by_session_and_exact_nfc_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut deep = root.join("src/café");
+        for _ in 0..=RESCAN_DEPTH {
+            deep.push("nested");
+        }
+        std::fs::create_dir_all(deep).unwrap();
+        let make_claim = |id, session, paths: &[&str], fold_case| {
+            serde_json::from_value(json!({
+                "id": id, "session": session, "paths": paths, "case_insensitive_paths": fold_case
+            }))
+            .unwrap()
+        };
+        let claims = [
+            make_claim(
+                1,
+                "alice",
+                &["src/café", "src/cafe\u{301}", "SRC/CAFÉ"],
+                true,
+            ),
+            make_claim(2, "bob", &["src/café"], false),
+        ];
+        assert_eq!(
+            rescan(root, &claims, 0).incomplete,
+            BTreeMap::from([
+                (("alice", "src/café".into()), ScanLimits::DEPTH),
+                (("alice", "SRC/CAFÉ".into()), ScanLimits::DEPTH),
+                (("bob", "src/café".into()), ScanLimits::DEPTH),
+            ])
         );
     }
 
@@ -1068,18 +1152,20 @@ mod tests {
     }
 
     #[test]
-    fn a_capped_alias_lookup_preserves_the_literal_subtree_walk() {
+    fn a_capped_alias_lookup_still_walks_verified_matches_from_the_shared_listing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir(root.join("src")).unwrap();
         std::fs::write(root.join("src/changed.rs"), "changed").unwrap();
+        let mut listing = AliasDirectory::read(root, &mut 1);
+        listing.truncated = true;
         let mut scan = Rescan {
             root,
             since: 0,
             remaining: 1,
             alias_remaining: 0,
             limits: 0,
-            alias_listings: HashMap::new(),
+            alias_listings: HashMap::from([(root.to_path_buf(), listing)]),
             found: Vec::new(),
         };
         scan.walk_aliases(root, &["missing"], true);
