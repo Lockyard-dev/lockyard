@@ -419,6 +419,38 @@
     }
 
     #[test]
+    fn zone_claim_rejects_ttl_aliases_before_claiming() {
+        let dir = project();
+        for (alias, value) in [("ttl_minutes", 1), ("ttl_seconds", 60), ("duration", 1)] {
+            let result = call(
+                &dir,
+                "worker",
+                "zone_claim",
+                json!({"paths": ["src"], (alias): value}),
+            );
+            assert_eq!(result["isError"], true, "zone_claim accepted {alias}");
+            let message = text(&result);
+            assert!(
+                message.contains(alias) && message.contains("use ttl") && message.contains("minutes"),
+                "{message}"
+            );
+        }
+        let result = call(&dir, "other", "zone_claim", json!({"paths": ["src"], "ttl": 1}));
+        assert_eq!(result["isError"], false, "{}", text(&result));
+
+        for tool in tools(Surface::Full) {
+            if tool.pointer("/inputSchema/properties/ttl").is_none() {
+                continue;
+            }
+            let name = tool["name"].as_str().unwrap();
+            for args in [json!({"ttl_seconds": 60}), json!({"ttl": "10m"})] {
+                let error = tool_registry().validate_fields(name, &args).unwrap_err();
+                assert!(error.to_string().contains("minutes"), "{name}: {error}");
+            }
+        }
+    }
+
+    #[test]
     fn finish_work_accepts_claim_ids_with_or_without_the_zone_prefix() {
         let dir = project();
         call(&dir, "a", "zone_claim", json!({"paths": ["src"]}));

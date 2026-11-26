@@ -156,13 +156,25 @@ impl ToolRegistry {
     }
 
     pub(super) fn validate_fields(&self, name: &str, args: &Value) -> Result<()> {
-        if !matches!(name, "update" | "start_work" | "zone_renew") {
-            return Ok(());
-        }
         let Some(definition) = self.definitions.iter().find(|d| d.wire["name"] == name) else {
             return Ok(());
         };
         let properties = &definition.wire["inputSchema"]["properties"];
+        if properties.get("ttl").is_some() {
+            for alias in ["ttl_minutes", "ttl_seconds", "duration"] {
+                if args.get(alias).is_some() {
+                    return Err(Error::Invalid(format!(
+                        "unknown field {alias}; use ttl, an integer number of minutes"
+                    )));
+                }
+            }
+            Args(args)
+                .some_int("ttl")
+                .map_err(|_| wrong_type("ttl", "an integer number of minutes"))?;
+        }
+        if !matches!(name, "update" | "start_work" | "zone_renew") {
+            return Ok(());
+        }
         if let Some(args) = args.as_object() {
             for key in args.keys() {
                 if properties.get(key).is_none() {

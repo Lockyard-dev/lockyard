@@ -125,16 +125,6 @@ pub(super) fn run_tool(
             "unknown field message; message text belongs in body".into(),
         ));
     }
-    if matches!(name, "start_work" | "zone_renew") {
-        for alias in ["ttl_minutes", "ttl_seconds", "duration"] {
-            if args.get(alias).is_some() {
-                return Err(Error::Invalid(format!(
-                    "unknown field {alias}; use ttl, an integer number of minutes (1-240)"
-                )));
-            }
-        }
-        args.ttl()?;
-    }
     tool_registry().validate_fields(name, args.0)?;
     let handler = tool_registry()
         .handler(name)

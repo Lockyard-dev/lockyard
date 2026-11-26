@@ -441,7 +441,7 @@ impl Client {
         let mut decision = window(pending, None);
         if decision == ReplayWindow::Unverified {
             let date = guard
-                .exchange(|| {
+                .exchange_with_budget(budget, cancellation, || {
                     self.replay_date(
                         pending,
                         budget.unwrap_or(RECONCILE_BUDGET).min(RECONCILE_BUDGET),
@@ -801,7 +801,7 @@ impl Client {
         budget: Option<Duration>,
         cancellation: Option<&crate::Cancellation>,
     ) -> Result<ReplayEncryption, ClientError> {
-        match guard.exchange(|| {
+        match guard.exchange_with_budget(budget, cancellation, || {
             self.check_replay_encryption(
                 self,
                 pending,

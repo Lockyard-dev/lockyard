@@ -193,6 +193,15 @@ impl PendingRequest {
         );
         write_reply(&mut self.stream, status, body);
     }
+
+    fn rate_limit(mut self, retry_after: u64) {
+        write_reply_with_retry_after(
+            &mut self.stream,
+            429,
+            json!({"status":429,"code":"rate_limited","detail":"fixture","details":{}}),
+            retry_after,
+        );
+    }
 }
 
 struct Server {
@@ -304,9 +313,18 @@ impl Drop for Server {
 }
 
 fn write_reply(stream: &mut TcpStream, status: u16, value: Value) {
+    write_reply_with_retry_after(stream, status, value, 2);
+}
+
+fn write_reply_with_retry_after(
+    stream: &mut TcpStream,
+    status: u16,
+    value: Value,
+    retry_after: u64,
+) {
     let body = value.to_string();
     let response = format!(
-        "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nLockyard-Protocol: 2\r\nDate: Thu, 12 Nov 2026 10:21:00 GMT\r\nRetry-After: 2\r\n\r\n{body}",
+        "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nLockyard-Protocol: 2\r\nDate: Thu, 12 Nov 2026 10:21:00 GMT\r\nRetry-After: {retry_after}\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();
@@ -361,6 +379,113 @@ fn start_call(client: Arc<Client>, call: Call) -> mpsc::Receiver<Result<Value, C
     });
     ready.recv_timeout(WAIT).unwrap();
     result
+}
+
+#[test]
+fn pending_replay_http_uses_the_time_left_after_journal_wait() {
+    let server = Server::start();
+    let journal = Journal::new();
+    let client = Arc::new(server.client(&journal));
+    let mut call = Call::write(
+        "me",
+        "POST",
+        "/api/v1/registry/items".into(),
+        json!({"title":"replay"}),
+    );
+    call.deadline_ms = Some(1_000);
+    assert_eq!(client.call(&call).unwrap_err().code(), Some("rate_limited"));
+    assert!(
+        client
+            .pending_operation(call.key.as_deref().unwrap())
+            .unwrap()
+            .pre_execution_rejected
+    );
+
+    let mut hold = Call::write("me", "POST", "/api/v1/presence".into(), json!({}));
+    hold.deadline_ms = Some(5_000);
+    let holder = start_call(Arc::clone(&client), hold);
+    let held = server.requests.recv_timeout(WAIT).unwrap();
+    let done = start_call(Arc::clone(&client), call.clone());
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(server.requests.try_recv().is_err());
+    held.reply(200, None);
+    assert!(holder.recv_timeout(WAIT).unwrap().is_ok());
+
+    let replay = server
+        .requests
+        .recv_timeout(WAIT)
+        .expect("the pending create reached HTTP");
+    assert_eq!(replay.key, call.key.unwrap());
+    // Keep the HTTP response open. At most 200 ms of the original budget were
+    // left when the journal unlocked. Allow scheduler slack when observing it.
+    let result = done.recv_timeout(Duration::from_millis(350));
+    drop(replay);
+    let error = result
+        .expect("pending replay exceeded the remaining HTTP budget")
+        .unwrap_err();
+    assert!(matches!(error, ClientError::OutcomeUnknown(_)), "{error:?}");
+    server.finish();
+}
+
+#[test]
+fn long_poll_retry_after_allows_a_sibling_zone_release() {
+    let server = Server::start();
+    let journal = Journal::new();
+    survey_prime(&server, &journal);
+    let waiter = Arc::new(server.client(&journal));
+    let sibling = Arc::new(server.client(&journal));
+    let done = start_call(Arc::clone(&waiter), survey_wait_call(8_000));
+    let first = server.requests.recv_timeout(WAIT).unwrap();
+    let original_body = first.body.clone();
+    let refused_at = Instant::now();
+    first.rate_limit(5);
+    let until = Instant::now() + Duration::from_secs(2);
+    while !waiter
+        .pending_operation("survey-wait-key")
+        .is_some_and(|row| row.pre_execution_rejected)
+    {
+        assert!(
+            Instant::now() < until,
+            "the rate limit was not recorded before backoff"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut release = Call::write(
+        "other",
+        "DELETE",
+        "/api/v1/zones/claims/1".into(),
+        json!({}),
+    );
+    release.deadline_ms = Some(2_000);
+    let released = start_call(sibling, release);
+    if let Ok(request) = server.requests.recv_timeout(Duration::from_millis(2_200)) {
+        assert_eq!(request.path, "/api/v1/zones/claims/1");
+        request.reply(200, None);
+    }
+    assert_eq!(
+        released
+            .recv_timeout(WAIT)
+            .unwrap()
+            .map_err(|error| error.to_string()),
+        Ok(json!({"id":"A-1"})),
+        "sibling release was blocked during Retry-After"
+    );
+    let retry = server
+        .requests
+        .recv_timeout(Duration::from_secs(8))
+        .unwrap_or_else(|error| {
+            panic!(
+                "no claim retry: {error}; wait result: {:?}",
+                done.try_recv()
+            )
+        });
+    assert!(refused_at.elapsed() >= Duration::from_secs(5));
+    assert_eq!(retry.key, "survey-wait-key");
+    assert_eq!(retry.body, original_body);
+    retry.reply(200, None);
+    assert!(done.recv_timeout(WAIT).unwrap().is_ok());
+    server.finish();
 }
 
 fn concurrent_retry(same_client: bool) {

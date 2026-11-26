@@ -1,7 +1,7 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 //! Typed catalog preparation and verified local projection at the HTTP boundary.
 use crate::{
-    Call, Client, ClientError,
+    Call, Client, ClientError, WorkspaceKey,
     catalog::{CatalogStore, seal_catalog},
 };
 use lockyard_core::catalog::{
@@ -107,7 +107,12 @@ impl Client {
         }
     }
     /// Runs only after capability negotiation and before serialization. All retry attempts share it.
-    pub(crate) fn prepare_catalog_call(&self, call: &Call) -> Result<Call, ClientError> {
+    pub(crate) fn prepare_catalog_call(
+        &self,
+        call: &Call,
+        workspace: Option<&str>,
+        key: Option<&WorkspaceKey>,
+    ) -> Result<Call, ClientError> {
         if !catalog_call(call) {
             return Ok(call.clone());
         }
@@ -117,13 +122,8 @@ impl Client {
         if call.method != "POST" {
             return Ok(prepared);
         }
-        let workspace = self
-            .workspace
-            .as_deref()
-            .ok_or_else(|| local("catalog_key_unavailable"))?;
-        let held = self.resolved_content_key()?;
-        let key = held
-            .as_ref()
+        let (workspace, key) = workspace
+            .zip(key)
             .ok_or_else(|| local("catalog_key_unavailable"))?;
         let repository = prepared.repository.as_deref().expect("set repository");
         let body = call.body.as_ref().ok_or_else(|| local("catalog_invalid"))?;
@@ -154,6 +154,8 @@ impl Client {
         &self,
         call: &Call,
         value: &mut Value,
+        workspace: Option<&str>,
+        key: Option<&WorkspaceKey>,
     ) -> Result<(), ClientError> {
         if !catalog_call(call) {
             return Ok(());
@@ -165,13 +167,8 @@ impl Client {
         {
             return Ok(());
         }
-        let workspace = self
-            .workspace
-            .as_deref()
-            .ok_or_else(|| local("catalog_key_unavailable"))?;
-        let held = self.resolved_content_key()?;
-        let key = held
-            .as_ref()
+        let (workspace, key) = workspace
+            .zip(key)
             .ok_or_else(|| local("catalog_key_unavailable"))?;
         let repository = call.repository.as_deref().unwrap_or_default();
         let wire = CoordinationZoneCatalog::from_json(&value.to_string()).map_err(local)?;

@@ -5094,6 +5094,67 @@ fn required_agent_named_catalog_preserves_strict_expansion_errors() {
 }
 
 #[test]
+fn offline_started_agent_catalog_put_works_after_cloud_key_create() {
+    use lockyard_cloud_client::{Call, ipc_credential_proof};
+    use std::os::unix::net::UnixStream;
+
+    const CATALOG: &str = "/api/v1/zones/catalog";
+    let server = Server::start();
+    server.state.lock().unwrap().api_offline = true;
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let _agent = start_agent_until(dir.path(), runtime.path(), false);
+    assert!(
+        !runtime
+            .path()
+            .join("state/lockyard/encryption.json")
+            .exists()
+    );
+    server.state.lock().unwrap().api_offline = false;
+    let created = cli(
+        dir.path(),
+        runtime.path(),
+        &["--json", "cloud", "key", "create"],
+    );
+    let key = json_of(&created);
+    assert_eq!(key["created"], true);
+    server.state.lock().unwrap().encryption_key_id = Some(key["key_id"].as_str().unwrap().into());
+
+    let call = Call::write(
+        "alice",
+        "POST",
+        CATALOG.into(),
+        json!({"expected_revision":0,
+            "catalog":{"version":1,"zones":{"private-zone":["src"]},"groups":{}}}),
+    );
+    let mut stream = UnixStream::connect(socket(runtime.path())).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    writeln!(
+        stream,
+        "{}",
+        json!({"workspace":"team","op":"call","call":call,
+            "credential_proof":ipc_credential_proof("test-token")})
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    let answer: Value = serde_json::from_str(&line).unwrap();
+    assert!(answer["error"].is_null(), "{answer}");
+    assert_eq!(answer["value"]["verified"], true);
+    assert_eq!(answer["value"]["revision"], 1);
+    let writes = server.seen("POST", CATALOG);
+    assert_eq!(writes.len(), 1);
+    assert!(
+        writes[0].body["catalog"]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("lyenc1.")
+    );
+}
+
+#[test]
 fn required_cli_catalog_put_encrypts_locally_and_preserves_publisher_denial() {
     let server = Server::start();
     let dir = cloud_project(&server);
