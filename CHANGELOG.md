@@ -12,6 +12,9 @@ All notable changes to Lockyard are recorded here. The format follows
   The server is moving to the same rule under LOCAL-0105.
 - Respect the claim's path case policy in the monitor and honor Unicode-equivalent exclusions in
   the monitor and agent daemon (LOCAL-0100).
+- Respect the claim's path case policy in MCP `zone_check` and when clearing alerts for reclaimed
+  zones. Rust callers now pass a case policy to `ZonePath::contains_with_case` or
+  `ZonePath::overlaps_with_case` (LOCAL-0100).
 
 ## [0.3.19] - 2026-11-26
 

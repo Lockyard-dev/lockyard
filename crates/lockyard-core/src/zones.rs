@@ -215,7 +215,8 @@ fn find_conflicts(
     let mut conflicts = Vec::new();
     for path in paths {
         for (claim, holder, note, expires_at, held_path) in &held {
-            if path.overlaps(&ZonePath::stored(held_path.clone())) {
+            // SQLite zones always ignore case across operating systems (D-3124).
+            if path.overlaps_with_case(&ZonePath::stored(held_path.clone()), true) {
                 conflicts.push(Conflict {
                     mode: Some(crate::proto::ClaimMode::Exclusive),
                     dirty: None,
@@ -276,6 +277,26 @@ mod tests {
         assert_eq!(conflicts[0].agent, "a");
         assert_eq!(conflicts[0].held_path, "src");
         assert_eq!(conflicts[0].note, "refactor");
+    }
+
+    #[test]
+    fn sqlite_conflicts_and_claim_filters_always_fold_case() {
+        let (_dir, mut store) = test_store();
+        let claim = store.claim("a", &[path("src/ſ")], "", TTL, 0).unwrap();
+        let wanted = "src/s/file.rs";
+        let conflict = store.check("b", &path(wanted), 1).unwrap().unwrap();
+        assert_eq!(conflict.claim, claim.id);
+        let matching = crate::Backend::claims(
+            &store,
+            &crate::proto::ClaimQuery {
+                session: None,
+                path: Some(wanted.into()),
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].id, claim.id);
     }
 
     #[test]

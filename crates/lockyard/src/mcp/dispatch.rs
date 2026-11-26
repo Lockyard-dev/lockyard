@@ -679,10 +679,13 @@ pub(super) fn run_tool(
                         },
                         now,
                     )?;
+                    let requested = lockyard_core::ZonePath::stored(path);
                     let held_by_me = own.iter().any(|claim| {
                         claim.paths.iter().any(|held| {
-                            lockyard_core::ZonePath::stored(held.clone())
-                                .contains(&lockyard_core::ZonePath::stored(path.clone()))
+                            lockyard_core::ZonePath::stored(held.clone()).contains_with_case(
+                                &requested,
+                                claim.case_insensitive_paths.unwrap_or(true),
+                            )
                         })
                     });
                     if !held_by_me {

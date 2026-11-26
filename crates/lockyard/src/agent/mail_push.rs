@@ -49,7 +49,13 @@ struct LocalZoneMutation {
     events: Vec<Event>,
 }
 
-fn paths_overlap(a: &str, b: &str) -> bool {
+fn reclaimed_paths_overlap(a: &str, b: &str, fold_case: Option<bool>) -> bool {
+    if let Some(fold_case) = fold_case {
+        return ZonePath::stored(a.into())
+            .overlaps_with_case(&ZonePath::stored(b.into()), fold_case);
+    }
+    // Legacy events and claims may omit the policy. Keep alerts for spelling aliases
+    // unless the server has confirmed that the repository treats them as equivalent.
     a == b
         || a.strip_prefix(b).is_some_and(|tail| tail.starts_with('/'))
         || b.strip_prefix(a).is_some_and(|tail| tail.starts_with('/'))
@@ -316,15 +322,22 @@ impl<T: Transport + 'static> Shared<T> {
         }
     }
 
-    fn clear_reclaimed_alerts(&self, session: &str, new_id: i64, paths: &[String]) {
+    fn clear_reclaimed_alerts(
+        &self,
+        session: &str,
+        new_id: i64,
+        paths: &[String],
+        fold_case: Option<bool>,
+    ) {
         let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(alerts) = push.zone_alerts.get_mut(session) {
             alerts.retain(|id, alert| {
                 *id == new_id
-                    || !alert
-                        .paths
-                        .iter()
-                        .any(|old| paths.iter().any(|new| paths_overlap(old, new)))
+                    || !alert.paths.iter().any(|old| {
+                        paths
+                            .iter()
+                            .any(|new| reclaimed_paths_overlap(old, new, fold_case))
+                    })
             });
             let remaining: HashSet<_> = alerts.keys().copied().collect();
             push.zone_alert_times
@@ -363,7 +376,10 @@ impl<T: Transport + 'static> Shared<T> {
                         .cloned()
                         .and_then(|v| serde_json::from_value(v).ok())
                         .unwrap_or_default();
-                    self.clear_reclaimed_alerts(session, id, &paths);
+                    let fold_case = event
+                        .field("case_insensitive_paths")
+                        .and_then(Value::as_bool);
+                    self.clear_reclaimed_alerts(session, id, &paths, fold_case);
                 }
             }
             return;
@@ -498,7 +514,6 @@ impl<T: Transport + 'static> Shared<T> {
             let acquired: Vec<_> = claims
                 .iter()
                 .filter(|claim| claim.session == session && seen.insert(claim.id))
-                .map(|claim| (claim.id, claim.paths.clone()))
                 .collect();
             let previous = push.status_claims.entry(session.into()).or_default();
             let missing = previous.difference(&current).copied().collect();
@@ -544,8 +559,13 @@ impl<T: Transport + 'static> Shared<T> {
         }
         // Share acquisition history with SSE and clear after fallback seeding so
         // an old /lost record cannot resurrect an alert in this same snapshot.
-        for (id, paths) in acquired {
-            self.clear_reclaimed_alerts(session, id, &paths);
+        for claim in acquired {
+            self.clear_reclaimed_alerts(
+                session,
+                claim.id,
+                &claim.paths,
+                claim.case_insensitive_paths,
+            );
         }
     }
 
@@ -2626,6 +2646,51 @@ mod tests {
             shared.push_event(round4_zone(3, "zone.released", 43, 4, Some("bob")));
             shared.observe_status_claims("alice", &[claim(43)], &backend, Duration::ZERO);
             assert_eq!(shared.push.lock().unwrap().zone_alerts["alice"].len(), 1);
+        }
+    }
+
+    #[test]
+    fn status_reacquisition_clears_case_alias_alerts_only_under_folding_policy() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let backend = lockyard_cloud_client::CloudBackend::new(
+            Client::new(&rig.server.url(), "test-token".into()).unwrap(),
+            "alice",
+        );
+        let mut lost = round4_zone(1, "zone.lost", 42, 2, None);
+        lost.payload["paths"] = json!(["src/ſ/file.rs"]);
+        shared.push_event(lost);
+        for (id, policy, remaining) in [(43, None, 1), (44, Some(false), 1), (45, Some(true), 0)] {
+            let claim = serde_json::from_value::<Claim>(json!({
+                "id": id, "session": "alice", "paths": ["src/s"],
+                "case_insensitive_paths": policy
+            }))
+            .unwrap();
+            shared.observe_status_claims("alice", &[claim], &backend, Duration::ZERO);
+            assert_eq!(shared.zone_alerts("alice").len(), remaining, "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn zone_acquisition_events_clear_case_alias_alerts_only_under_folding_policy() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let mut lost = round4_zone(1, "zone.lost", 42, 2, None);
+        lost.payload["paths"] = json!(["src/ſ/file.rs"]);
+        shared.push_event(lost);
+        for (seq, policy, remaining) in [(2, None, 1), (3, Some(false), 1), (4, Some(true), 0)] {
+            let mut claimed = round4_zone(seq, "zone.claimed", 42 + seq, 3, None);
+            claimed.payload["reason"] = json!("claimed");
+            claimed.payload["paths"] = json!(["src/s"]);
+            if let Some(policy) = policy {
+                claimed.payload["case_insensitive_paths"] = json!(policy);
+            }
+            shared.push_event(claimed);
+            assert_eq!(shared.zone_alerts("alice").len(), remaining, "{policy:?}");
         }
     }
 

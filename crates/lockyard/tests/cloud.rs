@@ -5292,6 +5292,32 @@ fn status_closes_open_mail_on_ack_not_on_cloud_sent() {
 }
 
 #[test]
+fn mcp_zone_check_respects_the_own_claim_case_policy() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    for (fold_case, expected) in [
+        (false, json!({"free": true})),
+        (true, json!({"free": false, "own": true, "holder": "you"})),
+    ] {
+        server.state.lock().unwrap().claims = vec![json!({
+            "id": 1,
+            "session": "alice",
+            "paths": ["src/ſ"],
+            "case_insensitive_paths": fold_case
+        })];
+        let checks = mcp_calls(
+            dir.path(),
+            runtime.path(),
+            "full",
+            &[("zone_check", json!({"path": "src/s"}))],
+        );
+        assert_eq!(checks[0]["isError"], false, "{}", checks[0]);
+        assert_eq!(checks[0]["structuredContent"], expected);
+    }
+}
+
+#[test]
 fn mcp_status_returns_open_mail() {
     let server = Server::start();
     {

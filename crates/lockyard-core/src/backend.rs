@@ -1050,10 +1050,10 @@ impl Backend for Store {
             })
             .filter(|claim| {
                 wanted.as_ref().is_none_or(|wanted| {
-                    claim
-                        .paths
-                        .iter()
-                        .any(|held| wanted.overlaps(&ZonePath::stored(held.clone())))
+                    // SQLite zones always ignore case across operating systems (D-3124).
+                    claim.paths.iter().any(|held| {
+                        wanted.overlaps_with_case(&ZonePath::stored(held.clone()), true)
+                    })
                 })
             })
             .map(claim_record)

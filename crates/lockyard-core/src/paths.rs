@@ -59,20 +59,7 @@ impl ZonePath {
         &self.0
     }
 
-    /// True when one path is the other or contains it.
-    pub fn overlaps(&self, other: &Self) -> bool {
-        // Always case-insensitive, on every OS, like the server's default (D-3124): one workspace can mix
-        // a Mac with a Linux host, and a lock that misses `src/Auth` vs `src/auth` is worse than a spare
-        // conflict between two names that differ only in case.
-        overlaps(self.as_str(), other.as_str(), true)
-    }
-
-    /// True when this path is the requested path or one of its parent directories.
-    pub fn contains(&self, other: &Self) -> bool {
-        self.contains_with_case(other, true)
-    }
-
-    /// Coverage under the repository path policy, independent of this machine's OS.
+    /// True when this path covers the other under the supplied path case policy.
     pub fn contains_with_case(&self, other: &Self, fold_case: bool) -> bool {
         let (repository_outer, outer) = crate::repository::split(self.as_str());
         let (repository_inner, inner) = crate::repository::split(other.as_str());
@@ -84,7 +71,7 @@ impl ZonePath {
         outer == ROOT || inner == outer || is_inside(&inner, &outer)
     }
 
-    /// Cloud caches use the repository policy returned by the server, rather than this machine's OS.
+    /// True when either path covers the other under the supplied path case policy.
     pub fn overlaps_with_case(&self, other: &Self, fold_case: bool) -> bool {
         overlaps(self.as_str(), other.as_str(), fold_case)
     }
@@ -274,13 +261,16 @@ mod tests {
         let file = path(".lockyard-repository/api/src/CAF\u{00c9}/file.rs");
         assert!(directory.overlaps_with_case(&file, true));
         assert!(!directory.overlaps_with_case(&file, false));
-        assert!(directory.contains(&file));
-        assert!(!file.contains(&directory));
-        assert!(root.contains(&file));
-        assert!(!path(".").contains(&file));
-        assert!(!root.contains(&path(".lockyard-repository/web/src/file.rs")));
-        assert!(!root.contains(&path("src/file.rs")));
-        assert!(!directory.overlaps(&path(".lockyard-repository/web/src/CAF\u{00c9}")));
+        assert!(directory.contains_with_case(&file, true));
+        assert!(!directory.contains_with_case(&file, false));
+        assert!(!file.contains_with_case(&directory, true));
+        assert!(root.contains_with_case(&file, true));
+        assert!(!path(".").contains_with_case(&file, true));
+        assert!(!root.contains_with_case(&path(".lockyard-repository/web/src/file.rs"), true));
+        assert!(!root.contains_with_case(&path("src/file.rs"), true));
+        assert!(
+            !directory.overlaps_with_case(&path(".lockyard-repository/web/src/CAF\u{00c9}"), true)
+        );
     }
 
     fn zone(root: &Path, cwd: &Path, raw: &str) -> String {
@@ -345,7 +335,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(composed, decomposed);
-        assert!(composed.overlaps(&case_alias));
+        assert!(composed.overlaps_with_case(&case_alias, true));
     }
 
     #[test]
@@ -374,8 +364,16 @@ mod tests {
             let (a, b) = (row["a"].as_str().unwrap(), row["b"].as_str().unwrap());
             let expected = row["overlap"].as_bool().unwrap();
             let path = |text: &str| ZonePath::stored(text.into());
-            assert_eq!(path(a).overlaps(&path(b)), expected, "{a:?} vs {b:?}");
-            assert_eq!(path(b).overlaps(&path(a)), expected, "{b:?} vs {a:?}");
+            assert_eq!(
+                path(a).overlaps_with_case(&path(b), true),
+                expected,
+                "{a:?} vs {b:?}"
+            );
+            assert_eq!(
+                path(b).overlaps_with_case(&path(a), true),
+                expected,
+                "{b:?} vs {a:?}"
+            );
         }
     }
 
@@ -388,20 +386,20 @@ mod tests {
     #[test]
     fn overlap_respects_path_components() {
         let path = |text: &str| ZonePath::stored(text.into());
-        assert!(path("src").overlaps(&path("src/a.rs")));
-        assert!(path("src/a.rs").overlaps(&path("src")));
-        assert!(path("src/a.rs").overlaps(&path("src/a.rs")));
-        assert!(path(".").overlaps(&path("anything")));
-        assert!(!path("src").overlaps(&path("src2/a.rs")));
-        assert!(!path("src/a").overlaps(&path("src/b")));
+        assert!(path("src").overlaps_with_case(&path("src/a.rs"), true));
+        assert!(path("src/a.rs").overlaps_with_case(&path("src"), true));
+        assert!(path("src/a.rs").overlaps_with_case(&path("src/a.rs"), true));
+        assert!(path(".").overlaps_with_case(&path("anything"), true));
+        assert!(!path("src").overlaps_with_case(&path("src2/a.rs"), true));
+        assert!(!path("src/a").overlaps_with_case(&path("src/b"), true));
     }
 
     #[test]
     fn contains_requires_the_existing_claim_to_cover_the_requested_path() {
         let directory = ZonePath::stored("Auth".into());
         let file = ZonePath::stored("auth/a.cs".into());
-        assert!(directory.contains(&file));
-        assert!(!file.contains(&directory));
+        assert!(directory.contains_with_case(&file, true));
+        assert!(!file.contains_with_case(&directory, true));
     }
 
     #[test]
