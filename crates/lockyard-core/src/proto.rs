@@ -877,7 +877,7 @@ pub struct Freeze {
 /// The server stores the catalog as an opaque document. This client reads `zones.<name>` as a list of
 /// paths or as an object with `paths`, and `groups.<name>` as a list of zone names.
 pub fn expand_zones(catalog: &Value, names: &[String]) -> Result<Vec<String>> {
-    let mut paths: Vec<String> = Vec::new();
+    let mut paths = Vec::new();
     for name in names {
         let members: Vec<String> = match catalog
             .pointer(&pointer("groups", name))
@@ -902,8 +902,9 @@ pub fn expand_zones(catalog: &Value, names: &[String]) -> Result<Vec<String>> {
                     Error::Protocol(format!("catalog entry for zone {member:?} has no paths"))
                 })?;
             for path in list.iter().filter_map(Value::as_str) {
-                if !paths.iter().any(|known| known == path) {
-                    paths.push(path.to_string());
+                let path = crate::paths::nfc_path(path);
+                if !paths.contains(&path) {
+                    paths.push(path);
                 }
             }
         }
@@ -1095,6 +1096,19 @@ mod tests {
             expand_zones(&catalog, &["nope".into()]),
             Err(Error::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn catalogs_deduplicate_nfc_and_use_d145_only_with_a_case_policy() {
+        let catalog = json!({
+            "version": 1, "zones": {"a": ["cafe\u{301}", "ſ"], "b": ["café", "s"]},
+            "groups": {"all": ["a", "b"]}
+        });
+        let names = ["all".into()];
+        let typed = crate::catalog::ZoneCatalogV1::from_json(&catalog.to_string()).unwrap();
+        assert_eq!(expand_zones(&catalog, &names).unwrap(), ["café", "ſ", "s"]);
+        assert_eq!(typed.expand(&names).unwrap(), ["café", "ſ", "s"]);
+        assert_eq!(typed.expand_with_case(&names, true).unwrap(), ["café", "ſ"]);
     }
 
     #[test]

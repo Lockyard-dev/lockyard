@@ -23,6 +23,11 @@ All notable changes to Lockyard are recorded here. The format follows
 - Find all canonically caseless path spellings during monitor rescans of case-insensitive claims.
   Reconcile loss alerts within the same repository and finish the policy check even if the
   recovered claim was narrowed while waiting (LOCAL-0100).
+- Find NFC-equivalent names during case-sensitive rescans, and keep pending loss reconciliation
+  until `/lost` succeeds. Preserve existing unannounced-write IDs, hit counts and notification
+  timestamps when normalizing legacy paths (LOCAL-0129).
+- Deduplicate claim and catalog paths with D145 where the case policy permits folding, and use NFC
+  for catalog merges and hook check replies (LOCAL-0129).
 - Report ownership in `zone_check` only when an own claim covers the whole requested zone.
   Reuse each parent listing during D145 alias lookups, with a separate budget and an explicit
   monitor warning when it runs out. Write and match monitor journal paths in NFC, and order

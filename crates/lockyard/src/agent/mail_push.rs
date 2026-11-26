@@ -13,7 +13,7 @@ pub(super) struct PushState {
     status_claims: HashMap<(String, Option<String>), HashSet<i64>>,
     local_zone_mutations: HashMap<(String, i64), Vec<LocalZoneMutation>>,
     next_zone_mutation: u64,
-    // A timestamp marks an acquisition that still needs a second check with the policy.
+    // Pending acquisitions still need the case policy or a successful /lost snapshot.
     seen_claims: HashMap<String, HashMap<i64, Option<Acquisition>>>,
     // Receipt times control alert expiry independently of loss ordering.
     zone_alert_times: HashMap<(String, i64), Instant>,
@@ -49,20 +49,31 @@ impl PushState {
         id: i64,
         fold_case: Option<bool>,
         acquired_at: Option<i64>,
+        wait_for_lost: bool,
     ) -> Option<Acquisition> {
         let acquisition = Acquisition {
             observed_at: self.now(),
             acquired_at: acquired_at.unwrap_or_else(now_ms),
+            waiting_for_lost: wait_for_lost,
         };
         let seen = self.seen_claims.entry(session.into()).or_default();
         match seen.entry(id) {
             Entry::Vacant(entry) => {
-                entry.insert(fold_case.is_none().then_some(acquisition));
+                entry.insert((fold_case.is_none() || wait_for_lost).then_some(acquisition));
                 Some(acquisition)
             }
             // Receiving the policy later keeps the original acquisition time.
-            Entry::Occupied(mut entry) if fold_case.is_some() => entry.get_mut().take(),
-            Entry::Occupied(_) => None,
+            Entry::Occupied(mut entry) => {
+                let pending = entry.get_mut().as_mut()?;
+                pending.waiting_for_lost |= wait_for_lost;
+                if wait_for_lost {
+                    Some(*pending)
+                } else if pending.waiting_for_lost || fold_case.is_none() {
+                    None
+                } else {
+                    entry.get_mut().take()
+                }
+            }
         }
     }
 
@@ -120,10 +131,11 @@ struct LocalZoneMutation {
     events: Vec<Event>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Acquisition {
     observed_at: Instant,
     acquired_at: i64,
+    waiting_for_lost: bool,
 }
 
 fn stamp_millis(stamp: &Stamp) -> Option<i64> {
@@ -424,7 +436,7 @@ impl<T: Transport + 'static> Shared<T> {
                         .and_then(Value::as_bool);
                     let acquired_at = event_stamp(event).as_ref().and_then(stamp_millis);
                     if let Some(acquisition) =
-                        push.record_acquisition(session, id, fold_case, acquired_at)
+                        push.record_acquisition(session, id, fold_case, acquired_at, false)
                     {
                         let read_paths = |key| {
                             event
@@ -588,6 +600,9 @@ impl<T: Transport + 'static> Shared<T> {
             .collect();
         let (missing, acquired): (HashSet<_>, Vec<_>) = {
             let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+            let previous = push.status_claims.entry(scope.clone()).or_default();
+            let missing: HashSet<_> = previous.difference(&current).copied().collect();
+            previous.extend(current.iter().copied());
             let acquired: Vec<_> = claims
                 .iter()
                 .filter(|claim| claim.session == session)
@@ -599,21 +614,22 @@ impl<T: Transport + 'static> Shared<T> {
                         claim.id,
                         claim.case_insensitive_paths,
                         acquired_at,
+                        !missing.is_empty(),
                     )
                     .map(|acquisition| (claim, acquisition))
                 })
                 .collect();
-            let previous = push.status_claims.entry(scope.clone()).or_default();
-            let missing = previous.difference(&current).copied().collect();
-            previous.extend(current.iter().copied());
             (missing, acquired)
         };
+        let lost = if missing.is_empty() || budget.is_zero() {
+            None
+        } else {
+            backend.lost_within(session, budget).ok()
+        };
+        let fetched_lost = lost.is_some();
+        let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
         // Repeated snapshots of the same id cannot acknowledge a later loss.
-        if !missing.is_empty()
-            && !budget.is_zero()
-            && let Ok(lost) = backend.lost_within(session, budget)
-        {
-            let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(lost) = lost {
             push.status_claims
                 .entry(scope)
                 .or_default()
@@ -648,7 +664,6 @@ impl<T: Transport + 'static> Shared<T> {
         }
         // Share acquisition history with SSE and clear after fallback seeding so
         // an old /lost record cannot resurrect an alert in this same snapshot.
-        let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
         for (claim, acquisition) in acquired {
             let (Some(paths), Some(excluded)) = (
                 workspace_paths(&claim.paths),
@@ -664,6 +679,23 @@ impl<T: Transport + 'static> Shared<T> {
                 claim.case_insensitive_paths,
                 acquisition,
             );
+            if fetched_lost
+                && let Some(pending) = push
+                    .seen_claims
+                    .get_mut(session)
+                    .and_then(|seen| seen.get_mut(&claim.id))
+                && *pending == Some(acquisition)
+            {
+                // A successful snapshot ends the wait for /lost. An absent case policy
+                // still requires the ordinary recheck when it eventually arrives.
+                *pending = claim
+                    .case_insensitive_paths
+                    .is_none()
+                    .then_some(Acquisition {
+                        waiting_for_lost: false,
+                        ..acquisition
+                    });
+            }
         }
     }
 
@@ -2808,11 +2840,39 @@ mod tests {
 
     #[test]
     fn local_0100_r6_lost_snapshot_orders_by_loss_time() {
+        lost_snapshot_orders_by_loss_time(None);
+    }
+
+    #[test]
+    fn lost_snapshot_retries_policy_reconciliation_after_zero_budget() {
+        lost_snapshot_orders_by_loss_time(Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn lost_snapshot_retries_policy_reconciliation_after_timeout() {
+        lost_snapshot_orders_by_loss_time(Some(Duration::from_millis(100)));
+    }
+
+    fn lost_snapshot_orders_by_loss_time(first_budget: Option<Duration>) {
+        struct LostSnapshotTransport<T>(T);
+        impl<T: Transport> Transport for LostSnapshotTransport<T> {
+            fn call(&self, call: &lockyard_cloud_client::Call) -> Result<Value, ClientError> {
+                if call.attempt_timeout_ms == Some(100) {
+                    assert!(call.path.starts_with("/api/v1/zones/lost?"));
+                    return Err(ClientError::Transport("request timed out".into()));
+                }
+                self.0.call(call)
+            }
+        }
+
         let mut rig = rig(true, None);
         rig.daemon.stop_workers();
         let shared = &rig.daemon.shared;
         shared.hear("alice");
-        let backend = shared.backend("alice");
+        let backend = lockyard_cloud_client::CloudBackend::new(
+            LostSnapshotTransport(shared.transport.clone()),
+            "alice",
+        );
         let old = [41, 42, 44].map(|id| {
             serde_json::from_value::<Claim>(
                 json!({"id": id, "session": "alice", "paths": ["src/straße/file.rs"]}),
@@ -2829,22 +2889,28 @@ mod tests {
         shared.push_event(claimed);
         shared.push.lock().unwrap().clock_now = Some(Instant::now() + Duration::from_secs(1));
 
-        rig.server.enqueue(
-            "/api/v1/zones/lost",
-            HttpReply::json(
-                200,
-                json!({"lost": [
-                    {"claim_id": 41, "paths": ["src/straße/file.rs"],
-                     "lost_at": lockyard_core::proto::rfc3339(acquired_at - 60_000)},
-                    {"claim_id": 42, "paths": ["src/straße/file.rs"]},
-                    {"claim_id": 44, "paths": ["src/straße/file.rs"], "lost_at": acquired_at + 60_000}
-                ]}),
-            ),
-        );
+        let lost = json!({"lost": [
+            {"claim_id": 41, "paths": ["src/straße/file.rs"],
+             "lost_at": lockyard_core::proto::rfc3339(acquired_at - 60_000)},
+            {"claim_id": 42, "paths": ["src/straße/file.rs"]},
+            {"claim_id": 44, "paths": ["src/straße/file.rs"], "lost_at": acquired_at + 60_000}
+        ]});
         let acquired = serde_json::from_value(json!({
             "id": 43, "session": "alice", "paths": ["src/STRASSE"], "case_insensitive_paths": true
         }))
         .unwrap();
+        if let Some(budget) = first_budget {
+            shared.observe_status_claims(
+                "alice",
+                None,
+                std::slice::from_ref(&acquired),
+                &backend,
+                budget,
+            );
+            assert!(shared.zone_alerts("alice").is_empty());
+        }
+        rig.server
+            .enqueue("/api/v1/zones/lost", HttpReply::json(200, lost));
         shared.observe_status_claims("alice", None, &[acquired], &backend, Duration::from_secs(2));
         let remaining: Vec<_> = shared
             .zone_alerts("alice")

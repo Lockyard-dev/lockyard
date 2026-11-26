@@ -13,13 +13,7 @@ pub(super) fn with_zones(
     let mut paths = opened.workspace_zone_paths(cwd, raw)?;
     if !zones.is_empty() {
         match opened.backend.catalog_expand(zones) {
-            Ok(expanded) => {
-                for path in expanded {
-                    if !paths.contains(&path) {
-                        paths.push(path);
-                    }
-                }
-            }
+            Ok(expanded) => crate::open::merge_catalog_paths(&mut paths, expanded),
             Err(error)
                 if error.to_string().contains("zone_unknown") || error.kind() == "zone_unknown" =>
             {

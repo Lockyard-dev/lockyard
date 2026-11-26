@@ -66,8 +66,8 @@ impl ZonePath {
         if repository_outer != repository_inner {
             return false;
         }
-        let outer = comparable(outer, fold_case);
-        let inner = comparable(inner, fold_case);
+        let outer = path_comparison_key(outer, fold_case);
+        let inner = path_comparison_key(inner, fold_case);
         outer == ROOT || inner == outer || is_inside(&inner, &outer)
     }
 
@@ -83,11 +83,14 @@ fn overlaps(a: &str, b: &str, fold_case: bool) -> bool {
     if repository_a != repository_b {
         return false;
     }
-    overlaps_exact(&comparable(a, fold_case), &comparable(b, fold_case))
+    overlaps_exact(
+        &path_comparison_key(a, fold_case),
+        &path_comparison_key(b, fold_case),
+    )
 }
 
 /// A zone comparison key under the repository's case policy.
-fn comparable(path: &str, fold_case: bool) -> String {
+pub(crate) fn path_comparison_key(path: &str, fold_case: bool) -> String {
     if fold_case {
         // `/` is unchanged by D145 and separates normalization sequences.
         fold_path_component(path)

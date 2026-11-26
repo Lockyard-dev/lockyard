@@ -242,7 +242,7 @@ fn inspect(
         (Vec::new(), false)
     };
     if aliases_truncated {
-        let message = "monitor rescan exhausted the D145 alias lookup budget; some equivalent paths may have been skipped";
+        let message = "monitor rescan exhausted the Unicode alias lookup budget; some equivalent paths may have been skipped";
         if settings.json {
             writeln!(out, "{}", json!({"event": "warning", "message": message}))?;
         } else {
@@ -344,9 +344,9 @@ fn rescan(root: &Path, claims: &[lockyard_core::proto::Claim], now: i64) -> (Vec
                 break 'claims;
             }
             scan.remaining -= 1;
-            if claim.folds_path_case() && held != "." {
+            if held != "." {
                 let components: Vec<_> = held.split('/').collect();
-                scan.walk_folded(root, &components);
+                scan.walk_aliases(root, &components, claim.folds_path_case());
             } else {
                 scan.walk(&root.join(held), 0);
             }
@@ -361,19 +361,20 @@ const RESCAN_WINDOW: Duration = Duration::from_secs(60);
 const RESCAN_DEPTH: usize = 12;
 /// Bound the walk through claimed subtrees independently of alias resolution.
 const RESCAN_ENTRIES: usize = 20_000;
-/// Bound the total number of directory entries indexed for D145 lookups per rescan.
+/// Bound the total number of directory entries indexed for Unicode alias lookups per rescan.
 const RESCAN_ALIAS_ENTRIES: usize = 20_000;
 
 #[derive(Default)]
 struct AliasDirectory {
-    by_key: HashMap<String, Vec<PathBuf>>,
+    by_nfc: HashMap<String, Vec<PathBuf>>,
+    by_d145: HashMap<String, Vec<PathBuf>>,
     truncated: bool,
 }
 
 impl AliasDirectory {
     fn read(at: &Path, remaining: &mut usize) -> Self {
         let mut listing = Self::default();
-        // Do not follow an intermediate symlink while resolving a folded path.
+        // Do not follow an intermediate symlink while resolving aliases.
         if !at.symlink_metadata().is_ok_and(|data| data.is_dir()) {
             return listing;
         }
@@ -392,11 +393,17 @@ impl AliasDirectory {
             *remaining -= 1;
             let Ok(entry) = entry else { continue };
             if let Some(name) = entry.file_name().to_str() {
+                let path = entry.path();
                 listing
-                    .by_key
+                    .by_nfc
+                    .entry(nfc_path(name))
+                    .or_default()
+                    .push(path.clone());
+                listing
+                    .by_d145
                     .entry(fold_path_component(name))
                     .or_default()
-                    .push(entry.path());
+                    .push(path);
             }
         }
         listing
@@ -409,13 +416,13 @@ struct Rescan<'a> {
     remaining: usize,
     alias_remaining: usize,
     aliases_truncated: bool,
-    // Group folded child lookups by their actual parent, then by the D145 key.
+    // Share each physical parent listing across both comparison policies.
     alias_listings: HashMap<PathBuf, AliasDirectory>,
     found: Vec<String>,
 }
 
 impl Rescan<'_> {
-    fn walk_folded(&mut self, at: &Path, components: &[&str]) {
+    fn walk_aliases(&mut self, at: &Path, components: &[&str], fold_case: bool) {
         let Some((component, rest)) = components.split_first() else {
             self.walk(at, 0);
             return;
@@ -427,11 +434,13 @@ impl Rescan<'_> {
             .alias_listings
             .entry(at.to_path_buf())
             .or_insert_with(|| AliasDirectory::read(at, &mut self.alias_remaining));
-        let mut matches = listing
-            .by_key
-            .get(&fold_path_component(component))
-            .cloned()
-            .unwrap_or_default();
+        let mut matches = if fold_case {
+            listing.by_d145.get(&fold_path_component(component))
+        } else {
+            listing.by_nfc.get(&nfc_path(component))
+        }
+        .cloned()
+        .unwrap_or_default();
         if listing.truncated {
             self.aliases_truncated = true;
             // Keep walking the literal spelling even when enumerating aliases is capped.
@@ -445,7 +454,7 @@ impl Rescan<'_> {
             }
         }
         for child in matches {
-            self.walk_folded(&child, rest);
+            self.walk_aliases(&child, rest, fold_case);
         }
     }
 
@@ -777,6 +786,33 @@ mod tests {
     }
 
     #[test]
+    fn case_sensitive_rescan_finds_the_on_disk_nfc_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let nfc = "café";
+        let nfd = "cafe\u{301}";
+        std::fs::create_dir_all(root.join("src").join(nfd)).unwrap();
+        std::fs::write(root.join("src").join(nfd).join("changed.rs"), "changed").unwrap();
+        let name = std::fs::read_dir(root.join("src"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name();
+        let on_disk = name.to_str().unwrap();
+        // Use the other spelling even on file systems that resolve both names literally.
+        let held = if on_disk == nfc { nfd } else { nfc };
+        let claim = serde_json::from_value(json!({
+            "id": 1, "paths": [format!("src/{held}")], "case_insensitive_paths": false
+        }))
+        .unwrap();
+        assert_eq!(
+            rescan(root, &[claim], 0),
+            (vec![format!("src/{on_disk}/changed.rs")], false)
+        );
+    }
+
+    #[test]
     fn local_0100_r6_rescan_does_not_starve_after_missing_siblings() {
         let project = Project::new();
         let root = project.root();
@@ -842,8 +878,8 @@ mod tests {
             alias_listings: HashMap::new(),
             found: Vec::new(),
         };
-        scan.walk_folded(root, &["missing"]);
-        scan.walk_folded(root, &["src"]);
+        scan.walk_aliases(root, &["missing"], true);
+        scan.walk_aliases(root, &["src"], false);
         assert!(scan.aliases_truncated);
         assert_eq!(
             scan.alias_listings.len(),

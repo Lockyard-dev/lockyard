@@ -272,11 +272,7 @@ pub(super) fn claim_paths(
         match opened.backend.catalog_expand(&zones) {
             Ok(expanded) => {
                 kept_zones = zones;
-                for path in expanded {
-                    if !paths.contains(&path) {
-                        paths.push(path);
-                    }
-                }
+                crate::open::merge_catalog_paths(&mut paths, expanded);
             }
             Err(Error::NeedsCloud(_)) => {
                 return Err(Error::Invalid(format!(

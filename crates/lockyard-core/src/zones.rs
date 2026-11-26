@@ -3,10 +3,12 @@
 //! Work zones. A claim is a lease on paths: nobody else can claim an overlapping path until it is
 //! released or expires, so a crashed agent cannot hold a zone forever.
 
+use crate::paths::{fold_path_component, nfc_path};
 use crate::proto::Stamp;
 use crate::{Error, Result, Store, ZonePath};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 
 /// Lease of a claim unless the caller asks for another one.
@@ -104,9 +106,13 @@ impl Store {
             params![agent, note, now, expires_at],
         )?;
         let id = transaction.last_insert_rowid();
-        let mut unique: Vec<String> = paths.iter().map(|p| p.as_str().to_string()).collect();
+        let mut unique: Vec<String> = paths.iter().map(|path| nfc_path(path.as_str())).collect();
         unique.sort();
-        unique.dedup();
+        let mut seen = HashSet::new();
+        unique.retain(|path| {
+            let (repository, path) = crate::repository::split(path);
+            seen.insert((repository.map(str::to_owned), fold_path_component(path)))
+        });
         for path in &unique {
             transaction.execute(
                 "INSERT INTO claim_paths (claim_id, path) VALUES (?1, ?2)",
@@ -277,6 +283,33 @@ mod tests {
         assert_eq!(conflicts[0].agent, "a");
         assert_eq!(conflicts[0].held_path, "src");
         assert_eq!(conflicts[0].note, "refactor");
+    }
+
+    #[test]
+    fn claim_deduplicates_nfc_and_d145_spellings_per_repository() {
+        let (_dir, mut store) = test_store();
+        let paths = [
+            "src/cafe\u{301}",
+            "src/café",
+            "src/ſ",
+            "src/s",
+            "src/ss",
+            ".lockyard-repository/api/src/ſ",
+            ".lockyard-repository/web/src/s",
+        ]
+        .map(path);
+        let claim = store.claim("a", &paths, "", TTL, 0).unwrap();
+        assert_eq!(
+            claim.paths,
+            [
+                ".lockyard-repository/api/src/ſ",
+                ".lockyard-repository/web/src/s",
+                "src/café",
+                "src/s",
+                "src/ss",
+            ]
+        );
+        assert_eq!(store.claims(1).unwrap(), [claim]);
     }
 
     #[test]

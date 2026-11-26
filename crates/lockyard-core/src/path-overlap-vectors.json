@@ -15,6 +15,7 @@
     { "a": "\u0386\u0345\u0301", "b": "\u03ac\u0345\u0301", "overlap": true },
     { "a": "\u0386\u0345\u0301", "b": "\u03b1\u0301\u0301\u03b9", "overlap": true },
     { "a": "\u03ac\u0345\u0301", "b": "\u03b1\u0301\u0301\u03b9", "overlap": true },
+    { "a": "x\u05c8\u0327", "b": "x\u0327\u05c8", "overlap": true },
     { "a": "straße", "b": "STRASSE", "overlap": true },
     { "a": "ΑΣ", "b": "ας", "overlap": true },
     { "a": "ſ", "b": "s", "overlap": true },

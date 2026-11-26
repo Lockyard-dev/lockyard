@@ -4266,6 +4266,27 @@ fn hook_check_refuses_unknown_and_incomplete_zone_answers() {
 }
 
 #[test]
+fn hook_check_validates_the_requested_path_in_nfc() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    for (requested, answered, accepted) in [
+        ("src/café", "src/cafe\u{301}", true),
+        ("src/s", "src/ſ", false),
+    ] {
+        server.state.lock().unwrap().check_reply =
+            Some(json!({"paths": [{"path": answered, "status": "free"}]}));
+        let result = cli(
+            dir.path(),
+            runtime.path(),
+            &["hook", "check", "--path", requested],
+        );
+        assert_eq!(result.status.success(), accepted, "{result:?}");
+    }
+    assert_eq!(server.seen("POST", "/api/v1/zones/check").len(), 2);
+}
+
+#[test]
 fn hook_check_refuses_unknown_from_the_agent_socket() {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
@@ -4898,7 +4919,7 @@ fn required_catalog_fixture(server: &Server, dir: &Path, runtime: &Path) {
     key.copy_to_private(&key_dir.join(format!("{workspace}.key")))
         .unwrap();
     let plaintext = lockyard_core::catalog::ZoneCatalogV1::from_json(
-        r#"{"version":1,"zones":{"code":["src","tests"]},"groups":{"all":["code"]}}"#,
+        r#"{"version":1,"zones":{"code":["src","ſrc","tests"]},"groups":{"all":["code"]}}"#,
     )
     .unwrap();
     let wire = seal_catalog(&key, workspace, "api", 0, true, &plaintext).unwrap();
@@ -4995,6 +5016,50 @@ fn required_mcp_zones_share_verified_catalog_expander() {
         "zone_unknown"
     );
     assert_eq!(server.seen("POST", "/api/v1/zones/claims").len(), 1);
+}
+
+#[test]
+fn cli_and_mcp_merge_catalog_aliases_with_explicit_paths_in_nfc() {
+    for mcp in [false, true] {
+        let server = Server::start();
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        server.state.lock().unwrap().catalog =
+            Some(json!({"zones": {"code": ["src/cafe\u{301}", "src/ſ"]}}));
+        if mcp {
+            let responses = mcp_calls(
+                dir.path(),
+                runtime.path(),
+                "full",
+                &[(
+                    "zone_claim",
+                    json!({"paths": ["src/café", "src/s"], "zones": ["code"]}),
+                )],
+            );
+            assert_ne!(responses[0]["isError"], true, "{responses:?}");
+        } else {
+            let result = cli(
+                dir.path(),
+                runtime.path(),
+                &[
+                    "--json",
+                    "zone",
+                    "claim",
+                    "src/café",
+                    "src/s",
+                    "--zone",
+                    "code",
+                ],
+            );
+            assert!(result.status.success(), "{result:?}");
+        }
+        let writes = server.seen("POST", "/api/v1/zones/claims");
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            writes[0].body["paths"],
+            json!(["src/café", "src/s", "src/ſ"])
+        );
+    }
 }
 
 #[test]
