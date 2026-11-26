@@ -822,6 +822,9 @@ fn acquire_claim(
     }
     let request = &effective;
     if !request.paths.is_empty() {
+        // The wire policy says whether to ignore case, but does not identify the
+        // comparison algorithm. Only the local store is known to use D145.
+        let allow_case_aliases = !backend.is_cloud();
         let existing = backend.claims(
             &ClaimQuery {
                 session: Some(agent.to_string()),
@@ -831,7 +834,7 @@ fn acquire_claim(
         )?;
         if let Some(claim) = existing
             .into_iter()
-            .find(|claim| claim_covers_request(claim, agent, request))
+            .find(|claim| claim_matches_request(claim, agent, request, false, allow_case_aliases))
         {
             return Ok((claim, false, Some(false)));
         }
@@ -839,7 +842,7 @@ fn acquire_claim(
     let (claim, created) = backend.claim_with_creation_status(agent, request, now)?;
     // A fresh receipt may explicitly exclude contended paths. That is a partial
     // grant, not a protocol failure; it must never qualify for full-coverage reuse.
-    if !claim_matches_request(&claim, agent, request, true) {
+    if !claim_matches_request(&claim, agent, request, true, true) {
         return Err(Error::Protocol(
             "claim response did not grant the requested paths to this session".into(),
         ));
@@ -847,24 +850,22 @@ fn acquire_claim(
     Ok((claim, true, created))
 }
 
-fn claim_covers_request(claim: &Claim, agent: &str, request: &ClaimRequest) -> bool {
-    claim_matches_request(claim, agent, request, false)
-}
-
 fn claim_matches_request(
     claim: &Claim,
     agent: &str,
     request: &ClaimRequest,
     allow_exclusions: bool,
+    allow_case_aliases: bool,
 ) -> bool {
-    let fold_case = claim.case_insensitive_paths.unwrap_or(true);
+    let fold_case = claim.folds_path_case();
+    let fold_held_paths = allow_case_aliases && fold_case;
     claim.session == agent
         && request.mode.is_none_or(|mode| claim.mode == mode)
         && request.paths.iter().all(|requested| {
             let requested = crate::paths::ZonePath::stored(requested.clone());
             let covered = claim.paths.iter().any(|held| {
                 crate::paths::ZonePath::stored(held.clone())
-                    .contains_with_case(&requested, fold_case)
+                    .contains_with_case(&requested, fold_held_paths)
             });
             if allow_exclusions {
                 covered
@@ -875,8 +876,16 @@ fn claim_matches_request(
             } else {
                 covered
                     && !claim.excluded_paths.iter().any(|excluded| {
-                        crate::paths::ZonePath::stored(excluded.clone())
-                            .overlaps_with_case(&requested, fold_case)
+                        // Without a declared comparison algorithm, let the server decide
+                        // whether a Unicode exclusion in this repository affects reuse.
+                        let uncertain = !allow_case_aliases
+                            && fold_case
+                            && (!excluded.is_ascii() || !requested.as_str().is_ascii())
+                            && crate::repository::split(excluded).0
+                                == crate::repository::split(requested.as_str()).0;
+                        uncertain
+                            || ZonePath::stored(excluded.clone())
+                                .overlaps_with_case(&requested, fold_case)
                     })
             }
         })

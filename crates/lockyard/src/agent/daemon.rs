@@ -288,22 +288,25 @@ impl View {
     fn check_path(&self, session: &str, raw: &str) -> PathCheck {
         let path = ZonePath::stored(raw.to_string());
         let repository = lockyard_core::repository::split(raw).0;
-        // The server uses .NET OrdinalIgnoreCase. ASCII folding cannot safely answer
-        // Unicode comparisons, including exclusions and Unicode holders of ASCII paths.
+        // The server has not announced its Unicode comparison rule. Also defer
+        // when an omitted case policy could change the cached answer.
         if self.claims.iter().any(|claim| {
-            claim
-                .case_insensitive_paths
-                .unwrap_or(cfg!(any(target_os = "macos", windows)))
+            if !claim.folds_path_case() {
+                return false;
+            }
+            let unicode = (!raw.is_ascii()
+                || claim
+                    .paths
+                    .iter()
+                    .chain(&claim.excluded_paths)
+                    .any(|held| !held.is_ascii()))
                 && claim
                     .paths
                     .iter()
-                    .any(|held| lockyard_core::repository::split(held).0 == repository)
-                && (!raw.is_ascii()
-                    || claim
-                        .paths
-                        .iter()
-                        .chain(&claim.excluded_paths)
-                        .any(|held| !held.is_ascii()))
+                    .any(|held| lockyard_core::repository::split(held).0 == repository);
+            unicode
+                || (claim.case_insensitive_paths.is_none()
+                    && claim.covers(&path) != claim.covers_with_case(&path, false))
         }) {
             return PathCheck {
                 mode: None,
@@ -315,12 +318,12 @@ impl View {
         }
         // A claim of an unavailable session stops blocking, as it does on the server.
         let covering =
-            |claim: &&Claim| claim.holder_available != Some(false) && covers(claim, &path);
+            |claim: &&Claim| claim.holder_available != Some(false) && claim.covers(&path);
         // Availability is about other sessions: a session that comes back still holds its own claims.
         let mine: Vec<&Claim> = self
             .claims
             .iter()
-            .filter(|claim| claim.session == session && covers(claim, &path))
+            .filter(|claim| claim.session == session && claim.covers(&path))
             .collect();
         let shares = mine.iter().any(|claim| claim.mode == ClaimMode::Shared);
         let holder = self
@@ -343,12 +346,8 @@ impl View {
                         .paths
                         .iter()
                         .find(|held| {
-                            ZonePath::stored((*held).clone()).overlaps_with_case(
-                                &path,
-                                claim
-                                    .case_insensitive_paths
-                                    .unwrap_or(cfg!(any(target_os = "macos", windows))),
-                            )
+                            ZonePath::stored((*held).clone())
+                                .overlaps_with_case(&path, claim.folds_path_case())
                         })
                         .cloned()
                         .unwrap_or_default(),
@@ -371,20 +370,6 @@ impl View {
             },
         }
     }
-}
-
-fn covers(claim: &Claim, path: &ZonePath) -> bool {
-    let fold_case = claim
-        .case_insensitive_paths
-        .unwrap_or(cfg!(any(target_os = "macos", windows)));
-    claim
-        .paths
-        .iter()
-        .any(|held| ZonePath::stored(held.clone()).overlaps_with_case(path, fold_case))
-        && !claim
-            .excluded_paths
-            .iter()
-            .any(|gap| ZonePath::stored(gap.clone()).contains_with_case(path, fold_case))
 }
 
 #[derive(Default)]
@@ -1624,7 +1609,7 @@ impl<T: Transport + 'static> Shared<T> {
             own.flat_map(|claim| {
                 paths
                     .iter()
-                    .filter(|path| covers(claim, &ZonePath::stored((*path).clone())))
+                    .filter(|path| claim.covers(&ZonePath::stored((*path).clone())))
                     .map(|path| (claim.id, path.clone()))
             })
             .collect()
@@ -5061,6 +5046,30 @@ mod tests {
             status("docs/b"),
             CheckStatus::Held,
             "no shared claim of mine covers it"
+        );
+    }
+
+    #[test]
+    fn local_0100_r4_cache_defers_case_alias_without_a_policy() {
+        let mut view = View {
+            claims: vec![
+                serde_json::from_value(json!({"id": 1, "session": "bob", "paths": ["src/A"]}))
+                    .unwrap(),
+            ],
+            ..View::default()
+        };
+        assert_eq!(
+            view.check_path("alice", "src/a/file.rs").status,
+            CheckStatus::Unknown
+        );
+        view.claims[0].case_insensitive_paths = Some(true);
+        let check = view.check_path("alice", "src/a/file.rs");
+        assert_eq!(check.status, CheckStatus::Held);
+        assert_eq!(check.holder.unwrap().held_path, "src/A");
+        view.claims[0].case_insensitive_paths = Some(false);
+        assert_eq!(
+            view.check_path("alice", "src/a/file.rs").status,
+            CheckStatus::Free
         );
     }
 

@@ -2,7 +2,7 @@
 
 use super::*;
 use lockyard_core::proto::Event;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, hash_map::Entry};
 
 #[derive(Default)]
 pub(super) struct PushState {
@@ -12,7 +12,8 @@ pub(super) struct PushState {
     status_claims: HashMap<String, HashSet<i64>>,
     local_zone_mutations: HashMap<(String, i64), Vec<LocalZoneMutation>>,
     next_zone_mutation: u64,
-    seen_claims: HashMap<String, HashSet<i64>>,
+    // A timestamp marks an acquisition that still needs a second check with the policy.
+    seen_claims: HashMap<String, HashMap<i64, Option<Instant>>>,
     zone_alert_times: HashMap<(String, i64), Instant>,
     replacement: Option<Replacement>,
     #[cfg(test)]
@@ -39,6 +40,63 @@ impl PushState {
         }
         Instant::now()
     }
+
+    fn record_acquisition(
+        &mut self,
+        session: &str,
+        id: i64,
+        fold_case: Option<bool>,
+    ) -> Option<Acquisition> {
+        let pending = fold_case.is_none().then(|| self.now());
+        let seen = self.seen_claims.entry(session.into()).or_default();
+        match seen.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert(pending);
+                Some(Acquisition::New)
+            }
+            Entry::Occupied(mut entry) if fold_case.is_some() => {
+                entry.get_mut().take().map(Acquisition::PolicyResolved)
+            }
+            Entry::Occupied(_) => None,
+        }
+    }
+
+    fn clear_reclaimed_alerts(
+        &mut self,
+        session: &str,
+        new_id: i64,
+        paths: &[String],
+        excluded: &[String],
+        fold_case: Option<bool>,
+        acquisition: Acquisition,
+    ) {
+        if let Some(alerts) = self.zone_alerts.get_mut(session) {
+            let times = &self.zone_alert_times;
+            alerts.retain(|id, alert| {
+                let predates_acquisition = match acquisition {
+                    Acquisition::New => true,
+                    Acquisition::PolicyResolved(first_seen) => times
+                        .get(&(session.into(), *id))
+                        .is_some_and(|at| *at <= first_seen),
+                };
+                *id == new_id
+                    || !predates_acquisition
+                    || alert.paths.is_empty()
+                    || !alert.paths.iter().all(|old| {
+                        let old = ZonePath::stored(old.clone());
+                        paths.iter().any(|new| {
+                            ZonePath::stored(new.clone())
+                                .contains_with_case(&old, fold_case.unwrap_or(false))
+                        }) && !excluded.iter().any(|gap| {
+                            ZonePath::stored(gap.clone())
+                                .overlaps_with_case(&old, fold_case.unwrap_or(true))
+                        })
+                    })
+            });
+            self.zone_alert_times
+                .retain(|(owner, id), _| owner != session || alerts.contains_key(id));
+        }
+    }
 }
 
 struct LocalZoneMutation {
@@ -49,16 +107,10 @@ struct LocalZoneMutation {
     events: Vec<Event>,
 }
 
-fn reclaimed_paths_overlap(a: &str, b: &str, fold_case: Option<bool>) -> bool {
-    if let Some(fold_case) = fold_case {
-        return ZonePath::stored(a.into())
-            .overlaps_with_case(&ZonePath::stored(b.into()), fold_case);
-    }
-    // Legacy events and claims may omit the policy. Keep alerts for spelling aliases
-    // unless the server has confirmed that the repository treats them as equivalent.
-    a == b
-        || a.strip_prefix(b).is_some_and(|tail| tail.starts_with('/'))
-        || b.strip_prefix(a).is_some_and(|tail| tail.starts_with('/'))
+enum Acquisition {
+    New,
+    // Receiving the policy later does not turn this into a new acquisition.
+    PolicyResolved(Instant),
 }
 
 enum PushExit {
@@ -322,29 +374,6 @@ impl<T: Transport + 'static> Shared<T> {
         }
     }
 
-    fn clear_reclaimed_alerts(
-        &self,
-        session: &str,
-        new_id: i64,
-        paths: &[String],
-        fold_case: Option<bool>,
-    ) {
-        let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(alerts) = push.zone_alerts.get_mut(session) {
-            alerts.retain(|id, alert| {
-                *id == new_id
-                    || !alert.paths.iter().any(|old| {
-                        paths
-                            .iter()
-                            .any(|new| reclaimed_paths_overlap(old, new, fold_case))
-                    })
-            });
-            let remaining: HashSet<_> = alerts.keys().copied().collect();
-            push.zone_alert_times
-                .retain(|(owner, id), _| owner != session || remaining.contains(id));
-        }
-    }
-
     fn observe_zone_loss(&self, event: &Event) {
         if !event.kind.starts_with("zone.") {
             return;
@@ -357,29 +386,37 @@ impl<T: Transport + 'static> Shared<T> {
                 if !self.sessions().contains_key(session) {
                     return;
                 }
-                let unseen = self
-                    .push
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .seen_claims
-                    .entry(session.into())
-                    .or_default()
-                    .insert(id);
-                if unseen
-                    && matches!(
-                        event.field("reason").and_then(Value::as_str),
-                        Some("claimed" | "granted")
-                    )
-                {
-                    let paths: Vec<String> = event
-                        .field("paths")
-                        .cloned()
-                        .and_then(|v| serde_json::from_value(v).ok())
-                        .unwrap_or_default();
+                let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+                if matches!(
+                    event.field("reason").and_then(Value::as_str),
+                    Some("claimed" | "granted")
+                ) {
                     let fold_case = event
                         .field("case_insensitive_paths")
                         .and_then(Value::as_bool);
-                    self.clear_reclaimed_alerts(session, id, &paths, fold_case);
+                    if let Some(acquisition) = push.record_acquisition(session, id, fold_case) {
+                        let read_paths = |key| {
+                            event
+                                .field(key)
+                                .cloned()
+                                .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+                                .unwrap_or_default()
+                        };
+                        push.clear_reclaimed_alerts(
+                            session,
+                            id,
+                            &read_paths("paths"),
+                            &read_paths("excluded_paths"),
+                            fold_case,
+                            acquisition,
+                        );
+                    }
+                } else {
+                    push.seen_claims
+                        .entry(session.into())
+                        .or_default()
+                        .entry(id)
+                        .or_insert(None);
                 }
             }
             return;
@@ -472,7 +509,7 @@ impl<T: Transport + 'static> Shared<T> {
         push.seen_claims
             .entry(session.into())
             .or_default()
-            .insert(id);
+            .insert(id, None);
         let version = push
             .zone_alert_versions
             .entry((session.into(), id))
@@ -510,10 +547,13 @@ impl<T: Transport + 'static> Shared<T> {
             .collect();
         let (missing, acquired): (HashSet<_>, Vec<_>) = {
             let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
-            let seen = push.seen_claims.entry(session.into()).or_default();
             let acquired: Vec<_> = claims
                 .iter()
-                .filter(|claim| claim.session == session && seen.insert(claim.id))
+                .filter(|claim| claim.session == session)
+                .filter_map(|claim| {
+                    push.record_acquisition(session, claim.id, claim.case_insensitive_paths)
+                        .map(|acquisition| (claim, acquisition))
+                })
                 .collect();
             let previous = push.status_claims.entry(session.into()).or_default();
             let missing = previous.difference(&current).copied().collect();
@@ -559,12 +599,15 @@ impl<T: Transport + 'static> Shared<T> {
         }
         // Share acquisition history with SSE and clear after fallback seeding so
         // an old /lost record cannot resurrect an alert in this same snapshot.
-        for claim in acquired {
-            self.clear_reclaimed_alerts(
+        let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+        for (claim, acquisition) in acquired {
+            push.clear_reclaimed_alerts(
                 session,
                 claim.id,
                 &claim.paths,
+                &claim.excluded_paths,
                 claim.case_insensitive_paths,
+                acquisition,
             );
         }
     }
@@ -2647,6 +2690,65 @@ mod tests {
             shared.observe_status_claims("alice", &[claim(43)], &backend, Duration::ZERO);
             assert_eq!(shared.push.lock().unwrap().zone_alerts["alice"].len(), 1);
         }
+    }
+
+    #[test]
+    fn local_0100_r4_reclaim_must_cover_the_lost_path() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let mut lost = round4_zone(1, "zone.lost", 42, 2, None);
+        lost.payload["paths"] = json!(["src/straße"]);
+        shared.push_event(lost);
+        for (seq, id, path, excluded, remaining) in [
+            (2, 43, "src/STRASSE/file.rs", None, 1),
+            (3, 44, "src/STRASSE", Some("src/STRASSE/private"), 1),
+            (4, 45, "src/STRASSE", None, 0),
+        ] {
+            let mut claimed = round4_zone(seq, "zone.claimed", id, 3, None);
+            claimed.payload["reason"] = json!("claimed");
+            claimed.payload["paths"] = json!([path]);
+            if let Some(excluded) = excluded {
+                claimed.payload["excluded_paths"] = json!([excluded]);
+            }
+            claimed.payload["case_insensitive_paths"] = json!(true);
+            shared.push_event(claimed);
+            assert_eq!(shared.zone_alerts("alice").len(), remaining, "{path}");
+        }
+    }
+
+    #[test]
+    fn local_0100_r4_rechecks_an_acquisition_when_the_policy_arrives() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let backend = lockyard_cloud_client::CloudBackend::new(
+            Client::new(&rig.server.url(), "test-token".into()).unwrap(),
+            "alice",
+        );
+        let mut lost = round4_zone(1, "zone.lost", 42, 2, None);
+        lost.payload["paths"] = json!(["src/straße/file.rs"]);
+        shared.push_event(lost);
+        let mut claimed = round4_zone(2, "zone.claimed", 43, 3, None);
+        claimed.payload["reason"] = json!("claimed");
+        claimed.payload["paths"] = json!(["src/STRASSE"]);
+        shared.push_event(claimed);
+        assert_eq!(shared.zone_alerts("alice").len(), 1);
+
+        let claim: Claim = serde_json::from_value(json!({
+            "id": 43, "session": "alice", "paths": ["src/STRASSE"], "case_insensitive_paths": true
+        }))
+        .unwrap();
+        shared.push.lock().unwrap().clock_now = Some(Instant::now() + Duration::from_secs(1));
+        let mut later_loss = round4_zone(3, "zone.lost", 44, 4, None);
+        later_loss.payload["paths"] = json!(["src/straße/later.rs"]);
+        shared.push_event(later_loss);
+        shared.observe_status_claims("alice", &[claim], &backend, Duration::ZERO);
+        let alerts = shared.zone_alerts("alice");
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].claim_id, 44);
     }
 
     #[test]

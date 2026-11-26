@@ -5292,6 +5292,64 @@ fn status_closes_open_mail_on_ack_not_on_cloud_sent() {
 }
 
 #[test]
+fn local_0100_r4_legacy_server_decides_caseless_claim_reuse() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    server.state.lock().unwrap().claims = vec![json!({
+        "id": 1, "session": "alice", "paths": ["src/straße", "src/cafe\u{0301}"],
+        "case_insensitive_paths": true
+    })];
+
+    for (path, expected_posts) in [
+        ("src/straße/other.rs", 0),
+        ("src/café/file.rs", 0),
+        ("src/STRASSE/file.rs", 1),
+    ] {
+        let checks = mcp_calls(
+            dir.path(),
+            runtime.path(),
+            "full",
+            &[("zone_claim", json!({"paths": [path]}))],
+        );
+        assert_eq!(checks[0]["isError"], false, "{}", checks[0]);
+        let posts = server.seen("POST", "/api/v1/zones/claims");
+        assert_eq!(posts.len(), expected_posts, "{path}");
+        if let Some(post) = posts.last() {
+            assert_eq!(post.body["paths"], json!([path]));
+        }
+    }
+}
+
+#[test]
+fn local_0100_r4_mcp_free_check_respects_own_exclusions() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    server.state.lock().unwrap().claims = vec![json!({
+        "id": 1,
+        "session": "alice",
+        "paths": ["src/straße"],
+        "excluded_paths": ["src/straße/private"],
+        "case_insensitive_paths": true
+    })];
+    let checks = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "full",
+        &[
+            ("zone_check", json!({"path": "src/STRASSE/private/file.rs"})),
+            ("zone_check", json!({"path": "src/STRASSE/public/file.rs"})),
+        ],
+    );
+    assert_eq!(checks[0]["structuredContent"], json!({"free": true}));
+    assert_eq!(
+        checks[1]["structuredContent"],
+        json!({"free": false, "own": true, "holder": "you"})
+    );
+}
+
+#[test]
 fn mcp_zone_check_respects_the_own_claim_case_policy() {
     let server = Server::start();
     let dir = cloud_project(&server);

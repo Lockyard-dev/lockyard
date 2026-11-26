@@ -15,6 +15,11 @@ All notable changes to Lockyard are recorded here. The format follows
 - Respect the claim's path case policy in MCP `zone_check` and when clearing alerts for reclaimed
   zones. Rust callers now pass a case policy to `ZonePath::contains_with_case` or
   `ZonePath::overlaps_with_case` (LOCAL-0100).
+- Reuse existing cloud claims locally only with exact NFC path coverage, and let the server decide
+  case aliases. Agent cache checks defer when an omitted case policy could change the answer
+  (LOCAL-0100).
+- Honor own-claim exclusions in MCP `zone_check`. Clear a loss alert only when the new claim
+  covers the lost paths, and recheck the acquisition once its case policy arrives (LOCAL-0100).
 
 ## [0.3.19] - 2026-11-26
 

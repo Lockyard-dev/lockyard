@@ -7,7 +7,7 @@
 //! on the wire are `agent` and `from` in output, the names local mode has always printed.
 
 use crate::zones::Conflict;
-use crate::{Error, Result};
+use crate::{Error, Result, ZonePath};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -209,6 +209,27 @@ pub struct Claim {
 }
 
 impl Claim {
+    /// Legacy claims use the D-3124 case-insensitive default.
+    pub fn folds_path_case(&self) -> bool {
+        self.case_insensitive_paths.unwrap_or(true)
+    }
+
+    /// A zone check sees overlapping held paths unless an exclusion covers the checked path.
+    pub fn covers(&self, path: &ZonePath) -> bool {
+        self.covers_with_case(path, self.folds_path_case())
+    }
+
+    /// Applies the same coverage check with an explicit policy.
+    pub fn covers_with_case(&self, path: &ZonePath, fold_case: bool) -> bool {
+        self.paths
+            .iter()
+            .any(|held| ZonePath::stored(held.clone()).overlaps_with_case(path, fold_case))
+            && !self
+                .excluded_paths
+                .iter()
+                .any(|gap| ZonePath::stored(gap.clone()).contains_with_case(path, fold_case))
+    }
+
     /// A partial grant remains usable, but its exclusions must be visible to the caller.
     pub fn excluded_paths_warning(&self) -> Option<String> {
         if self.excluded_paths.is_empty() {
@@ -230,10 +251,8 @@ impl Claim {
                             .filter_map(Value::as_str),
                     )
                     .any(|held| {
-                        crate::paths::ZonePath::stored(held.into()).overlaps_with_case(
-                            &excluded,
-                            self.case_insensitive_paths.unwrap_or(true),
-                        )
+                        crate::paths::ZonePath::stored(held.into())
+                            .overlaps_with_case(&excluded, self.folds_path_case())
                     });
                 if matches
                     && let Some(holder) = conflict["session"]
