@@ -672,15 +672,19 @@ pub(super) fn run_tool(
                     Ok(json!({"free": false, "own": true, "holder": "you"}))
                 }
                 Some(check) if check.status == CheckStatus::Free => {
+                    let session = me()?;
                     let own = opened.backend.claims(
                         &ClaimQuery {
-                            session: Some(me()?.to_string()),
+                            session: Some(session.into()),
                             path: Some(path.clone()),
                         },
                         now,
                     )?;
                     let requested = lockyard_core::ZonePath::stored(path);
-                    let held_by_me = own.iter().any(|claim| claim.covers(&requested));
+                    let held_by_me = own.iter().any(|claim| {
+                        claim.session == session
+                            && claim.fully_covers_with_case(&requested, claim.folds_path_case())
+                    });
                     if !held_by_me {
                         Ok(json!({"free": true}))
                     } else {

@@ -537,6 +537,7 @@ fn stale_completed_ownership(
                         claim.session == agent
                             && json!(claim.id) == saved["id"]
                             && json!(claim.fence) == saved["fence"]
+                            // The receipt records the exact ordered grant.
                             && json!(claim.paths) == saved["paths"]
                     })
                 }),
@@ -873,6 +874,43 @@ mod tests {
             );
             assert_eq!(
                 stale_completed_ownership(&reassigned, "me", 1, &steps, &receipt).unwrap()["kind"],
+                "ownership_changed"
+            );
+        }
+    }
+
+    #[test]
+    fn zone_receipt_requires_the_exact_ordered_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::init(dir.path()).unwrap();
+        let paths = vec!["docs".into(), "src/straße".into()];
+        let claim = Backend::claim(
+            &mut store,
+            "me",
+            &ClaimRequest {
+                paths: paths.clone(),
+                ttl_minutes: 30,
+                ..ClaimRequest::default()
+            },
+            1,
+        )
+        .unwrap();
+        let steps = [Step::ZoneClaim {
+            paths,
+            note: String::new(),
+            ttl: 30,
+        }];
+        let mut receipt = json!({"steps": [{"status": "completed", "result": claim}]});
+        assert!(stale_completed_ownership(&store, "me", 2, &steps, &receipt).is_none());
+
+        let mut reordered = claim.paths.clone();
+        reordered.reverse();
+        let mut alias = claim.paths.clone();
+        *alias.iter_mut().find(|path| *path == "src/straße").unwrap() = "src/STRASSE".into();
+        for paths in [reordered, alias] {
+            receipt["steps"][0]["result"]["paths"] = json!(paths);
+            assert_eq!(
+                stale_completed_ownership(&store, "me", 2, &steps, &receipt).unwrap()["kind"],
                 "ownership_changed"
             );
         }

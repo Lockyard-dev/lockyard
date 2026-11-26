@@ -14,11 +14,12 @@
 //! it on the path whose latency budget is measured in milliseconds, and an append of one short line
 //! costs a system call where opening the database costs a connection.
 
-use crate::{DIR_NAME, Result, Store, fsio};
+use crate::{DIR_NAME, Result, Store, fsio, paths::nfc_path};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 
 const JOURNAL: &str = "announced-writes.jsonl";
 const JOURNAL_MODE: u32 = 0o600;
@@ -69,7 +70,7 @@ pub fn announce(root: &Path, agent: &str, path: &str, now: i64) -> Result<()> {
     let line = serde_json::to_string(&Announcement {
         at: now,
         agent: agent.to_string(),
-        path: path.to_string(),
+        path: nfc_path(path),
     })
     .map_err(|error| crate::Error::Invalid(error.to_string()))?;
     Ok(fsio::append_line(&journal(root), &line, JOURNAL_MODE)?)
@@ -86,6 +87,10 @@ pub fn announcements(root: &Path, since: i64) -> Result<Vec<Announcement>> {
         .lines()
         .filter_map(|line| serde_json::from_str::<Announcement>(line).ok())
         .filter(|entry| entry.at >= since)
+        .map(|mut entry| {
+            entry.path = nfc_path(&entry.path);
+            entry
+        })
         .collect())
 }
 
@@ -111,11 +116,13 @@ pub fn compact(root: &Path, keep_since: i64) -> Result<()> {
     Ok(fsio::replace(&path, text.as_bytes(), JOURNAL_MODE)?)
 }
 
-/// True when some hook announced a write to `path` inside the window ending at `now`.
+/// True when some hook announced a canonically equivalent path within the window.
 pub fn was_announced(announced: &[Announcement], path: &str, now: i64) -> bool {
-    announced
-        .iter()
-        .any(|entry| entry.path == path && now.saturating_sub(entry.at) <= ANNOUNCE_WINDOW_MS)
+    let path = nfc_path(path);
+    announced.iter().any(|entry| {
+        now.saturating_sub(entry.at) <= ANNOUNCE_WINDOW_MS
+            && (entry.path == path || (!entry.path.is_ascii() && entry.path.nfc().eq(path.chars())))
+    })
 }
 
 impl Store {
@@ -127,6 +134,7 @@ impl Store {
         claim: i64,
         now: i64,
     ) -> Result<Unannounced> {
+        let path = nfc_path(path);
         let transaction = self.write()?;
         transaction.execute(
             "INSERT INTO unannounced_writes (path, holder, claim_id, first_at, last_at, hits)
@@ -138,7 +146,7 @@ impl Store {
             params![path, holder, claim, now],
         )?;
         transaction.commit()?;
-        self.unannounced_for(path, holder)
+        self.unannounced_for(&path, holder)
     }
 
     fn unannounced_for(&self, path: &str, holder: &str) -> Result<Unannounced> {
@@ -237,6 +245,35 @@ mod tests {
         text.push_str("{not json\n");
         fs::write(&path, text).unwrap();
         assert_eq!(announcements(dir.path(), 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn journal_paths_use_nfc_on_write_and_when_reading_legacy_entries() {
+        let (dir, mut store) = test_store();
+        let nfc = "src/café.rs";
+        let nfd = "src/cafe\u{301}.rs";
+        announce(dir.path(), "alice", nfd, 1).unwrap();
+        let path = journal(dir.path());
+        let on_disk: Announcement =
+            serde_json::from_str(fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(on_disk.path, nfc);
+
+        let legacy = Announcement {
+            path: nfd.into(),
+            ..on_disk
+        };
+        assert!(was_announced(std::slice::from_ref(&legacy), nfc, 1));
+        fs::write(path, serde_json::to_string(&legacy).unwrap()).unwrap();
+        let seen = announcements(dir.path(), 0).unwrap();
+        assert!(was_announced(&seen, nfc, 1));
+        assert!(was_announced(&seen, nfd, 1));
+        assert!(!was_announced(&seen, "src/CAFÉ.rs", 1));
+
+        let first = store.record_unannounced(nfd, "alice", 1, 1).unwrap();
+        let second = store.record_unannounced(nfc, "alice", 1, 2).unwrap();
+        assert_eq!(first.path, nfc);
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.hits, 2);
     }
 
     #[test]

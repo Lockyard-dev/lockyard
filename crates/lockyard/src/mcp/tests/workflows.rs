@@ -621,6 +621,21 @@
     }
 
     #[test]
+    fn local_0100_r6_mcp_ownership_requires_full_coverage() {
+        let dir = project();
+        let claim = call(&dir, "alice", "zone_claim", json!({"paths": ["src/ſ.rs"]}));
+        assert_eq!(claim["isError"], false, "{claim}");
+        for (path, expected) in [
+            ("src", json!({"free": true})),
+            ("src/s.rs", json!({"free": false, "own": true, "holder": "you"})),
+        ] {
+            let reply = call(&dir, "alice", "zone_check", json!({"path": path}));
+            assert_eq!(reply["isError"], false, "{reply}");
+            assert_eq!(reply["structuredContent"], expected, "{path}");
+        }
+    }
+
+    #[test]
     fn a_pending_handover_is_an_offer_and_not_the_receivers_claim() {
         let offered: Claim = serde_json::from_value(json!({
             "id": 414,

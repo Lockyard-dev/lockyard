@@ -306,7 +306,12 @@ impl View {
                     .any(|held| lockyard_core::repository::split(held).0 == repository);
             unicode
                 || (claim.case_insensitive_paths.is_none()
-                    && claim.covers(&path) != claim.covers_with_case(&path, false))
+                    && if claim.session == session {
+                        claim.fully_covers_with_case(&path, true)
+                            != claim.fully_covers_with_case(&path, false)
+                    } else {
+                        claim.covers(&path) != claim.covers_with_case(&path, false)
+                    })
         }) {
             return PathCheck {
                 mode: None,
@@ -320,12 +325,16 @@ impl View {
         let covering =
             |claim: &&Claim| claim.holder_available != Some(false) && claim.covers(&path);
         // Availability is about other sessions: a session that comes back still holds its own claims.
-        let mine: Vec<&Claim> = self
+        let mut mine = self
             .claims
             .iter()
-            .filter(|claim| claim.session == session && claim.covers(&path))
-            .collect();
-        let shares = mine.iter().any(|claim| claim.mode == ClaimMode::Shared);
+            .filter(|claim| {
+                claim.session == session
+                    && claim.fully_covers_with_case(&path, claim.folds_path_case())
+            })
+            .peekable();
+        let own = mine.peek().is_some();
+        let shares = mine.any(|claim| claim.mode == ClaimMode::Shared);
         let holder = self
             .claims
             .iter()
@@ -361,10 +370,10 @@ impl View {
                 mode: None,
                 auto_grantable: None,
                 path: raw.to_string(),
-                status: if mine.is_empty() {
-                    CheckStatus::Free
-                } else {
+                status: if own {
                     CheckStatus::Own
+                } else {
+                    CheckStatus::Free
                 },
                 holder: None,
             },
@@ -5077,6 +5086,26 @@ mod tests {
             view.check_path("alice", "src/a/file.rs").status,
             CheckStatus::Free
         );
+    }
+
+    #[test]
+    fn a_cached_own_claim_requires_coverage_of_the_whole_path() {
+        let view = View {
+            claims: vec![
+                serde_json::from_value(json!({
+                    "id": 1, "session": "me", "paths": ["src/a.rs", "docs"],
+                    "excluded_paths": ["docs/private"], "case_insensitive_paths": true
+                }))
+                .unwrap(),
+            ],
+            ..View::default()
+        };
+        let status = |path| view.check_path("me", path).status;
+        assert_eq!(status("src"), CheckStatus::Free);
+        assert_eq!(status("src/A.rs"), CheckStatus::Own);
+        assert_eq!(status("docs"), CheckStatus::Free);
+        assert_eq!(status("docs/public"), CheckStatus::Own);
+        assert_eq!(status("docs/private/a.rs"), CheckStatus::Free);
     }
 
     #[test]

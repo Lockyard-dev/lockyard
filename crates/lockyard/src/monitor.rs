@@ -16,7 +16,7 @@
 //! coalesces and inotify overflows without telling anyone. Switch the events off entirely with
 //! `LOCKYARD_WATCH=off` and the monitor still works, at the reconcile interval.
 
-use lockyard_core::paths::fold_path_component;
+use lockyard_core::paths::{fold_path_component, nfc_path};
 use lockyard_core::proto::{DirtyPath, InboxQuery, Message, SendRequest};
 use lockyard_core::watch::{Backend as WatchBackend, Tick, Watcher};
 use lockyard_core::{Backend, Error, Result, Store, ZonePath, outside, watch};
@@ -235,14 +235,28 @@ fn inspect(
     if claims.is_empty() {
         return Ok(0);
     }
-    let mut paths = changed;
-    if reconcile {
-        // The fallback: the file system may have dropped events, so walk the claimed paths and
-        // trust their modification times instead.
-        paths.extend(rescan(&settings.root, &claims, now));
-        paths.sort();
-        paths.dedup();
+    let (rescanned, aliases_truncated) = if reconcile {
+        // The file system may have dropped events, so check modification times too.
+        rescan(&settings.root, &claims, now)
+    } else {
+        (Vec::new(), false)
+    };
+    if aliases_truncated {
+        let message = "monitor rescan exhausted the D145 alias lookup budget; some equivalent paths may have been skipped";
+        if settings.json {
+            writeln!(out, "{}", json!({"event": "warning", "message": message}))?;
+        } else {
+            writeln!(out, "! {message}")?;
+        }
+        out.flush()?;
     }
+    let mut paths: Vec<_> = changed
+        .into_iter()
+        .chain(rescanned)
+        .map(|path| nfc_path(&path))
+        .collect();
+    paths.sort();
+    paths.dedup();
     if paths.is_empty() {
         return Ok(0);
     }
@@ -312,48 +326,130 @@ fn inspect(
     Ok(found)
 }
 
-/// The fallback for dropped events: files under a claim modified since the claim began.
-fn rescan(root: &Path, claims: &[lockyard_core::proto::Claim], now: i64) -> Vec<String> {
+/// The fallback for dropped events: recently modified files under the active claims.
+fn rescan(root: &Path, claims: &[lockyard_core::proto::Claim], now: i64) -> (Vec<String>, bool) {
     let since = now - i64::try_from(RESCAN_WINDOW.as_millis()).unwrap_or(i64::MAX);
     let mut scan = Rescan {
         root,
         since,
         remaining: RESCAN_ENTRIES,
+        alias_remaining: RESCAN_ALIAS_ENTRIES,
+        aliases_truncated: false,
+        alias_listings: HashMap::new(),
         found: Vec::new(),
     };
-    for claim in claims {
+    'claims: for claim in claims {
         for held in &claim.paths {
             if scan.remaining == 0 {
-                return scan.found;
+                break 'claims;
             }
             scan.remaining -= 1;
             if claim.folds_path_case() && held != "." {
-                let keys: Vec<_> = held.split('/').map(fold_path_component).collect();
-                scan.walk(root, &keys, 0);
+                let components: Vec<_> = held.split('/').collect();
+                scan.walk_folded(root, &components);
             } else {
-                scan.walk(&root.join(held), &[], 0);
+                scan.walk(&root.join(held), 0);
             }
         }
     }
-    scan.found
+    (scan.found, scan.aliases_truncated)
 }
 
 /// How far back a rescan looks. Longer than the reconcile interval, so nothing falls between rounds.
 const RESCAN_WINDOW: Duration = Duration::from_secs(60);
 /// A rescan does not descend further than this below a matched claim path.
 const RESCAN_DEPTH: usize = 12;
-/// Bound both subtree walks and the searches through parent directories for folded aliases.
+/// Bound the walk through claimed subtrees independently of alias resolution.
 const RESCAN_ENTRIES: usize = 20_000;
+/// Bound the total number of directory entries indexed for D145 lookups per rescan.
+const RESCAN_ALIAS_ENTRIES: usize = 20_000;
+
+#[derive(Default)]
+struct AliasDirectory {
+    by_key: HashMap<String, Vec<PathBuf>>,
+    truncated: bool,
+}
+
+impl AliasDirectory {
+    fn read(at: &Path, remaining: &mut usize) -> Self {
+        let mut listing = Self::default();
+        // Do not follow an intermediate symlink while resolving a folded path.
+        if !at.symlink_metadata().is_ok_and(|data| data.is_dir()) {
+            return listing;
+        }
+        if *remaining == 0 {
+            listing.truncated = true;
+            return listing;
+        }
+        let Ok(entries) = std::fs::read_dir(at) else {
+            return listing;
+        };
+        for entry in entries {
+            if *remaining == 0 {
+                listing.truncated = true;
+                break;
+            }
+            *remaining -= 1;
+            let Ok(entry) = entry else { continue };
+            if let Some(name) = entry.file_name().to_str() {
+                listing
+                    .by_key
+                    .entry(fold_path_component(name))
+                    .or_default()
+                    .push(entry.path());
+            }
+        }
+        listing
+    }
+}
 
 struct Rescan<'a> {
     root: &'a Path,
     since: i64,
     remaining: usize,
+    alias_remaining: usize,
+    aliases_truncated: bool,
+    // Group folded child lookups by their actual parent, then by the D145 key.
+    alias_listings: HashMap<PathBuf, AliasDirectory>,
     found: Vec<String>,
 }
 
 impl Rescan<'_> {
-    fn walk(&mut self, at: &Path, keys: &[String], depth: usize) {
+    fn walk_folded(&mut self, at: &Path, components: &[&str]) {
+        let Some((component, rest)) = components.split_first() else {
+            self.walk(at, 0);
+            return;
+        };
+        if watch::is_internal(at) {
+            return;
+        }
+        let listing = self
+            .alias_listings
+            .entry(at.to_path_buf())
+            .or_insert_with(|| AliasDirectory::read(at, &mut self.alias_remaining));
+        let mut matches = listing
+            .by_key
+            .get(&fold_path_component(component))
+            .cloned()
+            .unwrap_or_default();
+        if listing.truncated {
+            self.aliases_truncated = true;
+            // Keep walking the literal spelling even when enumerating aliases is capped.
+            let literal = at.join(component);
+            if Path::new(component)
+                .file_name()
+                .is_some_and(|name| name == *component)
+                && !matches.contains(&literal)
+            {
+                matches.push(literal);
+            }
+        }
+        for child in matches {
+            self.walk_folded(&child, rest);
+        }
+    }
+
+    fn walk(&mut self, at: &Path, depth: usize) {
         if watch::is_internal(at) {
             return;
         }
@@ -373,21 +469,11 @@ impl Rescan<'_> {
                 }
                 self.remaining -= 1;
                 let Ok(entry) = entry else { continue };
-                if let Some((key, rest)) = keys.split_first() {
-                    if entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| fold_path_component(name) == *key)
-                    {
-                        self.walk(&entry.path(), rest, 0);
-                    }
-                } else {
-                    self.walk(&entry.path(), &[], depth + 1);
-                }
+                self.walk(&entry.path(), depth + 1);
             }
             return;
         }
-        if !keys.is_empty() || !data.is_file() {
+        if !data.is_file() {
             return;
         }
         let modified = data
@@ -672,7 +758,8 @@ mod tests {
             "id": 1, "paths": ["src/straße"], "case_insensitive_paths": true
         }))
         .unwrap();
-        let mut found = rescan(root, std::slice::from_ref(&claim), 0);
+        let (mut found, truncated) = rescan(root, std::slice::from_ref(&claim), 0);
+        assert!(!truncated);
         found.sort();
         let other = if distinct {
             "src/straße/other.rs"
@@ -682,8 +769,118 @@ mod tests {
         assert_eq!(found, ["src/STRASSE/file.rs", other]);
         if distinct {
             claim.case_insensitive_paths = Some(false);
-            assert_eq!(rescan(root, &[claim], 0), ["src/straße/other.rs"]);
+            assert_eq!(
+                rescan(root, &[claim], 0),
+                (vec!["src/straße/other.rs".into()], false)
+            );
         }
+    }
+
+    #[test]
+    fn local_0100_r6_rescan_does_not_starve_after_missing_siblings() {
+        let project = Project::new();
+        let root = project.root();
+        for i in 0..105 {
+            std::fs::write(root.join(format!("unrelated-{i:03}")), "").unwrap();
+        }
+        std::fs::create_dir(root.join("zzz-live")).unwrap();
+        std::fs::write(root.join("zzz-live/changed.rs"), "changed").unwrap();
+
+        let mut paths: Vec<_> = (0..200).map(|i| format!("missing-{i:03}")).collect();
+        paths.push("zzz-live".into());
+        let mut backend = project.store();
+        Backend::touch_agent(&mut backend, "alice", 0).unwrap();
+        backend
+            .claim(
+                "alice",
+                &paths.into_iter().map(ZonePath::stored).collect::<Vec<_>>(),
+                "",
+                30,
+                1,
+            )
+            .unwrap();
+        let mut ports = Ports {
+            backend: &mut backend,
+            store: project.store(),
+            now: &now_is(1),
+        };
+        let mut settings = settings(&root, "alice");
+        settings.mail = false;
+        settings.timeout = Some(Duration::from_millis(500));
+        let mut out = Vec::new();
+        let _guard = lockyard_core::test_env_lock();
+        // The monitor reads the variable once, at startup.
+        unsafe { std::env::set_var("LOCKYARD_WATCH", "off") };
+        let summary = run(&settings, &mut ports, &mut out);
+        unsafe { std::env::remove_var("LOCKYARD_WATCH") };
+        let summary = summary.unwrap();
+        assert_eq!(summary.backend, Some("off"));
+        assert_eq!(summary.unannounced, 1);
+        assert_eq!(
+            ports.store.unannounced(0).unwrap()[0].path,
+            "zzz-live/changed.rs"
+        );
+        assert!(
+            !String::from_utf8(out)
+                .unwrap()
+                .contains("alias lookup budget")
+        );
+    }
+
+    #[test]
+    fn a_capped_alias_lookup_preserves_the_literal_subtree_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/changed.rs"), "changed").unwrap();
+        let mut scan = Rescan {
+            root,
+            since: 0,
+            remaining: 1,
+            alias_remaining: 0,
+            aliases_truncated: false,
+            alias_listings: HashMap::new(),
+            found: Vec::new(),
+        };
+        scan.walk_folded(root, &["missing"]);
+        scan.walk_folded(root, &["src"]);
+        assert!(scan.aliases_truncated);
+        assert_eq!(
+            scan.alias_listings.len(),
+            1,
+            "both requests share a parent listing"
+        );
+        assert_eq!(scan.found, ["src/changed.rs"]);
+    }
+
+    #[test]
+    fn local_0100_r6_rescan_matches_nfc_announcement() {
+        let project = Project::new();
+        let root = project.root();
+        let mut backend = project.store();
+        Backend::touch_agent(&mut backend, "alice", 0).unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/cafe\u{301}.rs"), "changed").unwrap();
+        backend
+            .claim("alice", &[ZonePath::stored("src".into())], "", 30, 1)
+            .unwrap();
+        outside::announce(&root, "alice", "src/café.rs", 1).unwrap();
+
+        let mut ports = Ports {
+            backend: &mut backend,
+            store: project.store(),
+            now: &now_is(1),
+        };
+        let found = inspect(
+            &settings(&root, "alice"),
+            &mut ports,
+            Vec::new(),
+            true,
+            1,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(found, 0, "the NFC announcement covers the rescanned file");
     }
 
     #[test]

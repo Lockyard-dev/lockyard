@@ -230,6 +230,17 @@ impl Claim {
                 .any(|gap| ZonePath::stored(gap.clone()).contains_with_case(path, fold_case))
     }
 
+    /// The whole requested zone lies within a held path and is clear of exclusion holes.
+    pub fn fully_covers_with_case(&self, path: &ZonePath, fold_case: bool) -> bool {
+        self.paths
+            .iter()
+            .any(|held| ZonePath::stored(held.clone()).contains_with_case(path, fold_case))
+            && !self
+                .excluded_paths
+                .iter()
+                .any(|gap| ZonePath::stored(gap.clone()).overlaps_with_case(path, fold_case))
+    }
+
     /// A partial grant remains usable, but its exclusions must be visible to the caller.
     pub fn excluded_paths_warning(&self) -> Option<String> {
         if self.excluded_paths.is_empty() {
@@ -1111,6 +1122,39 @@ mod tests {
         assert_eq!(
             Stamp::Millis(0).on_the_wire(),
             Stamp::Text("1970-01-01T00:00:00.000Z".into())
+        );
+    }
+
+    #[test]
+    fn excluded_path_warnings_match_holders_by_repository_case_policy() {
+        let mut claim: Claim = serde_json::from_value(json!({
+            "id": 1,
+            "excluded_paths": ["src/straße", "src/café"],
+            "conflicts": [
+                {"held_path": "src/STRASSE/file.rs", "session": "folded"},
+                {"paths": ["src/cafe\u{301}"], "holder": "normalized"},
+                {"path": "src/straße-sibling", "agent": "unrelated"}
+            ],
+            "case_insensitive_paths": true
+        }))
+        .unwrap();
+        let warning = claim.excluded_paths_warning().unwrap();
+        assert!(
+            warning.contains("src/straße (держатель: folded)"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("src/café (держатель: normalized)"),
+            "{warning}"
+        );
+        assert!(!warning.contains("unrelated"), "{warning}");
+
+        claim.case_insensitive_paths = Some(false);
+        let warning = claim.excluded_paths_warning().unwrap();
+        assert!(!warning.contains("folded"), "{warning}");
+        assert!(
+            warning.contains("src/café (держатель: normalized)"),
+            "{warning}"
         );
     }
 

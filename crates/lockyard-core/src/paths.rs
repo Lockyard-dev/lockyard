@@ -36,7 +36,7 @@ impl ZonePath {
             };
             // One stored form on every OS and on the server (D-3124): NFC, original case kept.
             // Case is folded only when comparing, so a Mac and a Linux client name `src/Auth` alike.
-            parts.push(part.nfc().collect::<String>());
+            parts.push(nfc_path(part));
         }
         if parts.first().map(String::as_str) == Some(".lockyard-repository") {
             return Err(Error::Invalid(
@@ -93,8 +93,13 @@ fn comparable(path: &str, fold_case: bool) -> String {
         fold_path_component(path)
     } else {
         // Match zones stored by older clients in NFD.
-        path.nfc().collect()
+        nfc_path(path)
     }
+}
+
+/// Canonical spelling for stored project paths, preserving case.
+pub fn nfc_path(path: &str) -> String {
+    path.nfc().collect()
 }
 
 /// Unicode D145 comparison key: NFD, full default case folding, then NFD.
