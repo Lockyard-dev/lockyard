@@ -39,6 +39,9 @@ All notable changes to Lockyard are recorded here. The format follows
 - Keep loss alerts until a status snapshot or an SSE event with explicit exclusions confirms
   coverage. Normalize agent activity and dirty reports to NFC while preserving each write's case
   (LOCAL-0135).
+- Warn when a directory listing fails and mark the monitor rescan incomplete. Report dirty paths
+  only for observed changes. Recheck remaining claim coverage on status after a partial takeover
+  preserves the claim ID (LOCAL-0135).
 
 ## [0.3.19] - 2026-11-26
 

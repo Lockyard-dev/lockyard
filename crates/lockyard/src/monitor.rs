@@ -22,7 +22,7 @@ use lockyard_core::watch::{Backend as WatchBackend, Tick, Watcher};
 use lockyard_core::{Backend, Error, Result, Store, ZonePath, outside, watch};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
-use std::io::{IsTerminal, Read, Write};
+use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -291,19 +291,20 @@ fn inspect(
         rescan_incomplete: !scan.incomplete.is_empty(),
         ..Inspection::default()
     };
-    let limits = [
-        (ScanLimits::ALIASES, "Unicode alias lookup budget"),
-        (ScanLimits::ENTRIES, "directory entry budget"),
-        (ScanLimits::DEPTH, "directory depth limit"),
+    let causes = [
+        (ScanIssues::ALIASES, "Unicode alias lookup budget"),
+        (ScanIssues::ENTRIES, "directory entry budget"),
+        (ScanIssues::DEPTH, "directory depth limit"),
+        (ScanIssues::LISTING, "directory listing error"),
     ];
-    for ((session, path), reached) in scan.incomplete {
-        let reasons = limits
+    for ((session, path), issues) in scan.incomplete {
+        let reasons = causes
             .iter()
-            .filter_map(|(limit, label)| (reached & limit != 0).then_some(*label))
+            .filter_map(|(issue, label)| (issues & issue != 0).then_some(*label))
             .collect::<Vec<_>>()
             .join(", ");
         let message = format!(
-            "monitor rescan coverage is incomplete for {path:?} (session {session:?}) after reaching the {reasons}"
+            "monitor rescan coverage is incomplete for {path:?} (session {session:?}): {reasons}"
         );
         eprintln!("warning: {message}");
         if settings.json {
@@ -398,7 +399,7 @@ fn rescan<'a>(root: &Path, claims: &'a [lockyard_core::proto::Claim], now: i64) 
         since,
         remaining: 0,
         alias_remaining: RESCAN_ALIAS_ENTRIES,
-        limits: 0,
+        issues: 0,
         alias_listings: HashMap::new(),
         found: Vec::new(),
     };
@@ -414,7 +415,7 @@ fn rescan<'a>(root: &Path, claims: &'a [lockyard_core::proto::Claim], now: i64) 
         let budget = remaining.div_ceil(zones_left);
         zones_left -= 1;
         scan.remaining = budget;
-        scan.limits = 0;
+        scan.issues = 0;
         if held == "." {
             scan.walk(root, 0);
         } else {
@@ -422,11 +423,11 @@ fn rescan<'a>(root: &Path, claims: &'a [lockyard_core::proto::Claim], now: i64) 
             scan.walk_aliases(root, &components, claim.folds_path_case());
         }
         remaining -= budget - scan.remaining;
-        if scan.limits != 0 {
+        if scan.issues != 0 {
             *result
                 .incomplete
                 .entry((claim.session.as_str(), nfc_path(held)))
-                .or_default() |= scan.limits;
+                .or_default() |= scan.issues;
         }
     }
     result.paths = scan.found;
@@ -440,12 +441,13 @@ struct ScanResult<'a> {
     incomplete: BTreeMap<(&'a str, String), u8>,
 }
 
-struct ScanLimits;
+struct ScanIssues;
 
-impl ScanLimits {
+impl ScanIssues {
     const ENTRIES: u8 = 1;
     const ALIASES: u8 = 2;
     const DEPTH: u8 = 4;
+    const LISTING: u8 = 8;
 }
 
 /// How far back a rescan looks. Longer than the reconcile interval, so nothing falls between rounds.
@@ -457,11 +459,22 @@ const RESCAN_ENTRIES: usize = 20_000;
 /// Bound the total number of directory entries indexed for Unicode alias lookups per rescan.
 const RESCAN_ALIAS_ENTRIES: usize = 20_000;
 
+fn list_directory(at: &Path, issues: &mut u8) -> Option<std::fs::ReadDir> {
+    match std::fs::read_dir(at) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(_) => {
+            *issues |= ScanIssues::LISTING;
+            None
+        }
+    }
+}
+
 #[derive(Default)]
 struct AliasDirectory {
     by_nfc: HashMap<String, Vec<PathBuf>>,
     by_d145: HashMap<String, Vec<PathBuf>>,
-    truncated: bool,
+    issues: u8,
 }
 
 impl AliasDirectory {
@@ -471,16 +484,19 @@ impl AliasDirectory {
         if !at.symlink_metadata().is_ok_and(|data| data.is_dir()) {
             return listing;
         }
-        let Ok(entries) = std::fs::read_dir(at) else {
+        let Some(entries) = list_directory(at, &mut listing.issues) else {
             return listing;
         };
         for entry in entries {
             if *remaining == 0 {
-                listing.truncated = true;
+                listing.issues |= ScanIssues::ALIASES;
                 break;
             }
             *remaining -= 1;
-            let Ok(entry) = entry else { continue };
+            let Ok(entry) = entry else {
+                listing.issues |= ScanIssues::LISTING;
+                continue;
+            };
             if let Some(name) = entry.file_name().to_str() {
                 let path = entry.path();
                 listing
@@ -504,7 +520,7 @@ struct Rescan<'a> {
     since: i64,
     remaining: usize,
     alias_remaining: usize,
-    limits: u8,
+    issues: u8,
     // Share each physical parent listing across both comparison policies.
     alias_listings: HashMap<PathBuf, AliasDirectory>,
     found: Vec<String>,
@@ -530,9 +546,7 @@ impl Rescan<'_> {
         }
         .cloned()
         .unwrap_or_default();
-        if listing.truncated {
-            self.limits |= ScanLimits::ALIASES;
-        }
+        self.issues |= listing.issues;
         for child in matches {
             self.walk_aliases(&child, rest, fold_case);
         }
@@ -546,20 +560,23 @@ impl Rescan<'_> {
             return;
         };
         if data.is_dir() {
-            let Ok(entries) = std::fs::read_dir(at) else {
+            let Some(entries) = list_directory(at, &mut self.issues) else {
                 return;
             };
             for entry in entries {
                 if depth == RESCAN_DEPTH {
-                    self.limits |= ScanLimits::DEPTH;
+                    self.issues |= ScanIssues::DEPTH;
                     break;
                 }
                 if self.remaining == 0 {
-                    self.limits |= ScanLimits::ENTRIES;
+                    self.issues |= ScanIssues::ENTRIES;
                     break;
                 }
                 self.remaining -= 1;
-                let Ok(entry) = entry else { continue };
+                let Ok(entry) = entry else {
+                    self.issues |= ScanIssues::LISTING;
+                    continue;
+                };
                 self.walk(&entry.path(), depth + 1);
             }
             return;
@@ -889,31 +906,35 @@ mod tests {
         assert!(out.contains("directory entry budget"), "{out}");
     }
 
-    #[test]
-    fn local_0100_r9_incomplete_cloud_rescan_reports_only_observed_writes() {
-        use lockyard_cloud_client::{Call, ClientError, CloudBackend, Transport};
-        use serde_json::Value;
-        use std::sync::Mutex;
+    struct RecordingCloud<'a> {
+        paths: &'a [&'a str],
+        reports: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
 
-        #[derive(Default)]
-        struct RecordingCloud(Mutex<Vec<Value>>);
-
-        impl Transport for &RecordingCloud {
-            fn call(&self, call: &Call) -> std::result::Result<Value, ClientError> {
-                match call.path.as_str() {
-                    "/api/v1/zones/claims" => Ok(json!([
-                        {"id": 1, "session": "alice", "paths": ["src", "live"]}
-                    ])),
-                    "/api/v1/zones/dirty" => {
-                        assert_eq!(call.session, "alice");
-                        self.0.lock().unwrap().push(call.body.clone().unwrap());
-                        Ok(json!({"stored": 1}))
-                    }
-                    path => panic!("unexpected cloud call: {path}"),
+    impl lockyard_cloud_client::Transport for &RecordingCloud<'_> {
+        fn call(
+            &self,
+            call: &lockyard_cloud_client::Call,
+        ) -> std::result::Result<serde_json::Value, lockyard_cloud_client::ClientError> {
+            match call.path.as_str() {
+                "/api/v1/zones/claims" => Ok(json!([
+                    {"id": 1, "session": "alice", "paths": self.paths}
+                ])),
+                "/api/v1/zones/dirty" => {
+                    assert_eq!(call.session, "alice");
+                    self.reports
+                        .lock()
+                        .unwrap()
+                        .push(call.body.clone().unwrap());
+                    Ok(json!({"stored": 1}))
                 }
+                path => panic!("unexpected cloud call: {path}"),
             }
         }
+    }
 
+    #[test]
+    fn local_0100_r9_incomplete_cloud_rescan_reports_only_observed_writes() {
         let project = Project::new();
         let root = project.root();
         let mut deep = root.join("src");
@@ -926,8 +947,11 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
             .unwrap();
         let now = crate::now_ms();
-        let cloud = RecordingCloud::default();
-        let mut backend = CloudBackend::new(&cloud, "alice");
+        let cloud = RecordingCloud {
+            paths: &["src", "live"],
+            reports: Default::default(),
+        };
+        let mut backend = lockyard_cloud_client::CloudBackend::new(&cloud, "alice");
         let mut ports = Ports {
             backend: &mut backend,
             store: project.store(),
@@ -939,7 +963,7 @@ mod tests {
         let inspection = inspect(&settings, &mut ports, Vec::new(), true, now, &mut out).unwrap();
         assert_eq!(inspection.unannounced, 0);
         assert!(inspection.rescan_incomplete);
-        let warning: Value = serde_json::from_slice(&out).unwrap();
+        let warning: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(warning["event"], "warning");
         assert!(
             warning["message"]
@@ -948,7 +972,7 @@ mod tests {
                 .contains("directory depth limit")
         );
         assert_eq!(
-            cloud.0.lock().unwrap().len(),
+            cloud.reports.lock().unwrap().len(),
             0,
             "an unchanged tree with an incomplete scan must not produce a dirty report"
         );
@@ -960,10 +984,88 @@ mod tests {
         let inspection = inspect(&settings, &mut ports, Vec::new(), true, now, &mut out).unwrap();
         assert_eq!(inspection.unannounced, 1);
         assert!(inspection.rescan_incomplete);
-        let reports = cloud.0.lock().unwrap();
+        let reports = cloud.reports.lock().unwrap();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0]["paths"].as_array().unwrap().len(), 1);
         assert_eq!(reports[0]["paths"][0]["path"], "live/checked.rs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_0100_r10_unreadable_listing_marks_rescan_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = Project::new();
+        let root = project.root();
+        let parents = [root.join("src"), root.join("tree")];
+        for parent in &parents {
+            std::fs::create_dir(parent).unwrap();
+            std::fs::write(parent.join("checked.rs"), "changed").unwrap();
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o311)).unwrap();
+        }
+        let cloud = RecordingCloud {
+            paths: &["src/checked.rs", "tree", "missing/checked.rs"],
+            reports: Default::default(),
+        };
+        let mut backend = lockyard_cloud_client::CloudBackend::new(&cloud, "alice");
+        let now = crate::now_ms();
+        let mut ports = Ports {
+            backend: &mut backend,
+            store: project.store(),
+            now: &now_is(now),
+        };
+        let mut settings = settings(&root, "alice");
+        settings.json = true;
+        let unreadable = parents.each_ref().map(|parent| {
+            std::fs::read_dir(parent)
+                .is_err_and(|error| error.kind() == ErrorKind::PermissionDenied)
+        });
+        let file_accessible = parents
+            .iter()
+            .all(|parent| parent.join("checked.rs").is_file());
+        let mut out = Vec::new();
+        let inspection = inspect(&settings, &mut ports, Vec::new(), true, now, &mut out);
+        for parent in &parents {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        if !unreadable.into_iter().all(|denied| denied) {
+            // Privileged users can list directories without read permission.
+            return;
+        }
+        assert!(file_accessible);
+        let inspection = inspection.unwrap();
+        assert!(
+            inspection.rescan_incomplete,
+            "unreadable listings must mark the rescan incomplete"
+        );
+        assert_eq!(inspection.unannounced, 0);
+        assert!(cloud.reports.lock().unwrap().is_empty());
+        let warnings: Vec<serde_json::Value> = serde_json::Deserializer::from_slice(&out)
+            .into_iter()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(warnings.len(), 2);
+        for (warning, path) in warnings.iter().zip(["src/checked.rs", "tree"]) {
+            assert_eq!(warning["event"], "warning");
+            assert_eq!(warning["path"], path);
+            assert!(
+                warning["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("directory listing error")
+            );
+        }
+
+        out.clear();
+        let inspection = inspect(&settings, &mut ports, Vec::new(), true, now, &mut out).unwrap();
+        assert!(!inspection.rescan_incomplete);
+        assert_eq!(inspection.unannounced, 2);
+        let reports = cloud.reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        let paths = reports[0]["paths"].as_array().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0]["path"], "src/checked.rs");
+        assert_eq!(paths[1]["path"], "tree/checked.rs");
     }
 
     #[test]
@@ -981,12 +1083,12 @@ mod tests {
             since: 0,
             remaining: RESCAN_ENTRIES,
             alias_remaining: 0,
-            limits: 0,
+            issues: 0,
             alias_listings: HashMap::new(),
             found: Vec::new(),
         };
         scan.walk_aliases(&parent, &[requested], false);
-        assert_eq!(scan.limits, ScanLimits::ALIASES);
+        assert_eq!(scan.issues, ScanIssues::ALIASES);
         assert_eq!(
             scan.found,
             Vec::<String>::new(),
@@ -995,12 +1097,12 @@ mod tests {
 
         scan.alias_listings.clear();
         scan.alias_remaining = 1;
-        scan.limits = 0;
+        scan.issues = 0;
         scan.walk_aliases(&parent, &["A"], false);
         assert!(scan.found.is_empty());
         scan.walk_aliases(&parent, &["A"], true);
         assert_eq!(scan.found, ["src/a/changed.rs"]);
-        assert_eq!(scan.limits, 0);
+        assert_eq!(scan.issues, 0);
     }
 
     #[test]
@@ -1030,9 +1132,9 @@ mod tests {
         assert_eq!(
             rescan(root, &claims, 0).incomplete,
             BTreeMap::from([
-                (("alice", "src/café".into()), ScanLimits::DEPTH),
-                (("alice", "SRC/CAFÉ".into()), ScanLimits::DEPTH),
-                (("bob", "src/café".into()), ScanLimits::DEPTH),
+                (("alice", "src/café".into()), ScanIssues::DEPTH),
+                (("alice", "SRC/CAFÉ".into()), ScanIssues::DEPTH),
+                (("bob", "src/café".into()), ScanIssues::DEPTH),
             ])
         );
     }
@@ -1158,19 +1260,19 @@ mod tests {
         std::fs::create_dir(root.join("src")).unwrap();
         std::fs::write(root.join("src/changed.rs"), "changed").unwrap();
         let mut listing = AliasDirectory::read(root, &mut 1);
-        listing.truncated = true;
+        listing.issues = ScanIssues::ALIASES;
         let mut scan = Rescan {
             root,
             since: 0,
             remaining: 1,
             alias_remaining: 0,
-            limits: 0,
+            issues: 0,
             alias_listings: HashMap::from([(root.to_path_buf(), listing)]),
             found: Vec::new(),
         };
         scan.walk_aliases(root, &["missing"], true);
         scan.walk_aliases(root, &["src"], false);
-        assert_eq!(scan.limits, ScanLimits::ALIASES);
+        assert_eq!(scan.issues, ScanIssues::ALIASES);
         assert_eq!(
             scan.alias_listings.len(),
             1,

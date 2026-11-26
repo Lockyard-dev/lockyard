@@ -571,8 +571,9 @@ impl<T: Transport + 'static> Shared<T> {
         }
         *version = event.seq;
         let seen = push.seen_claims.entry(session.into()).or_default();
-        if event.kind == "zone.released" && reason == "narrowed" {
-            // The remaining paths can still clear older losses once their policy arrives.
+        if event.kind == "zone.lost" || (event.kind == "zone.released" && reason == "narrowed") {
+            // A partial takeover uses the same event as a full loss. A status snapshot
+            // can confirm that this id still holds paths that clear older losses.
             seen.entry(id).or_insert(None);
         } else {
             seen.insert(id, None);
@@ -3073,11 +3074,19 @@ mod tests {
 
     #[test]
     fn local_0100_r5_narrowing_keeps_pending_policy() {
+        partial_loss_keeps_pending_policy("zone.released");
+    }
+
+    #[test]
+    fn local_0100_r10_partial_takeover_keeps_pending_policy() {
+        partial_loss_keeps_pending_policy("zone.lost");
+    }
+
+    fn partial_loss_keeps_pending_policy(kind: &str) {
         let mut rig = rig(true, None);
         rig.daemon.stop_workers();
         let shared = &rig.daemon.shared;
         shared.hear("alice");
-        let backend = shared.backend("alice");
         let mut lost = round4_zone(1, "zone.lost", 42, 2, None);
         lost.payload["paths"] = json!(["src/straße/file.rs"]);
         shared.push_event(lost);
@@ -3085,16 +3094,29 @@ mod tests {
         claimed.payload["reason"] = json!("claimed");
         claimed.payload["paths"] = json!(["src/STRASSE", "docs"]);
         shared.push_event(claimed);
-        let mut narrowed = round4_zone(3, "zone.released", 43, 4, Some("bob"));
-        narrowed.payload["paths"] = json!(["docs"]);
-        shared.push_event(narrowed);
+        let actor = (kind == "zone.released").then_some("bob");
+        let mut partial = round4_zone(3, kind, 43, 3, actor);
+        partial.payload["paths"] = json!(["docs"]);
+        shared.push_event(partial);
         assert_eq!(shared.zone_alerts("alice").len(), 2);
 
-        let claim = serde_json::from_value(json!({
-            "id": 43, "session": "alice", "paths": ["src/STRASSE"], "case_insensitive_paths": true
-        }))
-        .unwrap();
-        shared.observe_status_claims("alice", None, &[claim], &backend, Duration::ZERO);
+        rig.server.enqueue(
+            "/api/v1/zones/claims",
+            HttpReply::json(
+                200,
+                json!({"claims": [{
+                    "id": 43, "session": "alice", "paths": ["src/STRASSE"],
+                    "fence": 4, "expires_at": "2099-01-01T00:00:00Z", "case_insensitive_paths": true
+                }]}),
+            ),
+        );
+        let reply = rig.daemon.handle(Request::StatusRead {
+            session: "alice".into(),
+            repository: None,
+            deadline_ms: 2_000,
+        });
+        assert!(reply.error.is_none(), "{:?}", reply.error);
+        assert_eq!(reply.status_read.unwrap().claims[0].paths, ["src/STRASSE"]);
         let remaining: Vec<_> = shared
             .zone_alerts("alice")
             .iter()
