@@ -448,6 +448,50 @@
     }
 
     #[test]
+    fn mcp_ttl_uses_each_tools_contract() {
+        tool_registry()
+            .validate_fields("zone_queue", &json!({"ttl": 480}))
+            .unwrap();
+
+        let dir = project();
+        let result = call(
+            &dir,
+            "a",
+            "board_set",
+            json!({"key": "schedule", "value": "work", "ttl": 480}),
+        );
+        assert_eq!(result["isError"], false, "{}", text(&result));
+        let entry = &result["structuredContent"];
+        assert_eq!(
+            entry["expires_at"].as_i64().unwrap() - entry["updated_at"].as_i64().unwrap(),
+            480 * 60_000
+        );
+
+        let definitions = tools(Surface::Full);
+        for (name, min, max) in [
+            ("zone_queue", 1, 480),
+            ("board_set", 1, 43_200),
+            ("msg_send", 30, 1440),
+            ("start_work", 1, 240),
+            ("zone_renew", 1, 240),
+        ] {
+            let tool = definitions
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            let ttl = &tool["inputSchema"]["properties"]["ttl"];
+            assert_eq!(ttl["minimum"], min, "{name}");
+            assert_eq!(ttl["maximum"], max, "{name}");
+            assert!(ttl["description"].as_str().unwrap().contains("minutes"));
+            for outside in [min - 1, max + 1] {
+                let result = call(&dir, "a", name, json!({"ttl": outside}));
+                assert_eq!(result["isError"], true, "{name} accepted {outside}");
+                assert_eq!(text(&result), format!("ttl must be {min} to {max} minutes"));
+            }
+        }
+    }
+
+    #[test]
     fn zone_claim_rejects_ttl_aliases_before_claiming() {
         let dir = project();
         for (alias, value) in [("ttl_minutes", 1), ("ttl_seconds", 60), ("duration", 1)] {
@@ -468,18 +512,22 @@
         assert_eq!(result["isError"], false, "{}", text(&result));
 
         for tool in tools(Surface::Full) {
-            if tool.pointer("/inputSchema/properties/ttl").is_none() {
+            let Some(ttl) = tool.pointer("/inputSchema/properties/ttl") else {
                 continue;
-            }
+            };
             let name = tool["name"].as_str().unwrap();
+            let min = ttl["minimum"].as_i64().unwrap();
+            let max = ttl["maximum"].as_i64().unwrap();
             for args in [
                 json!({"ttl_seconds": 60}), json!({"ttl": "10m"}),
-                json!({"ttl": 0}), json!({"ttl": 241}),
+                json!({"ttl": min - 1}), json!({"ttl": max + 1}),
             ] {
                 let error = tool_registry().validate_fields(name, &args).unwrap_err();
                 let message = error.to_string();
                 assert!(
-                    ["minutes", "1", "240"].iter().all(|part| message.contains(part)),
+                    message.contains("minutes")
+                        && message.contains(&min.to_string())
+                        && message.contains(&max.to_string()),
                     "{name}: {error}"
                 );
             }

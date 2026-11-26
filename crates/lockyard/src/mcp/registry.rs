@@ -2,6 +2,15 @@
 
 use super::*;
 
+fn ttl_minutes_range(name: &str) -> RangeInclusive<i64> {
+    match name {
+        "zone_queue" => QUEUE_TTL_MINUTES,
+        "board_set" => BOARD_TTL_MINUTES,
+        "msg_send" => NOTICE_TTL_MINUTES,
+        _ => LEASE_TTL_MINUTES,
+    }
+}
+
 pub(super) fn tool_def(
     name: &str,
     description: &str,
@@ -10,10 +19,12 @@ pub(super) fn tool_def(
 ) -> Value {
     let mut description = description.to_string();
     if let Some(ttl) = properties.get_mut("ttl") {
-        ttl["minimum"] = json!(1);
-        ttl["maximum"] = json!(240);
+        let bounds = ttl_minutes_range(name);
+        let (min, max) = (bounds.start(), bounds.end());
+        ttl["minimum"] = json!(min);
+        ttl["maximum"] = json!(max);
         if ttl.get("description").is_none() {
-            ttl["description"] = json!("Integer minutes (1-240).");
+            ttl["description"] = json!(format!("Integer minutes ({min}-{max})."));
         }
     }
     if let Some(shared) = properties.get_mut("shared") {
@@ -81,7 +92,7 @@ impl ToolRegistry {
         let flag = json!({"type":"boolean"});
         let names = json!({"type":"array","items":{"type":"string"}});
         let task_identifier = canonical_task_schema();
-        let ttl_minutes = json!({"type":"integer","minimum":1,"maximum":240,"description":"ttl is an integer number of minutes, from 1 through 240."});
+        let ttl_minutes = json!({"type":"integer","description":"ttl is an integer number of minutes, from 1 through 240."});
         for wire in [
             tool_def(
                 "start_work",
@@ -167,15 +178,17 @@ impl ToolRegistry {
             return Ok(());
         };
         let properties = &definition.wire["inputSchema"]["properties"];
+        let bounds = ttl_minutes_range(name);
+        let (min, max) = (bounds.start(), bounds.end());
         if properties.get("ttl").is_some() {
             for alias in ["ttl_minutes", "ttl_seconds", "duration"] {
                 if args.get(alias).is_some() {
                     return Err(Error::Invalid(format!(
-                        "unknown field {alias}; use ttl, an integer number of minutes (1-240)"
+                        "unknown field {alias}; use ttl, an integer number of minutes ({min}-{max})"
                     )));
                 }
             }
-            Args(args).optional_ttl()?;
+            Args(args).optional_ttl(&bounds)?;
         }
         if !matches!(name, "update" | "start_work" | "zone_renew") {
             return Ok(());
@@ -184,9 +197,9 @@ impl ToolRegistry {
             for key in args.keys() {
                 if properties.get(key).is_none() {
                     let correct = if name == "update" {
-                        "body for message text"
+                        "body for message text".into()
                     } else {
-                        "ttl, an integer number of minutes (1-240)"
+                        format!("ttl, an integer number of minutes ({min}-{max})")
                     };
                     return Err(Error::Invalid(format!(
                         "unknown field {key}; use {correct}; see the {name} input schema"
@@ -219,10 +232,7 @@ impl ToolRegistry {
                 let mut wire = definition.wire.clone();
                 if surface == Surface::Compact && wire["name"].as_str().unwrap() == "zone_renew" {
                     wire["description"] = json!("Renew own claim; ttl: integer minutes (1-240, default 30); fence is filled from status.");
-                    wire["inputSchema"]["properties"]["ttl"] = json!({
-                        "type": "integer", "minimum": 1, "maximum": 240, "default": 30,
-                        "description": "Integer minutes (1-240), default 30."
-                    });
+                    wire["inputSchema"]["properties"]["ttl"]["default"] = json!(DEFAULT_TTL_MINUTES);
                 }
                 wire
             })

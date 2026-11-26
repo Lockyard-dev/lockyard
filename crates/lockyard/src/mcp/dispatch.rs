@@ -386,7 +386,9 @@ pub(super) fn run_tool(
             let request = QueueRequest {
                 paths,
                 note: args.optional_text("note")?.to_string(),
-                ttl_minutes: args.optional_ttl()?.unwrap_or(DEFAULT_QUEUE_MINUTES),
+                ttl_minutes: args
+                    .optional_ttl(&QUEUE_TTL_MINUTES)?
+                    .unwrap_or(DEFAULT_QUEUE_MINUTES),
                 mode: args.mode()?,
                 purpose: args.purpose()?,
                 zones,
@@ -889,7 +891,7 @@ pub(super) fn run_tool(
                 key: args.text("key")?.to_string(),
                 value: args.text("value")?.to_string(),
                 zone: args.some_text("zone")?,
-                ttl_minutes: args.optional_ttl()?,
+                ttl_minutes: args.optional_ttl(&BOARD_TTL_MINUTES)?,
             };
             encode(
                 &opened
@@ -1022,7 +1024,7 @@ pub(super) fn send_mail(
         zone: args.some_text("zone")?,
         re: args.some_text("re")?,
         key: args.some_text("key")?,
-        ttl_minutes: args.optional_ttl()?,
+        ttl_minutes: args.optional_ttl(&NOTICE_TTL_MINUTES)?,
     };
     let mut message = backend.send(agent, &request, crate::now_ms())?;
     message.body = escape_bidi_controls(&message.body);

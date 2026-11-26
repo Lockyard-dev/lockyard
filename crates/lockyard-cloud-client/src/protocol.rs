@@ -978,6 +978,14 @@ impl Client {
         &self,
         key: &str,
     ) -> Result<PendingSendGuard<'_>, ClientError> {
+        self.claim_pending_send_observing(key, &mut false)
+    }
+
+    fn claim_pending_send_observing(
+        &self,
+        key: &str,
+        observed_inflight: &mut bool,
+    ) -> Result<PendingSendGuard<'_>, ClientError> {
         let mut guard = self.reserve_pending_key(key)?;
         if let Some(directory) = &self.pending_journal {
             guard.reacquire_journal(Duration::ZERO, |_| Ok(()))?;
@@ -995,6 +1003,7 @@ impl Client {
                     .try_exists()
                     .map_err(journal_error)?
                 {
+                    *observed_inflight = true;
                     return Err(ClientError::JournalBusy);
                 }
                 if !active && !retry_cleanup {
@@ -1913,6 +1922,7 @@ impl Client {
             .key
             .as_deref()
             .and_then(|key| self.pending_operation(key));
+        let mut observed_inflight = false;
         let mut send_guard = if call.is_write() {
             let key = call.key.as_deref().expect("validated write key");
             // The flock is local and pre-send: wait inside the call deadline without starting a
@@ -1924,7 +1934,7 @@ impl Client {
             let mut delay = Duration::from_millis(25);
             loop {
                 call.check_cancelled()?;
-                match self.claim_pending_send(key) {
+                match self.claim_pending_send_observing(key, &mut observed_inflight) {
                     Ok(guard) => break Some(guard),
                     Err(error) if journal_busy(&error) => {
                         let left = budget.saturating_sub(started.elapsed());
@@ -1954,6 +1964,16 @@ impl Client {
         }
         if let Some(pending) = observed_pending {
             return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+        }
+        if observed_inflight && let Some(key) = &call.key {
+            // The sibling may have acknowledged a success while we waited. A
+            // missing row after same-key contention does not authorize a new send.
+            return Err(ClientError::Protocol(Problem {
+                status: None,
+                code: "outcome_unknown".into(),
+                detail: format!("Reconcile the mutation outcome using Idempotency-Key {key}"),
+                details: json!({"idempotency_key": key}),
+            }));
         }
         let route = call.path.split('?').next().unwrap_or(&call.path);
         if !route.starts_with('/')

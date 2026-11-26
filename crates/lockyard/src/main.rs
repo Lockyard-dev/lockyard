@@ -59,6 +59,7 @@ const DEFAULT_TOKEN_DAYS: i64 = 90;
 const DAY_MS: i64 = 86_400_000;
 /// Lease of a queued claim unless the caller asks for another one.
 const DEFAULT_QUEUE_MINUTES: i64 = 60;
+const QUEUE_TTL_MINUTES: std::ops::RangeInclusive<i64> = 1..=480;
 
 #[path = "cli/base.rs"]
 mod cli_base;

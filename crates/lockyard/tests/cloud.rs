@@ -1848,6 +1848,39 @@ fn mcp_calls(dir: &Path, runtime: &Path, surface: &str, calls: &[(&str, Value)])
     mcp_calls_env(dir, runtime, surface, calls, &[])
 }
 
+#[test]
+fn mcp_forwards_queue_and_notice_ttls_at_their_limits() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let results = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "full",
+        &[
+            ("zone_queue", json!({"paths":["src"], "ttl":480})),
+            (
+                "msg_send",
+                json!({"to":"*", "body":"short notice", "kind":"notice", "ttl":30}),
+            ),
+            (
+                "msg_send",
+                json!({"to":"*", "body":"long notice", "kind":"notice", "ttl":1440}),
+            ),
+        ],
+    );
+    for result in results {
+        assert_eq!(result["isError"], false, "{result}");
+    }
+    let queue = server.seen("POST", "/api/v1/zones/queue");
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].body["ttl_minutes"], 480);
+    let mail = server.seen("POST", "/api/v1/bus/messages");
+    assert_eq!(mail.len(), 2);
+    assert_eq!(mail[0].body["ttl_minutes"], 30);
+    assert_eq!(mail[1].body["ttl_minutes"], 1440);
+}
+
 fn mcp_calls_env(
     dir: &Path,
     runtime: &Path,

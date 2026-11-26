@@ -694,6 +694,12 @@ fn parse_queue_minutes(value: &str) -> std::result::Result<i64, String> {
     value
         .parse::<i64>()
         .ok()
-        .filter(|ttl| (1..=480).contains(ttl))
-        .ok_or_else(|| "queue ttl must be 1 to 480 minutes".into())
+        .filter(|ttl| QUEUE_TTL_MINUTES.contains(ttl))
+        .ok_or_else(|| {
+            format!(
+                "queue ttl must be {} to {} minutes",
+                QUEUE_TTL_MINUTES.start(),
+                QUEUE_TTL_MINUTES.end()
+            )
+        })
 }

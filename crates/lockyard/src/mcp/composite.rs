@@ -41,7 +41,7 @@ pub(super) fn run_composite_steps(
         "start_work" => {
             let paths = args.strings("paths")?;
             let zones = args.strings("zones")?;
-            let ttl = args.optional_ttl()?;
+            let ttl = args.optional_ttl(&LEASE_TTL_MINUTES)?;
             let hold_reason = args.some_text("hold_reason")?;
             let hold_until = args.some_text("hold_until")?;
             lockyard_core::validate_hold(hold_reason.as_deref(), hold_until.as_deref())?;

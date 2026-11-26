@@ -404,6 +404,49 @@ fn start_call(client: Arc<Client>, call: Call) -> mpsc::Receiver<Result<Value, C
 }
 
 #[test]
+fn same_key_waiter_does_not_resend_after_success() {
+    let server = Server::start();
+    let journal = Journal::new();
+    survey_prime(&server, &journal);
+    let sender = Arc::new(server.client(&journal));
+    let waiter = Arc::new(server.client(&journal));
+    let mut call = Call::write(
+        "me",
+        "POST",
+        "/api/v1/registry/items".into(),
+        json!({"title": "one create"}),
+    );
+    call.deadline_ms = Some(4_000);
+    let key = call.key.clone().unwrap();
+    assert!(waiter.pending_operation(&key).is_none());
+
+    let sent = start_call(sender, call.clone());
+    let first = server.requests.recv_timeout(WAIT).unwrap();
+    assert_eq!(first.key, key);
+    assert_eq!(first.path, call.path);
+    let waiting = start_call(waiter, call);
+    assert!(
+        server
+            .requests
+            .recv_timeout(Duration::from_millis(200))
+            .is_err()
+    );
+    assert!(waiting.try_recv().is_err());
+    first.reply(200, None);
+    assert!(sent.recv_timeout(WAIT).unwrap().is_ok());
+
+    if let Ok(duplicate) = server.requests.recv_timeout(Duration::from_millis(800)) {
+        duplicate.reply(200, None);
+        panic!("a second POST was sent after the first returned 200");
+    }
+    let error = waiting.recv_timeout(WAIT).unwrap().unwrap_err();
+    assert_eq!(error.code(), Some("outcome_unknown"));
+    assert!(error.to_string().contains(&key));
+    assert!(server.requests.try_recv().is_err());
+    server.finish();
+}
+
+#[test]
 fn pending_replay_http_uses_the_time_left_after_journal_wait() {
     let server = Server::start();
     let journal = Journal::new();

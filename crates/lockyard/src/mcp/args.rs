@@ -116,14 +116,20 @@ impl<'a> Args<'a> {
             .transpose()
     }
 
-    pub(super) fn optional_ttl(self) -> Result<Option<i64>> {
+    pub(super) fn optional_ttl(self, bounds: &RangeInclusive<i64>) -> Result<Option<i64>> {
         self.get("ttl")
             .map(|value| {
-                let ttl = value
-                    .as_i64()
-                    .ok_or_else(|| wrong_type("ttl", "an integer number of minutes (1-240)"))?;
-                if !(1..=240).contains(&ttl) {
-                    return Err(Error::Invalid("ttl must be 1 to 240 minutes".into()));
+                let (min, max) = (bounds.start(), bounds.end());
+                let ttl = value.as_i64().ok_or_else(|| {
+                    wrong_type(
+                        "ttl",
+                        &format!("an integer number of minutes ({min}-{max})"),
+                    )
+                })?;
+                if !bounds.contains(&ttl) {
+                    return Err(Error::Invalid(format!(
+                        "ttl must be {min} to {max} minutes"
+                    )));
                 }
                 Ok(ttl)
             })
@@ -131,7 +137,9 @@ impl<'a> Args<'a> {
     }
 
     pub(super) fn ttl(self) -> Result<i64> {
-        Ok(self.optional_ttl()?.unwrap_or(DEFAULT_TTL_MINUTES))
+        Ok(self
+            .optional_ttl(&LEASE_TTL_MINUTES)?
+            .unwrap_or(DEFAULT_TTL_MINUTES))
     }
 
     pub(super) fn strings(self, key: &str) -> Result<Vec<String>> {
