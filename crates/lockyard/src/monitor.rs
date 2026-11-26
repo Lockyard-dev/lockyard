@@ -16,6 +16,7 @@
 //! coalesces and inotify overflows without telling anyone. Switch the events off entirely with
 //! `LOCKYARD_WATCH=off` and the monitor still works, at the reconcile interval.
 
+use lockyard_core::paths::fold_path_component;
 use lockyard_core::proto::{DirtyPath, InboxQuery, Message, SendRequest};
 use lockyard_core::watch::{Backend as WatchBackend, Tick, Watcher};
 use lockyard_core::{Backend, Error, Result, Store, ZonePath, outside, watch};
@@ -313,59 +314,96 @@ fn inspect(
 
 /// The fallback for dropped events: files under a claim modified since the claim began.
 fn rescan(root: &Path, claims: &[lockyard_core::proto::Claim], now: i64) -> Vec<String> {
-    let mut found = Vec::new();
     let since = now - i64::try_from(RESCAN_WINDOW.as_millis()).unwrap_or(i64::MAX);
+    let mut scan = Rescan {
+        root,
+        since,
+        remaining: RESCAN_ENTRIES,
+        found: Vec::new(),
+    };
     for claim in claims {
         for held in &claim.paths {
-            let start = if held == "." {
-                root.to_path_buf()
+            if scan.remaining == 0 {
+                return scan.found;
+            }
+            scan.remaining -= 1;
+            if claim.folds_path_case() && held != "." {
+                let keys: Vec<_> = held.split('/').map(fold_path_component).collect();
+                scan.walk(root, &keys, 0);
             } else {
-                root.join(held)
-            };
-            walk(root, &start, since, 0, &mut found);
+                scan.walk(&root.join(held), &[], 0);
+            }
         }
     }
-    found
+    scan.found
 }
 
 /// How far back a rescan looks. Longer than the reconcile interval, so nothing falls between rounds.
 const RESCAN_WINDOW: Duration = Duration::from_secs(60);
-/// A rescan does not descend further than this, so one claim on `.` cannot stall a round.
+/// A rescan does not descend further than this below a matched claim path.
 const RESCAN_DEPTH: usize = 12;
-/// Nor does it look at more files than this.
-const RESCAN_FILES: usize = 20_000;
+/// Bound both subtree walks and the searches through parent directories for folded aliases.
+const RESCAN_ENTRIES: usize = 20_000;
 
-fn walk(root: &Path, at: &Path, since: i64, depth: usize, found: &mut Vec<String>) {
-    if depth > RESCAN_DEPTH || found.len() >= RESCAN_FILES || watch::is_internal(at) {
-        return;
-    }
-    let Ok(data) = at.symlink_metadata() else {
-        return;
-    };
-    if data.is_dir() {
-        let Ok(entries) = std::fs::read_dir(at) else {
+struct Rescan<'a> {
+    root: &'a Path,
+    since: i64,
+    remaining: usize,
+    found: Vec<String>,
+}
+
+impl Rescan<'_> {
+    fn walk(&mut self, at: &Path, keys: &[String], depth: usize) {
+        if watch::is_internal(at) {
+            return;
+        }
+        let Ok(data) = at.symlink_metadata() else {
             return;
         };
-        for entry in entries.flatten() {
-            walk(root, &entry.path(), since, depth + 1, found);
+        if data.is_dir() {
+            if depth == RESCAN_DEPTH || self.remaining == 0 {
+                return;
+            }
+            let Ok(entries) = std::fs::read_dir(at) else {
+                return;
+            };
+            for entry in entries {
+                if self.remaining == 0 {
+                    break;
+                }
+                self.remaining -= 1;
+                let Ok(entry) = entry else { continue };
+                if let Some((key, rest)) = keys.split_first() {
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| fold_path_component(name) == *key)
+                    {
+                        self.walk(&entry.path(), rest, 0);
+                    }
+                } else {
+                    self.walk(&entry.path(), &[], depth + 1);
+                }
+            }
+            return;
         }
-        return;
-    }
-    if !data.is_file() {
-        return;
-    }
-    let modified = data
-        .modified()
-        .ok()
-        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|since_epoch| i64::try_from(since_epoch.as_millis()).ok());
-    if modified.is_none_or(|at| at < since) {
-        return;
-    }
-    if let Ok(relative) = at.strip_prefix(root)
-        && let Some(text) = relative.to_str()
-    {
-        found.push(text.replace(std::path::MAIN_SEPARATOR, "/"));
+        if !keys.is_empty() || !data.is_file() {
+            return;
+        }
+        let modified = data
+            .modified()
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|since_epoch| i64::try_from(since_epoch.as_millis()).ok());
+        if modified.is_none_or(|at| at < self.since) {
+            return;
+        }
+        if let Ok(relative) = at.strip_prefix(self.root)
+            && let Some(text) = relative.to_str()
+        {
+            self.found
+                .push(text.replace(std::path::MAIN_SEPARATOR, "/"));
+        }
     }
 }
 
@@ -614,6 +652,38 @@ mod tests {
             project.store().unannounced(0).unwrap()[0].path,
             "src/late.rs"
         );
+    }
+
+    #[test]
+    fn local_0100_r5_rescan_walks_all_d145_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/STRASSE")).unwrap();
+        std::fs::write(root.join("src/STRASSE/file.rs"), "changed").unwrap();
+        let distinct = match std::fs::create_dir(root.join("src/straße")) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(error) => panic!("{error}"),
+        };
+        std::fs::write(root.join("src/straße/other.rs"), "also changed").unwrap();
+        std::fs::create_dir(root.join("src/STRASSE-sibling")).unwrap();
+        std::fs::write(root.join("src/STRASSE-sibling/unrelated.rs"), "outside").unwrap();
+        let mut claim: lockyard_core::proto::Claim = serde_json::from_value(json!({
+            "id": 1, "paths": ["src/straße"], "case_insensitive_paths": true
+        }))
+        .unwrap();
+        let mut found = rescan(root, std::slice::from_ref(&claim), 0);
+        found.sort();
+        let other = if distinct {
+            "src/straße/other.rs"
+        } else {
+            "src/STRASSE/other.rs"
+        };
+        assert_eq!(found, ["src/STRASSE/file.rs", other]);
+        if distinct {
+            claim.case_insensitive_paths = Some(false);
+            assert_eq!(rescan(root, &[claim], 0), ["src/straße/other.rs"]);
+        }
     }
 
     #[test]

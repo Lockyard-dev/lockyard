@@ -1114,6 +1114,7 @@ impl<T: Transport + 'static> Shared<T> {
             Ok(mut status) => {
                 self.observe_status_claims(
                     session,
+                    repository,
                     &status.claims,
                     &backend,
                     deadline
@@ -3827,6 +3828,7 @@ mod tests {
             serde_json::from_value(json!({"id":42,"session":"alice","paths":["src"]})).unwrap();
         rig.daemon.shared.observe_status_claims(
             "alice",
+            None,
             &[claim],
             &backend,
             Duration::from_secs(30),
@@ -3834,9 +3836,13 @@ mod tests {
         *rig.server.lost.lock().unwrap() = vec![
             json!({"claim_id":42,"session":"alice","paths":["src"],"reason":"expired","lost_at":1000000}),
         ];
-        rig.daemon
-            .shared
-            .observe_status_claims("alice", &[], &backend, Duration::from_secs(30));
+        rig.daemon.shared.observe_status_claims(
+            "alice",
+            None,
+            &[],
+            &backend,
+            Duration::from_secs(30),
+        );
         let calls = rig.server.calls.lock().unwrap().len();
         let reply = rig.daemon.handle(Request::Unread {
             attention_ack: Vec::new(),

@@ -20,6 +20,9 @@ All notable changes to Lockyard are recorded here. The format follows
   (LOCAL-0100).
 - Honor own-claim exclusions in MCP `zone_check`. Clear a loss alert only when the new claim
   covers the lost paths, and recheck the acquisition once its case policy arrives (LOCAL-0100).
+- Find all canonically caseless path spellings during monitor rescans of case-insensitive claims.
+  Reconcile loss alerts within the same repository and finish the policy check even if the
+  recovered claim was narrowed while waiting (LOCAL-0100).
 
 ## [0.3.19] - 2026-11-26
 
