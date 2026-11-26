@@ -109,6 +109,19 @@ fn comparable(path: &str, fold_case: bool) -> String {
     }
 }
 
+/// Canonical form for comparing individual path components across Unicode spellings and case.
+pub fn fold_path_component(component: &str) -> String {
+    // Lowercase first so capital sharp S expands the same way as small sharp S.
+    component
+        .nfc()
+        .collect::<String>()
+        .to_lowercase()
+        .to_uppercase()
+        .to_lowercase()
+        .nfc()
+        .collect()
+}
+
 fn overlaps_exact(a: &str, b: &str) -> bool {
     a == ROOT || b == ROOT || a == b || is_inside(a, b) || is_inside(b, a)
 }
@@ -198,6 +211,22 @@ mod tests {
         assert!(!overlaps("SRC", "src/file.rs", false));
         assert!(overlaps("SRC", "src/file.rs", true));
         assert!(!overlaps("Src", "src/file.rs", false));
+    }
+
+    #[test]
+    fn path_component_folding_matches_unicode_spellings_and_case() {
+        assert_eq!(
+            fold_path_component("cafe\u{0301}"),
+            fold_path_component("CAFÉ")
+        );
+        for variant in ["ß", "ẞ", "SS", "ss"] {
+            assert_eq!(fold_path_component(variant), "ss");
+        }
+        assert_eq!(fold_path_component("ſ"), fold_path_component("s"));
+        assert_ne!(
+            fold_path_component("Nested"),
+            fold_path_component("nested-sibling")
+        );
     }
 
     #[cfg(any(target_os = "macos", windows))]

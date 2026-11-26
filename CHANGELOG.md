@@ -5,6 +5,12 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.19] - 2026-11-26
+
+- Match gitlink path components using Unicode NFC normalization and case folding on every filesystem.
+  A task path behind an uninitialised submodule leaves the short SHA unresolved and warns in encrypted
+  workspaces.
+
 ## [0.3.18] - 2026-11-25
 
 - Show the registry's submit warnings: single and batch submissions keep `warnings`, the CLI prints

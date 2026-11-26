@@ -1516,6 +1516,74 @@ fn encrypted_registry_submission_accepts_a_promised_blob_missing_locally() {
 }
 
 #[test]
+fn encrypted_registry_submission_omits_sha_for_uninitialized_submodule_with_different_case() {
+    assert_encrypted_submission_omits_sha_behind_gitlink("Nested", "nested");
+}
+
+#[test]
+fn encrypted_registry_submission_omits_sha_for_uninitialized_submodule_with_unicode_case() {
+    assert_encrypted_submission_omits_sha_behind_gitlink("neſted", "nested");
+}
+
+#[test]
+fn encrypted_registry_submission_omits_sha_for_gitlink_with_decomposed_unicode() {
+    assert_encrypted_submission_omits_sha_behind_gitlink("CAFE\u{0301}", "café");
+}
+
+fn assert_encrypted_submission_omits_sha_behind_gitlink(gitlink: &str, task_component: &str) {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let (parent_sha, _) = encrypted_commit_evidence_fixture(&server, dir.path(), runtime.path());
+    let checkout = dir.path().join("checkout");
+
+    git_evidence_fixture(
+        &checkout,
+        &[
+            "-c",
+            "core.precomposeunicode=false",
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{parent_sha},{gitlink}"),
+        ],
+    );
+    let index = git_evidence_fixture(&checkout, &["ls-files", "--stage", "-z"]);
+    let gitlink_entry = format!("160000 {parent_sha} 0\t{gitlink}");
+    assert!(
+        index
+            .split_terminator('\0')
+            .any(|entry| entry == gitlink_entry)
+    );
+    assert!(!checkout.join(task_component).exists());
+    server.state.lock().unwrap().registry_items[0]["paths"] =
+        json!([format!("checkout/{task_component}/src/file.txt")]);
+
+    let evidence = format!("{}:src/file.txt", &parent_sha[..12]);
+    let response = cli(
+        dir.path(),
+        runtime.path(),
+        &["--json", "task", "submit", "D-1", "--evidence", &evidence],
+    );
+    let result = json_of(&response);
+    assert_eq!(result["status"], "review");
+    let requests = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
+    assert!(
+        requests[0].body.get("commit_sha").is_none(),
+        "expanded a short SHA in the parent repository behind gitlink {gitlink}"
+    );
+    assert!(
+        result["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("Не удалось развернуть SHA")
+    );
+    assert!(
+        String::from_utf8_lossy(&response.stderr).contains("warning: Не удалось развернуть SHA")
+    );
+}
+
+#[test]
 fn encrypted_registry_submission_resolves_sha_only_in_the_submodule_checkout() {
     let server = Server::start();
     let dir = cloud_project(&server);

@@ -1,7 +1,10 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
 use crate::Call;
-use lockyard_core::{Error, Result, ZonePath, paths::find_root};
+use lockyard_core::{
+    Error, Result, ZonePath,
+    paths::{find_root, fold_path_component},
+};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -52,18 +55,36 @@ fn toplevel(path: &Path) -> Option<PathBuf> {
     .ok()
 }
 
+fn gitlink_contains_path(gitlink: &[u8], relative: &Path) -> bool {
+    // Git uses `/` in the index. Path iteration handles native separators, including Windows `\`.
+    let mut requested = relative.iter();
+    gitlink.split(|&byte| byte == b'/').all(|indexed| {
+        let Some(requested) = requested.next() else {
+            return false;
+        };
+        if indexed == requested.as_encoded_bytes() {
+            return true;
+        }
+        // Unicode spelling and case variants may resolve to this gitlink.
+        match (std::str::from_utf8(indexed), requested.to_str()) {
+            (Ok(indexed), Some(requested)) => {
+                fold_path_component(indexed) == fold_path_component(requested)
+            }
+            _ => false,
+        }
+    })
+}
+
 fn checkout_contains_path(repo: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(repo) else {
         return false;
     };
-    let Some(first) = relative.components().next() else {
+    if relative.as_os_str().is_empty() {
         return true;
-    };
-    // Query from the first component so the index also reports gitlink ancestors.
-    let relative = relative.as_os_str().as_encoded_bytes();
+    }
+    // Scan all index entries so Git's pathspec matching cannot exclude Unicode case variants.
     git(repo)
-        .args(["--literal-pathspecs", "ls-files", "--stage", "-z", "--"])
-        .arg(first.as_os_str())
+        .args(["ls-files", "--stage", "-z"])
         .output()
         .is_ok_and(|output| {
             output.status.success()
@@ -72,8 +93,7 @@ fn checkout_contains_path(repo: &Path, path: &Path) -> bool {
                         && entry
                             .splitn(2, |&byte| byte == b'\t')
                             .nth(1)
-                            .and_then(|gitlink| relative.strip_prefix(gitlink))
-                            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(b"/"))
+                            .is_some_and(|gitlink| gitlink_contains_path(gitlink, relative))
                 })
         })
 }
@@ -221,6 +241,26 @@ fn add_missing_sha_warning(response: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gitlink_matches_only_complete_path_components() {
+        let gitlink = b"vendor/Nested";
+        assert!(gitlink_contains_path(gitlink, Path::new("vendor/nested")));
+        assert!(gitlink_contains_path(
+            gitlink,
+            Path::new("vendor/nested/src/file")
+        ));
+        assert!(!gitlink_contains_path(gitlink, Path::new("vendor")));
+        assert!(!gitlink_contains_path(
+            gitlink,
+            Path::new("vendor/nested-sibling/src/file")
+        ));
+        #[cfg(windows)]
+        assert!(gitlink_contains_path(
+            gitlink,
+            Path::new(r"vendor\nested\src\file")
+        ));
+    }
 
     #[test]
     fn encrypted_response_schema_accepts_single_and_batch_warnings_as_clear_metadata() {
