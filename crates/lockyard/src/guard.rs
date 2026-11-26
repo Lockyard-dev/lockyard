@@ -69,37 +69,17 @@ fn ensure_shared_dir() -> io::Result<std::path::PathBuf> {
 }
 
 fn acquire_state_lock(lock: &File, hook: bool, has_stale: bool) -> io::Result<bool> {
-    #[cfg(unix)]
-    {
-        let flags = libc::LOCK_EX | if hook { libc::LOCK_NB } else { 0 };
-        if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(lock), flags) } == 0 {
-            return Ok(true);
-        }
-        if hook && has_stale {
-            return Ok(false);
-        }
-        if hook {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "machine state unavailable",
-            ));
-        }
-        Err(io::Error::last_os_error())
+    if !hook {
+        lock.lock()?;
+        return Ok(true);
     }
-    #[cfg(not(unix))]
-    {
-        if !hook {
-            lock.lock()?;
-            return Ok(true);
-        }
-        match lock.try_lock() {
-            Ok(()) => Ok(true),
-            Err(_) if has_stale => Ok(false),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "machine state unavailable",
-            )),
-        }
+    match lock.try_lock() {
+        Ok(()) => Ok(true),
+        Err(_) if has_stale => Ok(false),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "machine state unavailable",
+        )),
     }
 }
 
@@ -194,9 +174,7 @@ fn with_state_mode(config: &MachineConfig, details: bool, hook: bool) -> io::Res
         maintain_reserve(config, &report);
     }
     #[cfg(unix)]
-    unsafe {
-        libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_UN);
-    }
+    let _ = lock.unlock();
     Ok(report)
 }
 
@@ -800,11 +778,7 @@ fn coordinate_groups(own_group: i32, report: &MachineReport) -> io::Result<()> {
         .read(true)
         .write(true)
         .open(dir.join("coordinator.lock"))?;
-    #[cfg(unix)]
-    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    #[cfg(windows)]
+    #[cfg(any(unix, windows))]
     lock.lock()?;
     let runner_dir = dir.join("runners");
     let paused_dir = pause_dir();
@@ -879,9 +853,7 @@ fn coordinate_groups(own_group: i32, report: &MachineReport) -> io::Result<()> {
         }
     }
     #[cfg(unix)]
-    unsafe {
-        libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_UN);
-    }
+    let _ = lock.unlock();
     Ok(())
 }
 
@@ -1075,13 +1047,7 @@ fn acquire_slot(config: &MachineConfig, max_wait: Duration) -> io::Result<Option
                     .truncate(false)
                     .open(&path)?;
                 #[cfg(unix)]
-                if unsafe {
-                    libc::flock(
-                        std::os::fd::AsRawFd::as_raw_fd(&file),
-                        libc::LOCK_EX | libc::LOCK_NB,
-                    )
-                } == 0
-                {
+                if file.try_lock().is_ok() {
                     drop(ticket);
                     return Ok(Some(Slot { _file: file }));
                 }
@@ -1122,9 +1088,7 @@ fn make_ticket(base: &Path) -> io::Result<QueueTicket> {
         .write(true)
         .open(&counter_path)?;
     #[cfg(unix)]
-    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&counter), libc::LOCK_EX) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
+    counter.lock()?;
     let mut old = String::new();
     counter.read_to_string(&mut old)?;
     let id = old.trim().parse::<u64>().unwrap_or(0).saturating_add(1);
@@ -1133,9 +1097,7 @@ fn make_ticket(base: &Path) -> io::Result<QueueTicket> {
     write!(counter, "{id}")?;
     counter.sync_all()?;
     #[cfg(unix)]
-    unsafe {
-        libc::flock(std::os::fd::AsRawFd::as_raw_fd(&counter), libc::LOCK_UN);
-    }
+    let _ = counter.unlock();
     let start = process_start_time(std::process::id() as i32)
         .ok_or_else(|| io::Error::other("cannot verify runner process identity"))?;
     let path = base.join(format!("queue-{id:020}.json"));
@@ -1215,10 +1177,7 @@ mod format_tests {
             .write(true)
             .open(&path)
             .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&holder), libc::LOCK_EX) },
-            0
-        );
+        holder.lock().unwrap();
         assert!(!acquire_state_lock(&contender, true, true).unwrap());
         assert_eq!(
             acquire_state_lock(&contender, true, false)
