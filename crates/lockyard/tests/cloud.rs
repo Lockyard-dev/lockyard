@@ -1530,6 +1530,14 @@ fn encrypted_registry_submission_omits_sha_for_gitlink_with_decomposed_unicode()
     assert_encrypted_submission_omits_sha_behind_gitlink("CAFE\u{0301}", "café");
 }
 
+#[test]
+fn encrypted_registry_submission_omits_sha_for_gitlink_with_greek_caseless_match() {
+    assert_encrypted_submission_omits_sha_behind_gitlink(
+        "\u{0386}\u{0345}\u{0301}",
+        "\u{03AC}\u{0345}\u{0301}",
+    );
+}
+
 fn assert_encrypted_submission_omits_sha_behind_gitlink(gitlink: &str, task_component: &str) {
     let server = Server::start();
     let dir = cloud_project(&server);

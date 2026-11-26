@@ -5,6 +5,7 @@
 
 use crate::store::DIR_NAME;
 use crate::{Error, Result};
+use caseless::Caseless;
 use std::path::{Component, Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
@@ -98,28 +99,20 @@ fn overlaps(a: &str, b: &str, fold_case: bool) -> bool {
     overlaps_exact(&comparable(a, fold_case), &comparable(b, fold_case))
 }
 
-/// The form two zones are compared in: NFC, and lower case when the file system ignores case.
-/// NFC here also matches zones stored by older clients in NFD.
+/// A zone comparison key under the repository's case policy.
 fn comparable(path: &str, fold_case: bool) -> String {
-    let composed = path.nfc().collect::<String>();
     if fold_case {
-        composed.to_lowercase()
+        // `/` is unchanged by D145 and separates normalization sequences.
+        fold_path_component(path)
     } else {
-        composed
+        // Match zones stored by older clients in NFD.
+        path.nfc().collect()
     }
 }
 
-/// Canonical form for comparing individual path components across Unicode spellings and case.
+/// Unicode D145 comparison key: NFD, full default case folding, then NFD.
 pub fn fold_path_component(component: &str) -> String {
-    // Lowercase first so capital sharp S expands the same way as small sharp S.
-    component
-        .nfc()
-        .collect::<String>()
-        .to_lowercase()
-        .to_uppercase()
-        .to_lowercase()
-        .nfc()
-        .collect()
+    component.chars().nfd().default_case_fold().nfd().collect()
 }
 
 fn overlaps_exact(a: &str, b: &str) -> bool {
@@ -222,11 +215,29 @@ mod tests {
         for variant in ["ß", "ẞ", "SS", "ss"] {
             assert_eq!(fold_path_component(variant), "ss");
         }
+        assert_eq!(
+            fold_path_component("straße"),
+            fold_path_component("STRASSE")
+        );
+        assert_eq!(fold_path_component("ΑΣ"), fold_path_component("ας"));
         assert_eq!(fold_path_component("ſ"), fold_path_component("s"));
+        assert_ne!(fold_path_component("ı"), fold_path_component("i"));
         assert_ne!(
             fold_path_component("Nested"),
             fold_path_component("nested-sibling")
         );
+    }
+
+    #[test]
+    fn path_component_folding_normalizes_greek_before_folding() {
+        let decomposed = "\u{03B1}\u{0301}\u{0301}\u{03B9}";
+        for spelling in [
+            "\u{0386}\u{0345}\u{0301}",
+            "\u{03AC}\u{0345}\u{0301}",
+            decomposed,
+        ] {
+            assert_eq!(fold_path_component(spelling), decomposed);
+        }
     }
 
     #[cfg(any(target_os = "macos", windows))]

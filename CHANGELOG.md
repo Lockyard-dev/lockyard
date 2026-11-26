@@ -5,6 +5,12 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.20] - 2026-11-26
+
+- Use Unicode D145 canonical caseless matching via `caseless` for case-insensitive zone and gitlink
+  comparisons. This fixes Greek path aliases behind uninitialised submodules (LOCAL-0100).
+  The server is moving to the same rule under LOCAL-0105.
+
 ## [0.3.19] - 2026-11-26
 
 - Match gitlink path components using Unicode NFC normalization and case folding on every filesystem.
