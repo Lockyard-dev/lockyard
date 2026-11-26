@@ -433,16 +433,59 @@ fn same_key_waiter_does_not_resend_after_success() {
     );
     assert!(waiting.try_recv().is_err());
     first.reply(200, None);
-    assert!(sent.recv_timeout(WAIT).unwrap().is_ok());
+    let expected = sent.recv_timeout(WAIT).unwrap().unwrap();
 
     if let Ok(duplicate) = server.requests.recv_timeout(Duration::from_millis(800)) {
         duplicate.reply(200, None);
         panic!("a second POST was sent after the first returned 200");
     }
-    let error = waiting.recv_timeout(WAIT).unwrap().unwrap_err();
-    assert_eq!(error.code(), Some("outcome_unknown"));
-    assert!(error.to_string().contains(&key));
+    assert_eq!(waiting.recv_timeout(WAIT).unwrap().unwrap(), expected);
     assert!(server.requests.try_recv().is_err());
+    server.finish();
+}
+
+#[test]
+fn same_client_key_waiter_started_before_pending_gets_the_same_response() {
+    let server = Server::start();
+    let journal = Journal::new();
+    survey_prime(&server, &journal);
+    let client = Arc::new(server.client(&journal));
+    server.hold_discovery.store(true, Ordering::Release);
+    let mut call = Call::write(
+        "me",
+        "POST",
+        "/api/v1/registry/items".into(),
+        json!({"title": "one create"}),
+    );
+    call.deadline_ms = Some(4_000);
+    let sent = start_call(Arc::clone(&client), call.clone());
+    let mut discovery = server.requests.recv_timeout(WAIT).unwrap();
+    assert_eq!(discovery.path, "/api/v1/protocol");
+    assert!(
+        client
+            .pending_operation(call.key.as_deref().unwrap())
+            .is_none()
+    );
+    let waiting = start_call(client, call);
+    assert!(
+        server
+            .requests
+            .recv_timeout(Duration::from_millis(200))
+            .is_err()
+    );
+    assert!(waiting.try_recv().is_err());
+    write_reply(
+        &mut discovery.stream,
+        200,
+        json!({"selected_protocol":2,"min_protocol":1,"max_protocol":2,"capabilities":[]}),
+    );
+    server.requests.recv_timeout(WAIT).unwrap().reply(200, None);
+    let expected = sent.recv_timeout(WAIT).unwrap().unwrap();
+    if let Ok(duplicate) = server.requests.recv_timeout(Duration::from_millis(800)) {
+        duplicate.reply(200, None);
+        panic!("a second POST was sent after the first returned 200");
+    }
+    assert_eq!(waiting.recv_timeout(WAIT).unwrap().unwrap(), expected);
     server.finish();
 }
 
