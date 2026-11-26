@@ -130,7 +130,7 @@ pub fn run(settings: &Settings, ports: &mut Ports<'_>, out: &mut dyn Write) -> R
             summary.rescan_incomplete |= inspection.rescan_incomplete;
         }
         if reconcile {
-            let _ = outside::compact(&settings.root, now - outside::ANNOUNCE_WINDOW_MS);
+            let _ = compact_announcements(&settings.root, now);
             let _ = ports.store.forget_unannounced(now - KEEP_RECORDS_MS);
         }
         if settings.once && (summary.delivered > 0 || summary.unannounced > 0) {
@@ -184,6 +184,20 @@ fn save_rescan_state(root: &Path, previous: Option<&RescanState>, state: RescanS
     if let Err(error) = lockyard_core::fsio::replace(&rescan_status_path(root), &bytes, 0o600) {
         eprintln!("warning: could not save monitor rescan status: {error}");
     }
+}
+
+fn compact_announcements(root: &Path, now: i64) -> Result<()> {
+    let earliest = read_rescan_state(root)
+        .and_then(|state| {
+            state
+                .listing_failures
+                .into_values()
+                .flatten()
+                .map(|(_, at)| at)
+                .min()
+        })
+        .map_or(now, |at| at.min(now));
+    outside::compact(root, earliest.saturating_sub(outside::ANNOUNCE_WINDOW_MS))
 }
 
 /// `None` when the events are switched off; the monitor then runs on its timer alone.
@@ -340,20 +354,31 @@ fn inspect(
             )?;
         }
     }
-    let mut paths: Vec<_> = changed
+    let mut paths: BTreeMap<_, Option<i64>> = changed
         .into_iter()
         .chain(scan.paths)
-        .map(|path| nfc_path(&path))
+        .map(|path| (nfc_path(&path), None))
         .collect();
-    paths.sort();
-    paths.dedup();
+    for (path, modified) in scan.recovered_paths {
+        let at = paths.entry(nfc_path(&path)).or_default();
+        *at = (*at).max(Some(modified));
+    }
     let announced = if paths.is_empty() {
         Vec::new()
     } else {
-        outside::announcements(&settings.root, now - outside::ANNOUNCE_WINDOW_MS)?
+        let earliest = paths
+            .values()
+            .flatten()
+            .copied()
+            .min()
+            .map_or(now, |at| at.min(now));
+        outside::announcements(
+            &settings.root,
+            earliest.saturating_sub(outside::ANNOUNCE_WINDOW_MS),
+        )?
     };
     let mut dirty: HashMap<String, Vec<DirtyPath>> = HashMap::new();
-    for path in paths {
+    for (path, modified) in paths {
         let zone = ZonePath::stored(path.clone());
         let Some(claim) = claims.iter().find(|claim| claim.covers(&zone)) else {
             continue;
@@ -368,7 +393,7 @@ fn inspect(
                 reason: Some("changed on disk while the zone was held".into()),
                 task_id: None,
             });
-        if outside::was_announced(&announced, &path, now) {
+        if outside::was_announced(&announced, &path, modified.unwrap_or(now)) {
             continue;
         }
         inspection.unannounced += 1;
@@ -405,21 +430,31 @@ fn inspect(
         }
     }
     out.flush()?;
+    let mut dirty_failed = false;
     for (session, paths) in &dirty {
         // Local mode has no dirty tracking; the call says so and there is nothing to report.
         if let Err(error) = ports.backend.dirty_report(session, paths)
             && !matches!(error, Error::NeedsCloud(_))
         {
+            dirty_failed = true;
             writeln!(out, "! could not report dirty paths: {error}")?;
         }
     }
     if reconcile {
+        let mut listing_failures = scan.listing_failures;
+        if dirty_failed {
+            // A complete walk does not settle recovery until the dirty report is
+            // accepted. Keep its original bounds even across a monitor restart.
+            for (id, paths) in scan.recovered_listings {
+                listing_failures.entry(id).or_default().extend(paths);
+            }
+        }
         save_rescan_state(
             &settings.root,
             previous.as_ref(),
             RescanState {
                 incomplete: inspection.rescan_incomplete,
-                listing_failures: scan.listing_failures,
+                listing_failures,
             },
         );
     }
@@ -474,7 +509,14 @@ fn rescan<'a>(
         remaining -= budget - scan.remaining;
         if scan.issues == 0 {
             if let Some((_, recovered)) = scan.recovery.take() {
-                scan.found.extend(recovered);
+                result.recovered_paths.extend(recovered);
+            }
+            if let Some(first_failure) = first_failure {
+                result
+                    .recovered_listings
+                    .entry(claim.id)
+                    .or_default()
+                    .insert(path, first_failure);
             }
         } else {
             // A limited scan still cannot finish recovery. Keep the original time.
@@ -500,6 +542,8 @@ fn rescan<'a>(
 #[derive(Default)]
 struct ScanResult<'a> {
     paths: Vec<String>,
+    recovered_paths: Vec<(String, i64)>,
+    recovered_listings: ListingFailures,
     // One warning per session and NFC path in this rescan, preserving case.
     incomplete: BTreeMap<(&'a str, String), u8>,
     listing_failures: ListingFailures,
@@ -605,7 +649,7 @@ struct Rescan<'a> {
     alias_listings: HashMap<PathBuf, AliasDirectory>,
     found: Vec<String>,
     // Older writes are emitted once the held path has been scanned completely.
-    recovery: Option<(i64, Vec<String>)>,
+    recovery: Option<(i64, Vec<(String, i64)>)>,
 }
 
 impl Rescan<'_> {
@@ -679,19 +723,17 @@ impl Rescan<'_> {
         else {
             return;
         };
-        let found = if modified >= self.since {
-            &mut self.found
-        } else if let Some((since, recovered)) = &mut self.recovery
-            && modified >= *since
-        {
-            recovered
-        } else {
-            return;
-        };
         if let Ok(relative) = at.strip_prefix(self.root)
             && let Some(text) = relative.to_str()
         {
-            found.push(text.replace(std::path::MAIN_SEPARATOR, "/"));
+            if modified >= self.since {
+                self.found
+                    .push(text.replace(std::path::MAIN_SEPARATOR, "/"));
+            } else if let Some((since, recovered)) = &mut self.recovery
+                && modified >= *since
+            {
+                recovered.push((text.replace(std::path::MAIN_SEPARATOR, "/"), modified));
+            }
         }
     }
 }
@@ -1004,6 +1046,7 @@ mod tests {
     struct RecordingCloud<'a> {
         paths: &'a [&'a str],
         reports: std::sync::Mutex<Vec<serde_json::Value>>,
+        fail_first_dirty: bool,
     }
 
     impl lockyard_cloud_client::Transport for &RecordingCloud<'_> {
@@ -1017,10 +1060,17 @@ mod tests {
                 ])),
                 "/api/v1/zones/dirty" => {
                     assert_eq!(call.session, "alice");
-                    self.reports
-                        .lock()
-                        .unwrap()
-                        .push(call.body.clone().unwrap());
+                    let mut reports = self.reports.lock().unwrap();
+                    reports.push(call.body.clone().unwrap());
+                    if self.fail_first_dirty && reports.len() == 1 {
+                        return Err(lockyard_cloud_client::ClientError::from_api(
+                            lockyard_cloud_client::ApiError {
+                                status: 503,
+                                code: "unavailable".into(),
+                                ..Default::default()
+                            },
+                        ));
+                    }
                     Ok(json!({"stored": 1}))
                 }
                 path => panic!("unexpected cloud call: {path}"),
@@ -1045,6 +1095,7 @@ mod tests {
         let cloud = RecordingCloud {
             paths: &["src", "live"],
             reports: Default::default(),
+            fail_first_dirty: false,
         };
         let mut backend = lockyard_cloud_client::CloudBackend::new(&cloud, "alice");
         let mut ports = Ports {
@@ -1118,6 +1169,7 @@ mod tests {
         let cloud = RecordingCloud {
             paths: &["src/checked.rs", "tree", "missing/checked.rs"],
             reports: Default::default(),
+            fail_first_dirty: false,
         };
         let mut backend = lockyard_cloud_client::CloudBackend::new(&cloud, "alice");
         let mut ports = Ports {
@@ -1210,6 +1262,108 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0]["path"], "src/checked.rs");
         assert_eq!(paths[1]["path"], "tree/checked.rs");
+    }
+
+    #[test]
+    fn local_0143_retries_recovered_dirty_paths_after_503() {
+        let project = Project::new();
+        let root = project.root();
+        let (failed_at, modified) = recovered_write(&root, "src/checked.rs");
+        let cloud = RecordingCloud {
+            paths: &["src"],
+            reports: Default::default(),
+            fail_first_dirty: true,
+        };
+        let mut backend = lockyard_cloud_client::CloudBackend::new(&cloud, "alice");
+        let mut ports = Ports {
+            backend: &mut backend,
+            store: project.store(),
+            now: &now_is(failed_at),
+        };
+        let settings = settings(&root, "alice");
+        let mut out = Vec::new();
+        for now in [modified + 61_000, modified + 62_000, modified + 63_000] {
+            inspect(&settings, &mut ports, Vec::new(), true, now, &mut out).unwrap();
+        }
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("could not report dirty paths")
+        );
+        let reports = cloud.reports.lock().unwrap();
+        assert_eq!(
+            reports.len(),
+            2,
+            "the next round must retry the recovered write"
+        );
+        assert_eq!(reports[0], reports[1]);
+        assert_eq!(reports[1]["paths"][0]["path"], "src/checked.rs");
+    }
+
+    #[test]
+    fn local_0143_recovered_announcement_is_relative_to_mtime() {
+        let project = Project::new();
+        let root = project.root();
+        let (failed_at, modified) = recovered_write(&root, "src/checked.rs");
+        let recovered_at = modified + outside::ANNOUNCE_WINDOW_MS + 1_000;
+        outside::announce(&root, "alice", "src/checked.rs", modified - 1_000).unwrap();
+        outside::announce(
+            &root,
+            "alice",
+            &"x".repeat(1024 * 1024),
+            failed_at - outside::ANNOUNCE_WINDOW_MS - 1,
+        )
+        .unwrap();
+        compact_announcements(&root, recovered_at).unwrap();
+        assert_eq!(outside::announcements(&root, 0).unwrap().len(), 1);
+        let cloud = RecordingCloud {
+            paths: &["src"],
+            reports: Default::default(),
+            fail_first_dirty: false,
+        };
+        let mut backend = lockyard_cloud_client::CloudBackend::new(&cloud, "alice");
+        let mut ports = Ports {
+            backend: &mut backend,
+            store: project.store(),
+            now: &now_is(failed_at),
+        };
+        let inspection = inspect(
+            &settings(&root, "alice"),
+            &mut ports,
+            Vec::new(),
+            true,
+            recovered_at,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            inspection.unannounced, 0,
+            "the hook announced the recovered write"
+        );
+        assert_eq!(cloud.reports.lock().unwrap().len(), 1);
+    }
+
+    fn recovered_write(root: &Path, path: &str) -> (i64, i64) {
+        let modified = crate::now_ms();
+        let failed_at = modified - 2_000;
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::File::create(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(modified as u64))
+            .unwrap();
+        save_rescan_state(
+            root,
+            None,
+            RescanState {
+                incomplete: true,
+                listing_failures: BTreeMap::from([(
+                    1,
+                    BTreeMap::from([("src".into(), failed_at)]),
+                )]),
+            },
+        );
+        (failed_at, modified)
     }
 
     #[test]

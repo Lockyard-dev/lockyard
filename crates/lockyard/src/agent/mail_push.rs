@@ -5,12 +5,14 @@ use lockyard_core::proto::{Event, parse_rfc3339};
 use lockyard_core::repository::qualify;
 use std::collections::{BTreeMap, hash_map::Entry};
 
+const MAX_ZONE_ALERTS: usize = 256;
+const MAX_ZONE_ALERT_VERSIONS: usize = 1_024;
+
 #[derive(Default)]
 pub(super) struct PushState {
     epoch: u64,
     zone_alerts: HashMap<String, BTreeMap<i64, lockyard_core::proto::LostClaim>>,
-    // None means the loss came from /lost, with no corresponding push event seen yet.
-    zone_alert_versions: HashMap<(String, i64), Option<ZoneLossEvent>>,
+    zone_alert_versions: HashMap<String, ZoneAlertVersions>,
     status_claims: HashMap<(String, Option<String>), HashSet<i64>>,
     local_zone_mutations: HashMap<(String, i64), Vec<LocalZoneMutation>>,
     next_zone_mutation: u64,
@@ -101,10 +103,13 @@ impl PushState {
     ) {
         if let Some(alerts) = self.zone_alerts.get_mut(session) {
             let times = &self.zone_alert_times;
-            let versions = &self.zone_alert_versions;
+            let versions = self.zone_alert_versions.get(session);
             alerts.retain(|id, alert| {
                 let key = (session.into(), *id);
-                let predates_acquisition = if matches!(versions.get(&key), Some(None)) {
+                let from_lost = versions
+                    .and_then(|versions| versions.entries.get(id))
+                    .is_some_and(|version| version.seq.is_none());
+                let predates_acquisition = if from_lost {
                     // A /lost snapshot can contain historical losses observed for the first time.
                     alert
                         .lost_at
@@ -136,15 +141,81 @@ impl PushState {
     }
 
     fn status_predates_loss(&self, session: &str, id: i64, started: Instant) -> bool {
-        self.zone_alert_versions
-            .get(&(session.into(), id))
-            .and_then(Option::as_ref)
-            .is_some_and(|loss| started <= loss.received_at)
+        let Some(versions) = self.zone_alert_versions.get(session) else {
+            return false;
+        };
+        versions
+            .entries
+            .get(&id)
+            .and_then(|version| version.seq.map(|_| version.received_at))
+            // A status request can have started before it exposed the claim IDs it
+            // needs. Keep a conservative time fence for pruned loss versions.
+            .or(versions.evicted_at)
+            .is_some_and(|received_at| started <= received_at)
+    }
+
+    fn record_zone_alert(&mut self, session: &str, alert: lockyard_core::proto::LostClaim) {
+        let now = self.now();
+        self.zone_alert_times
+            .insert((session.into(), alert.claim_id), now);
+        let alerts = self.zone_alerts.entry(session.into()).or_default();
+        alerts.insert(alert.claim_id, alert);
+        if alerts.len() > MAX_ZONE_ALERTS {
+            let (id, _) = alerts.pop_first().expect("zone alerts beyond cap");
+            self.zone_alert_times.remove(&(session.into(), id));
+        }
+    }
+
+    fn trim_zone_alert_versions(&mut self, session: &str) {
+        let Some(versions) = self.zone_alert_versions.get_mut(session) else {
+            return;
+        };
+        let excess = versions
+            .entries
+            .len()
+            .saturating_sub(MAX_ZONE_ALERT_VERSIONS);
+        if excess == 0 {
+            return;
+        }
+        let tracked: HashSet<_> = self
+            .status_claims
+            .iter()
+            .filter(|((owner, _), _)| owner == session)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        let pending = self.seen_claims.get(session);
+        let alerts = self.zone_alerts.get(session);
+        let mut oldest: Vec<_> = versions
+            .entries
+            .iter()
+            .filter(|(id, _)| {
+                !tracked.contains(id)
+                    && !pending
+                        .and_then(|seen| seen.get(id))
+                        .is_some_and(Option::is_some)
+                    && !alerts.is_some_and(|alerts| alerts.contains_key(id))
+            })
+            .map(|(&id, version)| (version.received_at, id))
+            .collect();
+        // Active alerts and IDs needed by status take precedence over the history cap.
+        // The coordination cursor still filters replayed SSE frames after eviction.
+        oldest.sort_unstable();
+        for (_, id) in oldest.into_iter().take(excess) {
+            let version = versions.entries.remove(&id).expect("selected loss version");
+            versions.evicted_at = versions.evicted_at.max(Some(version.received_at));
+        }
     }
 }
 
-struct ZoneLossEvent {
-    seq: i64,
+#[derive(Default)]
+struct ZoneAlertVersions {
+    entries: HashMap<i64, ZoneAlertVersion>,
+    evicted_at: Option<Instant>,
+}
+
+struct ZoneAlertVersion {
+    // None means /lost supplied the alert before any matching SSE event.
+    seq: Option<i64>,
     received_at: Instant,
 }
 
@@ -319,6 +390,7 @@ impl<T: Transport + 'static> Shared<T> {
             }
             push.zone_alert_times.remove(&(session.into(), id));
         }
+        push.trim_zone_alert_versions(session);
         push.zone_alerts
             .get(session)
             .map(|alerts| alerts.values().cloned().collect())
@@ -347,6 +419,7 @@ impl<T: Transport + 'static> Shared<T> {
                     .remove(&(session.into(), ack.claim_id));
             }
         }
+        push.trim_zone_alert_versions(session);
     }
 
     #[cfg(all(test, unix))]
@@ -365,7 +438,7 @@ impl<T: Transport + 'static> Shared<T> {
         push.zone_alerts
             .retain(|session, _| sessions.contains_key(session));
         push.zone_alert_versions
-            .retain(|(session, _), _| sessions.contains_key(session));
+            .retain(|session, _| sessions.contains_key(session));
         push.zone_alert_times
             .retain(|(session, _), _| sessions.contains_key(session));
         push.local_zone_mutations
@@ -575,17 +648,25 @@ impl<T: Transport + 'static> Shared<T> {
             lost_at: Some(event_stamp(event).unwrap_or_else(|| Stamp::Millis(now_ms()))),
         };
         let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
-        let version = push
+        let versions = &mut push
             .zone_alert_versions
-            .entry((session.into(), id))
-            .or_default();
-        if version.as_ref().is_some_and(|loss| loss.seq >= event.seq) {
+            .entry(session.into())
+            .or_default()
+            .entries;
+        if versions
+            .get(&id)
+            .and_then(|loss| loss.seq)
+            .is_some_and(|seq| seq >= event.seq)
+        {
             return;
         }
-        *version = Some(ZoneLossEvent {
-            seq: event.seq,
-            received_at: Instant::now(),
-        });
+        versions.insert(
+            id,
+            ZoneAlertVersion {
+                seq: Some(event.seq),
+                received_at: Instant::now(),
+            },
+        );
         let seen = push.seen_claims.entry(session.into()).or_default();
         if event.kind == "zone.lost" || (event.kind == "zone.released" && reason == "narrowed") {
             // A partial takeover uses the same event as a full loss. A status snapshot
@@ -594,15 +675,8 @@ impl<T: Transport + 'static> Shared<T> {
         } else {
             seen.insert(id, None);
         }
-        let now = push.now();
-        push.zone_alert_times.insert((session.into(), id), now);
-        let alerts = push.zone_alerts.entry(session.into()).or_default();
-        alerts.insert(id, lost);
-        // Keep the event ordering after the alert is dropped, just as for acknowledged alerts.
-        while alerts.len() > 256 {
-            let key = *alerts.keys().next().unwrap();
-            alerts.remove(&key);
-        }
+        push.record_zone_alert(session, lost);
+        push.trim_zone_alert_versions(session);
     }
 
     pub(super) fn observe_status_claims(
@@ -632,39 +706,50 @@ impl<T: Transport + 'static> Shared<T> {
             .map(|c| c.id)
             .collect();
         let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
-        let (missing, acquired): (HashSet<_>, Vec<_>) = {
-            let previous = push.status_claims.entry(scope.clone()).or_default();
-            let missing: HashSet<_> = previous.difference(&current).copied().collect();
-            previous.extend(current.iter().copied());
-            let acquired: Vec<_> = claims
-                .iter()
-                .filter(|claim| claim.session == session)
-                .filter_map(|claim| {
-                    if push.status_predates_loss(session, claim.id, snapshot_started) {
-                        // The fallback can still finish a previous wait for /lost
-                        // without accepting this claim's coverage.
-                        return push
-                            .seen_claims
-                            .get(session)
-                            .and_then(|seen| seen.get(&claim.id))
-                            .and_then(|pending| pending.filter(|a| a.waiting_for_lost))
-                            .map(|pending| (claim, pending));
-                    }
-                    // An omitted created_at is deserialized as zero.
-                    let acquired_at = stamp_millis(&claim.created_at).filter(|at| *at != 0);
-                    push.record_acquisition(
-                        session,
-                        claim.id,
-                        claim.case_insensitive_paths,
-                        acquired_at,
-                        true,
-                        !missing.is_empty(),
-                    )
-                    .map(|acquisition| (claim, acquisition))
-                })
-                .collect();
-            (missing, acquired)
-        };
+        let (mut missing, acquired): (HashSet<_>, Vec<_>) =
+            {
+                let push = &mut *push;
+                let pruned = push.zone_alert_versions.get(session).filter(|versions| {
+                    versions.evicted_at.is_some_and(|at| snapshot_started <= at)
+                });
+                let previous = push.status_claims.entry(scope.clone()).or_default();
+                let missing: HashSet<_> = previous.difference(&current).copied().collect();
+                // An older response cannot introduce a new /lost lookup for an ID
+                // whose already-reported loss might have been evicted.
+                previous.extend(
+                    current.iter().copied().filter(|id| {
+                        pruned.is_none_or(|versions| versions.entries.contains_key(id))
+                    }),
+                );
+                let acquired: Vec<_> = claims
+                    .iter()
+                    .filter(|claim| claim.session == session)
+                    .filter_map(|claim| {
+                        if push.status_predates_loss(session, claim.id, snapshot_started) {
+                            // The fallback can still finish a previous wait for /lost
+                            // without accepting this claim's coverage.
+                            return push
+                                .seen_claims
+                                .get(session)
+                                .and_then(|seen| seen.get(&claim.id))
+                                .and_then(|pending| pending.filter(|a| a.waiting_for_lost))
+                                .map(|pending| (claim, pending));
+                        }
+                        // An omitted created_at is deserialized as zero.
+                        let acquired_at = stamp_millis(&claim.created_at).filter(|at| *at != 0);
+                        push.record_acquisition(
+                            session,
+                            claim.id,
+                            claim.case_insensitive_paths,
+                            acquired_at,
+                            true,
+                            !missing.is_empty(),
+                        )
+                        .map(|acquisition| (claim, acquisition))
+                    })
+                    .collect();
+                (missing, acquired)
+            };
         let lost = if missing.is_empty() || budget.is_zero() {
             None
         } else {
@@ -676,16 +761,16 @@ impl<T: Transport + 'static> Shared<T> {
         let fetched_lost = lost.is_some();
         // Repeated snapshots of the same id cannot acknowledge a later loss.
         if let Some(lost) = lost {
-            push.status_claims
-                .entry(scope)
-                .or_default()
-                .retain(|id| !missing.contains(id));
+            let previous = push.status_claims.entry(scope).or_default();
+            // Another status can finish the same /lost lookup while this one waits.
+            missing.retain(|id| previous.remove(id));
             for mut claim in lost.into_iter().filter(|c| {
                 missing.contains(&c.claim_id) && (c.session.is_empty() || c.session == session)
             }) {
                 if push
                     .zone_alert_versions
-                    .contains_key(&(session.into(), claim.claim_id))
+                    .get(session)
+                    .is_some_and(|versions| versions.entries.contains_key(&claim.claim_id))
                 {
                     continue;
                 }
@@ -695,17 +780,18 @@ impl<T: Transport + 'static> Shared<T> {
                     claim.session = session.into();
                 }
                 claim.paths = workspace_paths(&claim.paths).unwrap_or_default();
-                let now = push.now();
-                push.zone_alert_times
-                    .insert((session.into(), claim.claim_id), now);
                 push.zone_alert_versions
-                    .insert((session.into(), claim.claim_id), None);
-                let alerts = push.zone_alerts.entry(session.into()).or_default();
-                alerts.insert(claim.claim_id, claim);
-                while alerts.len() > 256 {
-                    let id = *alerts.keys().next().unwrap();
-                    alerts.remove(&id);
-                }
+                    .entry(session.into())
+                    .or_default()
+                    .entries
+                    .insert(
+                        claim.claim_id,
+                        ZoneAlertVersion {
+                            seq: None,
+                            received_at: Instant::now(),
+                        },
+                    );
+                push.record_zone_alert(session, claim);
             }
         }
         // Share acquisition history with SSE and clear after fallback seeding so
@@ -746,6 +832,7 @@ impl<T: Transport + 'static> Shared<T> {
                     });
             }
         }
+        push.trim_zone_alert_versions(session);
     }
 
     pub(super) fn peek_hook_mail(&self, session: &str) -> Reply {
@@ -2796,6 +2883,53 @@ mod tests {
     }
 
     #[test]
+    fn local_0143_zone_versions_evict_history_but_keep_pending_status() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let started = Instant::now();
+        {
+            let mut push = shared.push.lock().unwrap();
+            push.status_claims
+                .insert(("alice".into(), None), HashSet::from([1]));
+            push.record_acquisition("alice", 2, None, None, true, true);
+        }
+        for id in 1..=1_025 {
+            shared.observe_zone_loss(&round4_zone(id, "zone.lost", id, 1, None));
+        }
+        let push = shared.push.lock().unwrap();
+        let entries = &push.zone_alert_versions["alice"].entries;
+        assert_eq!(entries.len(), MAX_ZONE_ALERT_VERSIONS);
+        assert!(entries.contains_key(&1));
+        assert!(entries.contains_key(&2));
+        assert!(!entries.contains_key(&3));
+        assert!(push.status_predates_loss("alice", 1, started));
+        assert!(push.status_predates_loss("alice", 2, started));
+        drop(push);
+
+        let evicted: Claim = serde_json::from_value(json!({
+            "id":3,"session":"alice","paths":["src"],"case_insensitive_paths":false
+        }))
+        .unwrap();
+        shared.observe_status_claims(
+            started,
+            "alice",
+            None,
+            &[evicted],
+            &shared.backend("alice"),
+            Duration::ZERO,
+        );
+        let push = shared.push.lock().unwrap();
+        assert!(!push.status_claims[&("alice".into(), None)].contains(&3));
+        drop(push);
+
+        shared.take_zone_alerts("alice");
+        shared.observe_zone_loss(&round4_zone(1_025, "zone.lost", 1_025, 1, None));
+        assert!(shared.zone_alerts("alice").is_empty());
+    }
+
+    #[test]
     fn round6_status_reacquisition_clears_loss_before_or_without_sse() {
         for with_sse in [false, true] {
             let mut rig = rig(true, None);
@@ -3853,12 +3987,7 @@ mod tests {
         shared.refresh_unread();
         let push = shared.push.lock().unwrap();
         assert!(!push.status_claims.contains_key(&("alice".into(), None)));
-        assert!(
-            !push
-                .zone_alert_versions
-                .keys()
-                .any(|(session, _)| session == "alice")
-        );
+        assert!(!push.zone_alert_versions.contains_key("alice"));
         assert!(!push.zone_alerts.contains_key("alice"));
     }
 

@@ -116,11 +116,12 @@ pub fn compact(root: &Path, keep_since: i64) -> Result<()> {
     Ok(fsio::replace(&path, text.as_bytes(), JOURNAL_MODE)?)
 }
 
-/// True when some hook announced a canonically equivalent path within the window.
-pub fn was_announced(announced: &[Announcement], path: &str, now: i64) -> bool {
+/// True when a hook announced a canonically equivalent path within the window before `at`.
+pub fn was_announced(announced: &[Announcement], path: &str, at: i64) -> bool {
     let path = nfc_path(path);
+    let window = at.saturating_sub(ANNOUNCE_WINDOW_MS)..=at;
     announced.iter().any(|entry| {
-        now.saturating_sub(entry.at) <= ANNOUNCE_WINDOW_MS
+        window.contains(&entry.at)
             && (entry.path == path || (!entry.path.is_ascii() && entry.path.nfc().eq(path.chars())))
     })
 }
@@ -259,6 +260,7 @@ mod tests {
         announce(dir.path(), "alice", "src/a.rs", 1_000).unwrap();
         let seen = announcements(dir.path(), 0).unwrap();
         assert_eq!(seen.len(), 1);
+        assert!(!was_announced(&seen, "src/a.rs", 999));
         assert!(was_announced(&seen, "src/a.rs", 1_000 + ANNOUNCE_WINDOW_MS));
         assert!(!was_announced(
             &seen,
