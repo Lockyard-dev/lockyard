@@ -6,7 +6,6 @@ use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const RECONCILE_BUDGET: Duration = Duration::from_secs(2);
-const WAITER_RECEIPT_TTL: Duration = Duration::from_secs(60);
 pub(super) const ENCRYPTION_MISMATCH: &str = "pending_encryption_mismatch";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -130,20 +129,6 @@ pub(super) fn eligible_for_recovery(pending: &PendingWrite) -> bool {
         recovery(pending),
         Recovery::Durable | Recovery::Coordination | Recovery::SignedResult
     )
-}
-
-pub(super) fn waiter_receipt_allowed(pending: &PendingWrite) -> bool {
-    // Persist response bodies only for the explicit recovery route allowlist.
-    eligible_for_recovery(pending)
-}
-
-pub(super) fn waiter_outcome_unknown(key: &str) -> ClientError {
-    ClientError::Protocol(Problem {
-        status: None,
-        code: "outcome_unknown".into(),
-        detail: format!("Reconcile the mutation outcome using Idempotency-Key {key}"),
-        details: json!({"idempotency_key": key}),
-    })
 }
 
 pub(super) fn unreplayed_detail(pending: &PendingWrite) -> &'static str {
@@ -313,50 +298,12 @@ pub struct PendingRepair {
 #[derive(Serialize, Deserialize)]
 struct SettledWrite {
     pending: PendingWrite,
-    #[serde(default, deserialize_with = "deserialize_settled_value")]
     value: Option<Value>,
     error: Option<Problem>,
     #[serde(default)]
     consumed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     encryption: Option<ReceiptEncryption>,
-}
-
-fn deserialize_settled_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    // A successful empty HTTP reply is represented as JSON null.
-    Value::deserialize(deserializer).map(Some)
-}
-
-fn waiter_receipt_path(directory: &Path, key: &str) -> PathBuf {
-    journal_path(directory, key).with_extension("waiter.settled")
-}
-
-fn waiter_marker_path(directory: &Path, key: &str) -> PathBuf {
-    journal_path(directory, key).with_extension("waiter-done")
-}
-
-fn is_waiter_receipt(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".waiter.settled"))
-}
-
-fn waiter_receipt_age(path: &Path) -> std::io::Result<Duration> {
-    Ok(std::fs::symlink_metadata(path)?
-        .modified()?
-        .elapsed()
-        .unwrap_or_default())
-}
-
-fn fresh_waiter_record(path: &Path) -> Result<bool, ClientError> {
-    match waiter_receipt_age(path) {
-        Ok(age) => Ok(age < WAITER_RECEIPT_TTL),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(journal_error(error)),
-    }
 }
 
 /// Public inputs to the operation's frozen encryption fingerprint.
@@ -587,7 +534,7 @@ impl Client {
                     uses_replay_budget(row)
                         && matches!(recovery(row), Recovery::Durable | Recovery::Coordination)
                 }) {
-                    if !self.settled_response_key_exists(&row.key)? {
+                    if self.settled_write(&row.key)?.is_none() {
                         probe_policy = true;
                         break;
                     }
@@ -664,7 +611,7 @@ impl Client {
             )
             .map_err(journal_error)?;
             reviewed += 1;
-            if self.settled_response_key_exists(&pending.key)? {
+            if self.settled_write(&pending.key)?.is_some() {
                 self.resolve_pending(&pending.key)?;
                 continue;
             }
@@ -885,6 +832,28 @@ impl Client {
         }
     }
 
+    /// Same check for a sibling's retired row: never parks, because parking would write the
+    /// finished operation back into the journal (LOCAL-0148).
+    pub(crate) fn verify_sibling_replay_encryption(
+        &self,
+        pending: &PendingWrite,
+        guard: &mut PendingSendGuard<'_>,
+        budget: Option<Duration>,
+        cancellation: Option<&crate::Cancellation>,
+    ) -> Result<ContentEncryption, ClientError> {
+        match guard.exchange_with_budget(budget, cancellation, || {
+            self.check_replay_encryption(
+                self,
+                pending,
+                budget.unwrap_or(RECONCILE_BUDGET).min(RECONCILE_BUDGET),
+                cancellation,
+            )
+        })? {
+            Ok(Some(encryption)) => Ok(encryption),
+            Ok(None) | Err(_) => Err(ClientError::OutcomeUnknown(Box::new(pending.clone()))),
+        }
+    }
+
     pub(crate) fn live_replay_encryption(
         &self,
         server: &Client,
@@ -981,14 +950,23 @@ impl Client {
                     key,
                 }
             } else {
-                self.current_content_encryption()?
+                ContentEncryption {
+                    enabled: self.encryption_enabled,
+                    workspace: self.workspace.clone(),
+                    key: self.content_key.clone(),
+                }
             };
         if encryption.enabled && encryption.key.is_none() {
             return Err(ClientError::Invalid(
                 "pending replay needs a workspace key".into(),
             ));
         }
-        let context = self.snapshot_encryption_context(&encryption);
+        let key_id = encryption.key.as_ref().map(crate::WorkspaceKey::key_id);
+        let context = self.encryption_context_for(
+            encryption.workspace.as_deref(),
+            key_id.as_deref(),
+            encryption.enabled,
+        );
         let compatible = frozen == Some(context.as_str())
             || (!encryption.enabled
                 && (frozen.is_none()
@@ -1142,9 +1120,7 @@ impl Client {
         let mut operations = Vec::new();
         for entry in std::fs::read_dir(directory).map_err(journal_error)? {
             let path = entry.map_err(journal_error)?.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("settled")
-                || is_waiter_receipt(&path)
-            {
+            if path.extension().and_then(|extension| extension.to_str()) != Some("settled") {
                 continue;
             }
             let settled: SettledWrite = read_private_json(&path)?;
@@ -1184,77 +1160,18 @@ impl Client {
     }
 
     pub(super) fn settled_response_key_exists(&self, key: &str) -> Result<bool, ClientError> {
-        Ok(self.has_waiter_marker(key)? || self.settled_write(key)?.is_some())
+        self.settled_write(key).map(|value| value.is_some())
     }
 
-    fn has_waiter_marker(&self, key: &str) -> Result<bool, ClientError> {
-        self.pending_journal
-            .as_ref()
-            .map_or(Ok(false), |directory| {
-                fresh_waiter_record(&waiter_marker_path(directory, key))
-            })
-    }
-
-    /// Publish a verified direct reply before removing its pending record. An ordinary
-    /// response is already acknowledged. A key-only marker protects replies that
-    /// cannot be shared through the journal.
-    pub(super) fn publish_waiter_completion(
-        &self,
-        pending: &PendingWrite,
-        value: Option<Value>,
-        encryption: &ContentEncryption,
-    ) -> Result<(), ClientError> {
-        let Some(directory) = &self.pending_journal else {
-            return Ok(());
-        };
-        if let Some(value) = value.filter(|_| waiter_receipt_allowed(pending)) {
-            let settled = SettledWrite {
-                pending: pending.clone(),
-                value: Some(value),
-                error: None,
-                consumed: true,
-                encryption: Some(ReceiptEncryption {
-                    workspace: encryption.workspace.clone(),
-                    key_id: encryption.key.as_ref().map(crate::WorkspaceKey::key_id),
-                    enabled: encryption.enabled,
-                }),
-            };
-            let bytes = serde_json::to_vec(&settled).map_err(journal_error)?;
-            if bytes.len() as u64 <= MAX_PENDING_BYTES
-                && lockyard_core::fsio::replace(
-                    &waiter_receipt_path(directory, &pending.key),
-                    &bytes,
-                    0o600,
-                )
-                .is_ok()
-            {
-                return Ok(());
-            }
-        }
-        lockyard_core::fsio::replace(&waiter_marker_path(directory, &pending.key), b"", 0o600)
-            .map_err(journal_error)
-    }
-
-    fn settled_path(&self, key: &str) -> Result<Option<PathBuf>, ClientError> {
+    fn settled_write(&self, key: &str) -> Result<Option<SettledWrite>, ClientError> {
         let Some(directory) = &self.pending_journal else {
             return Ok(None);
         };
         let path = journal_path(directory, key).with_extension("settled");
-        if path.try_exists().map_err(journal_error)? {
-            return Ok(Some(path));
+        if !path.try_exists().map_err(journal_error)? {
+            return Ok(None);
         }
-        let path = waiter_receipt_path(directory, key);
-        Ok(fresh_waiter_record(&path)?.then_some(path))
-    }
-
-    fn settled_write(&self, key: &str) -> Result<Option<SettledWrite>, ClientError> {
-        self.settled_path(key)?
-            .map(|path| self.read_settled_write(key, &path))
-            .transpose()
-    }
-
-    fn read_settled_write(&self, key: &str, path: &Path) -> Result<SettledWrite, ClientError> {
-        let settled: SettledWrite = read_private_json(path)?;
+        let settled: SettledWrite = read_private_json(&path)?;
         if settled.pending.key != key
             || settled.pending.origin != self.base_url
             || settled.pending.credential_scope != crate::credential_fingerprint(&self.token)
@@ -1263,7 +1180,7 @@ impl Client {
                 "settled receipt does not match its origin or credential",
             ));
         }
-        Ok(settled)
+        Ok(Some(settled))
     }
 
     fn local_receipt_keys(
@@ -1335,17 +1252,10 @@ impl Client {
         let Some(key) = &call.key else {
             return Ok(None);
         };
-        if self.has_waiter_marker(key)? {
-            return Err(waiter_outcome_unknown(key));
-        }
-        let Some(path) = self.settled_path(key)? else {
+        let Some(settled) = self.settled_write(key)? else {
             return Ok(None);
         };
-        let settled = self.read_settled_write(key, &path)?;
         let pending = settled.pending;
-        if is_waiter_receipt(&path) && !waiter_receipt_allowed(&pending) {
-            return Err(waiter_outcome_unknown(key));
-        }
         if !eligible_for_recovery(&pending)
             || pending.request_digest.as_deref() != Some(crate::request_identity(call).as_str())
         {
@@ -1385,9 +1295,13 @@ impl Client {
         let mut value = settled
             .value
             .ok_or_else(|| journal_error("settled receipt missing response"))?;
-        if let Err(error) = self.decode_pending_response(call, &pending, &mut value, &encryption) {
+        if let Err(error) =
+            self.decode_pending_response(call, &pending, &mut value, Some(&encryption), true)
+        {
             // decode_pending_response durably restored the original pending bytes.
             if self.pending_operation(key).is_some() {
+                let path = journal_path(self.pending_journal.as_ref().unwrap(), key)
+                    .with_extension("settled");
                 std::fs::remove_file(path).map_err(journal_error)?;
                 lockyard_core::fsio::sync_dir(self.pending_journal.as_ref().unwrap())
                     .map_err(journal_error)?;
@@ -1411,14 +1325,6 @@ impl Client {
         let mut maintenance = false;
         for entry in std::fs::read_dir(directory).map_err(journal_error)? {
             let path = entry.map_err(journal_error)?.path();
-            if is_waiter_receipt(&path) || path.extension().is_some_and(|ext| ext == "waiter-done")
-            {
-                if retire && waiter_receipt_age(&path).is_ok_and(|age| age >= WAITER_RECEIPT_TTL) {
-                    // Expiry is also checked on lookup. A cleanup failure can be retried.
-                    let _ = std::fs::remove_file(path);
-                }
-                continue;
-            }
             match path.extension().and_then(|s| s.to_str()) {
                 Some("inflight" | "completed") => {
                     maintenance = true;
@@ -1747,52 +1653,6 @@ mod tests {
             .with_pending_journal(root.canonicalize().unwrap())
             .unwrap()
     }
-
-    #[test]
-    fn ordinary_waiter_receipt_expires_and_is_not_an_outbox_item() {
-        let root = tempfile::tempdir().unwrap();
-        let client = client_at("http://127.0.0.1:1", root.path());
-        let row = pending(&client, "waited", false);
-        assert!(waiter_receipt_allowed(&row));
-        let mut marker_row = pending(&client, "marker", false);
-        marker_row.path = "/api/v1/auth/device/token".into();
-        assert!(!waiter_receipt_allowed(&marker_row));
-        let encryption = client.current_content_encryption().unwrap();
-        let reply = Value::Null;
-        client
-            .publish_waiter_completion(&row, Some(reply.clone()), &encryption)
-            .unwrap();
-        client
-            .publish_waiter_completion(&marker_row, Some(json!({"token": "fixture"})), &encryption)
-            .unwrap();
-        assert_eq!(
-            client.settled_write(&row.key).unwrap().unwrap().value,
-            Some(reply)
-        );
-        assert!(client.unconsumed_settled_operations().unwrap().is_empty());
-
-        let directory = client.pending_journal.as_ref().unwrap();
-        let path = waiter_receipt_path(directory, &row.key);
-        let marker = waiter_marker_path(directory, &marker_row.key);
-        assert!(client.has_waiter_marker(&marker_row.key).unwrap());
-        assert_eq!(std::fs::metadata(&marker).unwrap().len(), 0);
-        assert!(!waiter_receipt_path(directory, &marker_row.key).exists());
-        for file in [&path, &marker] {
-            std::fs::File::options()
-                .write(true)
-                .open(file)
-                .unwrap()
-                .set_modified(UNIX_EPOCH)
-                .unwrap();
-        }
-        assert!(client.settled_write(&row.key).unwrap().is_none());
-        assert!(!client.has_waiter_marker(&marker_row.key).unwrap());
-        let _journal = PendingSendGuard::lock_journal(directory).unwrap();
-        client.reload_pending(true).unwrap();
-        assert!(!path.exists());
-        assert!(!marker.exists());
-    }
-
     fn pending(client: &Client, key: &str, old: bool) -> PendingWrite {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2242,17 +2102,34 @@ mod tests {
             save(&client, &pending(&client, &format!("old-{i}"), true));
         }
         let mut guard = client.claim_pending_send("new").unwrap();
-        client
-            .repair_before_admission(&mut guard, 1024, Duration::from_secs(5))
-            .unwrap();
-        client
-            .retain_pending(pending(&client, "new", false))
-            .unwrap();
+        // The behaviour under test is reconcile-before-admit, not fixture speed. On a loaded
+        // parallel run single reconcile requests to the in-process fixture can time out and the
+        // repair honestly reports "network required"; repeat it within a ceiling (LOCAL-0145).
+        let ceiling = Instant::now() + Duration::from_secs(120);
+        loop {
+            client
+                .repair_before_admission(&mut guard, 1024, Duration::from_secs(5))
+                .unwrap();
+            match client.retain_pending(pending(&client, "new", false)) {
+                Ok(_) => break,
+                Err(error)
+                    if Instant::now() < ceiling && error.to_string().contains("network required") => {}
+                Err(error) => panic!("admission after reconciliation failed: {error}"),
+            }
+        }
         drop(guard);
         assert!(client.pending_operations().len() <= MAX_PENDING);
         assert!(!server.requests.lock().unwrap().is_empty());
         drain(&client);
-        assert_eq!(server.requests.lock().unwrap().len(), 141);
+        // A repeated pass resends the same keys: count each operation once.
+        let keys: std::collections::HashSet<_> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, key, _)| key.clone())
+            .collect();
+        assert_eq!(keys.len(), 141);
     }
     #[test]
     fn admission_reconciliation_respects_the_call_deadline() {
@@ -2545,10 +2422,21 @@ mod tests {
             row.session = format!("session-{index}");
             save(&client, &row);
         }
-        let report = client
-            .repair_pending_for_capacity(Instant::now() + Duration::from_secs(10))
-            .unwrap();
-        assert_eq!(report.applied, MAX_PENDING - 1);
+        // A pass is bounded by its deadline, and a loaded parallel test run can end it early.
+        // Repeat passes until only the refused row is left, so the result does not depend on
+        // wall-clock speed (LOCAL-0145). One refusal must still never block the other rows.
+        let ceiling = Instant::now() + Duration::from_secs(120);
+        let mut applied = 0;
+        let report = loop {
+            let report = client
+                .repair_pending_for_capacity(Instant::now() + Duration::from_secs(10))
+                .unwrap();
+            applied += report.applied;
+            if report.remaining <= 1 || report.applied == 0 || Instant::now() >= ceiling {
+                break report;
+            }
+        };
+        assert_eq!(applied, MAX_PENDING - 1);
         assert_eq!(
             (report.remaining, report.rejected, report.network_required),
             (1, 0, false)

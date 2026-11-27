@@ -22,7 +22,7 @@ use lockyard_core::watch::{Backend as WatchBackend, Tick, Watcher};
 use lockyard_core::{Backend, Error, Result, Store, ZonePath, outside, watch};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
-use std::io::{ErrorKind, IsTerminal, Write};
+use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -128,9 +128,12 @@ pub fn run(settings: &Settings, ports: &mut Ports<'_>, out: &mut dyn Write) -> R
             let inspection = inspect(settings, ports, paths, reconcile, now, out)?;
             summary.unannounced += inspection.unannounced;
             summary.rescan_incomplete |= inspection.rescan_incomplete;
+            if reconcile {
+                save_rescan_status(&settings.root, inspection.rescan_incomplete);
+            }
         }
         if reconcile {
-            let _ = compact_announcements(&settings.root, now);
+            let _ = outside::compact(&settings.root, now - outside::ANNOUNCE_WINDOW_MS);
             let _ = ports.store.forget_unannounced(now - KEEP_RECORDS_MS);
         }
         if settings.once && (summary.delivered > 0 || summary.unannounced > 0) {
@@ -145,59 +148,31 @@ fn rescan_status_path(root: &Path) -> PathBuf {
 
 /// Completeness of the last finished reconcile tick, when a monitor has recorded one.
 pub(crate) fn read_rescan_status(root: &Path) -> Option<bool> {
-    read_rescan_state(root).map(|state| state.incomplete)
-}
-
-// First listing error per claim ID and NFC held path.
-type ListingFailures = BTreeMap<i64, BTreeMap<String, i64>>;
-
-#[derive(Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct RescanState {
-    incomplete: bool,
-    listing_failures: ListingFailures,
-}
-
-fn read_rescan_state(root: &Path) -> Option<RescanState> {
     let path = rescan_status_path(root);
     if !path.symlink_metadata().ok()?.is_file() {
         return None;
     }
-    match std::fs::read(path).ok()?.as_slice() {
-        b"0" => Some(RescanState::default()),
-        b"1" => Some(RescanState {
-            incomplete: true,
-            ..RescanState::default()
-        }),
-        bytes => serde_json::from_slice(bytes).ok(),
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(2)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    match bytes.as_slice() {
+        b"0" => Some(false),
+        b"1" => Some(true),
+        _ => None,
     }
 }
 
-fn save_rescan_state(root: &Path, previous: Option<&RescanState>, state: RescanState) {
-    if previous == Some(&state) {
+fn save_rescan_status(root: &Path, incomplete: bool) {
+    if read_rescan_status(root) == Some(incomplete) {
         return;
     }
-    let bytes = if state.listing_failures.is_empty() {
-        vec![if state.incomplete { b'1' } else { b'0' }]
-    } else {
-        serde_json::to_vec(&state).expect("rescan state is serializable")
-    };
-    if let Err(error) = lockyard_core::fsio::replace(&rescan_status_path(root), &bytes, 0o600) {
+    let bytes = if incomplete { b"1" } else { b"0" };
+    if let Err(error) = lockyard_core::fsio::replace(&rescan_status_path(root), bytes, 0o600) {
         eprintln!("warning: could not save monitor rescan status: {error}");
     }
-}
-
-fn compact_announcements(root: &Path, now: i64) -> Result<()> {
-    let earliest = read_rescan_state(root)
-        .and_then(|state| {
-            state
-                .listing_failures
-                .into_values()
-                .flatten()
-                .map(|(_, at)| at)
-                .min()
-        })
-        .map_or(now, |at| at.min(now));
-    outside::compact(root, earliest.saturating_sub(outside::ANNOUNCE_WINDOW_MS))
 }
 
 /// `None` when the events are switched off; the monitor then runs on its timer alone.
@@ -304,25 +279,12 @@ fn inspect(
     let claims = ports
         .backend
         .claims(&lockyard_core::proto::ClaimQuery::default(), now)?;
-    let previous = if reconcile {
-        read_rescan_state(&settings.root)
-    } else {
-        None
-    };
     if claims.is_empty() {
-        if reconcile {
-            save_rescan_state(&settings.root, previous.as_ref(), RescanState::default());
-        }
         return Ok(Inspection::default());
     }
     let scan = if reconcile {
         // The file system may have dropped events, so check modification times too.
-        rescan(
-            &settings.root,
-            &claims,
-            now,
-            previous.as_ref().map(|state| &state.listing_failures),
-        )
+        rescan(&settings.root, &claims, now)
     } else {
         ScanResult::default()
     };
@@ -354,31 +316,20 @@ fn inspect(
             )?;
         }
     }
-    let mut paths: BTreeMap<_, Option<i64>> = changed
+    let mut paths: Vec<_> = changed
         .into_iter()
         .chain(scan.paths)
-        .map(|path| (nfc_path(&path), None))
+        .map(|path| nfc_path(&path))
         .collect();
-    for (path, modified) in scan.recovered_paths {
-        let at = paths.entry(nfc_path(&path)).or_default();
-        *at = (*at).max(Some(modified));
-    }
+    paths.sort();
+    paths.dedup();
     let announced = if paths.is_empty() {
         Vec::new()
     } else {
-        let earliest = paths
-            .values()
-            .flatten()
-            .copied()
-            .min()
-            .map_or(now, |at| at.min(now));
-        outside::announcements(
-            &settings.root,
-            earliest.saturating_sub(outside::ANNOUNCE_WINDOW_MS),
-        )?
+        outside::announcements(&settings.root, now - outside::ANNOUNCE_WINDOW_MS)?
     };
     let mut dirty: HashMap<String, Vec<DirtyPath>> = HashMap::new();
-    for (path, modified) in paths {
+    for path in paths {
         let zone = ZonePath::stored(path.clone());
         let Some(claim) = claims.iter().find(|claim| claim.covers(&zone)) else {
             continue;
@@ -393,7 +344,7 @@ fn inspect(
                 reason: Some("changed on disk while the zone was held".into()),
                 task_id: None,
             });
-        if outside::was_announced(&announced, &path, modified.unwrap_or(now)) {
+        if outside::was_announced(&announced, &path, now) {
             continue;
         }
         inspection.unannounced += 1;
@@ -430,44 +381,19 @@ fn inspect(
         }
     }
     out.flush()?;
-    let mut dirty_failed = false;
     for (session, paths) in &dirty {
         // Local mode has no dirty tracking; the call says so and there is nothing to report.
         if let Err(error) = ports.backend.dirty_report(session, paths)
             && !matches!(error, Error::NeedsCloud(_))
         {
-            dirty_failed = true;
             writeln!(out, "! could not report dirty paths: {error}")?;
         }
-    }
-    if reconcile {
-        let mut listing_failures = scan.listing_failures;
-        if dirty_failed {
-            // A complete walk does not settle recovery until the dirty report is
-            // accepted. Keep its original bounds even across a monitor restart.
-            for (id, paths) in scan.recovered_listings {
-                listing_failures.entry(id).or_default().extend(paths);
-            }
-        }
-        save_rescan_state(
-            &settings.root,
-            previous.as_ref(),
-            RescanState {
-                incomplete: inspection.rescan_incomplete,
-                listing_failures,
-            },
-        );
     }
     Ok(inspection)
 }
 
 /// The fallback for dropped events: recently modified files under the active claims.
-fn rescan<'a>(
-    root: &Path,
-    claims: &'a [lockyard_core::proto::Claim],
-    now: i64,
-    listing_failures: Option<&ListingFailures>,
-) -> ScanResult<'a> {
+fn rescan<'a>(root: &Path, claims: &'a [lockyard_core::proto::Claim], now: i64) -> ScanResult<'a> {
     let since = now - i64::try_from(RESCAN_WINDOW.as_millis()).unwrap_or(i64::MAX);
     let mut scan = Rescan {
         root,
@@ -477,7 +403,6 @@ fn rescan<'a>(
         issues: 0,
         alias_listings: HashMap::new(),
         found: Vec::new(),
-        recovery: None,
     };
     let mut result = ScanResult::default();
     let mut zones_left: usize = claims.iter().map(|claim| claim.paths.len()).sum();
@@ -492,14 +417,6 @@ fn rescan<'a>(
         zones_left -= 1;
         scan.remaining = budget;
         scan.issues = 0;
-        let path = nfc_path(held);
-        let first_failure = listing_failures
-            .and_then(|failures| failures.get(&claim.id))
-            .and_then(|paths| paths.get(&path))
-            .copied();
-        scan.recovery = first_failure
-            .filter(|at| *at < since)
-            .map(|at| (at, Vec::new()));
         if held == "." {
             scan.walk(root, 0);
         } else {
@@ -507,31 +424,10 @@ fn rescan<'a>(
             scan.walk_aliases(root, &components, claim.folds_path_case());
         }
         remaining -= budget - scan.remaining;
-        if scan.issues == 0 {
-            if let Some((_, recovered)) = scan.recovery.take() {
-                result.recovered_paths.extend(recovered);
-            }
-            if let Some(first_failure) = first_failure {
-                result
-                    .recovered_listings
-                    .entry(claim.id)
-                    .or_default()
-                    .insert(path, first_failure);
-            }
-        } else {
-            // A limited scan still cannot finish recovery. Keep the original time.
-            if let Some(first_failure) =
-                first_failure.or_else(|| (scan.issues & ScanIssues::LISTING != 0).then_some(now))
-            {
-                result
-                    .listing_failures
-                    .entry(claim.id)
-                    .or_default()
-                    .insert(path.clone(), first_failure);
-            }
+        if scan.issues != 0 {
             *result
                 .incomplete
-                .entry((claim.session.as_str(), path))
+                .entry((claim.session.as_str(), nfc_path(held)))
                 .or_default() |= scan.issues;
         }
     }
@@ -542,11 +438,8 @@ fn rescan<'a>(
 #[derive(Default)]
 struct ScanResult<'a> {
     paths: Vec<String>,
-    recovered_paths: Vec<(String, i64)>,
-    recovered_listings: ListingFailures,
     // One warning per session and NFC path in this rescan, preserving case.
     incomplete: BTreeMap<(&'a str, String), u8>,
-    listing_failures: ListingFailures,
 }
 
 struct ScanIssues;
@@ -578,6 +471,8 @@ fn list_directory(at: &Path, issues: &mut u8) -> Option<std::fs::ReadDir> {
     }
 }
 
+/// Take one listing entry within the budget. A failed entry is a listing error even when the
+/// budget ends on it, so the warning keeps both causes (LOCAL-0100 r10).
 fn take_directory_entry(
     entry: std::io::Result<std::fs::DirEntry>,
     remaining: &mut usize,
@@ -648,8 +543,6 @@ struct Rescan<'a> {
     // Share each physical parent listing across both comparison policies.
     alias_listings: HashMap<PathBuf, AliasDirectory>,
     found: Vec<String>,
-    // Older writes are emitted once the held path has been scanned completely.
-    recovery: Option<(i64, Vec<(String, i64)>)>,
 }
 
 impl Rescan<'_> {
@@ -682,8 +575,15 @@ impl Rescan<'_> {
         if watch::is_internal(at) {
             return;
         }
-        let Ok(data) = at.symlink_metadata() else {
-            return;
+        let data = match at.symlink_metadata() {
+            Ok(data) => data,
+            // Removed between the listing and this check: nothing left to report.
+            Err(error) if error.kind() == ErrorKind::NotFound => return,
+            // An unreadable entry may hide a write: say the rescan is incomplete (LOCAL-0144).
+            Err(_) => {
+                self.issues |= ScanIssues::LISTING;
+                return;
+            }
         };
         if data.is_dir() {
             let Some(entries) = list_directory(at, &mut self.issues) else {
@@ -721,19 +621,18 @@ impl Rescan<'_> {
             .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
             .and_then(|since_epoch| i64::try_from(since_epoch.as_millis()).ok())
         else {
+            // No usable modification time: the write cannot be ruled out (LOCAL-0144).
+            self.issues |= ScanIssues::LISTING;
             return;
         };
+        if modified < self.since {
+            return;
+        }
         if let Ok(relative) = at.strip_prefix(self.root)
             && let Some(text) = relative.to_str()
         {
-            if modified >= self.since {
-                self.found
-                    .push(text.replace(std::path::MAIN_SEPARATOR, "/"));
-            } else if let Some((since, recovered)) = &mut self.recovery
-                && modified >= *since
-            {
-                recovered.push((text.replace(std::path::MAIN_SEPARATOR, "/"), modified));
-            }
+            self.found
+                .push(text.replace(std::path::MAIN_SEPARATOR, "/"));
         }
     }
 }
@@ -1046,7 +945,6 @@ mod tests {
     struct RecordingCloud<'a> {
         paths: &'a [&'a str],
         reports: std::sync::Mutex<Vec<serde_json::Value>>,
-        fail_first_dirty: bool,
     }
 
     impl lockyard_cloud_client::Transport for &RecordingCloud<'_> {
@@ -1060,17 +958,10 @@ mod tests {
                 ])),
                 "/api/v1/zones/dirty" => {
                     assert_eq!(call.session, "alice");
-                    let mut reports = self.reports.lock().unwrap();
-                    reports.push(call.body.clone().unwrap());
-                    if self.fail_first_dirty && reports.len() == 1 {
-                        return Err(lockyard_cloud_client::ClientError::from_api(
-                            lockyard_cloud_client::ApiError {
-                                status: 503,
-                                code: "unavailable".into(),
-                                ..Default::default()
-                            },
-                        ));
-                    }
+                    self.reports
+                        .lock()
+                        .unwrap()
+                        .push(call.body.clone().unwrap());
                     Ok(json!({"stored": 1}))
                 }
                 path => panic!("unexpected cloud call: {path}"),
@@ -1095,7 +986,6 @@ mod tests {
         let cloud = RecordingCloud {
             paths: &["src", "live"],
             reports: Default::default(),
-            fail_first_dirty: false,
         };
         let mut backend = lockyard_cloud_client::CloudBackend::new(&cloud, "alice");
         let mut ports = Ports {
@@ -1139,39 +1029,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_0100_r10_unreadable_listing_marks_rescan_incomplete() {
-        unreadable_listing_recovers_writes(1_000);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn local_0100_r11_listing_recovers_writes_older_than_rescan_window() {
-        unreadable_listing_recovers_writes(66_000);
-    }
-
-    #[cfg(unix)]
-    fn unreadable_listing_recovers_writes(elapsed: i64) {
         use std::os::unix::fs::PermissionsExt;
 
         let project = Project::new();
         let root = project.root();
         let parents = [root.join("src"), root.join("tree")];
-        let now = crate::now_ms();
-        let mtime = |offset: i64| {
-            std::time::UNIX_EPOCH + Duration::from_millis((now + offset).try_into().unwrap())
-        };
         for parent in &parents {
             std::fs::create_dir(parent).unwrap();
-            let unchanged = std::fs::File::create(parent.join("unchanged.rs")).unwrap();
-            unchanged.set_modified(mtime(-120_000)).unwrap();
-            std::fs::write(parent.join("checked.rs"), "before").unwrap();
+            std::fs::write(parent.join("checked.rs"), "changed").unwrap();
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o311)).unwrap();
         }
         let cloud = RecordingCloud {
             paths: &["src/checked.rs", "tree", "missing/checked.rs"],
             reports: Default::default(),
-            fail_first_dirty: false,
         };
         let mut backend = lockyard_cloud_client::CloudBackend::new(&cloud, "alice");
+        let now = crate::now_ms();
         let mut ports = Ports {
             backend: &mut backend,
             store: project.store(),
@@ -1189,21 +1062,6 @@ mod tests {
         let mut out = Vec::new();
         let inspection = inspect(&settings, &mut ports, Vec::new(), true, now, &mut out);
         for parent in &parents {
-            let mut file = std::fs::File::create(parent.join("checked.rs")).unwrap();
-            file.write_all(b"changed while listing was denied").unwrap();
-            file.set_modified(mtime(1_000)).unwrap();
-        }
-        let repeated = (elapsed > 60_000).then(|| {
-            inspect(
-                &settings,
-                &mut ports,
-                Vec::new(),
-                true,
-                now + elapsed - 1_000,
-                &mut Vec::new(),
-            )
-        });
-        for parent in &parents {
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         if !unreadable.into_iter().all(|denied| denied) {
@@ -1217,12 +1075,6 @@ mod tests {
             "unreadable listings must mark the rescan incomplete"
         );
         assert_eq!(inspection.unannounced, 0);
-        if let Some(repeated) = repeated {
-            let repeated = repeated.unwrap();
-            assert!(repeated.rescan_incomplete);
-            assert_eq!(repeated.unannounced, 0);
-        }
-        assert_eq!(read_rescan_status(&root), Some(true));
         assert!(cloud.reports.lock().unwrap().is_empty());
         let warnings: Vec<serde_json::Value> = serde_json::Deserializer::from_slice(&out)
             .into_iter()
@@ -1241,21 +1093,9 @@ mod tests {
         }
 
         out.clear();
-        let inspection = inspect(
-            &settings,
-            &mut ports,
-            Vec::new(),
-            true,
-            now + elapsed,
-            &mut out,
-        )
-        .unwrap();
+        let inspection = inspect(&settings, &mut ports, Vec::new(), true, now, &mut out).unwrap();
         assert!(!inspection.rescan_incomplete);
-        assert_eq!(read_rescan_status(&root), Some(false));
-        assert_eq!(
-            inspection.unannounced, 2,
-            "recover both writes after listing access returns"
-        );
+        assert_eq!(inspection.unannounced, 2);
         let reports = cloud.reports.lock().unwrap();
         assert_eq!(reports.len(), 1);
         let paths = reports[0]["paths"].as_array().unwrap();
@@ -1265,109 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn local_0143_retries_recovered_dirty_paths_after_503() {
-        let project = Project::new();
-        let root = project.root();
-        let (failed_at, modified) = recovered_write(&root, "src/checked.rs");
-        let cloud = RecordingCloud {
-            paths: &["src"],
-            reports: Default::default(),
-            fail_first_dirty: true,
-        };
-        let mut backend = lockyard_cloud_client::CloudBackend::new(&cloud, "alice");
-        let mut ports = Ports {
-            backend: &mut backend,
-            store: project.store(),
-            now: &now_is(failed_at),
-        };
-        let settings = settings(&root, "alice");
-        let mut out = Vec::new();
-        for now in [modified + 61_000, modified + 62_000, modified + 63_000] {
-            inspect(&settings, &mut ports, Vec::new(), true, now, &mut out).unwrap();
-        }
-        assert!(
-            String::from_utf8(out)
-                .unwrap()
-                .contains("could not report dirty paths")
-        );
-        let reports = cloud.reports.lock().unwrap();
-        assert_eq!(
-            reports.len(),
-            2,
-            "the next round must retry the recovered write"
-        );
-        assert_eq!(reports[0], reports[1]);
-        assert_eq!(reports[1]["paths"][0]["path"], "src/checked.rs");
-    }
-
-    #[test]
-    fn local_0143_recovered_announcement_is_relative_to_mtime() {
-        let project = Project::new();
-        let root = project.root();
-        let (failed_at, modified) = recovered_write(&root, "src/checked.rs");
-        let recovered_at = modified + outside::ANNOUNCE_WINDOW_MS + 1_000;
-        outside::announce(&root, "alice", "src/checked.rs", modified - 1_000).unwrap();
-        outside::announce(
-            &root,
-            "alice",
-            &"x".repeat(1024 * 1024),
-            failed_at - outside::ANNOUNCE_WINDOW_MS - 1,
-        )
-        .unwrap();
-        compact_announcements(&root, recovered_at).unwrap();
-        assert_eq!(outside::announcements(&root, 0).unwrap().len(), 1);
-        let cloud = RecordingCloud {
-            paths: &["src"],
-            reports: Default::default(),
-            fail_first_dirty: false,
-        };
-        let mut backend = lockyard_cloud_client::CloudBackend::new(&cloud, "alice");
-        let mut ports = Ports {
-            backend: &mut backend,
-            store: project.store(),
-            now: &now_is(failed_at),
-        };
-        let inspection = inspect(
-            &settings(&root, "alice"),
-            &mut ports,
-            Vec::new(),
-            true,
-            recovered_at,
-            &mut Vec::new(),
-        )
-        .unwrap();
-        assert_eq!(
-            inspection.unannounced, 0,
-            "the hook announced the recovered write"
-        );
-        assert_eq!(cloud.reports.lock().unwrap().len(), 1);
-    }
-
-    fn recovered_write(root: &Path, path: &str) -> (i64, i64) {
-        let modified = crate::now_ms();
-        let failed_at = modified - 2_000;
-        let path = root.join(path);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::File::create(path)
-            .unwrap()
-            .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(modified as u64))
-            .unwrap();
-        save_rescan_state(
-            root,
-            None,
-            RescanState {
-                incomplete: true,
-                listing_failures: BTreeMap::from([(
-                    1,
-                    BTreeMap::from([("src".into(), failed_at)]),
-                )]),
-            },
-        );
-        (failed_at, modified)
-    }
-
-    #[test]
-    fn local_0100_r11_listing_error_at_entry_budget_boundary() {
+    fn local_0100_r10_listing_error_at_entry_budget_boundary() {
         for budget_issue in [ScanIssues::ALIASES, ScanIssues::ENTRIES] {
             let mut issues = 0;
             let entry = Err(std::io::Error::from(ErrorKind::PermissionDenied));
@@ -1379,6 +1117,42 @@ mod tests {
             );
             assert_eq!(issues & budget_issue, budget_issue);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_0144_unreadable_entry_metadata_marks_rescan_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let parent = root.join("src");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("changed.rs"), "changed").unwrap();
+        // Readable listing, but no search permission: the child's metadata cannot be read.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let denied = std::fs::symlink_metadata(parent.join("changed.rs")).is_err();
+        let mut scan = Rescan {
+            root,
+            since: 0,
+            remaining: RESCAN_ENTRIES,
+            alias_remaining: RESCAN_ALIAS_ENTRIES,
+            issues: 0,
+            alias_listings: HashMap::new(),
+            found: Vec::new(),
+        };
+        scan.walk(&parent, 0);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !denied {
+            // Running with privileges that bypass permissions; nothing to observe.
+            return;
+        }
+        assert!(scan.found.is_empty());
+        assert_ne!(
+            scan.issues & ScanIssues::LISTING,
+            0,
+            "an unreadable entry must not be skipped silently"
+        );
     }
 
     #[test]
@@ -1399,7 +1173,6 @@ mod tests {
             issues: 0,
             alias_listings: HashMap::new(),
             found: Vec::new(),
-            recovery: None,
         };
         scan.walk_aliases(&parent, &[requested], false);
         assert_eq!(scan.issues, ScanIssues::ALIASES);
@@ -1444,7 +1217,7 @@ mod tests {
             make_claim(2, "bob", &["src/café"], false),
         ];
         assert_eq!(
-            rescan(root, &claims, 0, None).incomplete,
+            rescan(root, &claims, 0).incomplete,
             BTreeMap::from([
                 (("alice", "src/café".into()), ScanIssues::DEPTH),
                 (("alice", "SRC/CAFÉ".into()), ScanIssues::DEPTH),
@@ -1471,7 +1244,7 @@ mod tests {
             "id": 1, "paths": ["src/straße"], "case_insensitive_paths": true
         }))
         .unwrap();
-        let mut scan = rescan(root, std::slice::from_ref(&claim), 0, None);
+        let mut scan = rescan(root, std::slice::from_ref(&claim), 0);
         assert!(scan.incomplete.is_empty());
         scan.paths.sort();
         let other = if distinct {
@@ -1483,7 +1256,7 @@ mod tests {
         if distinct {
             claim.case_insensitive_paths = Some(false);
             let claims = [claim];
-            let scan = rescan(root, &claims, 0, None);
+            let scan = rescan(root, &claims, 0);
             assert_eq!(scan.paths, ["src/straße/other.rs"]);
             assert!(scan.incomplete.is_empty());
         }
@@ -1511,7 +1284,7 @@ mod tests {
         }))
         .unwrap();
         let claims = [claim];
-        let scan = rescan(root, &claims, 0, None);
+        let scan = rescan(root, &claims, 0);
         assert_eq!(scan.paths, [format!("src/{on_disk}/changed.rs")]);
         assert!(scan.incomplete.is_empty());
     }
@@ -1583,7 +1356,6 @@ mod tests {
             issues: 0,
             alias_listings: HashMap::from([(root.to_path_buf(), listing)]),
             found: Vec::new(),
-            recovery: None,
         };
         scan.walk_aliases(root, &["missing"], true);
         scan.walk_aliases(root, &["src"], false);

@@ -403,8 +403,68 @@ fn start_call(client: Arc<Client>, call: Call) -> mpsc::Receiver<Result<Value, C
     result
 }
 
+fn same_key_waiter_gets_the_first_reply(same_client: bool) {
+    let server = Server::start();
+    let journal = Journal::new();
+    survey_prime(&server, &journal);
+    let sender = Arc::new(server.client(&journal));
+    let waiter = if same_client {
+        Arc::clone(&sender)
+    } else {
+        Arc::new(server.client(&journal))
+    };
+    let mut call = Call::write(
+        "me",
+        "POST",
+        "/api/v1/registry/items".into(),
+        json!({"title": "one create"}),
+    );
+    call.deadline_ms = Some(4_000);
+    let key = call.key.clone().unwrap();
+
+    let sent = start_call(sender, call.clone());
+    let first = server.requests.recv_timeout(WAIT).unwrap();
+    let waiting = start_call(waiter, call.clone());
+    assert!(
+        server
+            .requests
+            .recv_timeout(Duration::from_millis(200))
+            .is_err(),
+        "same key was transmitted concurrently"
+    );
+    assert!(waiting.try_recv().is_err());
+    let (first_key, first_body) = (first.key.clone(), first.body.clone());
+    first.reply(200, None);
+    assert_eq!(sent.recv_timeout(WAIT).unwrap().unwrap(), json!({"id":"A-1"}));
+
+    // LOCAL-0148: the waiter reconciles through the server's Idempotency-Key receipt. It
+    // resends the first call's exact bytes, so an encrypted body still matches the receipt.
+    let resent = server.requests.recv_timeout(WAIT).unwrap();
+    assert_eq!(resent.key, first_key);
+    assert_eq!(resent.path, call.path);
+    assert_eq!(resent.body, first_body, "the resend must reuse the journaled wire bytes");
+    resent.reply(200, None);
+    assert_eq!(
+        waiting.recv_timeout(WAIT).unwrap().unwrap(),
+        json!({"id":"A-1"})
+    );
+    assert!(server.requests.recv_timeout(Duration::from_millis(300)).is_err());
+    assert!(server.client(&journal).pending_operation(&key).is_none());
+    server.finish();
+}
+
 #[test]
-fn same_key_waiter_does_not_resend_after_success() {
+fn same_key_waiter_in_another_client_gets_the_first_reply() {
+    same_key_waiter_gets_the_first_reply(false);
+}
+
+#[test]
+fn same_key_waiter_in_the_same_client_gets_the_first_reply() {
+    same_key_waiter_gets_the_first_reply(true);
+}
+
+#[test]
+fn same_key_resend_refused_as_reused_reconciles_by_key() {
     let server = Server::start();
     let journal = Journal::new();
     survey_prime(&server, &journal);
@@ -418,74 +478,31 @@ fn same_key_waiter_does_not_resend_after_success() {
     );
     call.deadline_ms = Some(4_000);
     let key = call.key.clone().unwrap();
-    assert!(waiter.pending_operation(&key).is_none());
-
     let sent = start_call(sender, call.clone());
     let first = server.requests.recv_timeout(WAIT).unwrap();
-    assert_eq!(first.key, key);
-    assert_eq!(first.path, call.path);
     let waiting = start_call(waiter, call);
-    assert!(
-        server
-            .requests
-            .recv_timeout(Duration::from_millis(200))
-            .is_err()
-    );
-    assert!(waiting.try_recv().is_err());
+    std::thread::sleep(Duration::from_millis(100));
     first.reply(200, None);
-    let expected = sent.recv_timeout(WAIT).unwrap().unwrap();
-
-    if let Ok(duplicate) = server.requests.recv_timeout(Duration::from_millis(800)) {
-        duplicate.reply(200, None);
-        panic!("a second POST was sent after the first returned 200");
-    }
-    assert_eq!(waiting.recv_timeout(WAIT).unwrap().unwrap(), expected);
-    assert!(server.requests.try_recv().is_err());
-    server.finish();
-}
-
-#[test]
-fn same_client_key_waiter_started_before_pending_gets_the_same_response() {
-    let server = Server::start();
-    let journal = Journal::new();
-    survey_prime(&server, &journal);
-    let client = Arc::new(server.client(&journal));
-    server.hold_discovery.store(true, Ordering::Release);
-    let mut call = Call::write(
-        "me",
-        "POST",
-        "/api/v1/registry/items".into(),
-        json!({"title": "one create"}),
-    );
-    call.deadline_ms = Some(4_000);
-    let sent = start_call(Arc::clone(&client), call.clone());
-    let mut discovery = server.requests.recv_timeout(WAIT).unwrap();
-    assert_eq!(discovery.path, "/api/v1/protocol");
-    assert!(
-        client
-            .pending_operation(call.key.as_deref().unwrap())
-            .is_none()
-    );
-    let waiting = start_call(client, call);
-    assert!(
-        server
-            .requests
-            .recv_timeout(Duration::from_millis(200))
-            .is_err()
-    );
-    assert!(waiting.try_recv().is_err());
+    assert!(sent.recv_timeout(WAIT).unwrap().is_ok());
+    let resent = server.requests.recv_timeout(WAIT).unwrap();
+    let mut stream = resent.stream;
     write_reply(
-        &mut discovery.stream,
-        200,
-        json!({"selected_protocol":2,"min_protocol":1,"max_protocol":2,"capabilities":[]}),
+        &mut stream,
+        409,
+        json!({"status":409,"code":"conflict",
+               "detail":"Idempotency-Key was used for another request.","details":{}}),
     );
-    server.requests.recv_timeout(WAIT).unwrap().reply(200, None);
-    let expected = sent.recv_timeout(WAIT).unwrap().unwrap();
-    if let Ok(duplicate) = server.requests.recv_timeout(Duration::from_millis(800)) {
-        duplicate.reply(200, None);
-        panic!("a second POST was sent after the first returned 200");
-    }
-    assert_eq!(waiting.recv_timeout(WAIT).unwrap().unwrap(), expected);
+    let error = waiting.recv_timeout(WAIT).unwrap().unwrap_err();
+    assert_eq!(error.code(), Some("outcome_unknown"));
+    // The waiter learns which key to reconcile, and the refused resend is not retried.
+    let reported = match &error {
+        ClientError::OutcomeUnknown(pending) => pending.key.clone(),
+        other => other.to_string(),
+    };
+    assert!(reported.contains(&key), "{reported}");
+    assert!(server.requests.recv_timeout(Duration::from_millis(300)).is_err());
+    // The finished sender's row is never written back by the waiter.
+    assert!(server.client(&journal).pending_operation(&key).is_none());
     server.finish();
 }
 

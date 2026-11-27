@@ -144,10 +144,13 @@ impl PushState {
         let Some(versions) = self.zone_alert_versions.get(session) else {
             return false;
         };
+        // A loss learned from SSE or from another status's /lost lookup fences the
+        // same way: a snapshot that started before it cannot confirm coverage (LOCAL-0143 r12).
+        // This status records /lost only for IDs missing from its own snapshot.
         versions
             .entries
             .get(&id)
-            .and_then(|version| version.seq.map(|_| version.received_at))
+            .map(|version| version.received_at)
             // A status request can have started before it exposed the claim IDs it
             // needs. Keep a conservative time fence for pruned loss versions.
             .or(versions.evicted_at)
@@ -203,6 +206,36 @@ impl PushState {
         for (_, id) in oldest.into_iter().take(excess) {
             let version = versions.entries.remove(&id).expect("selected loss version");
             versions.evicted_at = versions.evicted_at.max(Some(version.received_at));
+        }
+        // Hard bound: an acquisition whose claim ended while it still waited (for example
+        // zone.claimed without excluded_paths) must not pin history forever. Drop such waits
+        // oldest first; IDs in flight for status and visible alerts stay protected, and the
+        // eviction fence keeps older snapshots from using them (LOCAL-0143 r12 LOW).
+        let excess = versions
+            .entries
+            .len()
+            .saturating_sub(MAX_ZONE_ALERT_VERSIONS);
+        if excess == 0 {
+            return;
+        }
+        let mut waiting: Vec<_> = versions
+            .entries
+            .iter()
+            .filter(|(id, _)| {
+                !tracked.contains(id) && !alerts.is_some_and(|alerts| alerts.contains_key(id))
+            })
+            .map(|(&id, version)| (version.received_at, id))
+            .collect();
+        waiting.sort_unstable();
+        let dropped: Vec<i64> = waiting.into_iter().take(excess).map(|(_, id)| id).collect();
+        for id in &dropped {
+            let version = versions.entries.remove(id).expect("selected loss version");
+            versions.evicted_at = versions.evicted_at.max(Some(version.received_at));
+        }
+        if let Some(seen) = self.seen_claims.get_mut(session) {
+            for id in &dropped {
+                seen.remove(id);
+            }
         }
     }
 }
@@ -3373,6 +3406,122 @@ mod tests {
             Duration::ZERO,
         );
         assert_eq!(alerts(), [43], "fresh remainder still clears the old loss");
+    }
+
+    #[test]
+    fn local_0143_r12_loss_from_parallel_status_lost_fences_older_snapshot() {
+        struct LostTakeover;
+        impl Transport for LostTakeover {
+            fn call(&self, call: &Call) -> Result<Value, ClientError> {
+                assert!(call.path.starts_with("/api/v1/zones/lost"));
+                Ok(json!({"lost": [
+                    {"claim_id": 43, "session": "alice", "paths": ["src/STRASSE"]}
+                ]}))
+            }
+        }
+        // While the older status waits for /lost, a newer status no longer sees Z-43 and
+        // records its full takeover through its own /lost lookup (seq = None).
+        struct NewerStatusDuringRead<'a>(&'a Shared<Client>);
+        impl Transport for NewerStatusDuringRead<'_> {
+            fn call(&self, call: &Call) -> Result<Value, ClientError> {
+                assert!(call.path.starts_with("/api/v1/zones/lost"));
+                let newer = lockyard_cloud_client::CloudBackend::new(LostTakeover, "alice");
+                self.0.observe_status_claims(
+                    Instant::now(),
+                    "alice",
+                    None,
+                    &[],
+                    &newer,
+                    EVENT_TIMEOUT,
+                );
+                Ok(json!({"lost": []}))
+            }
+        }
+
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let previous = serde_json::from_value(json!({
+            "id": 41, "session": "alice", "paths": ["other"]
+        }))
+        .unwrap();
+        let idle = lockyard_cloud_client::CloudBackend::new(LostTakeover, "alice");
+        shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            &[previous],
+            &idle,
+            Duration::ZERO,
+        );
+        let mut lost = round4_zone(1, "zone.lost", 42, 6, None);
+        lost.payload["paths"] = json!(["src/straße/file.rs"]);
+        shared.push_event(lost);
+        let mut claimed = round4_zone(2, "zone.claimed", 43, 7, None);
+        claimed.payload["reason"] = json!("claimed");
+        claimed.payload["paths"] = json!(["src/STRASSE"]);
+        shared.push_event(claimed);
+
+        let older: Claim = serde_json::from_value(json!({
+            "id": 43, "session": "alice", "paths": ["src/STRASSE"], "excluded_paths": [],
+            "fence": 7, "case_insensitive_paths": true
+        }))
+        .unwrap();
+        let backend = lockyard_cloud_client::CloudBackend::new(NewerStatusDuringRead(shared), "alice");
+        shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            std::slice::from_ref(&older),
+            &backend,
+            EVENT_TIMEOUT,
+        );
+        let mut alerts: Vec<_> = shared
+            .zone_alerts("alice")
+            .into_iter()
+            .map(|alert| alert.claim_id)
+            .collect();
+        alerts.sort_unstable();
+        assert_eq!(
+            alerts,
+            [42, 43],
+            "a snapshot older than the /lost takeover must not clear Z-42"
+        );
+    }
+
+    #[test]
+    fn local_0143_r12_zone_versions_hard_bound_drops_stale_waits() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        {
+            let mut push = shared.push.lock().unwrap();
+            push.status_claims
+                .insert(("alice".into(), None), HashSet::from([1]));
+        }
+        for id in 1..=(MAX_ZONE_ALERT_VERSIONS as i64 * 4) {
+            // zone.claimed without excluded_paths leaves the acquisition waiting.
+            let mut claimed = round4_zone(id * 2, "zone.claimed", id, 1, None);
+            claimed.payload["reason"] = json!("claimed");
+            claimed.payload["paths"] = json!(["src"]);
+            shared.push_event(claimed);
+            shared.observe_zone_loss(&round4_zone(id * 2 + 1, "zone.lost", id, 1, None));
+            shared.take_zone_alerts("alice");
+        }
+        let push = shared.push.lock().unwrap();
+        let entries = &push.zone_alert_versions["alice"].entries;
+        assert!(
+            entries.len() <= MAX_ZONE_ALERT_VERSIONS,
+            "{} versions kept",
+            entries.len()
+        );
+        assert!(entries.contains_key(&1), "an ID in flight for status stays");
+        let waits = push.seen_claims.get("alice").map_or(0, |seen| {
+            seen.values().filter(|pending| pending.is_some()).count()
+        });
+        assert!(waits <= MAX_ZONE_ALERT_VERSIONS, "{waits} waits kept");
     }
 
     fn status_started_before_takeover(partial: bool) {
