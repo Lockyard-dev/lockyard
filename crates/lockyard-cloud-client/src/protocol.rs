@@ -331,31 +331,14 @@ pub(crate) struct PendingSendGuard<'a> {
 }
 
 impl PendingSendGuard<'_> {
-    fn mark_waiter(directory: &Path, key: &str) -> Result<(), ClientError> {
-        match std::fs::create_dir(journal_path(directory, key).with_extension("waiting")) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(error) => Err(journal_error(error)),
-        }
-    }
-
     fn remove_operation_lock(path: &Path) -> std::io::Result<()> {
+        // Older clients may still register a waiter beside the operation lock.
         match std::fs::remove_dir(path.with_extension("waiting")) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
         std::fs::remove_file(path)
-    }
-
-    fn needs_waiter_receipt(&self, pending: &PendingWrite) -> bool {
-        maintenance::waiter_receipt_allowed(pending)
-            && self.journal_dir.is_some_and(|directory| {
-                self.journal.is_none()
-                    || journal_path(directory, &self.key)
-                        .with_extension("waiting")
-                        .exists()
-            })
     }
 
     fn lock_operation(path: &Path) -> Result<PendingFileLock, ClientError> {
@@ -984,6 +967,18 @@ impl Client {
         )
     }
 
+    fn snapshot_encryption_context(&self, encryption: &ContentEncryption) -> String {
+        self.encryption_context_for(
+            encryption.workspace.as_deref(),
+            encryption
+                .key
+                .as_ref()
+                .map(crate::WorkspaceKey::key_id)
+                .as_deref(),
+            encryption.enabled,
+        )
+    }
+
     fn encryption_context_for(
         &self,
         workspace: Option<&str>,
@@ -1062,7 +1057,6 @@ impl Client {
                     .try_exists()
                     .map_err(journal_error)?
                 {
-                    PendingSendGuard::mark_waiter(directory, key)?;
                     observed.inflight = true;
                     return Err(ClientError::JournalBusy);
                 }
@@ -2053,12 +2047,7 @@ impl Client {
         {
             // The sibling may have acknowledged a success while we waited. A
             // missing row after same-key contention does not authorize a new send.
-            return Err(ClientError::Protocol(Problem {
-                status: None,
-                code: "outcome_unknown".into(),
-                detail: format!("Reconcile the mutation outcome using Idempotency-Key {key}"),
-                details: json!({"idempotency_key": key}),
-            }));
+            return Err(maintenance::waiter_outcome_unknown(key));
         }
         let route = call.path.split('?').next().unwrap_or(&call.path);
         if !route.starts_with('/')
@@ -2159,12 +2148,7 @@ impl Client {
         let content_key = encryption.key.as_ref();
         let encryption_enabled = encryption.enabled;
         self.feature_gate(call, &protocol, encryption_enabled)?;
-        let key_id = content_key.map(crate::WorkspaceKey::key_id);
-        let encryption_context = if live_write {
-            self.encryption_context_for(workspace, key_id.as_deref(), encryption_enabled)
-        } else {
-            self.encryption_context()
-        };
+        let encryption_context = self.snapshot_encryption_context(&encryption);
         // Seal the catalog with the same live workspace and key used to verify its reply.
         let prepared = self.prepare_catalog_call(call, workspace, content_key)?;
         let call = &prepared;
@@ -2335,9 +2319,10 @@ impl Client {
                         None => true,
                     };
                     let raw_receipt = pending.as_ref().and_then(|pending| {
-                        let guard = send_guard.as_ref().expect("write guard");
-                        (!call.defer_pending_ack && guard.needs_waiter_receipt(pending))
-                            .then(|| value.clone())
+                        (!call.defer_pending_ack
+                            && self.pending_journal.is_some()
+                            && maintenance::waiter_receipt_allowed(pending))
+                        .then(|| value.clone())
                     });
                     // Authenticate/decrypt the response before releasing its recovery record.
                     let event_page = call.method == "GET"
@@ -2400,13 +2385,19 @@ impl Client {
                         if call.defer_pending_ack {
                             return Ok(value);
                         }
-                        if let Some(raw) = raw_receipt
-                            && self
-                                .publish_waiter_receipt(&pending, raw, &encryption)
-                                .is_err()
+                        // A different client may still be blocked on the journal and
+                        // unable to observe this send. Publish before retiring its row.
+                        if self
+                            .publish_waiter_completion(&pending, raw_receipt, &encryption)
+                            .is_err()
                         {
-                            // Keep the frozen request for reconciliation if receipt storage failed.
-                            return Ok(value);
+                            // Keep the frozen request when no completion record can be stored.
+                            // A long poll still returns its verified success.
+                            return if call.long_poll || !journal_owned {
+                                Ok(value)
+                            } else {
+                                Err(ClientError::OutcomeUnknown(Box::new(pending)))
+                            };
                         }
                         if !journal_owned {
                             self.complete_pending_later(&pending);
@@ -2608,12 +2599,11 @@ impl Client {
             remaining(),
             call.cancellation.as_ref(),
         )?;
-        let live_write = self.check_live_write_encryption_policy;
         if pending.encryption_context.is_none()
-            || (!live_write
+            || (!self.check_live_write_encryption_policy
                 && (!self.pending_encryption_context_ready()
                     || pending.encryption_context.as_deref()
-                        != Some(self.encryption_context().as_str())))
+                        != Some(self.snapshot_encryption_context(&encryption).as_str())))
         {
             return Err(ClientError::OutcomeUnknown(Box::new(pending)));
         }
@@ -2672,21 +2662,19 @@ impl Client {
                 return Err(self.unknown(pending, &cause, error.status()));
             }
         };
-        let raw_receipt = (!call.defer_pending_ack && guard.needs_waiter_receipt(&pending))
-            .then(|| value.clone());
-        self.decode_pending_response(
-            call,
-            &pending,
-            &mut value,
-            live_write.then_some(&encryption),
-        )?;
+        let raw_receipt = (!call.defer_pending_ack
+            && self.pending_journal.is_some()
+            && maintenance::waiter_receipt_allowed(&pending))
+        .then(|| value.clone());
+        self.decode_pending_response(call, &pending, &mut value, &encryption)?;
         let _ = guard.response.set((pending.clone(), value.clone()));
-        if !call.defer_pending_ack
-            && raw_receipt.is_none_or(|raw| {
-                self.publish_waiter_receipt(&pending, raw, &encryption)
-                    .is_ok()
-            })
-        {
+        if !call.defer_pending_ack {
+            if self
+                .publish_waiter_completion(&pending, raw_receipt, &encryption)
+                .is_err()
+            {
+                return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+            }
             self.resolve_pending(&pending.key)?;
         }
         // The agent acknowledges only after its outbox completion marker is durable.
@@ -2708,27 +2696,17 @@ impl Client {
         call: &Call,
         pending: &PendingWrite,
         value: &mut Value,
-        encryption: Option<&ContentEncryption>,
+        encryption: &ContentEncryption,
     ) -> Result<(), ClientError> {
-        let (workspace, held, enabled) = match encryption {
-            Some(encryption) => (
-                encryption.workspace.as_deref(),
-                encryption.key.clone(),
-                encryption.enabled,
-            ),
-            None => (
-                self.workspace.as_deref(),
-                self.resolved_content_key()?,
-                self.encryption_enabled,
-            ),
-        };
+        let workspace = encryption.workspace.as_deref();
+        let key = encryption.key.as_ref();
         if let Some(workspace) = workspace
             && let Err(message) = crate::crypto::transform_fields_policy(
                 value,
                 &call.method,
                 &call.path,
                 workspace,
-                held.as_ref(),
+                key,
                 false,
                 self.expected_e2ee_workspace.is_some(),
             )
@@ -2740,8 +2718,9 @@ impl Client {
             };
             return Err(self.unknown(pending.clone(), cause, None));
         }
-        crate::commit_evidence::warn_if_sha_missing(call, enabled, value);
-        if let Err(error) = self.finish_catalog_call(call, value, workspace, held.as_ref(), enabled)
+        crate::commit_evidence::warn_if_sha_missing(call, encryption.enabled, value);
+        if let Err(error) =
+            self.finish_catalog_call(call, value, workspace, key, encryption.enabled)
         {
             let cause = error
                 .code()
@@ -3053,6 +3032,8 @@ fn private_directory(path: &Path) -> Result<(), ClientError> {
 #[cfg(test)]
 mod pending_completion_tests {
     use super::*;
+    use crate::Transport;
+    use crate::fake::{FakeServer, Reply};
 
     std::thread_local! {
         static MAINTENANCE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -3069,6 +3050,168 @@ mod pending_completion_tests {
             // Windows already used this global journal lock in 0.3.12.
             .filter(|path| path.file_name().unwrap() != ".journal.lock")
             .collect()
+    }
+
+    fn wait_for_mutation(server: &FakeServer) {
+        let started = Instant::now();
+        while server.requests().is_empty() {
+            assert!(started.elapsed() < Duration::from_secs(5), "missing POST");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn local_0146_device_token_waiter_keeps_response_off_disk_and_does_not_resend() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let (release, gate) = std::sync::mpsc::channel();
+        let token = "synthetic-device-token-response";
+        let reply = json!({"token": token, "workspace_id": "fixture"});
+        let server = FakeServer::start(vec![Reply::json(200, reply.clone()).gated(gate)]);
+        let new_client = || {
+            Client::new(&server.url(), "fixture".into())
+                .unwrap()
+                .with_pending_journal(&root)
+                .unwrap()
+        };
+        let sender = new_client();
+        let waiter = new_client();
+        let mut call = Call::write(
+            "fixture",
+            "POST",
+            "/api/v1/auth/device/token".into(),
+            json!({"device_code": "synthetic-device-code"}),
+        );
+        call.deadline_ms = Some(5_000);
+        let key = call.key.as_deref().unwrap();
+        std::thread::scope(|scope| {
+            let sender = scope.spawn(|| sender.call(&call));
+            wait_for_mutation(&server);
+            assert!(matches!(
+                waiter.claim_pending_send(key),
+                Err(ClientError::JournalBusy)
+            ));
+            release.send(()).unwrap();
+            assert_eq!(sender.join().unwrap().unwrap(), reply);
+        });
+
+        let directory = waiter.pending_journal.as_ref().unwrap();
+        for path in journal_files(directory)
+            .into_iter()
+            .filter(|path| path.is_file())
+        {
+            let contents = std::fs::read_to_string(path).unwrap();
+            assert!(
+                !contents.contains(token),
+                "device-token response reached the journal"
+            );
+        }
+        let error = waiter.call(&call).unwrap_err();
+        assert_eq!(error.code(), Some("outcome_unknown"));
+        let problem = error.problem().unwrap();
+        assert_eq!(problem.details["idempotency_key"], key);
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn local_0146_journal_busy_before_waiter_registration_does_not_resend() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let (release, gate) = std::sync::mpsc::channel();
+        let reply = json!({"id": "A-1"});
+        let server = FakeServer::start(vec![Reply::json(200, reply.clone()).gated(gate)]);
+        let new_client = || {
+            Client::new(&server.url(), "fixture".into())
+                .unwrap()
+                .with_pending_journal(&root)
+                .unwrap()
+        };
+        let sender = new_client();
+        let waiter = new_client();
+        let mut call = Call::write(
+            "fixture",
+            "POST",
+            "/api/v1/registry/items".into(),
+            json!({"title": "one create"}),
+        );
+        call.deadline_ms = Some(5_000);
+        let key = call.key.as_deref().unwrap();
+        let directory = waiter.pending_journal.as_ref().unwrap();
+        std::thread::scope(|scope| {
+            let sender = scope.spawn(|| sender.call(&call));
+            wait_for_mutation(&server);
+            let journal = PendingSendGuard::lock_journal(directory).unwrap();
+            // Drive admission and retry separately so the sender wins reacquisition deterministically.
+            let mut probe = call.clone();
+            probe.deadline_ms = Some(0);
+            assert!(matches!(waiter.call(&probe), Err(ClientError::JournalBusy)));
+            assert!(
+                !journal_path(directory, key)
+                    .with_extension("waiting")
+                    .exists()
+            );
+            drop(journal);
+            release.send(()).unwrap();
+            assert_eq!(sender.join().unwrap().unwrap(), reply);
+        });
+        assert!(!journal_path(directory, key).exists());
+        let observed = waiter.call(&call);
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "a second POST followed the journal-busy window"
+        );
+        assert_eq!(observed.unwrap(), reply);
+    }
+
+    #[test]
+    fn local_0146_waiter_receipt_uses_workspace_key_loaded_from_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let _keys = crate::test_support::KeyEnv::new();
+        let workspace = "local-0146-disk-key";
+        let key = crate::WorkspaceKey::from_entropy([42; 32]);
+        key.store_for_workspace(workspace).unwrap();
+        let encrypted_note = key.encrypt(workspace, "note", "fixture note").unwrap();
+        let (release, gate) = std::sync::mpsc::channel();
+        let server = FakeServer::start(vec![
+            Reply::json(200, json!({"id": 7, "note": encrypted_note})).gated(gate),
+        ]);
+        let new_client = || {
+            Client::new(&server.url(), "fixture".into())
+                .unwrap()
+                .with_pending_journal(&root)
+                .unwrap()
+                .with_content_encryption(workspace, None, true)
+        };
+        let sender = new_client();
+        let waiter = new_client();
+        let mut call = Call::write(
+            "fixture",
+            "POST",
+            "/api/v1/zones/claims".into(),
+            json!({"paths": ["src"], "note": "fixture request"}),
+        );
+        call.deadline_ms = Some(5_000);
+        let key = call.key.as_deref().unwrap();
+        let expected = std::thread::scope(|scope| {
+            let server = &server;
+            scope.spawn(move || {
+                wait_for_mutation(server);
+                assert!(matches!(
+                    waiter.claim_pending_send(key),
+                    Err(ClientError::JournalBusy)
+                ));
+                release.send(()).unwrap();
+            });
+            sender.call(&call).unwrap()
+        });
+        assert_eq!(expected["note"], "fixture note");
+        assert_eq!(
+            sender.call(&call).expect("disk-key receipt should verify"),
+            expected
+        );
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[test]

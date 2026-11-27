@@ -8,7 +8,7 @@ All notable changes to Lockyard are recorded here. The format follows
 ## [0.3.20] - 2026-11-26
 
 - Keep pending HTTP replay and admission-time reconciliation within the original call deadline. If a writer waits on the same idempotency key and the pending record disappears, require reconciliation by key (LY-0057).
-- Return a verified write response to callers already waiting on the same idempotency key, including concurrent calls on one HTTP client (LOCAL-0146).
+- Return a verified write response to callers waiting on the same idempotency key. Keep a short-lived journal receipt for approved routes, use the actual workspace key to verify encrypted replies, and require reconciliation by key when a completion marker has no stored reply (LY-0057 / LOCAL-0146).
 - Let an offline-started agent read and publish encrypted catalogs using live workspace settings and a newly created or imported key (LY-0058).
 - Release the shared write journal during HTTP requests, protocol discovery and retry backoff while keeping the operation key reserved (LY-0059).
 - Reject incorrect MCP TTL field names, publish and enforce per-tool minute limits for leases, queues, board entries and mail notices, and forward the requested TTL to task and zone claims in `start_work` (LY-0060).
