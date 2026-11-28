@@ -4,6 +4,9 @@
 
 use crate::{Error, Result, Store};
 use rusqlite::{OptionalExtension, params};
+
+/// Supported lifetimes for board entries with an explicit TTL.
+pub const BOARD_TTL_MINUTES: std::ops::RangeInclusive<i64> = 1..=43_200;
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -49,10 +52,12 @@ impl Store {
             ));
         }
         let expires = ttl_minutes.map(|ttl| now.saturating_add(ttl.saturating_mul(60_000)));
-        if ttl_minutes.is_some_and(|ttl| !(1..=43_200).contains(&ttl)) {
-            return Err(Error::Invalid(
-                "board TTL must be between 1 and 43200 minutes".into(),
-            ));
+        if ttl_minutes.is_some_and(|ttl| !BOARD_TTL_MINUTES.contains(&ttl)) {
+            return Err(Error::Invalid(format!(
+                "board TTL must be between {} and {} minutes",
+                BOARD_TTL_MINUTES.start(),
+                BOARD_TTL_MINUTES.end()
+            )));
         }
         self.conn.execute("INSERT INTO board(key,value,zone,expires_at,updated_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(key) DO UPDATE SET value=excluded.value,zone=excluded.zone,expires_at=excluded.expires_at,updated_at=excluded.updated_at", params![key, value, zone, expires, now])?;
         self.board_get(key, now)?

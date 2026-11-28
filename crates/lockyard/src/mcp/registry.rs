@@ -2,6 +2,15 @@
 
 use super::*;
 
+fn ttl_minutes_range(name: &str) -> RangeInclusive<i64> {
+    match name {
+        "zone_queue" => QUEUE_TTL_MINUTES,
+        "board_set" => BOARD_TTL_MINUTES,
+        "msg_send" => NOTICE_TTL_MINUTES,
+        _ => LEASE_TTL_MINUTES,
+    }
+}
+
 pub(super) fn tool_def(
     name: &str,
     description: &str,
@@ -9,6 +18,15 @@ pub(super) fn tool_def(
     required: &[&str],
 ) -> Value {
     let mut description = description.to_string();
+    if let Some(ttl) = properties.get_mut("ttl") {
+        let bounds = ttl_minutes_range(name);
+        let (min, max) = (bounds.start(), bounds.end());
+        ttl["minimum"] = json!(min);
+        ttl["maximum"] = json!(max);
+        if ttl.get("description").is_none() {
+            ttl["description"] = json!(format!("Integer minutes ({min}-{max})."));
+        }
+    }
     if let Some(shared) = properties.get_mut("shared") {
         shared["description"] = json!(
             "Omit for the server default (soft_zones_v1: shared file/folder claims, exclusive hosts; older servers: exclusive). true allows overlapping shared claims; dirty files remain exclusive. false reserves paths exclusively for migrations, contracts or hosts. Use shared:false in MCP or --exclusive in CLI."
@@ -74,7 +92,7 @@ impl ToolRegistry {
         let flag = json!({"type":"boolean"});
         let names = json!({"type":"array","items":{"type":"string"}});
         let task_identifier = canonical_task_schema();
-        let ttl_minutes = json!({"type":"integer","minimum":1,"maximum":240,"description":"ttl is an integer number of minutes, from 1 through 240."});
+        let ttl_minutes = json!({"type":"integer","description":"ttl is an integer number of minutes, from 1 through 240."});
         for wire in [
             tool_def(
                 "start_work",
@@ -111,7 +129,7 @@ impl ToolRegistry {
             tool_def(
                 "tasks",
                 "Compact registry workflow: list, show, claim, submit, accept, reject, block, unblock, or cancel tasks.",
-                json!({"action": text, "id": task_identifier, "area": text, "prefix": text, "evidence": text, "reason": text, "note": text, "status": text}),
+                json!({"action": text, "id": task_identifier, "area": text, "prefix": text, "evidence": text, "reason": text, "note": text, "status": text, "ttl": {"type":"integer","description":"Lease in integer minutes (1-240) for the claim action."}}),
                 &["action"],
             ),
             tool_def(
@@ -156,20 +174,32 @@ impl ToolRegistry {
     }
 
     pub(super) fn validate_fields(&self, name: &str, args: &Value) -> Result<()> {
-        if !matches!(name, "update" | "start_work" | "zone_renew") {
-            return Ok(());
-        }
         let Some(definition) = self.definitions.iter().find(|d| d.wire["name"] == name) else {
             return Ok(());
         };
         let properties = &definition.wire["inputSchema"]["properties"];
+        let bounds = ttl_minutes_range(name);
+        let (min, max) = (bounds.start(), bounds.end());
+        if properties.get("ttl").is_some() {
+            for alias in ["ttl_minutes", "ttl_seconds", "duration"] {
+                if args.get(alias).is_some() {
+                    return Err(Error::Invalid(format!(
+                        "unknown field {alias}; use ttl, an integer number of minutes ({min}-{max})"
+                    )));
+                }
+            }
+            Args(args).optional_ttl(&bounds)?;
+        }
+        if !matches!(name, "update" | "start_work" | "zone_renew") {
+            return Ok(());
+        }
         if let Some(args) = args.as_object() {
             for key in args.keys() {
                 if properties.get(key).is_none() {
                     let correct = if name == "update" {
-                        "body for message text"
+                        "body for message text".into()
                     } else {
-                        "ttl, an integer number of minutes (1-240)"
+                        format!("ttl, an integer number of minutes ({min}-{max})")
                     };
                     return Err(Error::Invalid(format!(
                         "unknown field {key}; use {correct}; see the {name} input schema"
@@ -202,10 +232,7 @@ impl ToolRegistry {
                 let mut wire = definition.wire.clone();
                 if surface == Surface::Compact && wire["name"].as_str().unwrap() == "zone_renew" {
                     wire["description"] = json!("Renew own claim; ttl: integer minutes (1-240, default 30); fence is filled from status.");
-                    wire["inputSchema"]["properties"]["ttl"] = json!({
-                        "type": "integer", "minimum": 1, "maximum": 240, "default": 30,
-                        "description": "Integer minutes (1-240), default 30."
-                    });
+                    wire["inputSchema"]["properties"]["ttl"]["default"] = json!(DEFAULT_TTL_MINUTES);
                 }
                 wire
             })

@@ -223,6 +223,9 @@ impl Client {
         if sessions.is_empty() || sessions.len() > 32 {
             return Err(ClientError::Invalid("SSE requires 1..=32 sessions".into()));
         }
+        if self.check_live_write_encryption_policy {
+            self.live_replay_encryption(self, Duration::from_secs(2), None)?;
+        }
         let protocol = self.negotiated_protocol(session)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -340,6 +343,7 @@ impl Client {
     pub(crate) fn decode_json_events(
         &self,
         value: &mut serde_json::Value,
+        encryption: &crate::ContentEncryption,
     ) -> Result<(), ClientError> {
         let events = if value.is_array() {
             value.as_array_mut()
@@ -362,7 +366,7 @@ impl Client {
                 .map_err(|e| ClientError::Decode(e.to_string()))
                 .and_then(|event| {
                     let mut event = event;
-                    self.decode_stream_event(&mut event)?;
+                    self.decode_event_with_encryption(&mut event, encryption)?;
                     Ok(event)
                 });
             match decoded {
@@ -385,15 +389,22 @@ impl Client {
     }
 
     pub(crate) fn decode_stream_event(&self, event: &mut Event) -> Result<(), ClientError> {
-        if let Some(workspace) = &self.workspace {
-            let key = self.resolved_content_key()?;
+        self.decode_event_with_encryption(event, &self.current_content_encryption()?)
+    }
+
+    fn decode_event_with_encryption(
+        &self,
+        event: &mut Event,
+        encryption: &crate::ContentEncryption,
+    ) -> Result<(), ClientError> {
+        if let Some(workspace) = encryption.workspace.as_deref() {
             let mut value = serde_json::json!([&*event]);
             crate::crypto::transform_fields_policy(
                 &mut value,
                 "GET",
                 "/api/v1/events",
                 workspace,
-                key.as_ref(),
+                encryption.key.as_ref(),
                 false,
                 self.expected_e2ee_workspace.is_some(),
             )
@@ -477,7 +488,9 @@ mod tests {
             .unwrap()
             .with_content_encryption(workspace, Some(key), true);
         let mut value = serde_json::json!({"events":[{"seq":99,"type":"unknown","payload":{"body":"PRIVATE"}}]});
-        client.decode_json_events(&mut value).unwrap();
+        client
+            .decode_json_events(&mut value, &client.current_content_encryption().unwrap())
+            .unwrap();
         assert_eq!(
             value["events"][0],
             serde_json::json!({"seq":99,"type":"","payload":null})
@@ -533,7 +546,8 @@ mod tests {
             broken["events"][1]["payload"]["body"] =
                 key.encrypt(&workspace, "text", "wrong AAD").unwrap().into();
             assert!(matches!(
-                client.decode_json_events(&mut broken),
+                client
+                    .decode_json_events(&mut broken, &client.current_content_encryption().unwrap()),
                 Err(ClientError::Invalid(_))
             ));
         }
@@ -552,12 +566,15 @@ mod tests {
                 "claim":{"id":7,"note":key.encrypt(&workspace,"body","wrong AAD").unwrap()}
             }}]});
             assert!(matches!(
-                client.decode_json_events(&mut nested),
+                client
+                    .decode_json_events(&mut nested, &client.current_content_encryption().unwrap()),
                 Err(ClientError::Invalid(_))
             ));
             nested["events"][0]["payload"]["claim"]["note"] =
                 key.encrypt(&workspace, "note", "held").unwrap().into();
-            client.decode_json_events(&mut nested).unwrap();
+            client
+                .decode_json_events(&mut nested, &client.current_content_encryption().unwrap())
+                .unwrap();
             assert_eq!(nested["events"][0]["payload"]["claim"]["note"], "held");
         }
         std::fs::remove_file(WorkspaceKey::storage_path(&workspace).unwrap()).unwrap();

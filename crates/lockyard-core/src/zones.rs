@@ -3,10 +3,12 @@
 //! Work zones. A claim is a lease on paths: nobody else can claim an overlapping path until it is
 //! released or expires, so a crashed agent cannot hold a zone forever.
 
+use crate::paths::{fold_path_component, nfc_path};
 use crate::proto::Stamp;
 use crate::{Error, Result, Store, ZonePath};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 
 /// Lease of a claim unless the caller asks for another one.
@@ -104,9 +106,13 @@ impl Store {
             params![agent, note, now, expires_at],
         )?;
         let id = transaction.last_insert_rowid();
-        let mut unique: Vec<String> = paths.iter().map(|p| p.as_str().to_string()).collect();
+        let mut unique: Vec<String> = paths.iter().map(|path| nfc_path(path.as_str())).collect();
         unique.sort();
-        unique.dedup();
+        let mut seen = HashSet::new();
+        unique.retain(|path| {
+            let (repository, path) = crate::repository::split(path);
+            seen.insert((repository.map(str::to_owned), fold_path_component(path)))
+        });
         for path in &unique {
             transaction.execute(
                 "INSERT INTO claim_paths (claim_id, path) VALUES (?1, ?2)",
@@ -215,7 +221,8 @@ fn find_conflicts(
     let mut conflicts = Vec::new();
     for path in paths {
         for (claim, holder, note, expires_at, held_path) in &held {
-            if path.overlaps(&ZonePath::stored(held_path.clone())) {
+            // SQLite zones always ignore case across operating systems (D-3124).
+            if path.overlaps_with_case(&ZonePath::stored(held_path.clone()), true) {
                 conflicts.push(Conflict {
                     mode: Some(crate::proto::ClaimMode::Exclusive),
                     dirty: None,
@@ -276,6 +283,53 @@ mod tests {
         assert_eq!(conflicts[0].agent, "a");
         assert_eq!(conflicts[0].held_path, "src");
         assert_eq!(conflicts[0].note, "refactor");
+    }
+
+    #[test]
+    fn claim_deduplicates_nfc_and_d145_spellings_per_repository() {
+        let (_dir, mut store) = test_store();
+        let paths = [
+            "src/cafe\u{301}",
+            "src/café",
+            "src/ſ",
+            "src/s",
+            "src/ss",
+            ".lockyard-repository/api/src/ſ",
+            ".lockyard-repository/web/src/s",
+        ]
+        .map(path);
+        let claim = store.claim("a", &paths, "", TTL, 0).unwrap();
+        assert_eq!(
+            claim.paths,
+            [
+                ".lockyard-repository/api/src/ſ",
+                ".lockyard-repository/web/src/s",
+                "src/café",
+                "src/s",
+                "src/ss",
+            ]
+        );
+        assert_eq!(store.claims(1).unwrap(), [claim]);
+    }
+
+    #[test]
+    fn sqlite_conflicts_and_claim_filters_always_fold_case() {
+        let (_dir, mut store) = test_store();
+        let claim = store.claim("a", &[path("src/ſ")], "", TTL, 0).unwrap();
+        let wanted = "src/s/file.rs";
+        let conflict = store.check("b", &path(wanted), 1).unwrap().unwrap();
+        assert_eq!(conflict.claim, claim.id);
+        let matching = crate::Backend::claims(
+            &store,
+            &crate::proto::ClaimQuery {
+                session: None,
+                path: Some(wanted.into()),
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].id, claim.id);
     }
 
     #[test]

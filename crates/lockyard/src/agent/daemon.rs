@@ -20,6 +20,7 @@ use super::wire::{AgentStatus, CredentialProof, Envelope, Phase, Reply, Request,
 use lockyard_cloud_client::{
     Call, Cancellation, ClientError, CloudBackend, RepositoryTransport, Transport, ulid,
 };
+use lockyard_core::paths::nfc_path;
 use lockyard_core::proto::{
     AccessRecord, ActivityRequest, BoardEntry, CheckStatus, Claim, ClaimMode, ClaimQuery,
     DirtyPath, EventPage, EventQuery, InboxQuery, LostClaim, Message, PathCheck, PresenceBeat,
@@ -288,22 +289,30 @@ impl View {
     fn check_path(&self, session: &str, raw: &str) -> PathCheck {
         let path = ZonePath::stored(raw.to_string());
         let repository = lockyard_core::repository::split(raw).0;
-        // The server uses .NET OrdinalIgnoreCase. ASCII folding cannot safely answer
-        // Unicode comparisons, including exclusions and Unicode holders of ASCII paths.
+        // The server has not announced its Unicode comparison rule. Also defer
+        // when an omitted case policy could change the cached answer.
         if self.claims.iter().any(|claim| {
-            claim
-                .case_insensitive_paths
-                .unwrap_or(cfg!(any(target_os = "macos", windows)))
+            if !claim.folds_path_case() {
+                return false;
+            }
+            let unicode = (!raw.is_ascii()
+                || claim
+                    .paths
+                    .iter()
+                    .chain(&claim.excluded_paths)
+                    .any(|held| !held.is_ascii()))
                 && claim
                     .paths
                     .iter()
-                    .any(|held| lockyard_core::repository::split(held).0 == repository)
-                && (!raw.is_ascii()
-                    || claim
-                        .paths
-                        .iter()
-                        .chain(&claim.excluded_paths)
-                        .any(|held| !held.is_ascii()))
+                    .any(|held| lockyard_core::repository::split(held).0 == repository);
+            unicode
+                || (claim.case_insensitive_paths.is_none()
+                    && if claim.session == session {
+                        claim.fully_covers_with_case(&path, true)
+                            != claim.fully_covers_with_case(&path, false)
+                    } else {
+                        claim.covers(&path) != claim.covers_with_case(&path, false)
+                    })
         }) {
             return PathCheck {
                 mode: None,
@@ -315,14 +324,18 @@ impl View {
         }
         // A claim of an unavailable session stops blocking, as it does on the server.
         let covering =
-            |claim: &&Claim| claim.holder_available != Some(false) && covers(claim, &path);
+            |claim: &&Claim| claim.holder_available != Some(false) && claim.covers(&path);
         // Availability is about other sessions: a session that comes back still holds its own claims.
-        let mine: Vec<&Claim> = self
+        let mut mine = self
             .claims
             .iter()
-            .filter(|claim| claim.session == session && covers(claim, &path))
-            .collect();
-        let shares = mine.iter().any(|claim| claim.mode == ClaimMode::Shared);
+            .filter(|claim| {
+                claim.session == session
+                    && claim.fully_covers_with_case(&path, claim.folds_path_case())
+            })
+            .peekable();
+        let own = mine.peek().is_some();
+        let shares = mine.any(|claim| claim.mode == ClaimMode::Shared);
         let holder = self
             .claims
             .iter()
@@ -343,12 +356,8 @@ impl View {
                         .paths
                         .iter()
                         .find(|held| {
-                            ZonePath::stored((*held).clone()).overlaps_with_case(
-                                &path,
-                                claim
-                                    .case_insensitive_paths
-                                    .unwrap_or(cfg!(any(target_os = "macos", windows))),
-                            )
+                            ZonePath::stored((*held).clone())
+                                .overlaps_with_case(&path, claim.folds_path_case())
                         })
                         .cloned()
                         .unwrap_or_default(),
@@ -362,30 +371,15 @@ impl View {
                 mode: None,
                 auto_grantable: None,
                 path: raw.to_string(),
-                status: if mine.is_empty() {
-                    CheckStatus::Free
-                } else {
+                status: if own {
                     CheckStatus::Own
+                } else {
+                    CheckStatus::Free
                 },
                 holder: None,
             },
         }
     }
-}
-
-fn covers(claim: &Claim, path: &ZonePath) -> bool {
-    let fold = claim
-        .case_insensitive_paths
-        .unwrap_or(cfg!(any(target_os = "macos", windows)));
-    let inside = |list: &[String]| {
-        list.iter()
-            .any(|held| ZonePath::stored(held.clone()).overlaps_with_case(path, fold))
-    };
-    let excluded = claim.excluded_paths.iter().any(|gap| {
-        let gap = ZonePath::stored(gap.clone());
-        gap.overlaps_with_case(path, fold) && gap.as_str().len() <= path.as_str().len()
-    });
-    inside(&claim.paths) && !excluded
 }
 
 #[derive(Default)]
@@ -1126,10 +1120,13 @@ impl<T: Transport + 'static> Shared<T> {
             .clamp(Duration::from_millis(25), Duration::from_millis(150));
         let network_budget = left.saturating_sub(reply_reserve);
         let cache_key = (session.to_owned(), repository.map(str::to_owned));
+        let snapshot_started = Instant::now();
         match backend.status_read(session, now_ms(), network_budget) {
             Ok(mut status) => {
                 self.observe_status_claims(
+                    snapshot_started,
                     session,
+                    repository,
                     &status.claims,
                     &backend,
                     deadline
@@ -1619,13 +1616,15 @@ impl<T: Transport + 'static> Shared<T> {
 
     /// Collects written paths per claim. [`Shared::flush_activity`] sends them, spaced per claim.
     fn note_writes(&self, session: &str, paths: Vec<String>) {
+        // Wire clients can supply NFD. Keep the case of the actual write in both reports.
+        let paths: Vec<_> = paths.into_iter().map(|path| nfc_path(&path)).collect();
         let matches: Vec<(i64, String)> = {
             let view = self.read_view();
             let own = view.claims.iter().filter(|claim| claim.session == session);
             own.flat_map(|claim| {
                 paths
                     .iter()
-                    .filter(|path| covers(claim, &ZonePath::stored((*path).clone())))
+                    .filter(|path| claim.covers(&ZonePath::stored((*path).clone())))
                     .map(|path| (claim.id, path.clone()))
             })
             .collect()
@@ -3842,7 +3841,9 @@ mod tests {
         let claim: Claim =
             serde_json::from_value(json!({"id":42,"session":"alice","paths":["src"]})).unwrap();
         rig.daemon.shared.observe_status_claims(
+            Instant::now(),
             "alice",
+            None,
             &[claim],
             &backend,
             Duration::from_secs(30),
@@ -3850,9 +3851,14 @@ mod tests {
         *rig.server.lost.lock().unwrap() = vec![
             json!({"claim_id":42,"session":"alice","paths":["src"],"reason":"expired","lost_at":1000000}),
         ];
-        rig.daemon
-            .shared
-            .observe_status_claims("alice", &[], &backend, Duration::from_secs(30));
+        rig.daemon.shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            &[],
+            &backend,
+            Duration::from_secs(30),
+        );
         let calls = rig.server.calls.lock().unwrap().len();
         let reply = rig.daemon.handle(Request::Unread {
             attention_ack: Vec::new(),
@@ -5063,6 +5069,71 @@ mod tests {
             CheckStatus::Held,
             "no shared claim of mine covers it"
         );
+    }
+
+    #[test]
+    fn local_0100_r4_cache_defers_case_alias_without_a_policy() {
+        let mut view = View {
+            claims: vec![
+                serde_json::from_value(json!({"id": 1, "session": "bob", "paths": ["src/A"]}))
+                    .unwrap(),
+            ],
+            ..View::default()
+        };
+        assert_eq!(
+            view.check_path("alice", "src/a/file.rs").status,
+            CheckStatus::Unknown
+        );
+        view.claims[0].case_insensitive_paths = Some(true);
+        let check = view.check_path("alice", "src/a/file.rs");
+        assert_eq!(check.status, CheckStatus::Held);
+        assert_eq!(check.holder.unwrap().held_path, "src/A");
+        view.claims[0].case_insensitive_paths = Some(false);
+        assert_eq!(
+            view.check_path("alice", "src/a/file.rs").status,
+            CheckStatus::Free
+        );
+    }
+
+    #[test]
+    fn a_cached_own_claim_requires_coverage_of_the_whole_path() {
+        let view = View {
+            claims: vec![
+                serde_json::from_value(json!({
+                    "id": 1, "session": "me", "paths": ["src/a.rs", "docs"],
+                    "excluded_paths": ["docs/private"], "case_insensitive_paths": true
+                }))
+                .unwrap(),
+            ],
+            ..View::default()
+        };
+        let status = |path| view.check_path("me", path).status;
+        assert_eq!(status("src"), CheckStatus::Free);
+        assert_eq!(status("src/A.rs"), CheckStatus::Own);
+        assert_eq!(status("docs"), CheckStatus::Free);
+        assert_eq!(status("docs/public"), CheckStatus::Own);
+        assert_eq!(status("docs/private/a.rs"), CheckStatus::Free);
+    }
+
+    #[test]
+    fn cache_recognizes_a_decomposed_exclusion_for_a_composed_path() {
+        let view = View {
+            claims: vec![
+                serde_json::from_value(json!({
+                    "id": 1,
+                    "session": "bob",
+                    "paths": ["src"],
+                    "excluded_paths": ["src/cafe\u{0301}"],
+                    "case_insensitive_paths": false,
+                }))
+                .unwrap(),
+            ],
+            ..View::default()
+        };
+        let status = |path: &str| view.check_path("alice", path).status;
+        assert_eq!(status("src/café"), CheckStatus::Free);
+        assert_eq!(status("src/café/file"), CheckStatus::Free);
+        assert_eq!(status("src"), CheckStatus::Held);
     }
 
     #[test]
@@ -6548,11 +6619,17 @@ mod tests {
             phase: Phase::Post,
             write_paths: vec![path.into()],
         };
-        for path in ["src/a", "src/b", "src/c", "elsewhere"] {
+        for path in [
+            "src/cafe\u{301}",
+            "src/café",
+            "src/straße",
+            "src/STRASSE",
+            "elsewhere",
+        ] {
             rig.daemon.handle(write(path));
         }
         for _ in 0..10 {
-            rig.daemon.handle(write("src/a"));
+            rig.daemon.handle(write("src/cafe\u{301}"));
         }
         wait_for("dirty path reporting", || {
             rig.server.writes_to("/zones/dirty").len() >= 3
@@ -6563,7 +6640,18 @@ mod tests {
             3,
             "unclaimed and repeated paths are not reported twice"
         );
-        assert_eq!(dirty[0].body.as_ref().unwrap()["paths"][0]["path"], "src/a");
+        assert_eq!(
+            dirty[0].body.as_ref().unwrap()["paths"][0]["path"],
+            "src/café"
+        );
+        assert_eq!(
+            dirty[1].body.as_ref().unwrap()["paths"][0]["path"],
+            "src/straße"
+        );
+        assert_eq!(
+            dirty[2].body.as_ref().unwrap()["paths"][0]["path"],
+            "src/STRASSE"
+        );
         assert_eq!(
             dirty[0].body.as_ref().unwrap()["paths"][0]["owner_session"],
             "me"
@@ -6585,21 +6673,24 @@ mod tests {
         };
         wait_for("the later batches", || {
             rig.server.writes_to("/activity").len() >= 2
-                && later().contains("src/b")
-                && later().contains("src/c")
+                && later().contains("src/straße")
+                && later().contains("src/STRASSE")
         });
         let batches = rig.server.writes_to("/activity");
-        assert_eq!(batches[0].body.as_ref().unwrap()["paths"], json!(["src/a"]));
+        assert_eq!(
+            batches[0].body.as_ref().unwrap()["paths"],
+            json!(["src/café"])
+        );
         assert_eq!(batches.len(), 2, "pending writes form one later batch");
         let mut paths: Vec<String> =
             serde_json::from_value(batches[1].body.as_ref().unwrap()["paths"].clone()).unwrap();
         paths.sort();
-        assert_eq!(paths, ["src/a", "src/b", "src/c"]);
+        assert_eq!(paths, ["src/STRASSE", "src/café", "src/straße"]);
         assert!(batches.iter().all(|batch| batch.session == "me"));
         assert!(!later().contains("elsewhere"), "{}", later());
-        // Activity keeps counting repeated writes of src/a, which only the dirty report folds.
+        // Activity records the next batch even when the dirty path was already reported.
         let before = batches.len();
-        rig.daemon.handle(write("src/a"));
+        rig.daemon.handle(write("src/cafe\u{301}"));
         flush_due();
         wait_for("the next activity batch", || {
             rig.server.writes_to("/activity").len() == before + 1
@@ -6610,7 +6701,7 @@ mod tests {
                 .body
                 .as_ref()
                 .unwrap()["paths"],
-            json!(["src/a"])
+            json!(["src/café"])
         );
     }
 

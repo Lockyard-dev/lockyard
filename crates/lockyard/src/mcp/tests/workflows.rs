@@ -105,6 +105,35 @@
     }
 
     #[test]
+    fn start_work_forwards_task_lease_ttl_with_and_without_paths() {
+        for with_paths in [false, true] {
+            let dir = project();
+            let added = call(&dir, "lead", "task_add", json!({"title": "ttl regression"}));
+            let id = &added["structuredContent"]["id"];
+            assert!(id.is_string(), "{added}");
+            let mut args = json!({"task": id});
+            if with_paths {
+                args["paths"] = json!(["src"]);
+            }
+            for ttl in [0, 241] {
+                args["ttl"] = json!(ttl);
+                let result = compact_call(&dir, "worker", "start_work", args.clone());
+                assert_eq!(result["isError"], true, "start_work accepted ttl {ttl}: {result}");
+                assert_eq!(text(&result), "ttl must be 1 to 240 minutes");
+            }
+            let shown = compact_call(&dir, "worker", "tasks", json!({"action": "show", "id": id}));
+            assert_eq!(shown["structuredContent"]["task"]["status"], "open");
+            args["ttl"] = json!(1);
+            let result = compact_call(&dir, "worker", "start_work", args);
+            assert_eq!(result["isError"], false, "{}", text(&result));
+            let lease = &result["structuredContent"]["task"];
+            let until = lease["lease_until"].as_i64().unwrap();
+            let updated = lease["updated_at"].as_i64().unwrap();
+            assert_eq!(until - updated, 60_000, "{lease}");
+        }
+    }
+
+    #[test]
     fn compact_renewal_validates_optional_fence_and_bounds_ttl_in_minutes() {
         let dir = project();
         for (arguments, expected) in [
@@ -419,6 +448,93 @@
     }
 
     #[test]
+    fn mcp_ttl_uses_each_tools_contract() {
+        tool_registry()
+            .validate_fields("zone_queue", &json!({"ttl": 480}))
+            .unwrap();
+
+        let dir = project();
+        let result = call(
+            &dir,
+            "a",
+            "board_set",
+            json!({"key": "schedule", "value": "work", "ttl": 480}),
+        );
+        assert_eq!(result["isError"], false, "{}", text(&result));
+        let entry = &result["structuredContent"];
+        assert_eq!(
+            entry["expires_at"].as_i64().unwrap() - entry["updated_at"].as_i64().unwrap(),
+            480 * 60_000
+        );
+
+        let definitions = tools(Surface::Full);
+        for (name, min, max) in [
+            ("zone_queue", 1, 480),
+            ("board_set", 1, 43_200),
+            ("msg_send", 30, 1440),
+            ("start_work", 1, 240),
+            ("zone_renew", 1, 240),
+        ] {
+            let tool = definitions
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            let ttl = &tool["inputSchema"]["properties"]["ttl"];
+            assert_eq!(ttl["minimum"], min, "{name}");
+            assert_eq!(ttl["maximum"], max, "{name}");
+            assert!(ttl["description"].as_str().unwrap().contains("minutes"));
+            for outside in [min - 1, max + 1] {
+                let result = call(&dir, "a", name, json!({"ttl": outside}));
+                assert_eq!(result["isError"], true, "{name} accepted {outside}");
+                assert_eq!(text(&result), format!("ttl must be {min} to {max} minutes"));
+            }
+        }
+    }
+
+    #[test]
+    fn zone_claim_rejects_ttl_aliases_before_claiming() {
+        let dir = project();
+        for (alias, value) in [("ttl_minutes", 1), ("ttl_seconds", 60), ("duration", 1)] {
+            let result = call(
+                &dir,
+                "worker",
+                "zone_claim",
+                json!({"paths": ["src"], (alias): value}),
+            );
+            assert_eq!(result["isError"], true, "zone_claim accepted {alias}");
+            let message = text(&result);
+            assert!(
+                message.contains(alias) && message.contains("use ttl") && message.contains("minutes"),
+                "{message}"
+            );
+        }
+        let result = call(&dir, "other", "zone_claim", json!({"paths": ["src"], "ttl": 1}));
+        assert_eq!(result["isError"], false, "{}", text(&result));
+
+        for tool in tools(Surface::Full) {
+            let Some(ttl) = tool.pointer("/inputSchema/properties/ttl") else {
+                continue;
+            };
+            let name = tool["name"].as_str().unwrap();
+            let min = ttl["minimum"].as_i64().unwrap();
+            let max = ttl["maximum"].as_i64().unwrap();
+            for args in [
+                json!({"ttl_seconds": 60}), json!({"ttl": "10m"}),
+                json!({"ttl": min - 1}), json!({"ttl": max + 1}),
+            ] {
+                let error = tool_registry().validate_fields(name, &args).unwrap_err();
+                let message = error.to_string();
+                assert!(
+                    message.contains("minutes")
+                        && message.contains(&min.to_string())
+                        && message.contains(&max.to_string()),
+                    "{name}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn finish_work_accepts_claim_ids_with_or_without_the_zone_prefix() {
         let dir = project();
         call(&dir, "a", "zone_claim", json!({"paths": ["src"]}));
@@ -618,6 +734,21 @@
         assert_eq!(answer["free"], false);
         assert_eq!(answer["own"], true);
         assert_eq!(answer["holder"], "you");
+    }
+
+    #[test]
+    fn local_0100_r6_mcp_ownership_requires_full_coverage() {
+        let dir = project();
+        let claim = call(&dir, "alice", "zone_claim", json!({"paths": ["src/ſ.rs"]}));
+        assert_eq!(claim["isError"], false, "{claim}");
+        for (path, expected) in [
+            ("src", json!({"free": true})),
+            ("src/s.rs", json!({"free": false, "own": true, "holder": "you"})),
+        ] {
+            let reply = call(&dir, "alice", "zone_check", json!({"path": path}));
+            assert_eq!(reply["isError"], false, "{reply}");
+            assert_eq!(reply["structuredContent"], expected, "{path}");
+        }
     }
 
     #[test]

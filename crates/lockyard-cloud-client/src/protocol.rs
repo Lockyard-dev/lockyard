@@ -1,7 +1,10 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
 //! HTTP generation negotiation is independent of RPC frames and package versions.
-use crate::{ApiError, Call, Cancellation, Client, ClientError, Failure, WorkspaceEncryption};
+use crate::{
+    ApiError, Call, Cancellation, Client, ClientError, ContentEncryption, Failure,
+    WorkspaceEncryption,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -314,10 +317,10 @@ pub(crate) struct PendingSendGuard<'a> {
     state: &'a std::sync::Mutex<ProtocolState>,
     key: String,
     /// Directory whose flock serializes journal writes across processes. Held only while
-    /// mutating the journal or a short non-poll send — never for the whole long poll.
+    /// mutating the journal. HTTP and retry waits keep only the per-key lock.
     journal_dir: Option<&'a Path>,
     journal: Option<PendingFileLock>,
-    /// Per-key ownership survives releasing the shared journal during a long poll.
+    /// Per-key ownership survives releasing the shared journal during network work or backoff.
     operation: Option<PendingFileLock>,
 }
 
@@ -384,14 +387,34 @@ impl PendingSendGuard<'_> {
     }
 
     pub(crate) fn exchange<T>(&mut self, network: impl FnOnce() -> T) -> Result<T, ClientError> {
+        self.exchange_with_budget(None, None, network)
+    }
+
+    pub(crate) fn exchange_with_budget<T>(
+        &mut self,
+        budget: Option<Duration>,
+        cancellation: Option<&Cancellation>,
+        network: impl FnOnce() -> T,
+    ) -> Result<T, ClientError> {
+        let started = Instant::now();
         self.release_journal()?;
         let result = network();
-        self.wait_for_journal()?;
+        let left = budget.map_or(crate::MAX_RETRY_WAIT, |limit| {
+            limit.saturating_sub(started.elapsed())
+        });
+        self.wait_for_journal_with_budget(left, cancellation)?;
         Ok(result)
     }
 
-    fn wait_for_journal(&mut self) -> Result<(), ClientError> {
-        self.reacquire_journal(Duration::from_secs(5), |delay| {
+    fn wait_for_journal_with_budget(
+        &mut self,
+        budget: Duration,
+        cancellation: Option<&Cancellation>,
+    ) -> Result<(), ClientError> {
+        self.reacquire_journal(budget, |delay| {
+            if let Some(cancellation) = cancellation {
+                cancellation.check()?;
+            }
             std::thread::sleep(delay.min(Duration::from_millis(2)));
             Ok(())
         })
@@ -431,7 +454,7 @@ impl PendingSendGuard<'_> {
         }
     }
 
-    /// Re-take the flock before journal cleanup after a long poll. Retries inside `budget`.
+    /// Re-take the flock before mutating the journal. Retries inside `budget`.
     pub(crate) fn reacquire_journal(
         &mut self,
         budget: Duration,
@@ -959,7 +982,26 @@ impl Client {
         &self,
         key: &str,
     ) -> Result<PendingSendGuard<'_>, ClientError> {
-        let mut guard = self.reserve_pending_key(key)?;
+        self.claim_pending_send_observing(key, &mut SameKeyContention::default())
+    }
+
+    fn claim_pending_send_observing(
+        &self,
+        key: &str,
+        contention: &mut SameKeyContention,
+    ) -> Result<PendingSendGuard<'_>, ClientError> {
+        let mut guard = match self.reserve_pending_key(key) {
+            Ok(guard) => guard,
+            Err(error) => {
+                // Another call in this client holds the key. Keep its exact wire bytes
+                // when they are already journaled, so this call can resend them (LOCAL-0148).
+                contention.seen = true;
+                if contention.sibling.is_none() {
+                    contention.sibling = self.pending_operation(key);
+                }
+                return Err(error);
+            }
+        };
         if let Some(directory) = &self.pending_journal {
             guard.reacquire_journal(Duration::ZERO, |_| Ok(()))?;
             if directory
@@ -976,6 +1018,16 @@ impl Client {
                     .try_exists()
                     .map_err(journal_error)?
                 {
+                    contention.seen = true;
+                    if contention.sibling.is_none()
+                        && let Ok(row) =
+                            read_private_json::<PendingWrite>(&journal_path(directory, key))
+                        && row.key == key
+                        && row.origin == self.base_url
+                        && row.credential_scope == crate::credential_fingerprint(&self.token)
+                    {
+                        contention.sibling = Some(row);
+                    }
                     return Err(ClientError::JournalBusy);
                 }
                 if !active && !retry_cleanup {
@@ -1061,7 +1113,16 @@ impl Client {
                         return Ok(guard);
                     }
                     if let Some(pending) = observed.or_else(|| self.pending_operation(key)) {
-                        return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+                        // Another client finished this key. Its row is gone, so never write it
+                        // back; the caller resends these exact bytes and the server answers
+                        // from its Idempotency-Key receipt (LOCAL-0148).
+                        self.protocol_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .pending
+                            .remove(key);
+                        contention.seen = true;
+                        contention.sibling.get_or_insert(pending);
                     }
                 }
                 Err(error) => return Err(journal_error(error)),
@@ -1118,7 +1179,7 @@ impl Client {
         self
     }
 
-    /// Prepare and attest new wire bodies for a long-lived client.
+    /// Prepare and attest new wire bodies, and discover the read context for a long-lived client.
     pub fn with_live_write_encryption_policy(mut self) -> Self {
         self.check_live_write_encryption_policy = true;
         self.with_pending_encryption_policy()
@@ -1456,7 +1517,8 @@ impl Client {
         let left = || budget.saturating_sub(started.elapsed());
         loop {
             guard.release_journal()?;
-            let repair = self.repair_pending_for_capacity(left().min(Duration::from_secs(2)));
+            let repair = self
+                .repair_pending_for_capacity(Instant::now() + left().min(Duration::from_secs(2)));
             if matches!(repair, Err(ClientError::JournalBusy)) {
                 std::thread::sleep(left().min(Duration::from_millis(25)));
             }
@@ -1559,18 +1621,14 @@ impl Client {
 
     /// Resolve the current generation without performing any write or changing origin.
     pub fn negotiated_protocol(&self, session: &str) -> Result<NegotiatedProtocol, ClientError> {
-        self.discover(session, None, None)
+        self.discover(session, None, None, false)
     }
 
     pub(crate) fn refresh_protocol(
         &self,
         session: &str,
     ) -> Result<NegotiatedProtocol, ClientError> {
-        self.protocol_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cached = None;
-        self.discover(session, None, None)
+        self.discover(session, None, None, true)
     }
 
     fn discover(
@@ -1578,17 +1636,30 @@ impl Client {
         session: &str,
         remaining: Option<Duration>,
         cancellation: Option<&Cancellation>,
+        refresh: bool,
     ) -> Result<NegotiatedProtocol, ClientError> {
         let started = Instant::now();
-        // Discovery is shared by concurrent status workers. Waiting for another thread's
-        // discovery is part of this caller's deadline, including a long unrelated request.
-        let mut state = if remaining.is_some() || cancellation.is_some() {
+        let cached = || {
+            self.protocol_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cached
+                .as_ref()
+                .filter(|cached| cached.obtained.elapsed() < CACHE_TTL)
+                .map(|cached| cached.value.clone())
+        };
+        if !refresh && let Some(value) = cached() {
+            return Ok(value);
+        }
+        // Serialize discovery without holding the pending journal state mutex over HTTP.
+        // A sibling can still use a fresh cached protocol while a forced refresh is in flight.
+        let _discovery = if remaining.is_some() || cancellation.is_some() {
             loop {
                 if let Some(cancellation) = cancellation {
                     cancellation.check()?;
                 }
-                match self.protocol_state.try_lock() {
-                    Ok(state) => break state,
+                match self.protocol_discovery.try_lock() {
+                    Ok(lock) => break lock,
                     Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
                     Err(std::sync::TryLockError::WouldBlock) => {
                         let left = remaining
@@ -1604,14 +1675,12 @@ impl Client {
                 }
             }
         } else {
-            self.protocol_state
+            self.protocol_discovery
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         };
-        if let Some(cached) = &state.cached
-            && cached.obtained.elapsed() < CACHE_TTL
-        {
-            return Ok(cached.value.clone());
+        if !refresh && let Some(value) = cached() {
+            return Ok(value);
         }
         let mut call = Call::get(session, DISCOVERY.into());
         call.cancellation = cancellation.cloned();
@@ -1652,7 +1721,10 @@ impl Client {
                         result.capabilities.insert(crate::MAIL_OPEN_V1.into());
                     }
                     self.save_status_protocol_hint(&result);
-                    state.cached = Some(CachedProtocol {
+                    self.protocol_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .cached = Some(CachedProtocol {
                         value: result.clone(),
                         obtained: Instant::now(),
                     });
@@ -1732,7 +1804,10 @@ impl Client {
                             "legacy encryption policy values are invalid",
                         ));
                     }
-                    state.cached = Some(CachedProtocol {
+                    self.protocol_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .cached = Some(CachedProtocol {
                         value: legacy.clone(),
                         obtained: Instant::now(),
                     });
@@ -1747,12 +1822,15 @@ impl Client {
         ))
     }
 
-    fn feature_gate(&self, call: &Call, protocol: &NegotiatedProtocol) -> Result<(), ClientError> {
+    fn feature_gate(
+        &self,
+        call: &Call,
+        protocol: &NegotiatedProtocol,
+        encryption_enabled: bool,
+    ) -> Result<(), ClientError> {
         let route = call.path.split('?').next().unwrap_or(&call.path);
         let required = if route == "/api/v1/zones/catalog"
-            && (call.is_write()
-                || self.encryption_enabled
-                || self.expected_e2ee_workspace.is_some())
+            && (call.is_write() || encryption_enabled || self.expected_e2ee_workspace.is_some())
         {
             Some(("zone_catalog_v1", 2))
         } else if route == "/api/v1/revocations" || route.starts_with("/api/v1/revocations/") {
@@ -1858,6 +1936,32 @@ impl Client {
         call: &Call,
         registry_capability: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Value, ClientError> {
+        let mut resent_after_contention = false;
+        let result =
+            self.call_negotiated_inner(call, registry_capability, &mut resent_after_contention);
+        match result {
+            // The key was already used by a same-key sibling whose bytes this call never saw
+            // (a fresh encryption differs). The server applied that sibling's write at most once;
+            // this caller reconciles by key instead of reading a conflict (LOCAL-0148).
+            Err(error) if resent_after_contention && idempotency_key_reused(&error) => {
+                let key = call.key.clone().unwrap_or_default();
+                Err(ClientError::Protocol(Problem {
+                    status: None,
+                    code: "outcome_unknown".into(),
+                    detail: format!("Reconcile the mutation outcome using Idempotency-Key {key}"),
+                    details: json!({"idempotency_key": key}),
+                }))
+            }
+            other => other,
+        }
+    }
+
+    fn call_negotiated_inner(
+        &self,
+        call: &Call,
+        registry_capability: Option<&std::sync::atomic::AtomicBool>,
+        resent_after_contention: &mut bool,
+    ) -> Result<Value, ClientError> {
         call.check_cancelled()?;
         if call.is_write() && call.key.as_deref().is_none_or(str::is_empty) {
             return Err(ClientError::Invalid(
@@ -1877,6 +1981,7 @@ impl Client {
             .key
             .as_deref()
             .and_then(|key| self.pending_operation(key));
+        let mut contention = SameKeyContention::default();
         let mut send_guard = if call.is_write() {
             let key = call.key.as_deref().expect("validated write key");
             // The flock is local and pre-send: wait inside the call deadline without starting a
@@ -1888,7 +1993,7 @@ impl Client {
             let mut delay = Duration::from_millis(25);
             loop {
                 call.check_cancelled()?;
-                match self.claim_pending_send(key) {
+                match self.claim_pending_send_observing(key, &mut contention) {
                     Ok(guard) => break Some(guard),
                     Err(error) if journal_busy(&error) => {
                         let left = budget.saturating_sub(started.elapsed());
@@ -1905,18 +2010,34 @@ impl Client {
         } else {
             None
         };
-        if let Some(value) = self.settled_response(call)? {
+        if let Some(guard) = send_guard.as_mut()
+            && let Some(value) = self.settled_response(call, guard, &remaining)?
+        {
             return Ok(value);
         }
         if let Some(key) = &call.key
             && let Some(pending) = self.pending_operation(key)
             && let Some(guard) = send_guard.as_mut()
         {
-            return self.replay_pending(call, pending, guard);
+            return self.replay_pending(call, pending, guard, &remaining);
         }
         if let Some(pending) = observed_pending {
-            return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+            if send_guard.is_none() {
+                return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+            }
+            contention.seen = true;
+            contention.sibling.get_or_insert(pending);
         }
+        if let Some(sibling) = contention.sibling.take()
+            && let Some(guard) = send_guard.as_mut()
+        {
+            // Its row is gone: the same-key sender finished. Resend its exact bytes; the
+            // server returns the stored receipt for this Idempotency-Key (LOCAL-0148).
+            return self.replay_sibling_receipt(call, sibling, guard, &remaining);
+        }
+        // Same-key contention without visible bytes: a new send is safe because the server
+        // replays a matching receipt or refuses a different body for the same key.
+        *resent_after_contention = contention.seen;
         let route = call.path.split('?').next().unwrap_or(&call.path);
         if !route.starts_with('/')
             || route.starts_with("//")
@@ -1940,52 +2061,91 @@ impl Client {
             crate::crypto::validate_required_route(&call.method, &call.path)
                 .map_err(ClientError::Invalid)?;
         }
+        // Initial discovery and policy lookup may block. Reserve the operation key,
+        // then give other writers access to the journal until this call has wire bytes.
+        if let Some(guard) = send_guard.as_mut() {
+            guard.release_journal()?;
+        }
         let request_digest = crate::request_identity(call);
-        let mut protocol =
-            match self.discover(&call.session, remaining(), call.cancellation.as_ref()) {
-                Ok(protocol) => protocol,
-                Err(error @ ClientError::Transport(_)) => {
+        let mut protocol = match self.discover(
+            &call.session,
+            remaining(),
+            call.cancellation.as_ref(),
+            false,
+        ) {
+            Ok(protocol) => protocol,
+            Err(error @ ClientError::Transport(_)) => {
+                if let Some(cached) = self.catalog_offline_call(call)? {
+                    return Ok(cached);
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        // A logical call, including one restored from the daemon's outbox, gets
+        // its first wire body under the live policy before it enters the HTTP journal.
+        let live_write =
+            self.check_live_write_encryption_policy && call.is_write() && call.body.is_some();
+        let policy_read = call.method == "GET" && route == crate::ENCRYPTION_PATH;
+        let current = (!live_write && !policy_read).then(|| self.current_content_encryption());
+        let live = if live_write
+            || (self.check_live_write_encryption_policy
+                && !policy_read
+                && (self.live_encryption_setting().is_none()
+                    || matches!(route, "/api/v1/zones/catalog" | "/api/v1/events")
+                    || current.as_ref().is_some_and(Result::is_err)))
+        {
+            match self.live_replay_encryption(
+                self,
+                remaining()
+                    .unwrap_or(crate::MAX_RETRY_WAIT)
+                    .min(Duration::from_secs(2)),
+                call.cancellation.as_ref(),
+            ) {
+                Ok(setting) => setting,
+                Err(error @ ClientError::Transport(_)) if !call.is_write() => {
                     if let Some(cached) = self.catalog_offline_call(call)? {
                         return Ok(cached);
                     }
                     return Err(error);
                 }
                 Err(error) => return Err(error),
-            };
-        self.feature_gate(call, &protocol)?;
-        let prepared = self.prepare_catalog_call(call)?;
-        let call = &prepared;
-        // A logical call, including one restored from the daemon's outbox, gets
-        // its first wire body under the live policy before it enters the HTTP journal.
-        let live_write =
-            self.check_live_write_encryption_policy && call.is_write() && call.body.is_some();
-        let live = if live_write {
-            self.live_replay_encryption(
-                self,
-                remaining()
-                    .unwrap_or(crate::MAX_RETRY_WAIT)
-                    .min(Duration::from_secs(2)),
-                call.cancellation.as_ref(),
-            )?
+            }
         } else {
             None
         };
-        // Share the request's content context with response decryption.
-        let (workspace, content_key, encryption_enabled, encryption_context) =
-            if let Some(setting) = &live {
-                let (key, enabled) = self.validate_content_encryption(setting)?;
-                let key_id = key.as_ref().map(crate::WorkspaceKey::key_id);
-                let workspace = Some(setting.workspace_id.as_str());
-                let context = self.encryption_context_for(workspace, key_id.as_deref(), enabled);
-                (workspace, key, enabled, context)
-            } else {
-                (
-                    self.workspace.as_deref(),
-                    self.resolved_content_key()?,
-                    self.encryption_enabled,
-                    self.encryption_context(),
-                )
-            };
+        // Snapshot one workspace and key for preparation and response verification.
+        let encryption = if policy_read {
+            ContentEncryption {
+                workspace: None,
+                key: None,
+                enabled: false,
+            }
+        } else if let Some(setting) = live {
+            // The policy GET may have had to renegotiate before it completed.
+            protocol = self.discover(
+                &call.session,
+                remaining(),
+                call.cancellation.as_ref(),
+                false,
+            )?;
+            self.content_encryption_from(setting)?
+        } else {
+            current.unwrap_or_else(|| self.current_content_encryption())?
+        };
+        let workspace = encryption.workspace.as_deref();
+        let content_key = encryption.key.as_ref();
+        let encryption_enabled = encryption.enabled;
+        self.feature_gate(call, &protocol, encryption_enabled)?;
+        let key_id = content_key.map(crate::WorkspaceKey::key_id);
+        let encryption_context = if live_write {
+            self.encryption_context_for(workspace, key_id.as_deref(), encryption_enabled)
+        } else {
+            self.encryption_context()
+        };
+        // Seal the catalog with the same live workspace and key used to verify its reply.
+        let prepared = self.prepare_catalog_call(call, workspace, content_key)?;
+        let call = &prepared;
         let mut body = call.body.clone();
         // 579d557 requires mode. Only LC-0019 servers advertising this capability
         // may choose their own default. Freeze the selected wire bytes for retries.
@@ -2022,7 +2182,7 @@ impl Client {
                 &call.method,
                 &call.path,
                 workspace,
-                content_key.as_ref(),
+                content_key,
                 encryption_enabled,
                 self.expected_e2ee_workspace.is_some(),
                 Some(&identity_context),
@@ -2081,40 +2241,39 @@ impl Client {
                 result_retry_at: None,
             });
             if let Some(pending) = &pending {
+                let guard = send_guard.as_mut().expect("write guard");
+                guard.reacquire_journal(remaining().unwrap_or(crate::MAX_RETRY_WAIT), |pause| {
+                    call.wait(pause)
+                })?;
                 if let Some(previous) = refused_pending.take() {
                     self.verify_pending_replay_encryption(
                         &previous,
-                        send_guard.as_mut().expect("write guard"),
+                        guard,
                         remaining(),
                         call.cancellation.as_ref(),
                     )?;
                     self.update_pending(&previous, pending.clone())?;
                 } else {
-                    if maintenance::uses_replay_budget(pending)
-                        && let Some(guard) = send_guard.as_mut()
-                    {
+                    if maintenance::uses_replay_budget(pending) {
                         self.repair_before_admission(
                             guard,
                             serde_json::to_vec(pending).map_err(journal_error)?.len(),
                             remaining().unwrap_or(crate::MAX_RETRY_WAIT),
                         )?;
                     }
+                    if remaining().is_some_and(|limit| limit.is_zero()) {
+                        return Err(ClientError::Transport("call deadline elapsed".into()));
+                    }
                     self.retain_pending(pending.clone())?;
                     if attempt > 1 {
                         self.verify_pending_replay_encryption(
                             pending,
-                            send_guard.as_mut().expect("write guard"),
+                            guard,
                             remaining(),
                             call.cancellation.as_ref(),
                         )?;
                     }
                 }
-            }
-            // zone wait / long poll can sit on the server for tens of seconds; holding the
-            // local write journal that whole time deadlocks sibling release / finish_work.
-            if call.long_poll
-                && let Some(guard) = send_guard.as_mut()
-            {
                 guard.release_journal()?;
             }
             let result = match &pending {
@@ -2138,20 +2297,26 @@ impl Client {
             };
             let failure = match result {
                 Ok(mut value) => {
-                    let journal_owned = !call.long_poll
-                        || send_guard.as_mut().is_none_or(|guard| {
-                            guard
-                                .reacquire_journal(
-                                    remaining().unwrap_or(crate::MAX_RETRY_WAIT),
-                                    |pause| call.wait(pause),
-                                )
-                                .is_ok()
-                        });
+                    let journal_owned = match &mut send_guard {
+                        Some(guard) => match guard.reacquire_journal(
+                            remaining().unwrap_or(crate::MAX_RETRY_WAIT),
+                            |pause| call.wait(pause),
+                        ) {
+                            Ok(()) => true,
+                            Err(error) if call.long_poll || journal_busy(&error) => false,
+                            Err(_) => {
+                                return Err(ClientError::OutcomeUnknown(Box::new(
+                                    pending.expect("write pending record"),
+                                )));
+                            }
+                        },
+                        None => true,
+                    };
                     // Authenticate/decrypt the response before releasing its recovery record.
                     let event_page = call.method == "GET"
                         && call.path.split('?').next() == Some("/api/v1/events");
                     if event_page {
-                        self.decode_json_events(&mut value)?;
+                        self.decode_json_events(&mut value, &encryption)?;
                     }
                     if !event_page
                         && let Some(workspace) = workspace
@@ -2160,7 +2325,7 @@ impl Client {
                             &call.method,
                             &call.path,
                             workspace,
-                            content_key.as_ref(),
+                            content_key,
                             false,
                             self.expected_e2ee_workspace.is_some(),
                         )
@@ -2183,7 +2348,13 @@ impl Client {
                         encryption_enabled,
                         &mut value,
                     );
-                    if let Err(error) = self.finish_catalog_call(call, &mut value) {
+                    if let Err(error) = self.finish_catalog_call(
+                        call,
+                        &mut value,
+                        workspace,
+                        content_key,
+                        encryption_enabled,
+                    ) {
                         if let Some(pending) = pending {
                             if !journal_owned {
                                 return Err(ClientError::OutcomeUnknown(Box::new(pending)));
@@ -2204,19 +2375,16 @@ impl Client {
                             return Ok(value);
                         }
                         if let Err(error) = self.resolve_pending(&pending.key) {
-                            if call.long_poll {
-                                self.complete_pending_later(&pending);
-                                return Ok(value);
+                            if !call.long_poll {
+                                return Err(error);
                             }
-                            return Err(error);
+                            self.complete_pending_later(&pending);
                         }
                     }
                     return Ok(value);
                 }
                 Err(failure) => {
-                    if call.long_poll
-                        && let Some(guard) = send_guard.as_mut()
-                    {
+                    if let Some(guard) = send_guard.as_mut() {
                         let budget = remaining().unwrap_or(crate::MAX_RETRY_WAIT);
                         if guard
                             .reacquire_journal(budget, |pause| call.wait(pause))
@@ -2309,11 +2477,11 @@ impl Client {
             {
                 replica_changed = true;
                 self.invalidate_status_protocol_hint();
-                self.protocol_state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .cached = None;
-                protocol = self.discover(&call.session, remaining(), call.cancellation.as_ref())?;
+                if let Some(guard) = send_guard.as_mut() {
+                    guard.release_journal()?;
+                }
+                protocol =
+                    self.discover(&call.session, remaining(), call.cancellation.as_ref(), true)?;
                 if call.path.contains("&assignee_session=")
                     && let Some(capability) = registry_capability
                     && !protocol
@@ -2323,7 +2491,7 @@ impl Client {
                     capability.store(false, std::sync::atomic::Ordering::Relaxed);
                     return Err(error);
                 }
-                self.feature_gate(call, &protocol)?;
+                self.feature_gate(call, &protocol, encryption_enabled)?;
                 continue;
             }
             let temporary = error
@@ -2350,7 +2518,13 @@ impl Client {
             {
                 return Err(error);
             }
-            call.wait(crate::retry_wait(&error, delay))?;
+            let wait = crate::retry_wait(&error, delay);
+            if let Some(guard) = send_guard.as_mut() {
+                // The refusal or removal is durable. The next iteration retakes the
+                // journal under the same deadline to update or insert the pending row.
+                guard.release_journal()?;
+            }
+            call.wait(wait)?;
             delay *= 2;
         }
         Err(local(
@@ -2366,6 +2540,7 @@ impl Client {
         call: &Call,
         mut pending: PendingWrite,
         guard: &mut PendingSendGuard<'_>,
+        remaining: &dyn Fn() -> Option<Duration>,
     ) -> Result<Value, ClientError> {
         let refused = pending.pre_execution_rejected;
         if !maintenance::eligible_for_recovery(&pending)
@@ -2383,11 +2558,6 @@ impl Client {
         wire.session = pending.session.clone();
         wire.repository = pending.repository.clone();
         wire.key = Some(pending.key.clone());
-        let replay_started = Instant::now();
-        let remaining = || {
-            call.deadline_ms
-                .map(|ms| Duration::from_millis(ms).saturating_sub(replay_started.elapsed()))
-        };
         if remaining().is_some_and(|limit| limit.is_zero()) {
             return Err(ClientError::OutcomeUnknown(Box::new(pending)));
         }
@@ -2409,6 +2579,9 @@ impl Client {
         {
             return Err(ClientError::OutcomeUnknown(Box::new(pending)));
         }
+        if remaining().is_some_and(|limit| limit.is_zero()) {
+            return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+        }
         if refused {
             let previous = pending.clone();
             pending.pre_execution_rejected = false;
@@ -2419,11 +2592,13 @@ impl Client {
         }
         // No discovery, route preparation or encryption: those would mutate the operation.
         // A refusal after an originally unknown attempt cannot prove that earlier write failed.
-        let budget = remaining().unwrap_or(Duration::from_secs(5));
-        let mut value = match guard.exchange(|| {
+        let result = guard.exchange_with_budget(remaining(), call.cancellation.as_ref(), || {
             let start = Instant::now();
-            self.reconcile_wire(&wire, &pending, || budget.saturating_sub(start.elapsed()))
-        })? {
+            self.reconcile_wire(&wire, &pending, || {
+                remaining().unwrap_or_else(|| crate::MAX_RETRY_WAIT.saturating_sub(start.elapsed()))
+            })
+        })?;
+        let mut value = match result {
             Ok(value) => value,
             Err(error) => {
                 if error.code() == Some(maintenance::ENCRYPTION_MISMATCH) {
@@ -2464,11 +2639,84 @@ impl Client {
             &pending,
             &mut value,
             live_write.then_some(&encryption),
+            true,
         )?;
         if !call.defer_pending_ack {
             self.resolve_pending(&pending.key)?;
         }
         // The agent acknowledges only after its outbox completion marker is durable.
+        Ok(value)
+    }
+
+    /// A same-key sender finished and retired its journal row. Resend its exact bytes under
+    /// this call's key guard; the server answers from its Idempotency-Key receipt. The row is
+    /// never recreated: every failure is an unknown outcome reconciled by key (LOCAL-0148).
+    fn replay_sibling_receipt(
+        &self,
+        call: &Call,
+        mut pending: PendingWrite,
+        guard: &mut PendingSendGuard<'_>,
+        remaining: &dyn Fn() -> Option<Duration>,
+    ) -> Result<Value, ClientError> {
+        let unknown = |mut pending: PendingWrite, cause: &str, status: Option<u16>| {
+            pending.cause_code = cause.into();
+            pending.cause_status = status;
+            ClientError::OutcomeUnknown(Box::new(pending))
+        };
+        if !maintenance::eligible_for_recovery(&pending)
+            || pending.request_digest.as_deref() != Some(crate::request_identity(call).as_str())
+            || pending.method != call.method
+            || pending.request_path != call.path
+            || pending.origin != self.base_url
+            || pending.credential_scope != crate::credential_fingerprint(&self.token)
+            || remaining().is_some_and(|limit| limit.is_zero())
+        {
+            return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+        }
+        let live_write = self.check_live_write_encryption_policy;
+        if pending.encryption_context.is_none()
+            || (!live_write
+                && (!self.pending_encryption_context_ready()
+                    || pending.encryption_context.as_deref()
+                        != Some(self.encryption_context().as_str())))
+        {
+            return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+        }
+        let encryption = self.verify_sibling_replay_encryption(
+            &pending,
+            guard,
+            remaining(),
+            call.cancellation.as_ref(),
+        )?;
+        let mut wire = call.clone();
+        wire.method = pending.method.clone();
+        wire.path = pending.path.clone();
+        wire.session = pending.session.clone();
+        wire.repository = pending.repository.clone();
+        wire.key = Some(pending.key.clone());
+        let result = guard.exchange_with_budget(remaining(), call.cancellation.as_ref(), || {
+            let start = Instant::now();
+            self.reconcile_wire(&wire, &pending, || {
+                remaining().unwrap_or_else(|| crate::MAX_RETRY_WAIT.saturating_sub(start.elapsed()))
+            })
+        })?;
+        let mut value = match result {
+            Ok(value) => value,
+            Err(error) => {
+                let cause = error.code().unwrap_or("outcome_unknown").to_owned();
+                if cause == "protocol_response_invalid" {
+                    pending.diagnostic = Some(error.to_string());
+                }
+                return Err(unknown(pending, &cause, error.status()));
+            }
+        };
+        self.decode_pending_response(
+            call,
+            &pending,
+            &mut value,
+            live_write.then_some(&encryption),
+            false,
+        )?;
         Ok(value)
     }
 
@@ -2487,8 +2735,20 @@ impl Client {
         call: &Call,
         pending: &PendingWrite,
         value: &mut Value,
-        encryption: Option<&maintenance::ReplayEncryption>,
+        encryption: Option<&ContentEncryption>,
+        journaled: bool,
     ) -> Result<(), ClientError> {
+        // A retired sibling row is never written back: report the unknown outcome only.
+        let unknown = |cause: &str, status: Option<u16>| {
+            if journaled {
+                self.unknown(pending.clone(), cause, status)
+            } else {
+                let mut pending = pending.clone();
+                pending.cause_code = cause.into();
+                pending.cause_status = status;
+                ClientError::OutcomeUnknown(Box::new(pending))
+            }
+        };
         let (workspace, held, enabled) = match encryption {
             Some(encryption) => (
                 encryption.workspace.as_deref(),
@@ -2517,15 +2777,16 @@ impl Client {
             } else {
                 "content_authentication_failed"
             };
-            return Err(self.unknown(pending.clone(), cause, None));
+            return Err(unknown(cause, None));
         }
         crate::commit_evidence::warn_if_sha_missing(call, enabled, value);
-        if let Err(error) = self.finish_catalog_call(call, value) {
+        if let Err(error) = self.finish_catalog_call(call, value, workspace, held.as_ref(), enabled)
+        {
             let cause = error
                 .code()
                 .unwrap_or("catalog_authentication_failed")
                 .to_owned();
-            return Err(self.unknown(pending.clone(), &cause, error.status()));
+            return Err(unknown(&cause, error.status()));
         }
         Ok(())
     }
@@ -2551,6 +2812,24 @@ impl Client {
         }
         ClientError::OutcomeUnknown(Box::new(pending))
     }
+}
+
+/// What one call learned about another call holding its Idempotency-Key (LOCAL-0148).
+#[derive(Default)]
+struct SameKeyContention {
+    /// Another call or client held this key while this call waited.
+    seen: bool,
+    /// Its exact journaled wire bytes, when they were visible.
+    sibling: Option<PendingWrite>,
+}
+
+/// The server refused this body because the key already belongs to another request.
+/// Coordination answers `conflict` and the registry its own code with the same text.
+fn idempotency_key_reused(error: &ClientError) -> bool {
+    const TEXT: &str = "Idempotency-Key was used for another request";
+    error.status() == Some(409)
+        && (error.code() == Some("idempotency_conflict")
+            || error.api_error().is_some_and(|api| api.message.contains(TEXT)))
 }
 
 fn failure_error(failure: Failure) -> ClientError {

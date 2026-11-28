@@ -760,9 +760,15 @@ impl<T: Transport + ?Sized> Transport for Arc<T> {
     }
 }
 
-/// HTTP transport. The token is passed in by the caller and never stored by this crate.
 type ReplicaResolver = Box<dyn Fn(Option<&str>, Option<&str>) -> Option<String> + Send + Sync>;
 
+pub(crate) struct ContentEncryption {
+    enabled: bool,
+    workspace: Option<String>,
+    key: Option<WorkspaceKey>,
+}
+
+/// HTTP transport. The token is passed in by the caller and never stored by this crate.
 pub struct Client {
     base_url: String,
     token: String,
@@ -772,9 +778,11 @@ pub struct Client {
     content_key: Option<WorkspaceKey>,
     /// Key id from the workspace encryption setting; disk keys must match when set.
     expected_key_id: Option<String>,
+    live_encryption: Mutex<Option<WorkspaceEncryption>>,
     encryption_enabled: bool,
     expected_e2ee_workspace: Option<String>,
     protocol_state: std::sync::Mutex<protocol::ProtocolState>,
+    protocol_discovery: Mutex<()>,
     registry_auto_area_observed: AtomicBool,
     mail_open_v1_observed: AtomicBool,
     pending_journal: Option<std::path::PathBuf>,
@@ -1063,9 +1071,11 @@ impl Client {
             workspace: None,
             content_key: None,
             expected_key_id: None,
+            live_encryption: Mutex::default(),
             encryption_enabled: false,
             expected_e2ee_workspace,
             protocol_state: std::sync::Mutex::new(protocol::ProtocolState::default()),
+            protocol_discovery: Mutex::default(),
             registry_auto_area_observed: AtomicBool::new(false),
             mail_open_v1_observed: AtomicBool::new(false),
             pending_journal: None,
@@ -1147,6 +1157,36 @@ impl Client {
         self.content_key = key;
         self.encryption_enabled = enabled;
         self
+    }
+
+    fn live_encryption_setting(&self) -> Option<WorkspaceEncryption> {
+        self.live_encryption
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn content_encryption_from(
+        &self,
+        setting: WorkspaceEncryption,
+    ) -> Result<ContentEncryption, ClientError> {
+        let (key, enabled) = self.validate_content_encryption(&setting)?;
+        Ok(ContentEncryption {
+            workspace: Some(setting.workspace_id),
+            key,
+            enabled,
+        })
+    }
+
+    fn current_content_encryption(&self) -> Result<ContentEncryption, ClientError> {
+        if let Some(setting) = self.live_encryption_setting() {
+            return self.content_encryption_from(setting);
+        }
+        Ok(ContentEncryption {
+            workspace: self.workspace.clone(),
+            key: self.resolved_content_key()?,
+            enabled: self.encryption_enabled,
+        })
     }
 
     /// With a known key id, matching memory avoids disk I/O. Without a setting, reload
@@ -1545,8 +1585,13 @@ impl Client {
                         .is_some_and(|header| {
                             header.split(',').any(|part| part.trim() == MAIL_OPEN_V1)
                         });
-                let mut value = decode_for_call(response, call, self.encryption_enabled)
-                    .map_err(Failure::Retry)?;
+                let required_catalog = self
+                    .live_encryption_setting()
+                    .map_or(self.encryption_enabled, |setting| {
+                        setting.encryption == "required"
+                    });
+                let mut value =
+                    decode_for_call(response, call, required_catalog).map_err(Failure::Retry)?;
                 call.check_cancelled().map_err(Failure::Final)?;
                 // Only the latest successful response confirms support. Discovery may
                 // advertise it in its body alone; ordinary responses must confirm it in
@@ -1721,15 +1766,17 @@ impl Client {
                 {
                     echo.map_err(Failure::Final)?;
                 }
-                if let Some(workspace) = self.workspace.as_deref() {
-                    let held = self.resolved_content_key().map_err(Failure::Final)?;
-                    crypto::transform_error_details(
-                        &mut api_error.details,
-                        workspace,
-                        held.as_ref(),
-                        self.expected_e2ee_workspace.is_some(),
-                    )
-                    .map_err(|message| Failure::Final(ClientError::Invalid(message)))?;
+                if !(call.method == "GET" && call.path == ENCRYPTION_PATH) {
+                    let encryption = self.current_content_encryption().map_err(Failure::Final)?;
+                    if let Some(workspace) = encryption.workspace.as_deref() {
+                        crypto::transform_error_details(
+                            &mut api_error.details,
+                            workspace,
+                            encryption.key.as_ref(),
+                            self.expected_e2ee_workspace.is_some(),
+                        )
+                        .map_err(|message| Failure::Final(ClientError::Invalid(message)))?;
+                    }
                 }
                 if self.expected_e2ee_workspace.is_some() {
                     // Error messages are server-authored text, not authenticated application content.
@@ -2458,7 +2505,7 @@ mod tests {
     fn status_cancellation_interrupts_shared_protocol_discovery_wait() {
         let server = FakeServer::start(Vec::new());
         let client = Client::new(&server.url(), "fixture".into()).unwrap();
-        let _discovery_in_flight = client.protocol_state.lock().unwrap();
+        let _discovery_in_flight = client.protocol_discovery.lock().unwrap();
         let cancellation = Cancellation::new();
         let mut call = Call::get("me", "/api/v1/zones/claims".into());
         call.cancellation = Some(cancellation.clone());

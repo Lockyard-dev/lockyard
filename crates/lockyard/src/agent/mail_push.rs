@@ -1,18 +1,24 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
 use super::*;
-use lockyard_core::proto::Event;
-use std::collections::BTreeMap;
+use lockyard_core::proto::{Event, parse_rfc3339};
+use lockyard_core::repository::qualify;
+use std::collections::{BTreeMap, hash_map::Entry};
+
+const MAX_ZONE_ALERTS: usize = 256;
+const MAX_ZONE_ALERT_VERSIONS: usize = 1_024;
 
 #[derive(Default)]
 pub(super) struct PushState {
     epoch: u64,
     zone_alerts: HashMap<String, BTreeMap<i64, lockyard_core::proto::LostClaim>>,
-    zone_alert_versions: HashMap<(String, i64), i64>,
-    status_claims: HashMap<String, HashSet<i64>>,
+    zone_alert_versions: HashMap<String, ZoneAlertVersions>,
+    status_claims: HashMap<(String, Option<String>), HashSet<i64>>,
     local_zone_mutations: HashMap<(String, i64), Vec<LocalZoneMutation>>,
     next_zone_mutation: u64,
-    seen_claims: HashMap<String, HashSet<i64>>,
+    // Pending acquisitions still need coverage, the case policy or a successful /lost snapshot.
+    seen_claims: HashMap<String, HashMap<i64, Option<Acquisition>>>,
+    // Receipt times control alert expiry independently of loss ordering.
     zone_alert_times: HashMap<(String, i64), Instant>,
     replacement: Option<Replacement>,
     #[cfg(test)]
@@ -39,6 +45,211 @@ impl PushState {
         }
         Instant::now()
     }
+
+    fn record_acquisition(
+        &mut self,
+        session: &str,
+        id: i64,
+        fold_case: Option<bool>,
+        acquired_at: Option<i64>,
+        coverage_known: bool,
+        wait_for_lost: bool,
+    ) -> Option<Acquisition> {
+        let acquisition = Acquisition {
+            observed_at: self.now(),
+            acquired_at: acquired_at.unwrap_or_else(now_ms),
+            coverage_known,
+            waiting_for_lost: wait_for_lost,
+        };
+        let seen = self.seen_claims.entry(session.into()).or_default();
+        match seen.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert(
+                    (!coverage_known || fold_case.is_none() || wait_for_lost)
+                        .then_some(acquisition),
+                );
+                coverage_known.then_some(acquisition)
+            }
+            // Completing the acquisition details keeps the original acquisition time.
+            Entry::Occupied(mut entry) => {
+                let pending = entry.get_mut().as_mut()?;
+                pending.waiting_for_lost |= wait_for_lost;
+                if !coverage_known {
+                    return None;
+                }
+                let coverage_arrived = !pending.coverage_known;
+                pending.coverage_known = true;
+                if wait_for_lost {
+                    Some(*pending)
+                } else if pending.waiting_for_lost {
+                    None
+                } else if fold_case.is_some() {
+                    entry.get_mut().take()
+                } else {
+                    coverage_arrived.then_some(*pending)
+                }
+            }
+        }
+    }
+
+    fn clear_reclaimed_alerts(
+        &mut self,
+        session: &str,
+        new_id: i64,
+        paths: &[String],
+        excluded: &[String],
+        fold_case: Option<bool>,
+        acquisition: Acquisition,
+    ) {
+        if let Some(alerts) = self.zone_alerts.get_mut(session) {
+            let times = &self.zone_alert_times;
+            let versions = self.zone_alert_versions.get(session);
+            alerts.retain(|id, alert| {
+                let key = (session.into(), *id);
+                let from_lost = versions
+                    .and_then(|versions| versions.entries.get(id))
+                    .is_some_and(|version| version.seq.is_none());
+                let predates_acquisition = if from_lost {
+                    // A /lost snapshot can contain historical losses observed for the first time.
+                    alert
+                        .lost_at
+                        .as_ref()
+                        .and_then(stamp_millis)
+                        .is_none_or(|at| at <= acquisition.acquired_at)
+                } else {
+                    times
+                        .get(&key)
+                        .is_some_and(|at| *at <= acquisition.observed_at)
+                };
+                *id == new_id
+                    || !predates_acquisition
+                    || alert.paths.is_empty()
+                    || !alert.paths.iter().all(|old| {
+                        let old = ZonePath::stored(old.clone());
+                        paths.iter().any(|new| {
+                            ZonePath::stored(new.clone())
+                                .contains_with_case(&old, fold_case.unwrap_or(false))
+                        }) && !excluded.iter().any(|gap| {
+                            ZonePath::stored(gap.clone())
+                                .overlaps_with_case(&old, fold_case.unwrap_or(true))
+                        })
+                    })
+            });
+            self.zone_alert_times
+                .retain(|(owner, id), _| owner != session || alerts.contains_key(id));
+        }
+    }
+
+    fn status_predates_loss(&self, session: &str, id: i64, started: Instant) -> bool {
+        let Some(versions) = self.zone_alert_versions.get(session) else {
+            return false;
+        };
+        // A loss learned from SSE or from another status's /lost lookup fences the
+        // same way: a snapshot that started before it cannot confirm coverage (LOCAL-0143 r12).
+        // This status records /lost only for IDs missing from its own snapshot.
+        versions
+            .entries
+            .get(&id)
+            .map(|version| version.received_at)
+            // A status request can have started before it exposed the claim IDs it
+            // needs. Keep a conservative time fence for pruned loss versions.
+            .or(versions.evicted_at)
+            .is_some_and(|received_at| started <= received_at)
+    }
+
+    fn record_zone_alert(&mut self, session: &str, alert: lockyard_core::proto::LostClaim) {
+        let now = self.now();
+        self.zone_alert_times
+            .insert((session.into(), alert.claim_id), now);
+        let alerts = self.zone_alerts.entry(session.into()).or_default();
+        alerts.insert(alert.claim_id, alert);
+        if alerts.len() > MAX_ZONE_ALERTS {
+            let (id, _) = alerts.pop_first().expect("zone alerts beyond cap");
+            self.zone_alert_times.remove(&(session.into(), id));
+        }
+    }
+
+    fn trim_zone_alert_versions(&mut self, session: &str) {
+        let Some(versions) = self.zone_alert_versions.get_mut(session) else {
+            return;
+        };
+        let excess = versions
+            .entries
+            .len()
+            .saturating_sub(MAX_ZONE_ALERT_VERSIONS);
+        if excess == 0 {
+            return;
+        }
+        let tracked: HashSet<_> = self
+            .status_claims
+            .iter()
+            .filter(|((owner, _), _)| owner == session)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        let pending = self.seen_claims.get(session);
+        let alerts = self.zone_alerts.get(session);
+        let mut oldest: Vec<_> = versions
+            .entries
+            .iter()
+            .filter(|(id, _)| {
+                !tracked.contains(id)
+                    && !pending
+                        .and_then(|seen| seen.get(id))
+                        .is_some_and(Option::is_some)
+                    && !alerts.is_some_and(|alerts| alerts.contains_key(id))
+            })
+            .map(|(&id, version)| (version.received_at, id))
+            .collect();
+        // Active alerts and IDs needed by status take precedence over the history cap.
+        // The coordination cursor still filters replayed SSE frames after eviction.
+        oldest.sort_unstable();
+        for (_, id) in oldest.into_iter().take(excess) {
+            let version = versions.entries.remove(&id).expect("selected loss version");
+            versions.evicted_at = versions.evicted_at.max(Some(version.received_at));
+        }
+        // Hard bound: an acquisition whose claim ended while it still waited (for example
+        // zone.claimed without excluded_paths) must not pin history forever. Drop such waits
+        // oldest first; IDs in flight for status and visible alerts stay protected, and the
+        // eviction fence keeps older snapshots from using them (LOCAL-0143 r12 LOW).
+        let excess = versions
+            .entries
+            .len()
+            .saturating_sub(MAX_ZONE_ALERT_VERSIONS);
+        if excess == 0 {
+            return;
+        }
+        let mut waiting: Vec<_> = versions
+            .entries
+            .iter()
+            .filter(|(id, _)| {
+                !tracked.contains(id) && !alerts.is_some_and(|alerts| alerts.contains_key(id))
+            })
+            .map(|(&id, version)| (version.received_at, id))
+            .collect();
+        waiting.sort_unstable();
+        let dropped: Vec<i64> = waiting.into_iter().take(excess).map(|(_, id)| id).collect();
+        for id in &dropped {
+            let version = versions.entries.remove(id).expect("selected loss version");
+            versions.evicted_at = versions.evicted_at.max(Some(version.received_at));
+        }
+        if let Some(seen) = self.seen_claims.get_mut(session) {
+            for id in &dropped {
+                seen.remove(id);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ZoneAlertVersions {
+    entries: HashMap<i64, ZoneAlertVersion>,
+    evicted_at: Option<Instant>,
+}
+
+struct ZoneAlertVersion {
+    // None means /lost supplied the alert before any matching SSE event.
+    seq: Option<i64>,
+    received_at: Instant,
 }
 
 struct LocalZoneMutation {
@@ -49,10 +260,27 @@ struct LocalZoneMutation {
     events: Vec<Event>,
 }
 
-fn paths_overlap(a: &str, b: &str) -> bool {
-    a == b
-        || a.strip_prefix(b).is_some_and(|tail| tail.starts_with('/'))
-        || b.strip_prefix(a).is_some_and(|tail| tail.starts_with('/'))
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Acquisition {
+    observed_at: Instant,
+    acquired_at: i64,
+    coverage_known: bool,
+    waiting_for_lost: bool,
+}
+
+fn stamp_millis(stamp: &Stamp) -> Option<i64> {
+    match stamp {
+        Stamp::Millis(value) => Some(*value),
+        Stamp::Text(text) => parse_rfc3339(text),
+    }
+}
+
+fn event_stamp(event: &Event) -> Option<Stamp> {
+    event
+        .field("at")
+        .or_else(|| event.field("created_at"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
 }
 
 enum PushExit {
@@ -195,6 +423,7 @@ impl<T: Transport + 'static> Shared<T> {
             }
             push.zone_alert_times.remove(&(session.into(), id));
         }
+        push.trim_zone_alert_versions(session);
         push.zone_alerts
             .get(session)
             .map(|alerts| alerts.values().cloned().collect())
@@ -223,6 +452,7 @@ impl<T: Transport + 'static> Shared<T> {
                     .remove(&(session.into(), ack.claim_id));
             }
         }
+        push.trim_zone_alert_versions(session);
     }
 
     #[cfg(all(test, unix))]
@@ -237,11 +467,11 @@ impl<T: Transport + 'static> Shared<T> {
         push.seen_claims
             .retain(|session, _| sessions.contains_key(session));
         push.status_claims
-            .retain(|session, _| sessions.contains_key(session));
+            .retain(|(session, _), _| sessions.contains_key(session));
         push.zone_alerts
             .retain(|session, _| sessions.contains_key(session));
         push.zone_alert_versions
-            .retain(|(session, _), _| sessions.contains_key(session));
+            .retain(|session, _| sessions.contains_key(session));
         push.zone_alert_times
             .retain(|(session, _), _| sessions.contains_key(session));
         push.local_zone_mutations
@@ -316,22 +546,6 @@ impl<T: Transport + 'static> Shared<T> {
         }
     }
 
-    fn clear_reclaimed_alerts(&self, session: &str, new_id: i64, paths: &[String]) {
-        let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(alerts) = push.zone_alerts.get_mut(session) {
-            alerts.retain(|id, alert| {
-                *id == new_id
-                    || !alert
-                        .paths
-                        .iter()
-                        .any(|old| paths.iter().any(|new| paths_overlap(old, new)))
-            });
-            let remaining: HashSet<_> = alerts.keys().copied().collect();
-            push.zone_alert_times
-                .retain(|(owner, id), _| owner != session || remaining.contains(id));
-        }
-    }
-
     fn observe_zone_loss(&self, event: &Event) {
         if !event.kind.starts_with("zone.") {
             return;
@@ -344,26 +558,46 @@ impl<T: Transport + 'static> Shared<T> {
                 if !self.sessions().contains_key(session) {
                     return;
                 }
-                let unseen = self
-                    .push
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .seen_claims
-                    .entry(session.into())
-                    .or_default()
-                    .insert(id);
-                if unseen
-                    && matches!(
-                        event.field("reason").and_then(Value::as_str),
-                        Some("claimed" | "granted")
-                    )
-                {
-                    let paths: Vec<String> = event
-                        .field("paths")
-                        .cloned()
-                        .and_then(|v| serde_json::from_value(v).ok())
-                        .unwrap_or_default();
-                    self.clear_reclaimed_alerts(session, id, &paths);
+                let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+                if matches!(
+                    event.field("reason").and_then(Value::as_str),
+                    Some("claimed" | "granted")
+                ) {
+                    let fold_case = event
+                        .field("case_insensitive_paths")
+                        .and_then(Value::as_bool);
+                    let acquired_at = event_stamp(event).as_ref().and_then(stamp_millis);
+                    let read_paths = |key| {
+                        event
+                            .field(key)
+                            .cloned()
+                            .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+                    };
+                    let coverage = read_paths("paths").zip(read_paths("excluded_paths"));
+                    let acquisition = push.record_acquisition(
+                        session,
+                        id,
+                        fold_case,
+                        acquired_at,
+                        coverage.is_some(),
+                        false,
+                    );
+                    if let (Some(acquisition), Some((paths, excluded))) = (acquisition, coverage) {
+                        push.clear_reclaimed_alerts(
+                            session,
+                            id,
+                            &paths,
+                            &excluded,
+                            fold_case,
+                            acquisition,
+                        );
+                    }
+                } else {
+                    push.seen_claims
+                        .entry(session.into())
+                        .or_default()
+                        .entry(id)
+                        .or_insert(None);
                 }
             }
             return;
@@ -429,12 +663,6 @@ impl<T: Transport + 'static> Shared<T> {
             .cloned()
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
-        let at = event
-            .field("at")
-            .or_else(|| event.field("created_at"))
-            .cloned()
-            .and_then(|v| serde_json::from_value(v).ok())
-            .unwrap_or(lockyard_core::proto::Stamp::Millis(now_ms()));
         let lost = lockyard_core::proto::LostClaim {
             claim_id: id,
             session: session.into(),
@@ -450,77 +678,132 @@ impl<T: Transport + 'static> Shared<T> {
                     reason.into()
                 },
             ),
-            lost_at: Some(at),
+            lost_at: Some(event_stamp(event).unwrap_or_else(|| Stamp::Millis(now_ms()))),
         };
         let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
-        push.seen_claims
+        let versions = &mut push
+            .zone_alert_versions
             .entry(session.into())
             .or_default()
-            .insert(id);
-        let version = push
-            .zone_alert_versions
-            .entry((session.into(), id))
-            .or_insert(i64::MIN);
-        if *version >= event.seq {
+            .entries;
+        if versions
+            .get(&id)
+            .and_then(|loss| loss.seq)
+            .is_some_and(|seq| seq >= event.seq)
+        {
             return;
         }
-        *version = event.seq;
-        let now = push.now();
-        push.zone_alert_times.insert((session.into(), id), now);
-        let alerts = push.zone_alerts.entry(session.into()).or_default();
-        alerts.insert(id, lost);
-        let mut removed = Vec::new();
-        while alerts.len() > 256 {
-            let key = *alerts.keys().next().unwrap();
-            alerts.remove(&key);
-            removed.push(key);
+        versions.insert(
+            id,
+            ZoneAlertVersion {
+                seq: Some(event.seq),
+                received_at: Instant::now(),
+            },
+        );
+        let seen = push.seen_claims.entry(session.into()).or_default();
+        if event.kind == "zone.lost" || (event.kind == "zone.released" && reason == "narrowed") {
+            // A partial takeover uses the same event as a full loss. A status snapshot
+            // can confirm that this id still holds paths that clear older losses.
+            seen.entry(id).or_insert(None);
+        } else {
+            seen.insert(id, None);
         }
-        for id in removed {
-            push.zone_alert_versions.remove(&(session.into(), id));
-        }
+        push.record_zone_alert(session, lost);
+        push.trim_zone_alert_versions(session);
     }
 
     pub(super) fn observe_status_claims(
         &self,
+        snapshot_started: Instant,
         session: &str,
+        repository: Option<&str>,
         claims: &[Claim],
         backend: &dyn Backend,
         budget: Duration,
     ) {
+        let scope = (session.to_owned(), repository.map(str::to_owned));
+        // Status exposes repository-relative paths. Rebuild workspace addresses for
+        // comparison with SSE and keep the caller's snapshot relative.
+        let workspace_paths = |paths: &[String]| {
+            if repository.is_none() {
+                return Some(paths.to_vec());
+            }
+            paths
+                .iter()
+                .map(|path| qualify(repository, path).ok())
+                .collect()
+        };
         let current: HashSet<_> = claims
             .iter()
             .filter(|c| c.session == session)
             .map(|c| c.id)
             .collect();
-        let (missing, acquired): (HashSet<_>, Vec<_>) = {
-            let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
-            let seen = push.seen_claims.entry(session.into()).or_default();
-            let acquired: Vec<_> = claims
-                .iter()
-                .filter(|claim| claim.session == session && seen.insert(claim.id))
-                .map(|claim| (claim.id, claim.paths.clone()))
-                .collect();
-            let previous = push.status_claims.entry(session.into()).or_default();
-            let missing = previous.difference(&current).copied().collect();
-            previous.extend(current.iter().copied());
-            (missing, acquired)
+        let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+        let (mut missing, acquired): (HashSet<_>, Vec<_>) =
+            {
+                let push = &mut *push;
+                let pruned = push.zone_alert_versions.get(session).filter(|versions| {
+                    versions.evicted_at.is_some_and(|at| snapshot_started <= at)
+                });
+                let previous = push.status_claims.entry(scope.clone()).or_default();
+                let missing: HashSet<_> = previous.difference(&current).copied().collect();
+                // An older response cannot introduce a new /lost lookup for an ID
+                // whose already-reported loss might have been evicted.
+                previous.extend(
+                    current.iter().copied().filter(|id| {
+                        pruned.is_none_or(|versions| versions.entries.contains_key(id))
+                    }),
+                );
+                let acquired: Vec<_> = claims
+                    .iter()
+                    .filter(|claim| claim.session == session)
+                    .filter_map(|claim| {
+                        if push.status_predates_loss(session, claim.id, snapshot_started) {
+                            // The fallback can still finish a previous wait for /lost
+                            // without accepting this claim's coverage.
+                            return push
+                                .seen_claims
+                                .get(session)
+                                .and_then(|seen| seen.get(&claim.id))
+                                .and_then(|pending| pending.filter(|a| a.waiting_for_lost))
+                                .map(|pending| (claim, pending));
+                        }
+                        // An omitted created_at is deserialized as zero.
+                        let acquired_at = stamp_millis(&claim.created_at).filter(|at| *at != 0);
+                        push.record_acquisition(
+                            session,
+                            claim.id,
+                            claim.case_insensitive_paths,
+                            acquired_at,
+                            true,
+                            !missing.is_empty(),
+                        )
+                        .map(|acquisition| (claim, acquisition))
+                    })
+                    .collect();
+                (missing, acquired)
+            };
+        let lost = if missing.is_empty() || budget.is_zero() {
+            None
+        } else {
+            drop(push);
+            let lost = backend.lost_within(session, budget).ok();
+            push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
+            lost
         };
+        let fetched_lost = lost.is_some();
         // Repeated snapshots of the same id cannot acknowledge a later loss.
-        if !missing.is_empty()
-            && !budget.is_zero()
-            && let Ok(lost) = backend.lost_within(session, budget)
-        {
-            let mut push = self.push.lock().unwrap_or_else(PoisonError::into_inner);
-            push.status_claims
-                .entry(session.into())
-                .or_default()
-                .retain(|id| !missing.contains(id));
+        if let Some(lost) = lost {
+            let previous = push.status_claims.entry(scope).or_default();
+            // Another status can finish the same /lost lookup while this one waits.
+            missing.retain(|id| previous.remove(id));
             for mut claim in lost.into_iter().filter(|c| {
                 missing.contains(&c.claim_id) && (c.session.is_empty() || c.session == session)
             }) {
                 if push
                     .zone_alert_versions
-                    .contains_key(&(session.into(), claim.claim_id))
+                    .get(session)
+                    .is_some_and(|versions| versions.entries.contains_key(&claim.claim_id))
                 {
                     continue;
                 }
@@ -529,24 +812,60 @@ impl<T: Transport + 'static> Shared<T> {
                 if claim.session.is_empty() {
                     claim.session = session.into();
                 }
-                let now = push.now();
-                push.zone_alert_times
-                    .insert((session.into(), claim.claim_id), now);
+                claim.paths = workspace_paths(&claim.paths).unwrap_or_default();
                 push.zone_alert_versions
-                    .insert((session.into(), claim.claim_id), i64::MIN);
-                let alerts = push.zone_alerts.entry(session.into()).or_default();
-                alerts.insert(claim.claim_id, claim);
-                while alerts.len() > 256 {
-                    let id = *alerts.keys().next().unwrap();
-                    alerts.remove(&id);
-                }
+                    .entry(session.into())
+                    .or_default()
+                    .entries
+                    .insert(
+                        claim.claim_id,
+                        ZoneAlertVersion {
+                            seq: None,
+                            received_at: Instant::now(),
+                        },
+                    );
+                push.record_zone_alert(session, claim);
             }
         }
         // Share acquisition history with SSE and clear after fallback seeding so
         // an old /lost record cannot resurrect an alert in this same snapshot.
-        for (id, paths) in acquired {
-            self.clear_reclaimed_alerts(session, id, &paths);
+        for (claim, acquisition) in acquired {
+            // A loss can arrive while the /lost request releases the push lock.
+            let stale = push.status_predates_loss(session, claim.id, snapshot_started);
+            if !stale {
+                let (Some(paths), Some(excluded)) = (
+                    workspace_paths(&claim.paths),
+                    workspace_paths(&claim.excluded_paths),
+                ) else {
+                    continue;
+                };
+                push.clear_reclaimed_alerts(
+                    session,
+                    claim.id,
+                    &paths,
+                    &excluded,
+                    claim.case_insensitive_paths,
+                    acquisition,
+                );
+            }
+            if fetched_lost
+                && let Some(pending) = push
+                    .seen_claims
+                    .get_mut(session)
+                    .and_then(|seen| seen.get_mut(&claim.id))
+                && *pending == Some(acquisition)
+            {
+                // A successful /lost read ends that wait, even if coverage still needs
+                // a fresh status snapshot or a case policy.
+                *pending =
+                    (stale || claim.case_insensitive_paths.is_none()).then_some(Acquisition {
+                        coverage_known: !stale,
+                        waiting_for_lost: false,
+                        ..acquisition
+                    });
+            }
         }
+        push.trim_zone_alert_versions(session);
     }
 
     pub(super) fn peek_hook_mail(&self, session: &str) -> Reply {
@@ -2597,6 +2916,53 @@ mod tests {
     }
 
     #[test]
+    fn local_0143_zone_versions_evict_history_but_keep_pending_status() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let started = Instant::now();
+        {
+            let mut push = shared.push.lock().unwrap();
+            push.status_claims
+                .insert(("alice".into(), None), HashSet::from([1]));
+            push.record_acquisition("alice", 2, None, None, true, true);
+        }
+        for id in 1..=1_025 {
+            shared.observe_zone_loss(&round4_zone(id, "zone.lost", id, 1, None));
+        }
+        let push = shared.push.lock().unwrap();
+        let entries = &push.zone_alert_versions["alice"].entries;
+        assert_eq!(entries.len(), MAX_ZONE_ALERT_VERSIONS);
+        assert!(entries.contains_key(&1));
+        assert!(entries.contains_key(&2));
+        assert!(!entries.contains_key(&3));
+        assert!(push.status_predates_loss("alice", 1, started));
+        assert!(push.status_predates_loss("alice", 2, started));
+        drop(push);
+
+        let evicted: Claim = serde_json::from_value(json!({
+            "id":3,"session":"alice","paths":["src"],"case_insensitive_paths":false
+        }))
+        .unwrap();
+        shared.observe_status_claims(
+            started,
+            "alice",
+            None,
+            &[evicted],
+            &shared.backend("alice"),
+            Duration::ZERO,
+        );
+        let push = shared.push.lock().unwrap();
+        assert!(!push.status_claims[&("alice".into(), None)].contains(&3));
+        drop(push);
+
+        shared.take_zone_alerts("alice");
+        shared.observe_zone_loss(&round4_zone(1_025, "zone.lost", 1_025, 1, None));
+        assert!(shared.zone_alerts("alice").is_empty());
+    }
+
+    #[test]
     fn round6_status_reacquisition_clears_loss_before_or_without_sse() {
         for with_sse in [false, true] {
             let mut rig = rig(true, None);
@@ -2613,9 +2979,23 @@ mod tests {
                 )
                 .unwrap()
             };
-            shared.observe_status_claims("alice", &[claim(42)], &backend, Duration::ZERO);
+            shared.observe_status_claims(
+                Instant::now(),
+                "alice",
+                None,
+                &[claim(42)],
+                &backend,
+                Duration::ZERO,
+            );
             shared.push_event(round4_zone(1, "zone.released", 42, 2, Some("bob")));
-            shared.observe_status_claims("alice", &[claim(43)], &backend, Duration::ZERO);
+            shared.observe_status_claims(
+                Instant::now(),
+                "alice",
+                None,
+                &[claim(43)],
+                &backend,
+                Duration::ZERO,
+            );
             assert!(shared.push.lock().unwrap().zone_alerts["alice"].is_empty());
             if with_sse {
                 let mut event = round4_zone(2, "zone.claimed", 43, 3, None);
@@ -2624,8 +3004,706 @@ mod tests {
                 assert!(shared.take_zone_alerts("alice").is_empty());
             }
             shared.push_event(round4_zone(3, "zone.released", 43, 4, Some("bob")));
-            shared.observe_status_claims("alice", &[claim(43)], &backend, Duration::ZERO);
+            shared.observe_status_claims(
+                Instant::now(),
+                "alice",
+                None,
+                &[claim(43)],
+                &backend,
+                Duration::ZERO,
+            );
             assert_eq!(shared.push.lock().unwrap().zone_alerts["alice"].len(), 1);
+        }
+    }
+
+    #[test]
+    fn local_0100_r4_reclaim_must_cover_the_lost_path() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let mut lost = round4_zone(1, "zone.lost", 42, 2, None);
+        lost.payload["paths"] = json!(["src/straße"]);
+        shared.push_event(lost);
+        for (seq, id, path, excluded, remaining) in [
+            (2, 43, "src/STRASSE/file.rs", None, 1),
+            (3, 44, "src/STRASSE", Some("src/STRASSE/private"), 1),
+            (4, 45, "src/STRASSE", None, 0),
+        ] {
+            let mut claimed = round4_zone(seq, "zone.claimed", id, 3, None);
+            claimed.payload["reason"] = json!("claimed");
+            claimed.payload["paths"] = json!([path]);
+            if let Some(excluded) = excluded {
+                claimed.payload["excluded_paths"] = json!([excluded]);
+            } else {
+                claimed.payload["excluded_paths"] = json!([]);
+            }
+            claimed.payload["case_insensitive_paths"] = json!(true);
+            shared.push_event(claimed);
+            assert_eq!(shared.zone_alerts("alice").len(), remaining, "{path}");
+        }
+    }
+
+    #[test]
+    fn local_0100_r8_sse_without_exclusions_preserves_loss() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let backend = lockyard_cloud_client::CloudBackend::new(
+            Client::new(&rig.server.url(), "test-token".into()).unwrap(),
+            "alice",
+        );
+        let mut lost = round4_zone(1, "zone.lost", 42, 2, None);
+        lost.payload["paths"] = json!(["src/private/file.rs"]);
+        shared.push_event(lost);
+        let mut claimed = round4_zone(2, "zone.claimed", 43, 3, None);
+        claimed.payload["reason"] = json!("claimed");
+        claimed.payload["paths"] = json!(["src"]);
+        claimed.payload["case_insensitive_paths"] = json!(false);
+        shared.push_event(claimed);
+        assert_eq!(
+            shared.zone_alerts("alice").len(),
+            1,
+            "SSE omitted excluded_paths"
+        );
+
+        let claim = serde_json::from_value(json!({
+            "id": 43, "session": "alice", "paths": ["src"],
+            "excluded_paths": ["src/private"], "case_insensitive_paths": false,
+        }))
+        .unwrap();
+        shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            &[claim],
+            &backend,
+            Duration::ZERO,
+        );
+        let alerts = shared.zone_alerts("alice");
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].claim_id, 42);
+
+        let mut complete = round4_zone(3, "zone.claimed", 44, 4, None);
+        complete.payload["reason"] = json!("claimed");
+        complete.payload["case_insensitive_paths"] = json!(false);
+        shared.push_event(complete.clone());
+        assert_eq!(shared.zone_alerts("alice").len(), 1);
+        complete.seq += 1;
+        complete.payload["excluded_paths"] = json!([]);
+        shared.push_event(complete);
+        assert!(shared.zone_alerts("alice").is_empty());
+    }
+
+    #[test]
+    fn local_0100_r4_rechecks_an_acquisition_when_the_policy_arrives() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let backend = lockyard_cloud_client::CloudBackend::new(
+            Client::new(&rig.server.url(), "test-token".into()).unwrap(),
+            "alice",
+        );
+        let mut lost = round4_zone(1, "zone.lost", 42, 2, None);
+        lost.payload["paths"] = json!(["src/straße/file.rs"]);
+        shared.push_event(lost);
+        let mut claimed = round4_zone(2, "zone.claimed", 43, 3, None);
+        claimed.payload["reason"] = json!("claimed");
+        claimed.payload["paths"] = json!(["src/STRASSE"]);
+        shared.push_event(claimed);
+        assert_eq!(shared.zone_alerts("alice").len(), 1);
+
+        let claim: Claim = serde_json::from_value(json!({
+            "id": 43, "session": "alice", "paths": ["src/STRASSE"], "case_insensitive_paths": true
+        }))
+        .unwrap();
+        shared.push.lock().unwrap().clock_now = Some(Instant::now() + Duration::from_secs(1));
+        let mut later_loss = round4_zone(3, "zone.lost", 44, 4, None);
+        later_loss.payload["paths"] = json!(["src/straße/later.rs"]);
+        shared.push_event(later_loss);
+        shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            &[claim],
+            &backend,
+            Duration::ZERO,
+        );
+        let alerts = shared.zone_alerts("alice");
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].claim_id, 44);
+    }
+
+    #[test]
+    fn local_0100_r6_lost_snapshot_orders_by_loss_time() {
+        lost_snapshot_orders_by_loss_time(None);
+    }
+
+    #[test]
+    fn lost_snapshot_retries_policy_reconciliation_after_zero_budget() {
+        lost_snapshot_orders_by_loss_time(Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn lost_snapshot_retries_policy_reconciliation_after_timeout() {
+        lost_snapshot_orders_by_loss_time(Some(Duration::from_millis(100)));
+    }
+
+    fn lost_snapshot_orders_by_loss_time(first_budget: Option<Duration>) {
+        struct LostSnapshotTransport<T>(T);
+        impl<T: Transport> Transport for LostSnapshotTransport<T> {
+            fn call(&self, call: &lockyard_cloud_client::Call) -> Result<Value, ClientError> {
+                if call.attempt_timeout_ms == Some(100) {
+                    assert!(call.path.starts_with("/api/v1/zones/lost?"));
+                    return Err(ClientError::Transport("request timed out".into()));
+                }
+                self.0.call(call)
+            }
+        }
+
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let backend = lockyard_cloud_client::CloudBackend::new(
+            LostSnapshotTransport(shared.transport.clone()),
+            "alice",
+        );
+        let old = [41, 42, 44].map(|id| {
+            serde_json::from_value::<Claim>(
+                json!({"id": id, "session": "alice", "paths": ["src/straße/file.rs"]}),
+            )
+            .unwrap()
+        });
+        shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            &old,
+            &backend,
+            Duration::ZERO,
+        );
+
+        let acquired_at = now_ms();
+        let mut claimed = round4_zone(1, "zone.claimed", 43, 3, None);
+        claimed.payload["reason"] = json!("claimed");
+        claimed.payload["paths"] = json!(["src/STRASSE"]);
+        claimed.payload["at"] = json!(lockyard_core::proto::rfc3339(acquired_at));
+        shared.push_event(claimed);
+        shared.push.lock().unwrap().clock_now = Some(Instant::now() + Duration::from_secs(1));
+
+        let lost = json!({"lost": [
+            {"claim_id": 41, "paths": ["src/straße/file.rs"],
+             "lost_at": lockyard_core::proto::rfc3339(acquired_at - 60_000)},
+            {"claim_id": 42, "paths": ["src/straße/file.rs"]},
+            {"claim_id": 44, "paths": ["src/straße/file.rs"], "lost_at": acquired_at + 60_000}
+        ]});
+        let acquired = serde_json::from_value(json!({
+            "id": 43, "session": "alice", "paths": ["src/STRASSE"], "case_insensitive_paths": true
+        }))
+        .unwrap();
+        if let Some(budget) = first_budget {
+            shared.observe_status_claims(
+                Instant::now(),
+                "alice",
+                None,
+                std::slice::from_ref(&acquired),
+                &backend,
+                budget,
+            );
+            assert!(shared.zone_alerts("alice").is_empty());
+        }
+        rig.server
+            .enqueue("/api/v1/zones/lost", HttpReply::json(200, lost));
+        shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            &[acquired],
+            &backend,
+            Duration::from_secs(2),
+        );
+        let remaining: Vec<_> = shared
+            .zone_alerts("alice")
+            .iter()
+            .map(|alert| alert.claim_id)
+            .collect();
+        assert_eq!(remaining, [44]);
+    }
+
+    #[test]
+    fn local_0100_r5_status_reacquisition_keeps_namespaces_separate() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        for (id, path) in [
+            (41, "src/straße/file.rs"),
+            (42, ".lockyard-repository/api/src/straße/file.rs"),
+        ] {
+            let mut event = round4_zone(id, "zone.lost", id, 2, None);
+            event.payload["paths"] = json!([path]);
+            shared.push_event(event);
+        }
+        rig.server.enqueue(
+            "/api/v1/zones/claims",
+            HttpReply::json(
+                200,
+                json!({"claims": [{
+                    "id": 43, "session": "alice", "expires_at": "2099-01-01T00:00:00Z",
+                    "paths": [".lockyard-repository/api/src/STRASSE"],
+                    "case_insensitive_paths": true
+                }]}),
+            )
+            .header("X-Lockyard-Repository", "api"),
+        );
+        let status = |repository: &str| {
+            let reply = rig.daemon.handle(Request::StatusRead {
+                session: "alice".into(),
+                repository: Some(repository.into()),
+                deadline_ms: 2_000,
+            });
+            assert!(reply.error.is_none(), "{:?}", reply.error);
+            reply.status_read.unwrap()
+        };
+        assert_eq!(status("api").claims[0].paths, ["src/STRASSE"]);
+        let remaining: Vec<_> = shared
+            .zone_alerts("alice")
+            .iter()
+            .map(|alert| alert.claim_id)
+            .collect();
+        assert_eq!(remaining, [41], "only the legacy loss should remain");
+
+        let lost_reads = || {
+            rig.server
+                .requests()
+                .iter()
+                .filter(|request| request.path.starts_with("/api/v1/zones/lost"))
+                .count()
+        };
+        let before = lost_reads();
+        for repository in ["web", "api"] {
+            rig.server.enqueue(
+                "/api/v1/zones/claims",
+                HttpReply::json(200, json!({"claims": []}))
+                    .header("X-Lockyard-Repository", repository),
+            );
+        }
+        let api_path = ".lockyard-repository/api/src/straße/file.rs";
+        rig.server.enqueue(
+            "/api/v1/zones/lost",
+            HttpReply::json(
+                200,
+                json!({"lost": [{"claim_id": 43, "session": "alice", "paths": [api_path]}]}),
+            )
+            .header("X-Lockyard-Repository", "api"),
+        );
+        assert!(status("web").claims.is_empty());
+        assert_eq!(lost_reads(), before);
+        assert!(status("api").claims.is_empty());
+        assert_eq!(lost_reads(), before + 1);
+        assert_eq!(shared.zone_alerts("alice")[1].paths, [api_path]);
+
+        let mut claimed = round4_zone(44, "zone.claimed", 44, 3, None);
+        claimed.payload["reason"] = json!("claimed");
+        claimed.payload["paths"] = json!([".lockyard-repository/api/src/STRASSE"]);
+        claimed.payload["excluded_paths"] = json!([]);
+        claimed.payload["case_insensitive_paths"] = json!(true);
+        shared.push_event(claimed);
+        let alerts = shared.zone_alerts("alice");
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].claim_id, 41);
+    }
+
+    #[test]
+    fn local_0100_r5_narrowing_keeps_pending_policy() {
+        partial_loss_keeps_pending_policy("zone.released");
+    }
+
+    #[test]
+    fn local_0100_r10_partial_takeover_keeps_pending_policy() {
+        partial_loss_keeps_pending_policy("zone.lost");
+    }
+
+    #[test]
+    fn local_0100_r11_status_started_before_partial_takeover() {
+        status_started_before_takeover(true);
+    }
+
+    #[test]
+    fn local_0100_r11_status_started_before_full_takeover() {
+        status_started_before_takeover(false);
+    }
+
+    #[test]
+    fn local_0100_r11_loss_during_fallback_keeps_coverage_pending() {
+        struct LoseDuringRead<'a>(&'a Shared<Client>);
+        impl Transport for LoseDuringRead<'_> {
+            fn call(&self, call: &Call) -> Result<Value, ClientError> {
+                assert!(call.path.starts_with("/api/v1/zones/lost"));
+                let mut lost = round4_zone(3, "zone.lost", 43, 7, None);
+                lost.payload["paths"] = json!(["docs"]);
+                self.0.push_event(lost);
+                Ok(json!({"lost": []}))
+            }
+        }
+
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let backend = lockyard_cloud_client::CloudBackend::new(LoseDuringRead(shared), "alice");
+        let previous = serde_json::from_value(json!({
+            "id": 41, "session": "alice", "paths": ["other"]
+        }))
+        .unwrap();
+        shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            &[previous],
+            &backend,
+            Duration::ZERO,
+        );
+        shared.push_event(round4_zone(1, "zone.lost", 42, 6, None));
+        let mut claimed = round4_zone(2, "zone.claimed", 43, 7, None);
+        claimed.payload["reason"] = json!("claimed");
+        claimed.payload["paths"] = json!(["src", "docs"]);
+        shared.push_event(claimed);
+
+        let mut covering: Claim = serde_json::from_value(json!({
+            "id": 43, "session": "alice", "paths": ["src", "docs"],
+            "fence": 7, "case_insensitive_paths": false
+        }))
+        .unwrap();
+        shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            std::slice::from_ref(&covering),
+            &backend,
+            EVENT_TIMEOUT,
+        );
+        let alerts = || {
+            shared
+                .zone_alerts("alice")
+                .into_iter()
+                .map(|alert| alert.claim_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(alerts(), [42, 43]);
+
+        covering.paths = vec!["src".into()];
+        covering.fence = 8;
+        shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            &[covering],
+            &backend,
+            Duration::ZERO,
+        );
+        assert_eq!(alerts(), [43], "fresh remainder still clears the old loss");
+    }
+
+    #[test]
+    fn local_0143_r12_loss_from_parallel_status_lost_fences_older_snapshot() {
+        struct LostTakeover;
+        impl Transport for LostTakeover {
+            fn call(&self, call: &Call) -> Result<Value, ClientError> {
+                assert!(call.path.starts_with("/api/v1/zones/lost"));
+                Ok(json!({"lost": [
+                    {"claim_id": 43, "session": "alice", "paths": ["src/STRASSE"]}
+                ]}))
+            }
+        }
+        // While the older status waits for /lost, a newer status no longer sees Z-43 and
+        // records its full takeover through its own /lost lookup (seq = None).
+        struct NewerStatusDuringRead<'a>(&'a Shared<Client>);
+        impl Transport for NewerStatusDuringRead<'_> {
+            fn call(&self, call: &Call) -> Result<Value, ClientError> {
+                assert!(call.path.starts_with("/api/v1/zones/lost"));
+                let newer = lockyard_cloud_client::CloudBackend::new(LostTakeover, "alice");
+                self.0.observe_status_claims(
+                    Instant::now(),
+                    "alice",
+                    None,
+                    &[],
+                    &newer,
+                    EVENT_TIMEOUT,
+                );
+                Ok(json!({"lost": []}))
+            }
+        }
+
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let previous = serde_json::from_value(json!({
+            "id": 41, "session": "alice", "paths": ["other"]
+        }))
+        .unwrap();
+        let idle = lockyard_cloud_client::CloudBackend::new(LostTakeover, "alice");
+        shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            &[previous],
+            &idle,
+            Duration::ZERO,
+        );
+        let mut lost = round4_zone(1, "zone.lost", 42, 6, None);
+        lost.payload["paths"] = json!(["src/straße/file.rs"]);
+        shared.push_event(lost);
+        let mut claimed = round4_zone(2, "zone.claimed", 43, 7, None);
+        claimed.payload["reason"] = json!("claimed");
+        claimed.payload["paths"] = json!(["src/STRASSE"]);
+        shared.push_event(claimed);
+
+        let older: Claim = serde_json::from_value(json!({
+            "id": 43, "session": "alice", "paths": ["src/STRASSE"], "excluded_paths": [],
+            "fence": 7, "case_insensitive_paths": true
+        }))
+        .unwrap();
+        let backend = lockyard_cloud_client::CloudBackend::new(NewerStatusDuringRead(shared), "alice");
+        shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            std::slice::from_ref(&older),
+            &backend,
+            EVENT_TIMEOUT,
+        );
+        let mut alerts: Vec<_> = shared
+            .zone_alerts("alice")
+            .into_iter()
+            .map(|alert| alert.claim_id)
+            .collect();
+        alerts.sort_unstable();
+        assert_eq!(
+            alerts,
+            [42, 43],
+            "a snapshot older than the /lost takeover must not clear Z-42"
+        );
+    }
+
+    #[test]
+    fn local_0143_r12_zone_versions_hard_bound_drops_stale_waits() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        {
+            let mut push = shared.push.lock().unwrap();
+            push.status_claims
+                .insert(("alice".into(), None), HashSet::from([1]));
+        }
+        for id in 1..=(MAX_ZONE_ALERT_VERSIONS as i64 * 4) {
+            // zone.claimed without excluded_paths leaves the acquisition waiting.
+            let mut claimed = round4_zone(id * 2, "zone.claimed", id, 1, None);
+            claimed.payload["reason"] = json!("claimed");
+            claimed.payload["paths"] = json!(["src"]);
+            shared.push_event(claimed);
+            shared.observe_zone_loss(&round4_zone(id * 2 + 1, "zone.lost", id, 1, None));
+            shared.take_zone_alerts("alice");
+        }
+        let push = shared.push.lock().unwrap();
+        let entries = &push.zone_alert_versions["alice"].entries;
+        assert!(
+            entries.len() <= MAX_ZONE_ALERT_VERSIONS,
+            "{} versions kept",
+            entries.len()
+        );
+        assert!(entries.contains_key(&1), "an ID in flight for status stays");
+        let waits = push.seen_claims.get("alice").map_or(0, |seen| {
+            seen.values().filter(|pending| pending.is_some()).count()
+        });
+        assert!(waits <= MAX_ZONE_ALERT_VERSIONS, "{waits} waits kept");
+    }
+
+    fn status_started_before_takeover(partial: bool) {
+        const CLAIMS: &str = "/api/v1/zones/claims";
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let mut lost = round4_zone(1, "zone.lost", 42, 6, None);
+        lost.payload["paths"] = json!(["src/straße"]);
+        shared.push_event(lost);
+        let mut claimed = round4_zone(2, "zone.claimed", 43, 7, None);
+        claimed.payload["reason"] = json!("claimed");
+        claimed.payload["paths"] = json!(["src/STRASSE"]);
+        shared.push_event(claimed);
+
+        let before = json!({
+            "id": 43, "session": "alice", "paths": ["src/STRASSE"], "excluded_paths": [],
+            "fence": 7, "expires_at": "2099-01-01T00:00:00Z", "case_insensitive_paths": true
+        });
+        let after = if partial {
+            let mut remainder = before.clone();
+            remainder["excluded_paths"] = json!(["src/STRASSE/private"]);
+            remainder["fence"] = json!(8);
+            vec![remainder]
+        } else {
+            Vec::new()
+        };
+        let (release, gated) = mpsc::channel();
+        rig.server.enqueue(
+            CLAIMS,
+            HttpReply::json(200, json!({"claims": [before]})).gated(gated),
+        );
+        let claims_reads = || {
+            rig.server
+                .requests()
+                .iter()
+                .filter(|r| r.path.starts_with(CLAIMS))
+                .count()
+        };
+        let initial_reads = claims_reads();
+        let status = || {
+            rig.daemon.handle(Request::StatusRead {
+                session: "alice".into(),
+                repository: None,
+                deadline_ms: 5_000,
+            })
+        };
+        let alerts = || {
+            shared
+                .zone_alerts("alice")
+                .iter()
+                .map(|alert| alert.claim_id)
+                .collect::<Vec<_>>()
+        };
+        let stale = thread::scope(|scope| {
+            let pending = scope.spawn(status);
+            eventually(|| claims_reads() > initial_reads);
+            let mut takeover = round4_zone(3, "zone.lost", 43, 7, None);
+            takeover.payload["paths"] = if partial {
+                json!(["src/STRASSE/private"])
+            } else {
+                json!(["src/STRASSE"])
+            };
+            shared.push_event(takeover);
+            release.send(()).unwrap();
+            pending.join().unwrap()
+        });
+        assert!(stale.error.is_none(), "{:?}", stale.error);
+        assert_eq!(stale.status_read.unwrap().claims[0].fence, 7);
+        assert_eq!(alerts(), [42, 43], "status predates the takeover");
+
+        rig.server
+            .enqueue(CLAIMS, HttpReply::json(200, json!({"claims": after})));
+        let fresh = status();
+        assert!(fresh.error.is_none(), "{:?}", fresh.error);
+        let claims = fresh.status_read.unwrap().claims;
+        if partial {
+            assert_eq!(claims[0].excluded_paths, ["src/STRASSE/private"]);
+        } else {
+            assert!(claims.is_empty());
+        }
+        assert_eq!(alerts(), [42, 43], "fresh status confirms the coverage gap");
+    }
+
+    fn partial_loss_keeps_pending_policy(kind: &str) {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let mut lost = round4_zone(1, "zone.lost", 42, 2, None);
+        lost.payload["paths"] = json!(["src/straße/file.rs"]);
+        shared.push_event(lost);
+        let mut claimed = round4_zone(2, "zone.claimed", 43, 3, None);
+        claimed.payload["reason"] = json!("claimed");
+        claimed.payload["paths"] = json!(["src/STRASSE", "docs"]);
+        shared.push_event(claimed);
+        let actor = (kind == "zone.released").then_some("bob");
+        let mut partial = round4_zone(3, kind, 43, 3, actor);
+        partial.payload["paths"] = json!(["docs"]);
+        shared.push_event(partial);
+        assert_eq!(shared.zone_alerts("alice").len(), 2);
+
+        rig.server.enqueue(
+            "/api/v1/zones/claims",
+            HttpReply::json(
+                200,
+                json!({"claims": [{
+                    "id": 43, "session": "alice", "paths": ["src/STRASSE"],
+                    "fence": 4, "expires_at": "2099-01-01T00:00:00Z", "case_insensitive_paths": true
+                }]}),
+            ),
+        );
+        let reply = rig.daemon.handle(Request::StatusRead {
+            session: "alice".into(),
+            repository: None,
+            deadline_ms: 2_000,
+        });
+        assert!(reply.error.is_none(), "{:?}", reply.error);
+        assert_eq!(reply.status_read.unwrap().claims[0].paths, ["src/STRASSE"]);
+        let remaining: Vec<_> = shared
+            .zone_alerts("alice")
+            .iter()
+            .map(|alert| alert.claim_id)
+            .collect();
+        assert_eq!(
+            remaining,
+            [43],
+            "the pending acquisition must clear the old loss"
+        );
+    }
+
+    #[test]
+    fn status_reacquisition_clears_case_alias_alerts_only_under_folding_policy() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let backend = lockyard_cloud_client::CloudBackend::new(
+            Client::new(&rig.server.url(), "test-token".into()).unwrap(),
+            "alice",
+        );
+        let mut lost = round4_zone(1, "zone.lost", 42, 2, None);
+        lost.payload["paths"] = json!(["src/ſ/file.rs"]);
+        shared.push_event(lost);
+        for (id, policy, remaining) in [(43, None, 1), (44, Some(false), 1), (45, Some(true), 0)] {
+            let claim = serde_json::from_value::<Claim>(json!({
+                "id": id, "session": "alice", "paths": ["src/s"],
+                "case_insensitive_paths": policy
+            }))
+            .unwrap();
+            shared.observe_status_claims(
+                Instant::now(),
+                "alice",
+                None,
+                &[claim],
+                &backend,
+                Duration::ZERO,
+            );
+            assert_eq!(shared.zone_alerts("alice").len(), remaining, "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn zone_acquisition_events_clear_case_alias_alerts_only_under_folding_policy() {
+        let mut rig = rig(true, None);
+        rig.daemon.stop_workers();
+        let shared = &rig.daemon.shared;
+        shared.hear("alice");
+        let mut lost = round4_zone(1, "zone.lost", 42, 2, None);
+        lost.payload["paths"] = json!(["src/ſ/file.rs"]);
+        shared.push_event(lost);
+        for (seq, policy, remaining) in [(2, None, 1), (3, Some(false), 1), (4, Some(true), 0)] {
+            let mut claimed = round4_zone(seq, "zone.claimed", 42 + seq, 3, None);
+            claimed.payload["reason"] = json!("claimed");
+            claimed.payload["paths"] = json!(["src/s"]);
+            claimed.payload["excluded_paths"] = json!([]);
+            if let Some(policy) = policy {
+                claimed.payload["case_insensitive_paths"] = json!(policy);
+            }
+            shared.push_event(claimed);
+            assert_eq!(shared.zone_alerts("alice").len(), remaining, "{policy:?}");
         }
     }
 
@@ -2658,7 +3736,14 @@ mod tests {
             Client::new(&rig.server.url(), "test-token".into()).unwrap(),
             "alice",
         );
-        shared.observe_status_claims("alice", &[claim], &backend, Duration::ZERO);
+        shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            &[claim],
+            &backend,
+            Duration::ZERO,
+        );
         assert_eq!(
             shared.push.lock().unwrap().zone_alerts["alice"].len(),
             1,
@@ -2671,6 +3756,7 @@ mod tests {
         assert_eq!(shared.push.lock().unwrap().zone_alerts["alice"].len(), 1);
         let mut fresh = round4_zone(7, "zone.claimed", 44, 8, None);
         fresh.payload["reason"] = json!("claimed");
+        fresh.payload["excluded_paths"] = json!([]);
         shared.push_event(fresh);
         assert!(shared.take_zone_alerts("alice").is_empty());
     }
@@ -2727,7 +3813,14 @@ mod tests {
         let backend = shared.backend("alice");
         let claim: Claim =
             serde_json::from_value(json!({"id":42,"session":"alice","paths":["src"]})).unwrap();
-        shared.observe_status_claims("alice", &[claim], &backend, Duration::ZERO);
+        shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            &[claim],
+            &backend,
+            Duration::ZERO,
+        );
         rig.server.enqueue(
             "/api/v1/zones/lost",
             HttpReply::json(
@@ -2735,7 +3828,7 @@ mod tests {
                 json!({"lost":[{"claim_id":42,"paths":["src"],"reason":"expired"}]}),
             ),
         );
-        shared.observe_status_claims("alice", &[], &backend, EVENT_TIMEOUT);
+        shared.observe_status_claims(Instant::now(), "alice", None, &[], &backend, EVENT_TIMEOUT);
         let printed = rig
             .daemon
             .handle(Request::Unread {
@@ -2968,6 +4061,7 @@ mod tests {
         shared.push_event(round4_zone(2, "zone.released", 43, 3, Some("bob")));
         let mut claimed = round4_zone(3, "zone.claimed", 44, 4, None);
         claimed.payload["reason"] = json!("claimed");
+        claimed.payload["excluded_paths"] = json!([]);
         shared.push_event(claimed);
         assert!(shared.take_zone_alerts("alice").is_empty());
         assert!(
@@ -2990,6 +4084,7 @@ mod tests {
         shared.push_event(round4_zone(1, "zone.released", 42, 2, Some("bob")));
         let mut claim = round4_zone(2, "zone.claimed", 43, 3, None);
         claim.payload["reason"] = json!("claimed");
+        claim.payload["excluded_paths"] = json!([]);
         shared.push_event(claim);
         assert!(shared.take_zone_alerts("alice").is_empty());
     }
@@ -3035,18 +4130,13 @@ mod tests {
             .lock()
             .unwrap()
             .status_claims
-            .insert("alice".into(), HashSet::from([42]));
+            .insert(("alice".into(), None), HashSet::from([42]));
         shared.sessions().get_mut("alice").unwrap().heard =
             Some(Instant::now() - shared.timing().active_window - Duration::from_secs(1));
         shared.refresh_unread();
         let push = shared.push.lock().unwrap();
-        assert!(!push.status_claims.contains_key("alice"));
-        assert!(
-            !push
-                .zone_alert_versions
-                .keys()
-                .any(|(session, _)| session == "alice")
-        );
+        assert!(!push.status_claims.contains_key(&("alice".into(), None)));
+        assert!(!push.zone_alert_versions.contains_key("alice"));
         assert!(!push.zone_alerts.contains_key("alice"));
     }
 
@@ -3147,9 +4237,14 @@ mod tests {
         let claim: Claim =
             serde_json::from_value(json!({"id":42,"session":"alice","paths":["src"],"fence":1}))
                 .unwrap();
-        rig.daemon
-            .shared
-            .observe_status_claims("alice", &[claim], &backend, EVENT_TIMEOUT);
+        rig.daemon.shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            &[claim],
+            &backend,
+            EVENT_TIMEOUT,
+        );
         for (seq, kind, reason) in [
             (10, "zone.released", "narrowed"),
             (12, "zone.lost", "holder offline"),
@@ -3158,9 +4253,14 @@ mod tests {
             rig.daemon.shared.push_event(serde_json::from_value(json!({"seq":seq,"type":kind,"session":"alice","payload":{"session":"alice","claim_id":42,"paths":["src"],"reason":reason}})).unwrap());
         }
         rig.server.enqueue("/api/v1/zones/lost",HttpReply::json(200,json!({"claims":[{"claim_id":42,"session":"alice","paths":["src"],"reason":"holder offline"}]})));
-        rig.daemon
-            .shared
-            .observe_status_claims("alice", &[], &backend, EVENT_TIMEOUT);
+        rig.daemon.shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            &[],
+            &backend,
+            EVENT_TIMEOUT,
+        );
         assert_eq!(
             rig.daemon.shared.take_zone_alerts("alice")[0]
                 .reason
@@ -3173,9 +4273,14 @@ mod tests {
             .iter()
             .filter(|r| r.path.starts_with("/api/v1/zones/lost"))
             .count();
-        rig.daemon
-            .shared
-            .observe_status_claims("alice", &[], &backend, EVENT_TIMEOUT);
+        rig.daemon.shared.observe_status_claims(
+            Instant::now(),
+            "alice",
+            None,
+            &[],
+            &backend,
+            EVENT_TIMEOUT,
+        );
         assert_eq!(
             rig.server
                 .requests()

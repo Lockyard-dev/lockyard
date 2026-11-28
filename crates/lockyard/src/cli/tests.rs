@@ -836,6 +836,59 @@ fn cli_status_json_keeps_its_fields_and_does_not_request_lost_claims() {
 }
 
 #[test]
+fn local_0100_r9_status_shows_the_latest_monitor_rescan() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    Store::init(&root).unwrap();
+    let mut deep = root.join("src");
+    for _ in 0..20 {
+        deep.push("nested");
+    }
+    std::fs::create_dir_all(deep).unwrap();
+    let claim = serde_json::from_value(json!({"id": 1, "session": "a", "paths": ["src"]})).unwrap();
+    let mut opened = Opened {
+        backend: Box::new(Scripted {
+            claims: vec![claim],
+            ..Default::default()
+        }),
+        root: root.clone(),
+    };
+    let agent = "a".to_owned();
+    let settings = monitor::Settings {
+        root: root.clone(),
+        agent: agent.clone(),
+        reconcile: Duration::from_secs(1),
+        mail: false,
+        zones: true,
+        once: false,
+        timeout: Some(Duration::from_millis(20)),
+        json: true,
+        mark_read: false,
+    };
+    let _guard = lockyard_core::test_env_lock();
+    for incomplete in [true, false] {
+        let mut ports = monitor::Ports {
+            backend: opened.backend.as_mut(),
+            store: Store::open(&root).unwrap(),
+            now: &now_ms,
+        };
+        unsafe { std::env::set_var("LOCKYARD_WATCH", "off") };
+        let summary = monitor::run(&settings, &mut ports, &mut Vec::new());
+        unsafe { std::env::remove_var("LOCKYARD_WATCH") };
+        assert_eq!(summary.unwrap().rescan_incomplete, incomplete);
+        let status = run_status(&opened, Some(&agent)).unwrap();
+        assert_eq!(status.json["rescan_incomplete"], incomplete);
+        assert_eq!(
+            status.text.contains("last monitor rescan was incomplete"),
+            incomplete
+        );
+        if incomplete {
+            std::fs::remove_dir_all(root.join("src/nested")).unwrap();
+        }
+    }
+}
+
+#[test]
 fn incoming_fetch_unknown_omits_empty_array() {
     let mut data = json!({"renewed": 1});
     let mut lines = vec!["renewed 1".into()];

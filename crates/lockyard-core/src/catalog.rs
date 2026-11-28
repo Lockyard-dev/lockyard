@@ -1,10 +1,14 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 //! Strict EP-07 plaintext and wire records. Only the SDK may authenticate a wire record.
+use crate::paths::{nfc_path, path_comparison_key};
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{self, MapAccess, Visitor},
 };
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+};
 
 pub const CATALOG_FORMAT: &str = "lockyard.zone_catalog.v1";
 pub const MAX_CATALOG_REVISION: u64 = 9_007_199_254_740_991;
@@ -117,8 +121,18 @@ impl ZoneCatalogV1 {
     }
     /// First-seen paths follow requested-name, group-member and zone-path order.
     pub fn expand(&self, names: &[String]) -> Result<Vec<String>, CatalogError> {
+        self.expand_with_case(names, false)
+    }
+
+    /// Expands a catalog with a known path case policy, preserving NFC spelling.
+    pub fn expand_with_case(
+        &self,
+        names: &[String],
+        fold_case: bool,
+    ) -> Result<Vec<String>, CatalogError> {
         self.validate()?;
         let mut paths = Vec::new();
+        let mut seen = HashSet::new();
         for name in names {
             let members = self
                 .groups
@@ -131,8 +145,8 @@ impl ZoneCatalogV1 {
                     .get(member)
                     .ok_or_else(|| CatalogError::new("zone_unknown"))?;
                 for path in entries {
-                    if !paths.contains(path) {
-                        paths.push(path.clone());
+                    if seen.insert(path_comparison_key(path, fold_case)) {
+                        paths.push(nfc_path(path));
                     }
                     if paths.len() > 256 {
                         return Err(invalid());

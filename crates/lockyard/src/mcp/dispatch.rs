@@ -125,16 +125,6 @@ pub(super) fn run_tool(
             "unknown field message; message text belongs in body".into(),
         ));
     }
-    if matches!(name, "start_work" | "zone_renew") {
-        for alias in ["ttl_minutes", "ttl_seconds", "duration"] {
-            if args.get(alias).is_some() {
-                return Err(Error::Invalid(format!(
-                    "unknown field {alias}; use ttl, an integer number of minutes (1-240)"
-                )));
-            }
-        }
-        args.ttl()?;
-    }
     tool_registry().validate_fields(name, args.0)?;
     let handler = tool_registry()
         .handler(name)
@@ -396,7 +386,9 @@ pub(super) fn run_tool(
             let request = QueueRequest {
                 paths,
                 note: args.optional_text("note")?.to_string(),
-                ttl_minutes: args.some_int("ttl")?.unwrap_or(DEFAULT_QUEUE_MINUTES),
+                ttl_minutes: args
+                    .optional_ttl(&QUEUE_TTL_MINUTES)?
+                    .unwrap_or(DEFAULT_QUEUE_MINUTES),
                 mode: args.mode()?,
                 purpose: args.purpose()?,
                 zones,
@@ -553,12 +545,8 @@ pub(super) fn run_tool(
             let fence = args.some_int("fence")?;
             let agent = me()?;
             let id = args.optional_id()?;
-            let ttl = args.ttl()?;
-            if !(1..=240).contains(&ttl) {
-                return Err(Error::Invalid("ttl must be 1 to 240 minutes".into()));
-            }
             let request = RenewRequest {
-                ttl_minutes: ttl,
+                ttl_minutes: args.ttl()?,
                 hold_reason: args.some_text("hold_reason")?,
                 hold_until: args.some_text("hold_until")?.or_else(|| {
                     args.get("hold_reason")
@@ -672,18 +660,18 @@ pub(super) fn run_tool(
                     Ok(json!({"free": false, "own": true, "holder": "you"}))
                 }
                 Some(check) if check.status == CheckStatus::Free => {
+                    let session = me()?;
                     let own = opened.backend.claims(
                         &ClaimQuery {
-                            session: Some(me()?.to_string()),
+                            session: Some(session.into()),
                             path: Some(path.clone()),
                         },
                         now,
                     )?;
+                    let requested = lockyard_core::ZonePath::stored(path);
                     let held_by_me = own.iter().any(|claim| {
-                        claim.paths.iter().any(|held| {
-                            lockyard_core::ZonePath::stored(held.clone())
-                                .contains(&lockyard_core::ZonePath::stored(path.clone()))
-                        })
+                        claim.session == session
+                            && claim.fully_covers_with_case(&requested, claim.folds_path_case())
                     });
                     if !held_by_me {
                         Ok(json!({"free": true}))
@@ -903,7 +891,7 @@ pub(super) fn run_tool(
                 key: args.text("key")?.to_string(),
                 value: args.text("value")?.to_string(),
                 zone: args.some_text("zone")?,
-                ttl_minutes: args.some_int("ttl")?,
+                ttl_minutes: args.optional_ttl(&BOARD_TTL_MINUTES)?,
             };
             encode(
                 &opened
@@ -1036,7 +1024,7 @@ pub(super) fn send_mail(
         zone: args.some_text("zone")?,
         re: args.some_text("re")?,
         key: args.some_text("key")?,
-        ttl_minutes: args.some_int("ttl")?,
+        ttl_minutes: args.optional_ttl(&NOTICE_TTL_MINUTES)?,
     };
     let mut message = backend.send(agent, &request, crate::now_ms())?;
     message.body = escape_bidi_controls(&message.body);

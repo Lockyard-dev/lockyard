@@ -1,6 +1,7 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 
 use super::*;
+use lockyard_core::paths::nfc_path;
 
 pub(super) fn run_hook(command: HookCommand, agent: Option<String>, cwd: &Path) -> Result<Output> {
     if let HookCommand::Check { path } = &command {
@@ -11,7 +12,7 @@ pub(super) fn run_hook(command: HookCommand, agent: Option<String>, cwd: &Path) 
             opened
                 .backend
                 .check(&agent, std::slice::from_ref(&path), None, now_ms())?;
-        if checks.len() != 1 || checks[0].path != path {
+        if checks.len() != 1 || nfc_path(&checks[0].path) != path {
             return Err(Error::Unavailable(
                 "the zone check did not answer this path".into(),
             ));

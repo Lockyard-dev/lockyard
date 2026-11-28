@@ -74,7 +74,8 @@ impl VerifiedZoneCatalog {
         &self.highwater
     }
     pub fn expand(&self, names: &[String]) -> Result<Vec<String>, CatalogError> {
-        self.plaintext.expand(names)
+        self.plaintext
+            .expand_with_case(names, self.wire.case_insensitive_paths)
     }
     pub fn read_json(&self) -> Value {
         let mut value = json!({"format":self.wire.format,"repository":self.wire.repository,

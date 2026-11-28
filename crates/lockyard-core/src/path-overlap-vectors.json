@@ -1,5 +1,5 @@
 {
-  "about": "Shared zone-path vectors (D-3124). The Rust client and the C# server must agree on every row. Default rule: NFC, case ignored. Keep byte-identical with cloud/contracts/path-overlap-vectors.json.",
+  "about": "Shared zone-path vectors (D-3124, LOCAL-0100, LOCAL-0105). Storage uses NFC. Default comparison follows Unicode D145: NFD, full default case folding (C+F), then NFD. Keep byte-identical with cloud/contracts/path-overlap-vectors.json.",
   "normalize": [
     { "raw": "src/café.rs", "stored": "src/café.rs" },
     { "raw": "src/Auth", "stored": "src/Auth" },
@@ -12,6 +12,15 @@
     { "a": "src/É", "b": "src/é/file", "overlap": true },
     { "a": "src/café", "b": "src/CAFÉ/a.rs", "overlap": true },
     { "a": "src/café", "b": "src/café/a.rs", "overlap": true },
+    { "a": "\u0386\u0345\u0301", "b": "\u03ac\u0345\u0301", "overlap": true },
+    { "a": "\u0386\u0345\u0301", "b": "\u03b1\u0301\u0301\u03b9", "overlap": true },
+    { "a": "\u03ac\u0345\u0301", "b": "\u03b1\u0301\u0301\u03b9", "overlap": true },
+    { "a": "x\u05c8\u0327", "b": "x\u0327\u05c8", "overlap": true },
+    { "a": "straße", "b": "STRASSE", "overlap": true },
+    { "a": "ΑΣ", "b": "ας", "overlap": true },
+    { "a": "ſ", "b": "s", "overlap": true },
+    { "a": "ı", "b": "i", "overlap": false },
+    { "a": "Nested", "b": "nested-sibling", "overlap": false },
     { "a": ".", "b": "anything", "overlap": true },
     { "a": "src", "b": "src2/a.rs", "overlap": false },
     { "a": "src/a", "b": "src/b", "overlap": false },

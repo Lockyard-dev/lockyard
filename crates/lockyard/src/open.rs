@@ -4,7 +4,7 @@
 
 use lockyard_cloud_client::{Client, CloudBackend, RepositoryTransport};
 use lockyard_core::config::{Config, Mode};
-use lockyard_core::paths::find_root;
+use lockyard_core::paths::{find_root, nfc_path};
 use lockyard_core::{Backend, Error, Result, Store, ZonePath};
 use std::path::{Path, PathBuf};
 use std::{fs, io::Write};
@@ -16,6 +16,16 @@ const ANONYMOUS: &str = "lockyard-cli";
 pub struct Opened {
     pub backend: Box<dyn Backend>,
     pub root: PathBuf,
+}
+
+/// Merge resolved workspace paths with catalog paths when no case policy is available here.
+pub fn merge_catalog_paths(paths: &mut Vec<String>, expanded: Vec<String>) {
+    for path in expanded {
+        let path = nfc_path(&path);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
 }
 
 impl Opened {
@@ -477,9 +487,22 @@ mod tests {
                 r"platform\src\login.rs".into(),
                 "./platform/src/../src//login.rs".into(),
                 root.join("platform/new.rs").to_str().unwrap().into(),
+                "platform/cafe\u{301}".into(),
+                "platform/café".into(),
+                "platform/straße".into(),
+                "platform/STRASSE".into(),
             ])
             .unwrap();
-        assert_eq!(paths, vec!["platform/new.rs", "platform/src/login.rs"]);
+        assert_eq!(
+            paths,
+            [
+                "platform/STRASSE",
+                "platform/café",
+                "platform/new.rs",
+                "platform/src/login.rs",
+                "platform/straße"
+            ]
+        );
         assert!(opened.task_paths(&["../outside.rs".into()]).is_err());
         assert!(opened.task_paths(&[String::new()]).is_err());
         assert!(opened.task_paths(&vec!["platform/x".into(); 65]).is_err());

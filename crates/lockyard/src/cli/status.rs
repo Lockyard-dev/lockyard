@@ -186,11 +186,12 @@ fn render_status(
                 .ok()
                 .and_then(|store| store.unannounced(now_ms().saturating_sub(DAY_MS)).ok())
         };
-        let _ = send.send((machine, records));
+        let rescan_incomplete = monitor::read_rescan_status(&root_owned);
+        let _ = send.send((machine, records, rescan_incomplete));
     });
     let decoration = receive.recv_timeout(Duration::from_millis(50));
     let decoration_available = decoration.is_ok();
-    let (machine, records) = decoration.unwrap_or_default();
+    let (machine, records, rescan_incomplete) = decoration.unwrap_or_default();
     let machine_available = machine.is_some();
     let records_available = records.is_some();
     let machine_level = machine.map(|level| match level {
@@ -296,6 +297,12 @@ fn render_status(
         .collect();
     let mut data = json!({"unread": unread, "claims": claims,
         "machine_level": machine_level, "unannounced": unannounced});
+    if let Some(incomplete) = rescan_incomplete {
+        data["rescan_incomplete"] = json!(incomplete);
+        if incomplete {
+            lines.push("last monitor rescan was incomplete".into());
+        }
+    }
     if cloud
         && let Ok(config) = lockyard_core::config::Config::load(root)
         && let Some(url) = config.url.as_deref()
@@ -380,11 +387,16 @@ pub(super) fn run_monitor(
         String::new()
     } else {
         format!(
-            "monitor stopped: {} mail, {} outside writes, {} rounds ({})",
+            "monitor stopped: {} mail, {} outside writes, {} rounds ({}){}",
             summary.delivered,
             summary.unannounced,
             summary.rounds,
-            summary.backend.unwrap_or("off")
+            summary.backend.unwrap_or("off"),
+            if summary.rescan_incomplete {
+                ", rescan incomplete"
+            } else {
+                ""
+            },
         )
     };
     output(
@@ -393,6 +405,7 @@ pub(super) fn run_monitor(
             "unannounced": summary.unannounced,
             "rounds": summary.rounds,
             "backend": summary.backend,
+            "rescan_incomplete": summary.rescan_incomplete,
         }),
         text,
     )

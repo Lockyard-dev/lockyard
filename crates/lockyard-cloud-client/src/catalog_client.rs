@@ -1,7 +1,7 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 //! Typed catalog preparation and verified local projection at the HTTP boundary.
 use crate::{
-    Call, Client, ClientError,
+    Call, Client, ClientError, WorkspaceKey,
     catalog::{CatalogStore, seal_catalog},
 };
 use lockyard_core::catalog::{
@@ -59,17 +59,12 @@ impl Client {
             return Err(local("catalog_invalid"));
         }
         let value = crate::Transport::call(self, call)?;
-        if self.encryption_enabled
-            || self.expected_e2ee_workspace.is_some()
-            || value.get("format").is_some()
-        {
-            let workspace = self
+        if value.get("format").is_some() {
+            let encryption = self.current_content_encryption()?;
+            let (workspace, key) = encryption
                 .workspace
                 .as_deref()
-                .ok_or_else(|| local("catalog_key_unavailable"))?;
-            let held = self.resolved_content_key()?;
-            let key = held
-                .as_ref()
+                .zip(encryption.key.as_ref())
                 .ok_or_else(|| local("catalog_key_unavailable"))?;
             let repository = call.repository.as_deref().unwrap_or_default();
             return self
@@ -107,7 +102,12 @@ impl Client {
         }
     }
     /// Runs only after capability negotiation and before serialization. All retry attempts share it.
-    pub(crate) fn prepare_catalog_call(&self, call: &Call) -> Result<Call, ClientError> {
+    pub(crate) fn prepare_catalog_call(
+        &self,
+        call: &Call,
+        workspace: Option<&str>,
+        key: Option<&WorkspaceKey>,
+    ) -> Result<Call, ClientError> {
         if !catalog_call(call) {
             return Ok(call.clone());
         }
@@ -117,13 +117,8 @@ impl Client {
         if call.method != "POST" {
             return Ok(prepared);
         }
-        let workspace = self
-            .workspace
-            .as_deref()
-            .ok_or_else(|| local("catalog_key_unavailable"))?;
-        let held = self.resolved_content_key()?;
-        let key = held
-            .as_ref()
+        let (workspace, key) = workspace
+            .zip(key)
             .ok_or_else(|| local("catalog_key_unavailable"))?;
         let repository = prepared.repository.as_deref().expect("set repository");
         let body = call.body.as_ref().ok_or_else(|| local("catalog_invalid"))?;
@@ -154,24 +149,22 @@ impl Client {
         &self,
         call: &Call,
         value: &mut Value,
+        workspace: Option<&str>,
+        key: Option<&WorkspaceKey>,
+        encryption_enabled: bool,
     ) -> Result<(), ClientError> {
         if !catalog_call(call) {
             return Ok(());
         }
         if value.get("format").is_none()
-            && !self.encryption_enabled
+            && !encryption_enabled
             && self.expected_e2ee_workspace.is_none()
             && call.method == "GET"
         {
             return Ok(());
         }
-        let workspace = self
-            .workspace
-            .as_deref()
-            .ok_or_else(|| local("catalog_key_unavailable"))?;
-        let held = self.resolved_content_key()?;
-        let key = held
-            .as_ref()
+        let (workspace, key) = workspace
+            .zip(key)
             .ok_or_else(|| local("catalog_key_unavailable"))?;
         let repository = call.repository.as_deref().unwrap_or_default();
         let wire = CoordinationZoneCatalog::from_json(&value.to_string()).map_err(local)?;
@@ -191,16 +184,15 @@ impl Client {
         if !catalog_call(call) || call.method != "GET" {
             return Ok(None);
         }
-        let held = self.resolved_content_key()?;
-        if held.is_none() && self.expected_e2ee_workspace.is_none() && !self.encryption_enabled {
+        let encryption = self.current_content_encryption()?;
+        if encryption.key.is_none() && self.expected_e2ee_workspace.is_none() && !encryption.enabled
+        {
             return Ok(None);
         }
-        let workspace = self
+        let (workspace, key) = encryption
             .workspace
             .as_deref()
-            .ok_or_else(|| local("catalog_key_unavailable"))?;
-        let key = held
-            .as_ref()
+            .zip(encryption.key.as_ref())
             .ok_or_else(|| local("catalog_key_unavailable"))?;
         let repository = call.repository.as_deref().unwrap_or_default();
         self.catalog_store(workspace, repository)?

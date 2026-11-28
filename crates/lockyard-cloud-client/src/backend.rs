@@ -2915,7 +2915,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_reuse_keeps_owned_coverage_under_the_server_case_policy() {
+    fn claim_reuse_keeps_exact_coverage_with_an_unrelated_exclusion() {
         for case_policy in [None, Some(true), Some(false)] {
             let mut held = claim_json(7);
             held["paths"] = json!(["SRC"]);
@@ -2925,11 +2925,7 @@ mod tests {
             }
             let (server, mut cloud) = backend(vec![json!([held])]);
             let request = ClaimRequest {
-                paths: vec![if case_policy == Some(false) {
-                    "SRC/public/file.rs".into()
-                } else {
-                    "src/public/file.rs".into()
-                }],
+                paths: vec!["SRC/public/file.rs".into()],
                 ..ClaimRequest::default()
             };
             let claim = lockyard_core::claim_or_reuse(&mut cloud, "me", &request, 0).unwrap();

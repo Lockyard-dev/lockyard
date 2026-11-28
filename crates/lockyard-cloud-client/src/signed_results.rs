@@ -264,7 +264,7 @@ impl Client {
             {
                 return Err(protocol::local("invalid_request", "invalid result expiry"));
             }
-            let protocol = self.result_protocol(session)?;
+            let protocol = guard.exchange(|| self.result_protocol(session))??;
             let body = content_key
                 .encrypt(
                     workspace,
@@ -359,25 +359,27 @@ impl Client {
                 "Lockyard-Result-Expires-At",
                 pending.result_expires_at.as_deref().unwrap(),
             );
-        let send = || {
+        let response = guard.exchange(|| {
             self.result_response(
                 request.send_bytes(pending.body.as_ref().unwrap().as_bytes()),
                 &pending.protocol,
             )
-        };
-        let response = if replay {
-            guard.exchange(send)?
-        } else {
-            send()
-        };
-        match response {
-            Ok(response) if response.status() == 204 => {
-                if !read_bounded(response)?.is_empty() {
-                    return Err(self.unknown(pending, "protocol_response_invalid", None));
+            .map(|response| {
+                if response.status() == 204 {
+                    read_bounded(response).map(|body| body.is_empty())
+                } else {
+                    Ok(false)
                 }
-                Ok(())
+            })
+        })?;
+        match response {
+            Ok(empty) => {
+                if empty? {
+                    Ok(())
+                } else {
+                    Err(self.unknown(pending, "protocol_response_invalid", None))
+                }
             }
-            Ok(_) => Err(self.unknown(pending, "protocol_response_invalid", None)),
             Err(error) => {
                 if self.explicit_expiry(&pending, &error)? {
                     return Err(ClientError::OutcomeUnknown(Box::new(pending)));

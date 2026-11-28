@@ -14,11 +14,12 @@
 //! it on the path whose latency budget is measured in milliseconds, and an append of one short line
 //! costs a system call where opening the database costs a connection.
 
-use crate::{DIR_NAME, Result, Store, fsio};
+use crate::{DIR_NAME, Result, Store, fsio, paths::nfc_path};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 
 const JOURNAL: &str = "announced-writes.jsonl";
 const JOURNAL_MODE: u32 = 0o600;
@@ -69,7 +70,7 @@ pub fn announce(root: &Path, agent: &str, path: &str, now: i64) -> Result<()> {
     let line = serde_json::to_string(&Announcement {
         at: now,
         agent: agent.to_string(),
-        path: path.to_string(),
+        path: nfc_path(path),
     })
     .map_err(|error| crate::Error::Invalid(error.to_string()))?;
     Ok(fsio::append_line(&journal(root), &line, JOURNAL_MODE)?)
@@ -86,6 +87,10 @@ pub fn announcements(root: &Path, since: i64) -> Result<Vec<Announcement>> {
         .lines()
         .filter_map(|line| serde_json::from_str::<Announcement>(line).ok())
         .filter(|entry| entry.at >= since)
+        .map(|mut entry| {
+            entry.path = nfc_path(&entry.path);
+            entry
+        })
         .collect())
 }
 
@@ -111,11 +116,13 @@ pub fn compact(root: &Path, keep_since: i64) -> Result<()> {
     Ok(fsio::replace(&path, text.as_bytes(), JOURNAL_MODE)?)
 }
 
-/// True when some hook announced a write to `path` inside the window ending at `now`.
+/// True when some hook announced a canonically equivalent path within the window.
 pub fn was_announced(announced: &[Announcement], path: &str, now: i64) -> bool {
-    announced
-        .iter()
-        .any(|entry| entry.path == path && now.saturating_sub(entry.at) <= ANNOUNCE_WINDOW_MS)
+    let path = nfc_path(path);
+    announced.iter().any(|entry| {
+        now.saturating_sub(entry.at) <= ANNOUNCE_WINDOW_MS
+            && (entry.path == path || (!entry.path.is_ascii() && entry.path.nfc().eq(path.chars())))
+    })
 }
 
 impl Store {
@@ -127,27 +134,61 @@ impl Store {
         claim: i64,
         now: i64,
     ) -> Result<Unannounced> {
+        let path = nfc_path(path);
         let transaction = self.write()?;
-        transaction.execute(
-            "INSERT INTO unannounced_writes (path, holder, claim_id, first_at, last_at, hits)
-             VALUES (?1, ?2, ?3, ?4, ?4, 1)
-             ON CONFLICT(path, holder) DO UPDATE SET
-                 last_at = excluded.last_at,
-                 claim_id = excluded.claim_id,
-                 hits = unannounced_writes.hits + 1",
-            params![path, holder, claim, now],
-        )?;
+        // Old writers could store multiple Unicode spellings for a holder. Repair those
+        // rows on write, keeping the oldest ID and the latest notification timestamp.
+        let mut matches = {
+            let mut statement = transaction.prepare(
+                "SELECT id, path, holder, claim_id, first_at, last_at, hits, told_at
+                 FROM unannounced_writes WHERE holder = ?1
+                 AND (path = ?2 OR length(path) != length(CAST(path AS BLOB))) ORDER BY id",
+            )?;
+            let mut matches = Vec::new();
+            for row in statement.query_map(params![holder, path], row_to_unannounced)? {
+                let row = row?;
+                if row.path == path || row.path.nfc().eq(path.chars()) {
+                    matches.push(row);
+                }
+            }
+            matches.into_iter()
+        };
+        let record = if let Some(mut previous) = matches.next() {
+            for duplicate in matches {
+                transaction.execute(
+                    "DELETE FROM unannounced_writes WHERE id = ?1",
+                    [duplicate.id],
+                )?;
+                previous.first_at = previous.first_at.min(duplicate.first_at);
+                previous.hits = previous.hits.saturating_add(duplicate.hits);
+                previous.told_at = previous.told_at.max(duplicate.told_at);
+            }
+            transaction.query_row(
+                "UPDATE unannounced_writes SET path = ?2, claim_id = ?3, first_at = ?4,
+                     last_at = ?5, hits = ?6, told_at = ?7 WHERE id = ?1
+                 RETURNING id, path, holder, claim_id, first_at, last_at, hits, told_at",
+                params![
+                    previous.id,
+                    path,
+                    claim,
+                    previous.first_at,
+                    now,
+                    previous.hits.saturating_add(1),
+                    previous.told_at
+                ],
+                row_to_unannounced,
+            )?
+        } else {
+            transaction.query_row(
+                "INSERT INTO unannounced_writes (path, holder, claim_id, first_at, last_at, hits)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 1)
+                 RETURNING id, path, holder, claim_id, first_at, last_at, hits, told_at",
+                params![path, holder, claim, now],
+                row_to_unannounced,
+            )?
+        };
         transaction.commit()?;
-        self.unannounced_for(path, holder)
-    }
-
-    fn unannounced_for(&self, path: &str, holder: &str) -> Result<Unannounced> {
-        Ok(self.conn.query_row(
-            "SELECT id, path, holder, claim_id, first_at, last_at, hits, told_at
-             FROM unannounced_writes WHERE path = ?1 AND holder = ?2",
-            params![path, holder],
-            row_to_unannounced,
-        )?)
+        Ok(record)
     }
 
     /// Unannounced writes last seen at or after `since`, newest first.
@@ -237,6 +278,85 @@ mod tests {
         text.push_str("{not json\n");
         fs::write(&path, text).unwrap();
         assert_eq!(announcements(dir.path(), 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn journal_paths_use_nfc_on_write_and_when_reading_legacy_entries() {
+        let (dir, mut store) = test_store();
+        let nfc = "src/café.rs";
+        let nfd = "src/cafe\u{301}.rs";
+        announce(dir.path(), "alice", nfd, 1).unwrap();
+        let path = journal(dir.path());
+        let on_disk: Announcement =
+            serde_json::from_str(fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(on_disk.path, nfc);
+
+        let legacy = Announcement {
+            path: nfd.into(),
+            ..on_disk
+        };
+        assert!(was_announced(std::slice::from_ref(&legacy), nfc, 1));
+        fs::write(path, serde_json::to_string(&legacy).unwrap()).unwrap();
+        let seen = announcements(dir.path(), 0).unwrap();
+        assert!(was_announced(&seen, nfc, 1));
+        assert!(was_announced(&seen, nfd, 1));
+        assert!(!was_announced(&seen, "src/CAFÉ.rs", 1));
+
+        let first = store.record_unannounced(nfd, "alice", 1, 1).unwrap();
+        let second = store.record_unannounced(nfc, "alice", 1, 2).unwrap();
+        assert_eq!(first.path, nfc);
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.hits, 2);
+    }
+
+    #[test]
+    fn a_legacy_nfd_write_keeps_its_id_and_notification_history() {
+        let (_dir, mut store) = test_store();
+        let nfd = "src/cafe\u{301}.rs";
+        let nfc = "src/café.rs";
+        store.conn.execute(
+            "INSERT INTO unannounced_writes (path, holder, claim_id, first_at, last_at, hits, told_at)
+             VALUES (?1, 'alice', 7, 100, 200, 3, 200)",
+            [nfd],
+        ).unwrap();
+        let legacy_id = store.conn.last_insert_rowid();
+
+        let record = store.record_unannounced(nfc, "alice", 8, 300).unwrap();
+        assert_eq!(
+            record.id, legacy_id,
+            "the legacy row owns the canonical path"
+        );
+        assert_eq!(record.path, nfc);
+        assert_eq!(record.claim, 8);
+        assert_eq!(
+            (record.first_at, record.last_at, record.hits),
+            (100, 300, 4)
+        );
+        assert_eq!(record.told_at, Some(200));
+        assert!(!store.should_tell(record.id, 300).unwrap());
+        assert_eq!(store.unannounced(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_existing_nfc_duplicate_merges_into_the_oldest_record() {
+        let (_dir, mut store) = test_store();
+        store.conn.execute(
+            "INSERT INTO unannounced_writes (path, holder, claim_id, first_at, last_at, hits, told_at)
+             VALUES ('src/K', 'alice', 7, 200, 300, 3, 300), ('src/K', 'alice', 8, 100, 400, 2, 400)",
+            [],
+        ).unwrap();
+        let other_holder = store.record_unannounced("src/K", "bob", 9, 500).unwrap();
+        let other_case = store.record_unannounced("src/k", "alice", 10, 500).unwrap();
+        let record = store.record_unannounced("src/K", "alice", 11, 500).unwrap();
+        assert_eq!(
+            (record.id, record.path.as_str(), record.hits),
+            (1, "src/K", 6)
+        );
+        assert_eq!((record.first_at, record.told_at), (100, Some(400)));
+        assert_eq!(
+            store.unannounced(0).unwrap(),
+            [other_case, other_holder, record]
+        );
     }
 
     #[test]

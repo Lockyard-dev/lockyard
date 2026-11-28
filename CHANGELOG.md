@@ -5,6 +5,55 @@ All notable changes to Lockyard are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.20] - 2026-11-26
+
+- Keep pending HTTP replay and admission-time reconciliation within the original call deadline. If a writer waits on the same idempotency key and the pending record disappears, require reconciliation by key (LY-0057).
+- Return a verified write response to callers already waiting on the same idempotency key, including concurrent calls on one HTTP client (LOCAL-0146).
+- Let an offline-started agent read and publish encrypted catalogs using live workspace settings and a newly created or imported key (LY-0058).
+- Release the shared write journal during HTTP requests, protocol discovery and retry backoff while keeping the operation key reserved (LY-0059).
+- Reject incorrect MCP TTL field names, publish and enforce per-tool minute limits for leases, queues, board entries and mail notices, and forward the requested TTL to task and zone claims in `start_work` (LY-0060).
+
+- Use Unicode D145 canonical caseless matching via `caseless` for case-insensitive zone and gitlink
+  comparisons. This fixes Greek path aliases behind uninitialised submodules (LOCAL-0100).
+  The server is moving to the same rule under LOCAL-0105.
+- Respect the claim's path case policy in the monitor and honor Unicode-equivalent exclusions in
+  the monitor and agent daemon (LOCAL-0100).
+- Respect the claim's path case policy in MCP `zone_check` and when clearing alerts for reclaimed
+  zones. Rust callers now pass a case policy to `ZonePath::contains_with_case` or
+  `ZonePath::overlaps_with_case` (LOCAL-0100).
+- Reuse existing cloud claims locally only with exact NFC path coverage, and let the server decide
+  case aliases. Agent cache checks defer when an omitted case policy could change the answer
+  (LOCAL-0100).
+- Honor own-claim exclusions in MCP `zone_check`. Clear a loss alert only when the new claim
+  covers the lost paths, and recheck the acquisition once its case policy arrives (LOCAL-0100).
+- Find all canonically caseless path spellings during monitor rescans of case-insensitive claims.
+  Reconcile loss alerts within the same repository and finish the policy check even if the
+  recovered claim was narrowed while waiting (LOCAL-0100).
+- Find NFC-equivalent names during case-sensitive rescans, and keep pending loss reconciliation
+  until `/lost` succeeds. Preserve existing unannounced-write IDs, hit counts and notification
+  timestamps when normalizing legacy paths (LOCAL-0129).
+- Deduplicate claim and catalog paths with D145 where the case policy permits folding, and use NFC
+  for catalog merges and hook check replies (LOCAL-0129).
+- Report ownership in `zone_check` only when an own claim covers the whole requested zone.
+  Reuse each parent listing during D145 alias lookups, with a separate budget and an explicit
+  monitor warning when it runs out. Write and match monitor journal paths in NFC, and order
+  losses from `/lost` by the server timestamp when it is present (LOCAL-0129).
+- Share the monitor rescan entry budget across held paths. Warn locally when coverage is incomplete,
+  show the last rescan's completeness in `status`, and report dirty paths only for observed changes.
+  Resolve held paths using names returned by the filesystem under the claim's case policy, even when
+  the alias lookup budget runs out (LOCAL-0135).
+- Keep loss alerts until a status snapshot or an SSE event with explicit exclusions confirms
+  coverage. Normalize agent activity and dirty reports to NFC while preserving each write's case
+  (LOCAL-0135).
+- Warn when a directory listing fails and mark the monitor rescan incomplete. Report dirty paths
+  only for observed changes. Recheck remaining claim coverage on status after a partial takeover
+  preserves the claim ID (LOCAL-0135).
+- Require a status snapshot started after the latest loss or narrowing before using that claim
+  to clear earlier loss alerts. After a listing failure, rescan from the first failed round once
+  coverage returns, and report listing errors even at the entry budget limit (LOCAL-0143).
+- Retry recovered dirty paths until the report succeeds, match recovered writes to hook
+  announcements at file modification time, and bound each session's cached loss history (LOCAL-0143).
+
 ## [0.3.19] - 2026-11-26
 
 - Match gitlink path components using Unicode NFC normalization and case folding on every filesystem.

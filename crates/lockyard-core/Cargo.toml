@@ -18,6 +18,7 @@ toml.workspace = true
 libc.workspace = true
 unicode-normalization = "0.1"
 tempfile.workspace = true
+caseless = "0.2.2"
 
 [target.'cfg(windows)'.dependencies]
 tokio.workspace = true

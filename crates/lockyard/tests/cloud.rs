@@ -1530,6 +1530,14 @@ fn encrypted_registry_submission_omits_sha_for_gitlink_with_decomposed_unicode()
     assert_encrypted_submission_omits_sha_behind_gitlink("CAFE\u{0301}", "café");
 }
 
+#[test]
+fn encrypted_registry_submission_omits_sha_for_gitlink_with_greek_caseless_match() {
+    assert_encrypted_submission_omits_sha_behind_gitlink(
+        "\u{0386}\u{0345}\u{0301}",
+        "\u{03AC}\u{0345}\u{0301}",
+    );
+}
+
 fn assert_encrypted_submission_omits_sha_behind_gitlink(gitlink: &str, task_component: &str) {
     let server = Server::start();
     let dir = cloud_project(&server);
@@ -1627,7 +1635,7 @@ fn encrypted_registry_submission_resolves_sha_only_in_the_submodule_checkout() {
     ]);
     std::fs::create_dir(checkout.join("nested")).unwrap();
     server.state.lock().unwrap().registry_items[0]["paths"] =
-        json!(["checkout/nested/src/file.txt"]);
+        json!(["checkout/src/file.txt", "checkout/nested/src/file.txt"]);
 
     let submit = |sha: &str| {
         let evidence = format!("{}:src/file.txt", &sha[..12]);
@@ -1656,11 +1664,24 @@ fn encrypted_registry_submission_resolves_sha_only_in_the_submodule_checkout() {
     );
 
     git(&["submodule", "update", "--init", "--", "nested"]);
+    server.state.lock().unwrap().registry_items[0]["paths"] =
+        json!(["checkout/nested/src/file.txt", "checkout/nested/src"]);
     let result = json_of(&submit(&submodule_sha));
     assert_eq!(result["status"], "review");
     assert!(result.get("warnings").is_none());
     let requests = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
     assert_eq!(requests[1].body["commit_sha"], submodule_sha);
+
+    server.state.lock().unwrap().registry_items[0]["paths"] =
+        json!(["checkout/nested/src/file.txt", "checkout/src/file.txt"]);
+    let result = json_of(&submit(&submodule_sha));
+    assert_eq!(result["status"], "review");
+    assert!(result["warnings"].is_array());
+    let requests = server.seen("POST", "/api/v1/registry/items/D-1/evidence");
+    assert!(
+        requests[2].body.get("commit_sha").is_none(),
+        "expanded a short SHA for paths in different initialized repositories"
+    );
 }
 
 #[test]
@@ -1825,6 +1846,39 @@ fn registry_accept_explains_all_commit_refusals_in_cli_and_mcp() {
 
 fn mcp_calls(dir: &Path, runtime: &Path, surface: &str, calls: &[(&str, Value)]) -> Vec<Value> {
     mcp_calls_env(dir, runtime, surface, calls, &[])
+}
+
+#[test]
+fn mcp_forwards_queue_and_notice_ttls_at_their_limits() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let results = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "full",
+        &[
+            ("zone_queue", json!({"paths":["src"], "ttl":480})),
+            (
+                "msg_send",
+                json!({"to":"*", "body":"short notice", "kind":"notice", "ttl":30}),
+            ),
+            (
+                "msg_send",
+                json!({"to":"*", "body":"long notice", "kind":"notice", "ttl":1440}),
+            ),
+        ],
+    );
+    for result in results {
+        assert_eq!(result["isError"], false, "{result}");
+    }
+    let queue = server.seen("POST", "/api/v1/zones/queue");
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].body["ttl_minutes"], 480);
+    let mail = server.seen("POST", "/api/v1/bus/messages");
+    assert_eq!(mail.len(), 2);
+    assert_eq!(mail[0].body["ttl_minutes"], 30);
+    assert_eq!(mail[1].body["ttl_minutes"], 1440);
 }
 
 fn mcp_calls_env(
@@ -4258,6 +4312,27 @@ fn hook_check_refuses_unknown_and_incomplete_zone_answers() {
 }
 
 #[test]
+fn hook_check_validates_the_requested_path_in_nfc() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    for (requested, answered, accepted) in [
+        ("src/café", "src/cafe\u{301}", true),
+        ("src/s", "src/ſ", false),
+    ] {
+        server.state.lock().unwrap().check_reply =
+            Some(json!({"paths": [{"path": answered, "status": "free"}]}));
+        let result = cli(
+            dir.path(),
+            runtime.path(),
+            &["hook", "check", "--path", requested],
+        );
+        assert_eq!(result.status.success(), accepted, "{result:?}");
+    }
+    assert_eq!(server.seen("POST", "/api/v1/zones/check").len(), 2);
+}
+
+#[test]
 fn hook_check_refuses_unknown_from_the_agent_socket() {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
@@ -4890,7 +4965,7 @@ fn required_catalog_fixture(server: &Server, dir: &Path, runtime: &Path) {
     key.copy_to_private(&key_dir.join(format!("{workspace}.key")))
         .unwrap();
     let plaintext = lockyard_core::catalog::ZoneCatalogV1::from_json(
-        r#"{"version":1,"zones":{"code":["src","tests"]},"groups":{"all":["code"]}}"#,
+        r#"{"version":1,"zones":{"code":["src","ſrc","tests"]},"groups":{"all":["code"]}}"#,
     )
     .unwrap();
     let wire = seal_catalog(&key, workspace, "api", 0, true, &plaintext).unwrap();
@@ -4990,6 +5065,50 @@ fn required_mcp_zones_share_verified_catalog_expander() {
 }
 
 #[test]
+fn cli_and_mcp_merge_catalog_aliases_with_explicit_paths_in_nfc() {
+    for mcp in [false, true] {
+        let server = Server::start();
+        let dir = cloud_project(&server);
+        let runtime = tempfile::tempdir().unwrap();
+        server.state.lock().unwrap().catalog =
+            Some(json!({"zones": {"code": ["src/cafe\u{301}", "src/ſ"]}}));
+        if mcp {
+            let responses = mcp_calls(
+                dir.path(),
+                runtime.path(),
+                "full",
+                &[(
+                    "zone_claim",
+                    json!({"paths": ["src/café", "src/s"], "zones": ["code"]}),
+                )],
+            );
+            assert_ne!(responses[0]["isError"], true, "{responses:?}");
+        } else {
+            let result = cli(
+                dir.path(),
+                runtime.path(),
+                &[
+                    "--json",
+                    "zone",
+                    "claim",
+                    "src/café",
+                    "src/s",
+                    "--zone",
+                    "code",
+                ],
+            );
+            assert!(result.status.success(), "{result:?}");
+        }
+        let writes = server.seen("POST", "/api/v1/zones/claims");
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            writes[0].body["paths"],
+            json!(["src/café", "src/s", "src/ſ"])
+        );
+    }
+}
+
+#[test]
 fn required_agent_named_catalog_preserves_strict_expansion_errors() {
     let server = Server::start();
     let dir = cloud_project(&server);
@@ -5005,6 +5124,95 @@ fn required_agent_named_catalog_preserves_strict_expansion_errors() {
     let error: Value = serde_json::from_slice(&refused.stderr).unwrap();
     assert_eq!(error["error"]["code"], "zone_unknown", "{error}");
     assert!(server.seen("POST", "/api/v1/zones/claims").is_empty());
+}
+
+#[test]
+fn offline_started_agent_catalog_put_and_get_work_after_cloud_key_create() {
+    use lockyard_cloud_client::{Call, ipc_credential_proof};
+    use std::os::unix::net::UnixStream;
+
+    const CATALOG: &str = "/api/v1/zones/catalog";
+    let server = Server::start();
+    server.state.lock().unwrap().api_offline = true;
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let _agent = start_agent_until(dir.path(), runtime.path(), false);
+    assert!(
+        !runtime
+            .path()
+            .join("state/lockyard/encryption.json")
+            .exists()
+    );
+    server.state.lock().unwrap().api_offline = false;
+    let created = cli(
+        dir.path(),
+        runtime.path(),
+        &["--json", "cloud", "key", "create"],
+    );
+    let key = json_of(&created);
+    assert_eq!(key["created"], true);
+    server.state.lock().unwrap().encryption_key_id = Some(key["key_id"].as_str().unwrap().into());
+
+    let call = Call::write(
+        "alice",
+        "POST",
+        CATALOG.into(),
+        json!({"expected_revision":0,
+            "catalog":{"version":1,"zones":{"private-zone":["src"]},"groups":{}}}),
+    );
+    let mut stream = UnixStream::connect(socket(runtime.path())).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    writeln!(
+        stream,
+        "{}",
+        json!({"workspace":"team","op":"call","call":call,
+            "credential_proof":ipc_credential_proof("test-token")})
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    let answer: Value = serde_json::from_str(&line).unwrap();
+    assert!(answer["error"].is_null(), "{answer}");
+    assert_eq!(answer["value"]["verified"], true);
+    assert_eq!(answer["value"]["revision"], 1);
+    let writes = server.seen("POST", CATALOG);
+    assert_eq!(writes.len(), 1);
+    assert!(
+        writes[0].body["catalog"]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("lyenc1.")
+    );
+    let read = cli(dir.path(), runtime.path(), &["--json", "zone", "catalog"]);
+    assert!(
+        read.status.success(),
+        "offline-started agent catalog read failed: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let catalog = json_of(&read);
+    assert_eq!(catalog["zones"]["private-zone"], json!(["src"]));
+}
+
+#[test]
+fn offline_started_agent_expands_encrypted_zones_on_its_first_catalog_read() {
+    let server = Server::start();
+    server.state.lock().unwrap().api_offline = true;
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let _agent = start_agent_until(dir.path(), runtime.path(), false);
+    required_catalog_fixture(&server, dir.path(), runtime.path());
+    server.state.lock().unwrap().api_offline = false;
+
+    let claimed = cli(
+        dir.path(),
+        runtime.path(),
+        &["--json", "zone", "claim", "--zone", "code"],
+    );
+    let claim = json_of(&claimed);
+    assert!(claim["paths"].as_array().unwrap().contains(&json!("src")));
+    assert_eq!(server.seen("GET", "/api/v1/zones/catalog").len(), 1);
 }
 
 #[test]
@@ -5281,6 +5489,90 @@ fn status_closes_open_mail_on_ack_not_on_cloud_sent() {
     }
     let after = json_of(&cli(dir.path(), runtime.path(), &["--json", "status"]));
     assert_eq!(after["open_mail"].as_array().unwrap().len(), 0, "{after}");
+}
+
+#[test]
+fn local_0100_r4_legacy_server_decides_caseless_claim_reuse() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    server.state.lock().unwrap().claims = vec![json!({
+        "id": 1, "session": "alice", "paths": ["src/straße", "src/cafe\u{0301}"],
+        "case_insensitive_paths": true
+    })];
+
+    for (path, expected_posts) in [
+        ("src/straße/other.rs", 0),
+        ("src/café/file.rs", 0),
+        ("src/STRASSE/file.rs", 1),
+    ] {
+        let checks = mcp_calls(
+            dir.path(),
+            runtime.path(),
+            "full",
+            &[("zone_claim", json!({"paths": [path]}))],
+        );
+        assert_eq!(checks[0]["isError"], false, "{}", checks[0]);
+        let posts = server.seen("POST", "/api/v1/zones/claims");
+        assert_eq!(posts.len(), expected_posts, "{path}");
+        if let Some(post) = posts.last() {
+            assert_eq!(post.body["paths"], json!([path]));
+        }
+    }
+}
+
+#[test]
+fn local_0100_r4_mcp_free_check_respects_own_exclusions() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    server.state.lock().unwrap().claims = vec![json!({
+        "id": 1,
+        "session": "alice",
+        "paths": ["src/straße"],
+        "excluded_paths": ["src/straße/private"],
+        "case_insensitive_paths": true
+    })];
+    let checks = mcp_calls(
+        dir.path(),
+        runtime.path(),
+        "full",
+        &[
+            ("zone_check", json!({"path": "src/STRASSE/private/file.rs"})),
+            ("zone_check", json!({"path": "src/STRASSE/public/file.rs"})),
+        ],
+    );
+    assert_eq!(checks[0]["structuredContent"], json!({"free": true}));
+    assert_eq!(
+        checks[1]["structuredContent"],
+        json!({"free": false, "own": true, "holder": "you"})
+    );
+}
+
+#[test]
+fn mcp_zone_check_respects_the_own_claim_case_policy() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    for (fold_case, expected) in [
+        (false, json!({"free": true})),
+        (true, json!({"free": false, "own": true, "holder": "you"})),
+    ] {
+        server.state.lock().unwrap().claims = vec![json!({
+            "id": 1,
+            "session": "alice",
+            "paths": ["src/ſ"],
+            "case_insensitive_paths": fold_case
+        })];
+        let checks = mcp_calls(
+            dir.path(),
+            runtime.path(),
+            "full",
+            &[("zone_check", json!({"path": "src/s"}))],
+        );
+        assert_eq!(checks[0]["isError"], false, "{}", checks[0]);
+        assert_eq!(checks[0]["structuredContent"], expected);
+    }
 }
 
 #[test]

@@ -7,7 +7,7 @@
 //! on the wire are `agent` and `from` in output, the names local mode has always printed.
 
 use crate::zones::Conflict;
-use crate::{Error, Result};
+use crate::{Error, Result, ZonePath};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -209,6 +209,38 @@ pub struct Claim {
 }
 
 impl Claim {
+    /// Legacy claims use the D-3124 case-insensitive default.
+    pub fn folds_path_case(&self) -> bool {
+        self.case_insensitive_paths.unwrap_or(true)
+    }
+
+    /// A zone check sees overlapping held paths unless an exclusion covers the checked path.
+    pub fn covers(&self, path: &ZonePath) -> bool {
+        self.covers_with_case(path, self.folds_path_case())
+    }
+
+    /// Applies the same coverage check with an explicit policy.
+    pub fn covers_with_case(&self, path: &ZonePath, fold_case: bool) -> bool {
+        self.paths
+            .iter()
+            .any(|held| ZonePath::stored(held.clone()).overlaps_with_case(path, fold_case))
+            && !self
+                .excluded_paths
+                .iter()
+                .any(|gap| ZonePath::stored(gap.clone()).contains_with_case(path, fold_case))
+    }
+
+    /// The whole requested zone lies within a held path and is clear of exclusion holes.
+    pub fn fully_covers_with_case(&self, path: &ZonePath, fold_case: bool) -> bool {
+        self.paths
+            .iter()
+            .any(|held| ZonePath::stored(held.clone()).contains_with_case(path, fold_case))
+            && !self
+                .excluded_paths
+                .iter()
+                .any(|gap| ZonePath::stored(gap.clone()).overlaps_with_case(path, fold_case))
+    }
+
     /// A partial grant remains usable, but its exclusions must be visible to the caller.
     pub fn excluded_paths_warning(&self) -> Option<String> {
         if self.excluded_paths.is_empty() {
@@ -230,10 +262,8 @@ impl Claim {
                             .filter_map(Value::as_str),
                     )
                     .any(|held| {
-                        crate::paths::ZonePath::stored(held.into()).overlaps_with_case(
-                            &excluded,
-                            self.case_insensitive_paths.unwrap_or(true),
-                        )
+                        crate::paths::ZonePath::stored(held.into())
+                            .overlaps_with_case(&excluded, self.folds_path_case())
                     });
                 if matches
                     && let Some(holder) = conflict["session"]
@@ -847,7 +877,7 @@ pub struct Freeze {
 /// The server stores the catalog as an opaque document. This client reads `zones.<name>` as a list of
 /// paths or as an object with `paths`, and `groups.<name>` as a list of zone names.
 pub fn expand_zones(catalog: &Value, names: &[String]) -> Result<Vec<String>> {
-    let mut paths: Vec<String> = Vec::new();
+    let mut paths = Vec::new();
     for name in names {
         let members: Vec<String> = match catalog
             .pointer(&pointer("groups", name))
@@ -872,8 +902,9 @@ pub fn expand_zones(catalog: &Value, names: &[String]) -> Result<Vec<String>> {
                     Error::Protocol(format!("catalog entry for zone {member:?} has no paths"))
                 })?;
             for path in list.iter().filter_map(Value::as_str) {
-                if !paths.iter().any(|known| known == path) {
-                    paths.push(path.to_string());
+                let path = crate::paths::nfc_path(path);
+                if !paths.contains(&path) {
+                    paths.push(path);
                 }
             }
         }
@@ -1068,6 +1099,19 @@ mod tests {
     }
 
     #[test]
+    fn catalogs_deduplicate_nfc_and_use_d145_only_with_a_case_policy() {
+        let catalog = json!({
+            "version": 1, "zones": {"a": ["cafe\u{301}", "ſ"], "b": ["café", "s"]},
+            "groups": {"all": ["a", "b"]}
+        });
+        let names = ["all".into()];
+        let typed = crate::catalog::ZoneCatalogV1::from_json(&catalog.to_string()).unwrap();
+        assert_eq!(expand_zones(&catalog, &names).unwrap(), ["café", "ſ", "s"]);
+        assert_eq!(typed.expand(&names).unwrap(), ["café", "ſ", "s"]);
+        assert_eq!(typed.expand_with_case(&names, true).unwrap(), ["café", "ſ"]);
+    }
+
+    #[test]
     fn work_steps_keep_the_version_out_of_the_body() {
         let step = WorkStep {
             version: Some(3),
@@ -1092,6 +1136,39 @@ mod tests {
         assert_eq!(
             Stamp::Millis(0).on_the_wire(),
             Stamp::Text("1970-01-01T00:00:00.000Z".into())
+        );
+    }
+
+    #[test]
+    fn excluded_path_warnings_match_holders_by_repository_case_policy() {
+        let mut claim: Claim = serde_json::from_value(json!({
+            "id": 1,
+            "excluded_paths": ["src/straße", "src/café"],
+            "conflicts": [
+                {"held_path": "src/STRASSE/file.rs", "session": "folded"},
+                {"paths": ["src/cafe\u{301}"], "holder": "normalized"},
+                {"path": "src/straße-sibling", "agent": "unrelated"}
+            ],
+            "case_insensitive_paths": true
+        }))
+        .unwrap();
+        let warning = claim.excluded_paths_warning().unwrap();
+        assert!(
+            warning.contains("src/straße (держатель: folded)"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("src/café (держатель: normalized)"),
+            "{warning}"
+        );
+        assert!(!warning.contains("unrelated"), "{warning}");
+
+        claim.case_insensitive_paths = Some(false);
+        let warning = claim.excluded_paths_warning().unwrap();
+        assert!(!warning.contains("folded"), "{warning}");
+        assert!(
+            warning.contains("src/café (держатель: normalized)"),
+            "{warning}"
         );
     }
 

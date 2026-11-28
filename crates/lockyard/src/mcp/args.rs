@@ -116,11 +116,30 @@ impl<'a> Args<'a> {
             .transpose()
     }
 
+    pub(super) fn optional_ttl(self, bounds: &RangeInclusive<i64>) -> Result<Option<i64>> {
+        self.get("ttl")
+            .map(|value| {
+                let (min, max) = (bounds.start(), bounds.end());
+                let ttl = value.as_i64().ok_or_else(|| {
+                    wrong_type(
+                        "ttl",
+                        &format!("an integer number of minutes ({min}-{max})"),
+                    )
+                })?;
+                if !bounds.contains(&ttl) {
+                    return Err(Error::Invalid(format!(
+                        "ttl must be {min} to {max} minutes"
+                    )));
+                }
+                Ok(ttl)
+            })
+            .transpose()
+    }
+
     pub(super) fn ttl(self) -> Result<i64> {
-        self.get("ttl").map_or(Ok(DEFAULT_TTL_MINUTES), |_| {
-            self.int("ttl")
-                .map_err(|_| wrong_type("ttl", "an integer number of minutes (1-240)"))
-        })
+        Ok(self
+            .optional_ttl(&LEASE_TTL_MINUTES)?
+            .unwrap_or(DEFAULT_TTL_MINUTES))
     }
 
     pub(super) fn strings(self, key: &str) -> Result<Vec<String>> {
@@ -272,11 +291,7 @@ pub(super) fn claim_paths(
         match opened.backend.catalog_expand(&zones) {
             Ok(expanded) => {
                 kept_zones = zones;
-                for path in expanded {
-                    if !paths.contains(&path) {
-                        paths.push(path);
-                    }
-                }
+                crate::open::merge_catalog_paths(&mut paths, expanded);
             }
             Err(Error::NeedsCloud(_)) => {
                 return Err(Error::Invalid(format!(
@@ -317,9 +332,6 @@ pub(super) fn claim_paths(
 
 pub(super) fn claim_request(opened: &Opened, args: Args<'_>, cwd: &Path) -> Result<ClaimRequest> {
     let ttl = args.ttl()?;
-    if !(1..=240).contains(&ttl) {
-        return Err(Error::Invalid("ttl must be 1 to 240 minutes".into()));
-    }
     let (paths, zones) = claim_paths(opened, args, cwd)?;
     // Session label lives in claim meta when the backend stores it (cloud). Local SQLite
     // refuses meta — neighbours still see the agent id from the claim session field.
