@@ -636,7 +636,7 @@ fn check_completed_result_publication(import_legacy_refusal: bool) {
             .config
             .signed_results = Some(client.clone());
     } else {
-        client.resume_signed_result(&pending.key).unwrap();
+        crate::host::test_resume_signed_result_through_socket(executor.clone(), &record.spec.id);
     }
     for _ in 0..2 {
         executor.publish_signed_results();

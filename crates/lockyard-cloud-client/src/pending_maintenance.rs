@@ -345,6 +345,7 @@ impl Client {
             !row.replay_stopped
                 && recovery(row) == Recovery::SignedResult
                 && (row.replay_paused
+                    || Client::result_quota_suspended(row)
                     || (row.result_retry_at.is_some()
                         && window(row, Some(now)) == ReplayWindow::Closed))
         });
@@ -583,6 +584,13 @@ impl Client {
             }
             if recovery == Recovery::SignedResult && Client::result_permanently_refused(&pending) {
                 self.park_pending(&pending, true, admission_deadline)?;
+                continue;
+            }
+            if recovery == Recovery::SignedResult
+                && Client::result_quota_suspended(&pending)
+                && !pending.replay_paused
+            {
+                self.park_pending(&pending, false, admission_deadline)?;
                 continue;
             }
             // Transactions end before network I/O. Concurrent replay uses the same
@@ -2533,6 +2541,77 @@ mod tests {
                 .all(|(path, _, _)| path == DISCOVERY)
         );
     }
+
+    #[test]
+    fn signed_result_expiry_notice_requires_a_fresh_date_and_a_committed_transition() {
+        const CHILD: &str = "LY_TEST_SIGNED_RESULT_EXPIRY_NOTICE";
+        if std::env::var_os(CHILD).is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "protocol::maintenance::tests::signed_result_expiry_notice_requires_a_fresh_date_and_a_committed_transition",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(child.status.success(), "{child:?}");
+            let stderr = String::from_utf8(child.stderr).unwrap();
+            let notices: Vec<_> = stderr
+                .lines()
+                .filter(|line| line.contains("signed_result_publication_outcome_unknown"))
+                .collect();
+            assert_eq!(notices.len(), 1, "{stderr}");
+            assert!(
+                notices[0].contains("operation_key=\"review3-expiry\""),
+                "{stderr}"
+            );
+            return;
+        }
+
+        let server = Server::new();
+        let root = tempfile::tempdir().unwrap();
+        let client = server.client(root.path());
+        let mut row = pending(&client, "review3-expiry", false);
+        row.method = "PUT".into();
+        row.path = format!("/api/v1/nodes/node/jobs/{}/signed-result", crate::ulid());
+        row.request_path = row.path.clone();
+        row.result_expires_at = Some("2026-12-01T00:00:00Z".into());
+        row.first_sent_unix_secs = Some(0);
+        row.first_sent_server_secs = Some(1_700_000_000);
+        row.result_retry_at = Some(u64::MAX);
+        save(&client, &row);
+
+        let after_deadline = "Thu, 12 Nov 2026 10:21:00 GMT";
+        *server.date.lock().unwrap() = Some(after_deadline);
+        assert!(
+            client
+                .replay_date(&row, RECONCILE_BUDGET, None)
+                .unwrap()
+                .is_some()
+        );
+        server.requests.lock().unwrap().clear();
+        *server.date.lock().unwrap() = None;
+        client.maintain_stopped_signed_results().unwrap();
+        let parked = client.pending_operation(&row.key).unwrap();
+        assert!(parked.replay_paused);
+        assert!(
+            !parked.replay_stopped,
+            "a cached Date only schedules a fresh check"
+        );
+
+        // The old snapshot no longer matches after the successful park above.
+        client.park_pending(&row, true, None).unwrap();
+        assert_eq!(client.pending_operation(&row.key).unwrap(), parked);
+        *server.date.lock().unwrap() = Some(after_deadline);
+        client.maintain_stopped_signed_results().unwrap();
+        assert!(client.pending_operation(&row.key).unwrap().replay_stopped);
+        client.maintain_stopped_signed_results().unwrap();
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|(path, _, _)| path == DISCOVERY));
+    }
+
     #[test]
     fn ly0030_unlisted_routes_stay_unknown_and_do_not_fill_replay_budget() {
         let server = Server::new();

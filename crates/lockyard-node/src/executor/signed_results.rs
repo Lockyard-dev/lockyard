@@ -87,6 +87,21 @@ impl Executor {
         }
     }
 
+    pub(crate) fn resume_signed_result(&self, job: &str) -> Result<()> {
+        let client = self
+            .inner
+            .config
+            .signed_results
+            .as_ref()
+            .ok_or(ExecutorError("signed_result_publication_disabled"))?;
+        let pending = client
+            .signed_result_pending(&self.inner.config.node_id, job)
+            .ok_or(ExecutorError("signed_result_pending_missing"))?;
+        client
+            .resume_signed_result(&pending.key)
+            .map_err(|_| ExecutorError("signed_result_resume_failed"))
+    }
+
     /// One publication per tick, independent of retention/startup. A round-robin cursor
     /// prevents one unavailable result from starving later jobs and expired pending writes.
     pub(crate) fn publish_signed_results(&self) {

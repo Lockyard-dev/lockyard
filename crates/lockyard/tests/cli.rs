@@ -55,6 +55,21 @@ fn version_about_and_usage_errors() {
 }
 
 #[test]
+fn node_signed_result_resume_help_and_job_id_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let help = ok(dir.path(), "a", &["node", "resume-signed-result", "--help"]);
+    assert!(help.contains("quota-suspended signed result"), "{help}");
+    assert!(help.contains("Retry-After"), "{help}");
+    let invalid = lockyard(
+        dir.path(),
+        "a",
+        &["node", "resume-signed-result", "not-a-job"],
+    );
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid job ID"));
+}
+
+#[test]
 fn version_and_every_doctor_path_show_the_same_build_identity() {
     let dir = project();
     let version = ok(dir.path(), "a", &["--version"]);

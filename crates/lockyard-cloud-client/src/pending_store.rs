@@ -457,12 +457,12 @@ impl PendingJournal {
             // File journals could persist the latest HTTP status after an unknown
             // PUT without proving that the earlier PUT failed. Preserve the
             // explicit quota suspension and any absolute Retry-After.
-            if !pending.pre_execution_rejected
-                && crate::signed_results::is_result_path(&pending.path)
-                && (pending.cause_status, pending.cause_code.as_str())
-                    != (Some(429), "relay_budget_exceeded")
-            {
-                pending.cause_status = None;
+            if crate::signed_results::is_result_path(&pending.path) {
+                if Client::result_quota_suspended(&pending) {
+                    pending.replay_paused = true;
+                } else if !pending.pre_execution_rejected {
+                    pending.cause_status = None;
+                }
             }
             if let Some(receipt) = &mut receipt {
                 receipt.pending = pending.clone();
@@ -1442,6 +1442,32 @@ mod tests {
         write_legacy(&legacy_folder(&reopened, &root), &row, "unknown");
         let reopened = client().load_pending_journal(root).unwrap();
         assert_eq!(reopened.pending_operation(&row.key), Some(stopped));
+    }
+
+    #[test]
+    fn a_legacy_proven_signed_result_refusal_keeps_its_stop_and_frozen_request() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let setup = client();
+        let mut row = pending(&setup, "proven-legacy-result");
+        row.method = "PUT".into();
+        row.path = format!("/api/v1/nodes/worker/jobs/{}/signed-result", crate::ulid());
+        row.request_path = row.path.clone();
+        row.body = Some("lyenc1.synthetic-proven-result".into());
+        row.result_expires_at = Some("2026-12-01T00:00:00Z".into());
+        row.cause_status = Some(403);
+        row.cause_code = "revoked".into();
+        row.first_sent_server_secs = Some(maintenance::unix_now().unwrap());
+        row.pre_execution_rejected = true;
+        row.replay_paused = true;
+        row.replay_stopped = true;
+        write_legacy(&legacy_folder(&setup, &root), &row, "unknown");
+
+        let restored = setup.load_pending_journal(&root).unwrap();
+        let imported = restored.pending_operation(&row.key).unwrap();
+        assert_eq!(imported, row);
+        assert!(Client::result_permanently_refused(&imported));
+        assert!(!Client::result_retry_ready(&imported));
     }
 
     #[test]

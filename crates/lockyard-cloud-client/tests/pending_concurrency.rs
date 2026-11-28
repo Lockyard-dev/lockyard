@@ -910,15 +910,36 @@ fn full_byte_budget_keeps_a_signed_result_quota_suspension() {
         );
         (original, send.join().unwrap().unwrap_err())
     });
-    let reopened = server.load_client(&journal);
+    let reopened = server.load_client(&journal).with_content_encryption(
+        "00000000-0000-4000-8000-000000000001",
+        Some(WorkspaceKey::from_entropy([73; 32])),
+        true,
+    );
     let suspended = reopened.signed_result_pending("worker", &job).unwrap();
     assert_eq!(suspended.body, original.body);
+    assert_eq!(suspended.result_expires_at, original.result_expires_at);
     assert!(suspended.result_retry_at.unwrap() >= now.as_secs() + 3600);
     assert_eq!(suspended.cause_status, Some(429));
     assert_eq!(suspended.cause_code, "relay_budget_exceeded");
     assert!(suspended.pre_execution_rejected);
     assert!(!Client::result_retry_ready(&suspended));
     assert_eq!(error.code(), Some("relay_budget_exceeded"));
+    reopened.resume_signed_result(&suspended.key).unwrap();
+    let resumed = reopened.signed_result_pending("worker", &job).unwrap();
+    assert_eq!(resumed.cause_status, None);
+    assert!(resumed.replay_paused);
+    assert_eq!(resumed.result_retry_at, suspended.result_retry_at);
+    assert_eq!(resumed.body, suspended.body);
+    assert_eq!(resumed.result_expires_at, suspended.result_expires_at);
+    assert!(!Client::result_retry_ready(&resumed));
+    assert_eq!(
+        reopened
+            .replay_signed_result(&resumed.key)
+            .unwrap_err()
+            .code(),
+        Some("outcome_unknown")
+    );
+    assert!(server.requests.try_recv().is_err());
     server.finish();
 }
 

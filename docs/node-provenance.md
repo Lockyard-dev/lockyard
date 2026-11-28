@@ -43,4 +43,6 @@ The explicit verification command enforces the independently supplied revision a
 
 Result signatures are recovered for completed durable records that lost only the signature write. Recovery never executes the job again. A legacy record without immutable image provenance fails signature recovery explicitly. A changed result signer requires an authenticated trust update; keys are not rotated on a schedule, and a compromised key is not kept trusted automatically to make historical results appear valid.
 
+If Cloud reports `relay_budget_exceeded` for a signed result, free relay storage and run `lockyard node resume-signed-result JOB_ULID --config /private/worker.toml` as the running worker's local operator. The command schedules the saved upload. The worker honors the original `Retry-After` and checks the server replay window before sending the original ciphertext and expiry. When the window closes, reconcile the outcome by job ID using the retained journal entry.
+
 Downloads require an output directory owned by the invoking user and without group/world write permission. For a shared location such as `/tmp`, create an owned mode0700 subdirectory first. Patch/archive downloads retain one exclusive no-follow file descriptor through streaming and verification, publish without replacing an existing destination, and never reopen a writable temporary by pathname.

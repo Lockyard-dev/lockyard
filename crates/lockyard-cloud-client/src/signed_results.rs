@@ -417,6 +417,8 @@ impl Client {
                     refusal.cause_status = status;
                     refusal.pre_execution_rejected = true;
                     refusal.result_retry_at = error.retry_after().map(retry_at);
+                    // Operator-suspended results must leave room for other journal writes.
+                    refusal.replay_paused |= Self::result_quota_suspended(&refusal);
                     refusal
                 });
                 let proved = if let Some(journal) = &self.pending_journal {
@@ -461,6 +463,9 @@ impl Client {
                     | (Some(400), "protocol_unsupported")
             )
     }
+    pub(crate) fn result_quota_suspended(pending: &PendingWrite) -> bool {
+        (pending.cause_status, pending.cause_code.as_str()) == (Some(429), "relay_budget_exceeded")
+    }
     pub fn signed_result_pending(&self, node: &str, job: &str) -> Option<PendingWrite> {
         let (path, _) = route(node, job).ok()?;
         self.pending_operation(&crate::credential_fingerprint(&path))
@@ -478,13 +483,17 @@ impl Client {
     pub fn resume_signed_result(&self, key: &str) -> Result<(), ClientError> {
         let _guard = self.reserve_memory_send(key)?;
         let mut pending = self.result_for_replay(key)?;
-        if pending.cause_status != Some(429) || pending.cause_code != "relay_budget_exceeded" {
+        if !Self::result_quota_suspended(&pending) {
             return Err(protocol::local(
                 "invalid_request",
                 "result is not quota suspended",
             ));
         }
+        if pending.replay_stopped {
+            return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+        }
         let previous = pending.clone();
+        pending.replay_paused = true;
         pending.cause_code = "outcome_unknown".into();
         pending.cause_status = None;
         if self.update_pending(&previous, pending)? {

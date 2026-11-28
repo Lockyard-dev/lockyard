@@ -11,6 +11,7 @@ All notable changes to Lockyard are recorded here. The format follows
 - Retry a shared Idempotency-Key with the exact journaled HTTP request and obtain the server's original receipt. Report key reuse after contention as an unknown outcome that can be reconciled by key (LOCAL-0148).
 - Store pending writes in a private SQLite WAL journal. Migrate legacy records by generation, retain the original wire request for safe replay, and reserve keys even after their completed payloads are evicted (LY-0069).
 - Keep the longest applicable Retry-After for overlapping signed-result uploads. Preserve an unknown outcome when an imported file-journal refusal cannot establish whether an earlier upload succeeded.
+- Keep quota-suspended signed results outside the active replay budget. After relay budget relief, `lockyard node resume-signed-result <job-id>` schedules exact replay subject to the saved Retry-After and the server replay window.
 - Serialize credentials changes with `File::lock`, report malformed credentials by location, and let logout preserve a private backup without overwriting an earlier copy (LY-0039, LY-0041, LY-0044).
 - Let an offline-started agent read and publish encrypted catalogs using live workspace settings and a newly created or imported key (LY-0058).
 - Keep journal transactions local to durable state changes so HTTP, protocol discovery and retry backoff leave the journal available (LY-0059).

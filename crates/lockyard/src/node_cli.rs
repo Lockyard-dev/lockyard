@@ -185,6 +185,13 @@ pub enum NodeCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Schedule exact replay of a quota-suspended signed result after budget relief.
+    /// The saved Retry-After and the server replay window still apply.
+    ResumeSignedResult {
+        job_id: String,
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Inspect local drain state and outstanding work, without changing it.
     DrainStatus {
         #[arg(long)]
@@ -677,6 +684,15 @@ pub fn node(command: NodeCommand) -> Result<Value> {
         }
         NodeCommand::Drain { config } => local_drain(config, Some(true)),
         NodeCommand::Resume { config } => local_drain(config, Some(false)),
+        NodeCommand::ResumeSignedResult { job_id, config } => {
+            if !wire::valid_ulid(&job_id) {
+                return Err(invalid("invalid job ID"));
+            }
+            let path = config_path(config)?;
+            runtime()?
+                .block_on(host::resume_signed_result(&path, job_id))
+                .map_err(|_| invalid("signed-result resume failed; check the local node and the quota suspension for this job"))
+        }
         NodeCommand::DrainStatus { config } => local_drain(config, None),
         NodeCommand::List { config } => {
             let path = config_path(config)?;

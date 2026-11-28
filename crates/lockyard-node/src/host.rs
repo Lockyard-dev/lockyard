@@ -266,6 +266,9 @@ enum Control {
         enabled: bool,
     },
     DrainStatus,
+    ResumeSignedResult {
+        job_id: String,
+    },
     Workflow {
         request: crate::workflow::WorkflowControl,
     },
@@ -2162,6 +2165,15 @@ async fn control_connection(host: Arc<Host>, mut stream: UnixStream) -> Result<(
         Control::Status => Ok(serde_json::to_value(host.status())?),
         Control::Revocations { documents } => host.propagate_revocations(documents).await,
         Control::DrainStatus => host.drain_status_value(),
+        Control::ResumeSignedResult { job_id } => match host.executor.clone() {
+            Some(executor) => tokio::task::spawn_blocking(move || {
+                executor.resume_signed_result(&job_id)?;
+                Ok(json!({"job_id": job_id, "replay_scheduled": true}))
+            })
+            .await
+            .map_err(|_| "signed-result resume failed")?,
+            None => Err("signed-result publication disabled".into()),
+        },
         Control::Dispatch {
             expected_local_certificate_sha256,
             request,
@@ -2405,6 +2417,19 @@ pub async fn drain(config_path: &Path, enabled: Option<bool>) -> Result<Value> {
     call_control(
         &config.socket_path(),
         enabled.map_or(Control::DrainStatus, |enabled| Control::Drain { enabled }),
+        Duration::from_secs(10),
+    )
+    .await
+}
+/// Schedules replay through the running node's private operator socket.
+pub async fn resume_signed_result(config_path: &Path, job_id: String) -> Result<Value> {
+    let config = NodeConfig::load(config_path)?;
+    if config.delegation_socket.is_some() {
+        return Err("workload clients cannot resume signed results".into());
+    }
+    call_control(
+        &config.socket_path(),
+        Control::ResumeSignedResult { job_id },
         Duration::from_secs(10),
     )
     .await
@@ -4030,6 +4055,35 @@ fn store_data(dir: &Path, id: &str, bytes: &[u8]) -> Result<()> {
 
 #[cfg(unix)]
 use std::fs::OpenOptions;
+
+#[cfg(all(test, unix))]
+pub(crate) fn test_resume_signed_result_through_socket(executor: Executor, job_id: &str) {
+    let (root, mut host) = tests::fixture();
+    let config = root.path().join("node.toml");
+    lockyard_core::fsio::replace(
+        &config,
+        toml::to_string(&host.config).unwrap().as_bytes(),
+        0o600,
+    )
+    .unwrap();
+    host.executor = Some(executor);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let listener = make_socket(&host.config.socket_path()).unwrap();
+            let serving = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                control_connection(Arc::new(host), stream).await.unwrap();
+            });
+            assert_eq!(
+                resume_signed_result(&config, job_id.into()).await.unwrap(),
+                json!({"job_id": job_id, "replay_scheduled": true})
+            );
+            serving.await.unwrap();
+        });
+}
 
 #[cfg(all(test, unix))]
 mod tests {

@@ -539,6 +539,56 @@ fn put_timeout_is_unknown_and_the_server_window_stops_automatic_replay() {
 }
 
 #[test]
+fn quota_suspensions_leave_room_for_new_results_and_cannot_resume_after_replay_expiry() {
+    let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let (url, state, server) = fixture();
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 60_000;
+    let client = client(&url, directory.path());
+    let mut suspended = Vec::new();
+    state.lock().unwrap().put_error = Some((429, "relay_budget_exceeded", u64::MAX));
+    for _ in 0..128 {
+        let job = lockyard_cloud_client::ulid();
+        assert_eq!(
+            client
+                .put_signed_result("worker", "worker", &job, DOCUMENT, expiry)
+                .unwrap_err()
+                .code(),
+            Some("relay_budget_exceeded")
+        );
+        suspended.push(client.signed_result_pending("worker", &job).unwrap());
+    }
+    state.lock().unwrap().put_error = None;
+    client
+        .put_signed_result(
+            "worker",
+            "worker",
+            &lockyard_cloud_client::ulid(),
+            DOCUMENT,
+            expiry,
+        )
+        .expect("quota suspensions must leave admission space");
+    assert!(suspended.iter().all(|row| row.replay_paused));
+
+    let row = suspended.iter().min_by_key(|row| &row.key).unwrap();
+    state.lock().unwrap().date = Some("Sun, 12 Nov 2028 10:21:00 GMT");
+    assert!(client.repair_pending().is_ok());
+    let closed = client.pending_operation(&row.key).unwrap();
+    assert!(closed.replay_stopped);
+    assert_eq!(closed.result_retry_at, Some(u64::MAX));
+    assert_eq!(
+        client.resume_signed_result(&row.key).unwrap_err().code(),
+        Some("outcome_unknown")
+    );
+    assert_eq!(client.pending_operation(&row.key).unwrap(), closed);
+    assert_eq!(state.lock().unwrap().puts, 129);
+    stop(&url, server);
+}
+
+#[test]
 fn publication_refusal_and_retry_after_survive_restart_without_automatic_resend() {
     for (status, code) in [
         (401, "credential_revoked"),
