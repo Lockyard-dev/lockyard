@@ -346,18 +346,8 @@ impl CatalogStore {
             .open(self.path.with_extension("lock"))
             .map_err(|_| error("catalog_offline_unavailable"))?;
         validate_private_file(&lock)?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                return Err(error("catalog_offline_unavailable"));
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            lock.lock()
-                .map_err(|_| error("catalog_offline_unavailable"))?;
-        }
+        lock.lock()
+            .map_err(|_| error("catalog_offline_unavailable"))?;
         Ok(lock)
     }
 }

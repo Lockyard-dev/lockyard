@@ -462,12 +462,7 @@ fn operation_lock(path: &Path) -> Result<File> {
         || m.uid() != unsafe { libc::geteuid() }
         || m.mode() & 0o077 != 0
         || m.nlink() != 1
-        || unsafe {
-            libc::flock(
-                std::os::fd::AsRawFd::as_raw_fd(&f),
-                libc::LOCK_EX | libc::LOCK_NB,
-            )
-        } != 0
+        || f.try_lock().is_err()
     {
         return Err(Error::Invalid(
             "revocation operation is locked or state is unsafe".into(),

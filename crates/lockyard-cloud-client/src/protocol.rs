@@ -281,22 +281,32 @@ pub(crate) struct ProtocolState {
 /// Close alone leaves a Unix flock alive in a descriptor inherited by a concurrent fork,
 /// until that child execs. Release ownership explicitly before closing our descriptor.
 #[derive(Debug)]
-struct PendingFileLock(std::fs::File);
+enum PendingFileLock {
+    File(std::fs::File),
+    #[cfg(unix)]
+    Directory(std::fs::File),
+}
 
 impl Drop for PendingFileLock {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            // Retry interrupted unlocks; the guard must release ownership before close.
-            while unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } != 0 {
-                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                    break;
+        // Retry interrupted unlocks so the guard releases ownership before close.
+        loop {
+            let result = match self {
+                Self::File(file) => file.unlock(),
+                #[cfg(unix)]
+                Self::Directory(directory) => {
+                    use std::os::fd::AsRawFd;
+                    if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_UN) } == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
                 }
+            };
+            if !matches!(result, Err(error) if error.kind() == std::io::ErrorKind::Interrupted) {
+                break;
             }
         }
-        #[cfg(not(unix))]
-        let _ = self.0.unlock();
     }
 }
 
@@ -324,16 +334,8 @@ impl PendingSendGuard<'_> {
         }
         let file = options.open(path).map_err(journal_error)?;
         private_file(&file.metadata().map_err(journal_error)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                return Err(ClientError::JournalBusy);
-            }
-        }
-        #[cfg(not(unix))]
         file.try_lock().map_err(|_| ClientError::JournalBusy)?;
-        Ok(PendingFileLock(file))
+        Ok(PendingFileLock::File(file))
     }
 
     /// All contenders open operation locks while owning the shared journal lock.
@@ -416,15 +418,17 @@ impl PendingSendGuard<'_> {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
+            // File::try_lock does not guarantee exclusive locking of a read-only directory FD.
             if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 return Err(ClientError::JournalBusy);
             }
+            Ok(PendingFileLock::Directory(lock))
         }
         #[cfg(not(unix))]
         {
             lock.try_lock().map_err(|_| ClientError::JournalBusy)?;
+            Ok(PendingFileLock::File(lock))
         }
-        Ok(PendingFileLock(lock))
     }
 
     /// Re-take the flock before journal cleanup after a long poll. Retries inside `budget`.
@@ -2943,14 +2947,38 @@ mod pending_completion_tests {
         let mut guard = client.claim_pending_send("short").unwrap();
         // dup and fork share the same open file description. CLOEXEC only closes it at exec,
         // so a concurrently spawned child can retain ownership after the parent closes it.
-        let inherited_journal = guard.journal.as_ref().unwrap().0.try_clone().unwrap();
+        let Some(PendingFileLock::Directory(journal)) = &guard.journal else {
+            panic!("expected a directory lock");
+        };
+        let inherited_journal = journal.try_clone().unwrap();
         guard.release_journal().unwrap();
-        let inherited_operation = guard.operation.as_ref().unwrap().0.try_clone().unwrap();
+        let Some(PendingFileLock::File(operation)) = &guard.operation else {
+            panic!("expected an operation file lock");
+        };
+        let inherited_operation = operation.try_clone().unwrap();
         drop(client.claim_pending_send("other").unwrap());
         drop(guard);
         drop(client.claim_pending_send("short").unwrap());
         drop(inherited_operation);
         drop(inherited_journal);
+    }
+
+    #[test]
+    fn operation_file_try_lock_succeeds_after_guard_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("operation.inflight");
+        let guard = PendingSendGuard::lock_operation(&path).unwrap();
+        let contender = StateOpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(guard);
+        contender.try_lock().unwrap();
     }
 
     #[test]
