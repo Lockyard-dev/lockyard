@@ -7,11 +7,15 @@
 //! and read as `0600` and never copied into a project: `.lockyard/config.toml` still refuses a
 //! `token` field.
 
+#[cfg(windows)]
+use crate::windows::OpenOptions;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 /// One server a user is logged in to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,49 +63,111 @@ pub fn path() -> Result<PathBuf> {
     Ok(base.join("lockyard/credentials.toml"))
 }
 
-fn read(path: &Path) -> Result<File> {
+fn read_contents(path: &Path) -> Result<Vec<u8>> {
     #[cfg(unix)]
-    let contents = fs::read_to_string(path);
+    let contents = read_private(path);
     #[cfg(windows)]
-    let contents = crate::windows::read_private(path, 1024 * 1024).and_then(|bytes| {
-        String::from_utf8(bytes)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    });
-    let text = match contents {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(File::default()),
-        Err(error) => return Err(error.into()),
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = fs::metadata(path)?;
-        if metadata.mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
-            return Err(Error::Invalid(format!(
-                "{} holds a token and must be owned by this user and private (mode 0600); \
-                 run `lockyard cloud logout` and log in again",
-                path.display()
-            )));
-        }
+    let contents = crate::windows::read_private(path, 1024 * 1024).map_err(Error::from);
+    match contents {
+        Ok(bytes) => Ok(bytes),
+        Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
     }
-    toml::from_str(&text).map_err(|error| {
+}
+
+#[cfg(unix)]
+fn read_private(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !is_private_file(&metadata, unsafe { libc::geteuid() }) {
+        return Err(Error::Invalid(format!(
+            "{} holds a token and must be owned by this user and private (mode 0600); \
+             correct its owner and permissions before using it",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn is_private_file(metadata: &fs::Metadata, owner: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.is_file() && metadata.mode() & 0o077 == 0 && metadata.uid() == owner
+}
+
+/// Returns only the byte offset, if known, on a decoding or parsing error.
+fn parse(bytes: &[u8]) -> std::result::Result<File, Option<usize>> {
+    let text = std::str::from_utf8(bytes).map_err(|error| Some(error.valid_up_to()))?;
+    // The parser's Display and Debug include the source, which may contain tokens.
+    toml::from_str(text).map_err(|error| error.span().map(|span| span.start))
+}
+
+fn read(path: &Path) -> Result<File> {
+    let bytes = read_contents(path)?;
+    parse(&bytes).map_err(|offset| {
+        let location = offset.map_or_else(String::new, |offset| {
+            let prefix = &bytes[..offset.min(bytes.len())];
+            let line = prefix.iter().filter(|&&byte| byte == b'\n').count() + 1;
+            let line_prefix = prefix.rsplit(|&byte| byte == b'\n').next().unwrap_or(&[]);
+            let column = String::from_utf8_lossy(line_prefix).chars().count() + 1;
+            format!(" (line {line}, column {column})")
+        });
         Error::Invalid(format!(
-            "{} is not readable as credentials ({error}); \
-             run `lockyard cloud logout` and log in again",
+            "{} is not readable as credentials{location}; \
+             run `lockyard cloud logout --url <server-url>` to move the entire credentials file \
+             aside, then log in again to each server you use",
             path.display()
         ))
     })
 }
 
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn lock_for_update(path: &Path) -> io::Result<fs::File> {
+    // Keep this file in place so writers lock the same file even when credentials are replaced,
+    // removed, or moved aside. Dropping the handle releases the lock.
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let lock = options.open(with_suffix(path, ".lock"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = lock.metadata()?;
+        if !is_private_file(&metadata, unsafe { libc::geteuid() }) || metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "credentials lock must be a private file owned by this user",
+            ));
+        }
+    }
+    #[cfg(test)]
+    tests::before_lock();
+    lock.lock()?;
+    Ok(lock)
+}
+
 fn write(path: &Path, file: &File) -> Result<()> {
     let text = toml::to_string(file)
         .map_err(|error| Error::Invalid(format!("credentials could not be written: {error}")))?;
-    if let Some(parent) = path.parent() {
-        #[cfg(unix)]
-        fs::create_dir_all(parent)?;
-        #[cfg(windows)]
-        crate::windows::private_dir(parent)?;
-    }
     // Atomic rename after fsync: a crash leaves the old file or the new one, never a half-written
     // token. Mode 0600 is set on the temporary before the rename.
     crate::fsio::replace(path, text.as_bytes(), 0o600)
@@ -125,6 +191,13 @@ pub fn save_in(path: &Path, entry: &Entry) -> Result<()> {
     if entry.token.trim().is_empty() {
         return Err(Error::Invalid("an empty token is not a login".into()));
     }
+    if let Some(parent) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        #[cfg(unix)]
+        fs::create_dir_all(parent)?;
+        #[cfg(windows)]
+        crate::windows::private_dir(parent)?;
+    }
+    let _lock = lock_for_update(path)?;
     let mut file = read(path)?;
     file.servers.insert(
         key(&entry.url),
@@ -140,19 +213,126 @@ pub fn save_in(path: &Path, entry: &Entry) -> Result<()> {
 
 /// Drops one server's token. Answers whether there was one.
 pub fn forget_in(path: &Path, url: &str) -> Result<bool> {
-    let mut file = read(path)?;
+    let Some(_lock) = lock_for_removal(path)? else {
+        return Ok(false);
+    };
+    forget(path, url, read(path)?)
+}
+
+fn lock_for_removal(path: &Path) -> Result<Option<fs::File>> {
+    match lock_for_update(path) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn forget(path: &Path, url: &str, mut file: File) -> Result<bool> {
     if file.servers.remove(&key(url)).is_none() {
         return Ok(false);
     }
     if file.servers.is_empty() {
         match fs::remove_file(path) {
-            Ok(()) => return Ok(true),
+            Ok(()) => {
+                crate::fsio::sync_dir(parent_directory(path))?;
+                return Ok(true);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
             Err(error) => return Err(error.into()),
         }
     }
     write(path, &file)?;
     Ok(true)
+}
+
+/// What happened to the local credentials during logout.
+pub enum Logout {
+    NoToken,
+    Removed,
+    MovedAside(PathBuf),
+}
+
+/// Drops one server's token, or moves the entire private file aside if its TOML is invalid.
+pub fn logout_in(path: &Path, url: &str) -> Result<Logout> {
+    let Some(_lock) = lock_for_removal(path)? else {
+        return Ok(Logout::NoToken);
+    };
+    match parse(&read_contents(path)?) {
+        Ok(file) => Ok(if forget(path, url, file)? {
+            Logout::Removed
+        } else {
+            Logout::NoToken
+        }),
+        Err(_) => Ok(Logout::MovedAside(move_aside(path)?)),
+    }
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn move_aside(path: &Path) -> Result<PathBuf> {
+    let mut backup = with_suffix(path, ".corrupt");
+    let mut serial = 1;
+    loop {
+        match publish_corrupt_backup(path, &backup) {
+            Ok(()) => return Ok(backup),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                backup = with_suffix(path, &format!(".corrupt.{serial}"));
+                serial += 1;
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "could not move credentials {} to {}: {error}",
+                        path.display(),
+                        backup.display()
+                    ),
+                )
+                .into());
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn publish_corrupt_backup(path: &Path, backup: &Path) -> io::Result<()> {
+    publish_corrupt_backup_with(path, backup, |source, destination| {
+        fs::hard_link(source, destination)
+    })
+}
+
+#[cfg(unix)]
+fn publish_corrupt_backup_with(
+    path: &Path,
+    backup: &Path,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    match link(path, backup) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // Resume an interrupted move after the backup was linked.
+            let source = fs::symlink_metadata(path)?;
+            let destination = fs::symlink_metadata(backup)?;
+            if (source.dev(), source.ino()) != (destination.dev(), destination.ino()) {
+                return Err(error);
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    let parent = parent_directory(path);
+    crate::fsio::sync_dir(parent)?;
+    fs::remove_file(path)?;
+    crate::fsio::sync_dir(parent)
+}
+
+#[cfg(windows)]
+fn publish_corrupt_backup(path: &Path, backup: &Path) -> io::Result<()> {
+    crate::windows::rename_create_only(path, backup)
 }
 
 /// Every server this machine is logged in to, without the tokens.
@@ -173,6 +353,18 @@ pub fn find(url: &str) -> Result<Option<Entry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::sync::mpsc;
+
+    thread_local! {
+        static LOCK_STARTED: RefCell<Option<mpsc::Sender<()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn before_lock() {
+        if let Some(started) = LOCK_STARTED.take() {
+            started.send(()).unwrap();
+        }
+    }
 
     fn entry(url: &str, token: &str) -> Entry {
         Entry {
@@ -248,20 +440,153 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         let error = find_in(&path, "https://a.test").unwrap_err();
         assert!(format!("{error}").contains("0600"), "{error}");
+        assert!(logout_in(&path, "https://a.test").is_err());
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_lock_file_must_be_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.toml");
+        fs::write(with_suffix(&path, ".lock"), b"").unwrap();
+        fs::set_permissions(
+            with_suffix(&path, ".lock"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(save_in(&path, &entry("https://a.test", "fixture")).is_err());
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_rejects_non_regular_links_and_an_unexpected_owner() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.toml");
+        let lock_path = with_suffix(&path, ".lock");
+        let other = dir.path().join("other");
+        crate::fsio::replace(&other, b"fixture", 0o600).unwrap();
+        let meta = fs::File::open(&other).unwrap().metadata().unwrap();
+        assert!(is_private_file(&meta, meta.uid()));
+        assert!(!is_private_file(&meta, meta.uid() ^ 1));
+
+        symlink(&other, &lock_path).unwrap();
+        assert!(lock_for_update(&path).is_err());
+        fs::remove_file(&lock_path).unwrap();
+        fs::hard_link(&other, &lock_path).unwrap();
+        assert!(lock_for_update(&path).is_err());
+        fs::remove_file(&lock_path).unwrap();
+        fs::create_dir(&lock_path).unwrap();
+        assert!(lock_for_update(&path).is_err());
+        assert_eq!(fs::read(other).unwrap(), b"fixture");
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_filesystem_without_hard_links_leaves_the_source_and_backup_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.toml");
+        let backup = with_suffix(&path, ".corrupt");
+        let broken = b"invalid fixture [";
+        crate::fsio::replace(&path, broken, 0o600).unwrap();
+        crate::fsio::replace(&backup, b"older backup", 0o600).unwrap();
+        let error = publish_corrupt_backup_with(&path, &backup, |_, _| {
+            Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(fs::read(path).unwrap(), broken);
+        assert_eq!(fs::read(backup).unwrap(), b"older backup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logout_resumes_after_the_backup_was_linked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.toml");
+        let backup = with_suffix(&path, ".corrupt");
+        let broken = b"invalid fixture [";
+        crate::fsio::replace(&path, broken, 0o600).unwrap();
+        fs::hard_link(&path, &backup).unwrap();
+        assert!(matches!(
+            logout_in(&path, "https://a.test").unwrap(),
+            Logout::MovedAside(actual) if actual == backup
+        ));
+        assert_eq!(fs::read(backup).unwrap(), broken);
+        assert!(!path.exists());
+        assert!(!with_suffix(&path, ".corrupt.1").exists());
     }
 
     #[test]
-    #[cfg(unix)]
-    fn an_unreadable_file_says_so_instead_of_losing_the_other_logins() {
+    fn malformed_credentials_errors_contain_the_position_but_no_token() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials.toml");
-        fs::write(&path, "this is not toml = = =").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        assert!(find_in(&path, "https://a.test").is_err());
+        let token = "lk_fake_core_parse_error_token";
+        let broken = format!("[servers.'https://a.test']\ntoken = [{token}]\n");
+        crate::fsio::replace(&path, broken.as_bytes(), 0o600).unwrap();
+
+        let error = find_in(&path, "https://a.test").unwrap_err();
+        assert!(error.to_string().contains("(line 2, column 10)"));
+        assert!(!error.to_string().contains(token));
+        assert!(!format!("{error:?}").contains(token));
         assert!(save_in(&path, &entry("https://a.test", "one")).is_err());
+        assert!(forget_in(&path, "https://a.test").is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), broken);
+    }
+
+    #[test]
+    fn a_waiting_login_does_not_restore_credentials_removed_under_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.toml");
+        let removed = "https://a.test";
+        let incoming = entry("https://b.test", "fake-login-token");
+        save_in(&path, &entry(removed, "fake-logout-token")).unwrap();
+
+        let lock = lock_for_update(&path).unwrap();
+        std::thread::scope(|scope| {
+            let (started, ready) = mpsc::channel();
+            let (path, incoming) = (&path, &incoming);
+            let login = scope.spawn(move || {
+                LOCK_STARTED.set(Some(started));
+                save_in(path, incoming)
+            });
+            let ready = ready.recv_timeout(std::time::Duration::from_secs(5));
+            // Remove the last credential while the second writer is at the lock.
+            let result = read(path).and_then(|file| forget(path, removed, file));
+            drop(lock);
+            login.join().unwrap().unwrap();
+            ready.unwrap();
+            assert!(result.unwrap());
+        });
+
+        assert_eq!(find_in(&path, removed).unwrap(), None);
+        assert_eq!(find_in(&path, &incoming.url).unwrap(), Some(incoming));
+    }
+
+    #[test]
+    fn concurrent_login_and_forget_serialize_updates_to_different_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.toml");
+        let removed = "https://a.test";
+        let incoming = entry("https://b.test", "fake-login-token");
+        save_in(&path, &entry(removed, "fake-logout-token")).unwrap();
+
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let login = scope.spawn(|| {
+                start.wait();
+                save_in(&path, &incoming).unwrap();
+            });
+            start.wait();
+            assert!(forget_in(&path, removed).unwrap());
+            login.join().unwrap();
+        });
+
+        assert_eq!(find_in(&path, removed).unwrap(), None);
+        assert_eq!(find_in(&path, &incoming.url).unwrap(), Some(incoming));
     }
 }

@@ -187,6 +187,50 @@ impl<T: Transport> CloudBackend<T> {
         self.transport.call(call)
     }
 
+    /// Check the server's task identity before accepting a reconciliation ACK from IPC.
+    pub fn confirm_task_create_ack(&self, call: &Call) -> std::result::Result<(), ClientError> {
+        let key = call
+            .body
+            .as_ref()
+            .and_then(|body| body["client_key"].as_str())
+            .filter(|key| !key.is_empty());
+        let Some(key) = key.filter(|_| call.method == "POST" && call.path == ITEMS) else {
+            return Err(crate::protocol::local(
+                "invalid_request",
+                "IPC acknowledgement requires a task creation with a client key",
+            ));
+        };
+        let mut read = Call::get(&call.session, Self::task_client_key_path(key));
+        read.repository = call.repository.clone();
+        read.deadline_ms = Some(call.deadline_ms.unwrap_or(2_000).min(2_000));
+        let reply = self.call_cloud(&read)?;
+        if Self::matching_task_client_key(reply, key)
+            .map_err(|_| ClientError::Decode("invalid task reconciliation response".into()))?
+            .is_none()
+        {
+            return Err(crate::protocol::local(
+                "task_create_unconfirmed",
+                "task creation has no unique server confirmation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn task_client_key_path(key: &str) -> String {
+        format!("{ITEMS}{}", query(&[("client_key", Some(key.to_owned()))]))
+    }
+
+    fn matching_task_client_key(reply: Value, key: &str) -> Result<Option<tasks::Task>> {
+        let items: Vec<Value> = list(reply, &["items", "tasks"])?;
+        let mut matching = items
+            .iter()
+            .filter(|item| item["client_key"].as_str() == Some(key));
+        match (matching.next(), matching.next()) {
+            (Some(item), None) => task_from(item).map(Some),
+            _ => Ok(None),
+        }
+    }
+
     pub fn with_zone_stream_allowed(mut self, allowed: bool) -> Self {
         self.zone_stream_allowed = allowed;
         self
@@ -1743,19 +1787,8 @@ impl<T: Transport> Backend for CloudBackend<T> {
     }
 
     fn task_by_client_key(&self, key: &str) -> Result<Option<tasks::Task>> {
-        let reply = self.get(
-            &self.session,
-            format!("{ITEMS}{}", query(&[("client_key", Some(key.to_owned()))])),
-        )?;
-        let items: Vec<Value> = list(reply, &["items", "tasks"])?;
-        let matching: Vec<_> = items
-            .iter()
-            .filter(|item| item["client_key"].as_str() == Some(key))
-            .collect();
-        match matching.as_slice() {
-            [item] => task_from(item).map(Some),
-            _ => Ok(None),
-        }
+        let reply = self.get(&self.session, Self::task_client_key_path(key))?;
+        Self::matching_task_client_key(reply, key)
     }
 
     fn inbox(&mut self, agent: &str, filter: InboxQuery, now: i64) -> Result<InboxPage> {
@@ -4893,6 +4926,40 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[test]
+    fn ipc_task_ack_requires_a_unique_server_confirmed_task() {
+        struct TaskLookup(Vec<Value>);
+        impl Transport for TaskLookup {
+            fn call(&self, call: &Call) -> std::result::Result<Value, ClientError> {
+                assert_eq!(call.method, "GET");
+                assert_eq!(call.path, "/api/v1/registry/items?client_key=fixture-key");
+                assert_eq!(call.session, "fixture-session");
+                assert_eq!(call.repository.as_deref(), Some("fixture-repository"));
+                Ok(json!({"items": self.0}))
+            }
+        }
+        let mut call = Call::write(
+            "fixture-session",
+            "POST",
+            ITEMS.into(),
+            json!({"client_key":"fixture-key"}),
+        );
+        call.repository = Some("fixture-repository".into());
+        let mut row = item("ready", 1);
+        row["client_key"] = json!("fixture-key");
+        let mut unrelated = row.clone();
+        unrelated["client_key"] = json!("unrelated-key");
+        for rows in [vec![], vec![unrelated], vec![row.clone(), row.clone()]] {
+            let cloud = CloudBackend::new(TaskLookup(rows), "fixture-session");
+            assert_eq!(
+                cloud.confirm_task_create_ack(&call).unwrap_err().code(),
+                Some("task_create_unconfirmed")
+            );
+        }
+        let cloud = CloudBackend::new(TaskLookup(vec![row]), "fixture-session");
+        cloud.confirm_task_create_ack(&call).unwrap();
     }
 
     #[test]

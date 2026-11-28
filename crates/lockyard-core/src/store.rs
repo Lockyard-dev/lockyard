@@ -19,6 +19,124 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_AGENT_LEN: usize = 128;
 const TOUCH_INTERVAL_MS: i64 = 60_000;
 
+fn configure_durable_writes(conn: &Connection) -> Result<()> {
+    // Keep automatic checkpoints and sync each commit. Short-lived clients reuse the WAL.
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    Ok(())
+}
+
+/// A SQLite database in private client state, independent of a project-local store.
+pub struct PrivateStateDatabase {
+    conn: Connection,
+    #[cfg(windows)]
+    _directory: crate::windows::Directory,
+}
+
+impl std::ops::Deref for PrivateStateDatabase {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for PrivateStateDatabase {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+}
+
+/// Open SQLite state in an already validated, private client directory.
+pub fn open_private_state_database(dir: &Path, name: &str) -> Result<PrivateStateDatabase> {
+    use rusqlite::{ErrorCode, OpenFlags};
+    use std::time::Instant;
+
+    if Path::new(name).file_name().and_then(|part| part.to_str()) != Some(name) {
+        return Err(Error::Invalid("invalid client database name".into()));
+    }
+    let path = dir.join(name);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let validate = |metadata: fs::Metadata| {
+            if !metadata.is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err(Error::Invalid("client database file is not private".into()));
+            }
+            Ok(())
+        };
+        // Precreate privately. Never open/close a second descriptor to an existing
+        // database: close could release this process's SQLite POSIX locks.
+        if !path.try_exists()? {
+            let staged = tempfile::NamedTempFile::new_in(dir)?.into_temp_path();
+            match staged.persist_noclobber(&path) {
+                Ok(()) => crate::fsio::sync_dir(dir)?,
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.error.into()),
+            }
+        }
+        validate(fs::symlink_metadata(&path)?)?;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            match fs::symlink_metadata(dir.join(format!("{name}{suffix}"))) {
+                Ok(metadata) => validate(metadata)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    #[cfg(windows)]
+    let mut database = windows_named_database(dir, name, true)?;
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    #[cfg(windows)]
+    {
+        database.verify_connection(&conn)?;
+        drop(database.journal.take());
+    }
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+    configure_durable_writes(&conn)?;
+    let started = Instant::now();
+    loop {
+        // Concurrent first opens can race the transition out of rollback mode.
+        // SQLite can return BUSY immediately for this particular PRAGMA.
+        let mode = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+            .and_then(|mode| {
+                if mode == "wal" {
+                    Ok(mode)
+                } else {
+                    conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+                }
+            });
+        match mode {
+            Ok(mode) if mode == "wal" => break,
+            Err(error)
+                if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy)
+                    && started.elapsed() < BUSY_TIMEOUT =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => return Err(Error::Invalid("client database requires WAL mode".into())),
+        }
+    }
+    Ok(PrivateStateDatabase {
+        conn,
+        #[cfg(windows)]
+        _directory: database.directory,
+    })
+}
+
 const SCHEMA: &str = "
 CREATE TABLE agents (
     id TEXT PRIMARY KEY,
@@ -302,11 +420,7 @@ impl Store {
             |_| Ok(SCHEMA_VERSION),
         )?;
         conn.pragma_update(None, "foreign_keys", true)?;
-        // Short-lived CLI writers must not checkpoint, unlink and recreate WAL/SHM on every
-        // command. Keep the normal automatic checkpoints, and sync each commit before returning
-        // success: retaining a NORMAL-synchronous WAL would extend the power-loss window.
-        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
+        configure_durable_writes(&conn)?;
         drop(config_span);
         #[cfg(windows)]
         let WindowsDatabase {
@@ -740,12 +854,21 @@ impl WindowsDatabase {
 
 #[cfg(windows)]
 fn windows_database(dir: &Path, create: bool) -> std::io::Result<WindowsDatabase> {
+    windows_named_database(dir, DB_NAME, create)
+}
+
+#[cfg(windows)]
+fn windows_named_database(
+    dir: &Path,
+    name: &str,
+    create: bool,
+) -> std::io::Result<WindowsDatabase> {
     let directory = crate::windows::open_directory(dir)?;
-    let db = directory.pin_private_file(std::ffi::OsStr::new(DB_NAME), create)?;
+    let db = directory.pin_private_file(std::ffi::OsStr::new(name), create)?;
     let mut sidecars = Vec::new();
     let mut journal = None;
     for suffix in ["-wal", "-shm", "-journal"] {
-        let name = format!("{DB_NAME}{suffix}");
+        let name = format!("{name}{suffix}");
         match directory.pin_private_file(std::ffi::OsStr::new(&name), false) {
             Ok(file) if suffix == "-journal" => journal = Some(file),
             Ok(file) => sidecars.push(file),

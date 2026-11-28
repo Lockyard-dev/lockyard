@@ -17,14 +17,14 @@ const MAX_STATUS_PROTOCOL_HINT_BYTES: u64 = 16 * 1024;
 #[path = "pending_maintenance.rs"]
 mod maintenance;
 pub use maintenance::PendingRepair;
+#[path = "pending_store.rs"]
+mod pending_store;
+use pending_store::Admission;
+pub(crate) use pending_store::PendingJournal;
 
 const MAX_PENDING: usize = 128;
-const REPAIR_LOCK: &str = ".repair.lock";
 const PENDING_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 const MAX_PENDING_BYTES: u64 = 16 * 1024 * 1024;
-// An empty, lazily created directory flags released-journal ownership/cleanup. Its
-// absence is a single metadata lookup, not a scan of the ordinary pending journal.
-const LONG_POLL_MAINTENANCE: &str = ".long-poll";
 
 fn registry_create_key(pending: &PendingWrite) -> Option<String> {
     if pending.method != "POST" || pending.request_path != "/api/v1/registry/items" {
@@ -278,239 +278,20 @@ pub(crate) struct ProtocolState {
     pub(crate) cached: Option<CachedProtocol>,
     pending: BTreeMap<String, PendingWrite>,
     active_writes: BTreeSet<String>,
-    completed_writes: BTreeSet<String>,
 }
 
-/// Close alone leaves a Unix flock alive in a descriptor inherited by a concurrent fork,
-/// until that child execs. Release ownership explicitly before closing our descriptor.
-#[derive(Debug)]
-enum PendingFileLock {
-    File(std::fs::File),
-    #[cfg(unix)]
-    Directory(std::fs::File),
-}
-
-impl Drop for PendingFileLock {
-    fn drop(&mut self) {
-        // Retry interrupted unlocks so the guard releases ownership before close.
-        loop {
-            let result = match self {
-                Self::File(file) => file.unlock(),
-                #[cfg(unix)]
-                Self::Directory(directory) => {
-                    use std::os::fd::AsRawFd;
-                    if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_UN) } == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
-                    }
-                }
-            };
-            if !matches!(result, Err(error) if error.kind() == std::io::ErrorKind::Interrupted) {
-                break;
-            }
-        }
-    }
-}
-
-pub(crate) struct PendingSendGuard<'a> {
+pub(crate) struct MemorySendGuard<'a> {
     state: &'a std::sync::Mutex<ProtocolState>,
     key: String,
-    /// Directory whose flock serializes journal writes across processes. Held only while
-    /// mutating the journal. HTTP and retry waits keep only the per-key lock.
-    journal_dir: Option<&'a Path>,
-    journal: Option<PendingFileLock>,
-    /// Per-key ownership survives releasing the shared journal during network work or backoff.
-    operation: Option<PendingFileLock>,
 }
 
-impl PendingSendGuard<'_> {
-    fn lock_operation(path: &Path) -> Result<PendingFileLock, ClientError> {
-        let mut options = StateOpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        let file = options.open(path).map_err(journal_error)?;
-        private_file(&file.metadata().map_err(journal_error)?)?;
-        file.try_lock().map_err(|_| ClientError::JournalBusy)?;
-        Ok(PendingFileLock::File(file))
-    }
-
-    /// All contenders open operation locks while owning the shared journal lock.
-    /// Under that lock an unlocked inode can be removed without leaving stale waiters.
-    fn clean_operation_locks(directory: &Path) -> Result<bool, ClientError> {
-        #[cfg(test)]
-        pending_completion_tests::record_maintenance_scan();
-        let mut active = false;
-        for entry in std::fs::read_dir(directory).map_err(journal_error)? {
-            let path = entry.map_err(journal_error)?.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("inflight") {
-                continue;
-            }
-            match Self::lock_operation(&path) {
-                Ok(lock) => {
-                    // The shared journal excludes new openers. Close our probe before
-                    // unlinking so Windows does not race an outstanding file handle.
-                    drop(lock);
-                    std::fs::remove_file(path).map_err(journal_error)?;
-                }
-                Err(error) if journal_busy(&error) => active = true,
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(active)
-    }
-
-    /// Drop the cross-process flock so siblings can release / claim / add tasks while this
-    /// call waits on the server. The in-process active-write key stays reserved.
-    fn acquire_operation(&mut self) -> Result<(), ClientError> {
-        if let Some(directory) = self.journal_dir
-            && self.operation.is_none()
-        {
-            private_directory(&directory.join(LONG_POLL_MAINTENANCE))?;
-            self.operation = Some(Self::lock_operation(
-                &journal_path(directory, &self.key).with_extension("inflight"),
-            )?);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn release_journal(&mut self) -> Result<(), ClientError> {
-        self.acquire_operation()?;
-        self.journal = None;
-        Ok(())
-    }
-
-    pub(crate) fn exchange<T>(&mut self, network: impl FnOnce() -> T) -> Result<T, ClientError> {
-        self.exchange_with_budget(None, None, network)
-    }
-
-    pub(crate) fn exchange_with_budget<T>(
-        &mut self,
-        budget: Option<Duration>,
-        cancellation: Option<&Cancellation>,
-        network: impl FnOnce() -> T,
-    ) -> Result<T, ClientError> {
-        let started = Instant::now();
-        self.release_journal()?;
-        let result = network();
-        let left = budget.map_or(crate::MAX_RETRY_WAIT, |limit| {
-            limit.saturating_sub(started.elapsed())
-        });
-        self.wait_for_journal_with_budget(left, cancellation)?;
-        Ok(result)
-    }
-
-    fn wait_for_journal_with_budget(
-        &mut self,
-        budget: Duration,
-        cancellation: Option<&Cancellation>,
-    ) -> Result<(), ClientError> {
-        self.reacquire_journal(budget, |delay| {
-            if let Some(cancellation) = cancellation {
-                cancellation.check()?;
-            }
-            std::thread::sleep(delay.min(Duration::from_millis(2)));
-            Ok(())
-        })
-    }
-
-    fn lock_journal(directory: &Path) -> Result<PendingFileLock, ClientError> {
-        private_directory(directory)?;
-        let mut options = StateOpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        #[cfg(unix)]
-        let lock = options.open(directory).map_err(journal_error)?;
-        #[cfg(windows)]
-        let lock = StateOpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(directory.join(".journal.lock"))
-            .map_err(journal_error)?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            // File::try_lock does not guarantee exclusive locking of a read-only directory FD.
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                return Err(ClientError::JournalBusy);
-            }
-            Ok(PendingFileLock::Directory(lock))
-        }
-        #[cfg(not(unix))]
-        {
-            lock.try_lock().map_err(|_| ClientError::JournalBusy)?;
-            Ok(PendingFileLock::File(lock))
-        }
-    }
-
-    /// Re-take the flock before mutating the journal. Retries inside `budget`.
-    pub(crate) fn reacquire_journal(
-        &mut self,
-        budget: Duration,
-        wait: impl Fn(Duration) -> Result<(), ClientError>,
-    ) -> Result<(), ClientError> {
-        let Some(directory) = self.journal_dir else {
-            return Ok(());
-        };
-        if self.journal.is_some() {
-            return Ok(());
-        }
-        let started = Instant::now();
-        let mut delay = Duration::from_millis(25);
-        loop {
-            match Self::lock_journal(directory) {
-                Ok(lock) => {
-                    self.journal = Some(lock);
-                    return Ok(());
-                }
-                Err(error) if journal_busy(&error) => {
-                    let left = budget.saturating_sub(started.elapsed());
-                    if left.is_zero() {
-                        return Err(error);
-                    }
-                    let pause = delay.min(left).min(Duration::from_millis(250));
-                    wait(pause)?;
-                    delay = delay.saturating_mul(2).min(Duration::from_millis(250));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-}
-
-impl Drop for PendingSendGuard<'_> {
+impl Drop for MemorySendGuard<'_> {
     fn drop(&mut self) {
-        let had_operation = self.operation.is_some();
-        // Fields otherwise drop in declaration order (journal before operation).
-        // Close the operation handle while the shared journal still excludes cleanup
-        // in other processes, including on Windows where open handles impede unlink.
-        drop(self.operation.take());
-        // No process can open this inode while we own the shared journal lock.
-        // Without it, leave the inode for clean_operation_locks on the next acquisition.
-        if self.journal.is_some()
-            && had_operation
-            && let Some(directory) = self.journal_dir
-        {
-            let _ =
-                std::fs::remove_file(journal_path(directory, &self.key).with_extension("inflight"));
-        }
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .active_writes
             .remove(&self.key);
-        drop(self.journal.take());
     }
 }
 
@@ -560,7 +341,7 @@ impl ClientError {
         }
     }
 
-    fn api_error(&self) -> Option<&ApiError> {
+    pub(super) fn api_error(&self) -> Option<&ApiError> {
         match self {
             Self::Unauthorized(error)
             | Self::Denied(error)
@@ -842,14 +623,30 @@ impl Client {
     /// Opt into a private, 30-second modern negotiation hint for status-only clients. Live
     /// encryption policy and every response's protocol/repository echo remain mandatory.
     /// A missing, unsafe, stale or unreadable hint is simply a normal discovery cache miss.
-    pub fn with_status_protocol_cache(mut self) -> Self {
-        let Some(directory) = self.pending_journal.as_ref() else {
+    pub fn with_status_protocol_cache(self) -> Self {
+        let Some(journal) = self.pending_journal.as_ref() else {
             return self;
         };
-        if status_protocol_clock().is_none() || private_directory(directory).is_err() {
+        let path = journal.status_cache_path();
+        self.use_status_protocol_cache(path)
+    }
+
+    /// Locate the same cache for a read-only client without opening the pending database.
+    pub fn with_status_protocol_cache_at(self, root: impl AsRef<Path>) -> Self {
+        let path = pending_store::status_cache_path(&self, root.as_ref());
+        self.use_status_protocol_cache(path)
+    }
+
+    fn use_status_protocol_cache(mut self, path: PathBuf) -> Self {
+        if status_protocol_clock().is_none() {
             return self;
         }
-        let path = directory.join("status-protocol.cache");
+        if !path
+            .parent()
+            .is_some_and(Self::private_status_cache_directory)
+        {
+            return self;
+        }
         if let Some(cached) = self.load_status_protocol_hint(&path) {
             self.protocol_state
                 .lock()
@@ -858,6 +655,16 @@ impl Client {
         }
         self.status_protocol_cache = Some(path);
         self
+    }
+
+    fn private_status_cache_directory(directory: &Path) -> bool {
+        #[cfg(windows)]
+        match std::fs::symlink_metadata(directory) {
+            Ok(_) => return lockyard_core::windows::require_private(directory).is_ok(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
+        private_directory(directory).is_ok()
     }
 
     fn load_status_protocol_hint(&self, path: &Path) -> Option<CachedProtocol> {
@@ -912,7 +719,7 @@ impl Client {
         let Some(parent) = path.parent() else {
             return;
         };
-        if private_directory(parent).is_err() {
+        if !Self::private_status_cache_directory(parent) {
             return;
         }
         let hint = StatusProtocolHint {
@@ -956,8 +763,14 @@ impl Client {
         )
     }
 
-    /// Reserve the key in this client before waiting for the cross-process journal lock.
-    fn reserve_pending_key(&self, key: &str) -> Result<PendingSendGuard<'_>, ClientError> {
+    /// The in-memory transport has no durable admission record shared by callers.
+    pub(crate) fn reserve_memory_send(
+        &self,
+        key: &str,
+    ) -> Result<Option<MemorySendGuard<'_>>, ClientError> {
+        if self.pending_journal.is_some() {
+            return Ok(None);
+        }
         if !self
             .protocol_state
             .lock()
@@ -967,189 +780,14 @@ impl Client {
         {
             return Err(ClientError::JournalBusy);
         }
-        Ok(PendingSendGuard {
+        Ok(Some(MemorySendGuard {
             state: &self.protocol_state,
             key: key.to_owned(),
-            journal_dir: self.pending_journal.as_deref(),
-            journal: None,
-            operation: None,
-        })
-    }
-
-    /// Exclusive through send, response classification and receipt cleanup, including clients
-    /// sharing a journal. Busy callers retry later without issuing a concurrent operation.
-    pub(crate) fn claim_pending_send(
-        &self,
-        key: &str,
-    ) -> Result<PendingSendGuard<'_>, ClientError> {
-        self.claim_pending_send_observing(key, &mut SameKeyContention::default())
-    }
-
-    fn claim_pending_send_observing(
-        &self,
-        key: &str,
-        contention: &mut SameKeyContention,
-    ) -> Result<PendingSendGuard<'_>, ClientError> {
-        let mut guard = match self.reserve_pending_key(key) {
-            Ok(guard) => guard,
-            Err(error) => {
-                // Another call in this client holds the key. Keep its exact wire bytes
-                // when they are already journaled, so this call can resend them (LOCAL-0148).
-                contention.seen = true;
-                if contention.sibling.is_none() {
-                    contention.sibling = self.pending_operation(key);
-                }
-                return Err(error);
-            }
-        };
-        if let Some(directory) = &self.pending_journal {
-            guard.reacquire_journal(Duration::ZERO, |_| Ok(()))?;
-            if directory
-                .join(LONG_POLL_MAINTENANCE)
-                .try_exists()
-                .map_err(journal_error)?
-            {
-                let active = PendingSendGuard::clean_operation_locks(directory)?;
-                let retry_cleanup = self.retire_completed_pending(directory)?;
-                // Only locked inodes remain after cleanup. Do not create a second
-                // per-key inode for an ordinary send; the journal protects this check.
-                if journal_path(directory, key)
-                    .with_extension("inflight")
-                    .try_exists()
-                    .map_err(journal_error)?
-                {
-                    contention.seen = true;
-                    if contention.sibling.is_none()
-                        && let Ok(row) =
-                            read_private_json::<PendingWrite>(&journal_path(directory, key))
-                        && row.key == key
-                        && row.origin == self.base_url
-                        && row.credential_scope == crate::credential_fingerprint(&self.token)
-                    {
-                        contention.sibling = Some(row);
-                    }
-                    return Err(ClientError::JournalBusy);
-                }
-                if !active && !retry_cleanup {
-                    // Completion removal already synced the journal. Removing an empty
-                    // hint requires no durability: a stale hint only costs one scan.
-                    std::fs::remove_dir(directory.join(LONG_POLL_MAINTENANCE))
-                        .map_err(journal_error)?;
-                }
-            } else {
-                // A sibling may already have removed the sidecars and their hint.
-                // Retire our verified in-memory completions too, without scanning.
-                // This also retries durable cleanup if publishing their marker failed.
-                let keys = self
-                    .protocol_state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .completed_writes
-                    .clone();
-                self.retire_completed_keys(keys)?;
-            }
-            // Refresh the budget after sibling cleanup, but preserve this caller's
-            // knowledge of an already-sent key. Its disappearance is not permission
-            // to re-encrypt the queued call with fresh wire bytes.
-            let observed = self.pending_operation(key);
-            self.reload_pending(true)?;
-            let repair_lock = directory.join(REPAIR_LOCK);
-            if observed.is_none()
-                && self.pending_operation(key).is_none()
-                && repair_lock.try_exists().map_err(journal_error)?
-                && Self::pending_capacity_exceeded(
-                    &self
-                        .protocol_state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    0,
-                )
-            {
-                // A repair may have released the journal for HTTP while still
-                // reclaiming capacity. Existing keys can recover independently.
-                PendingSendGuard::lock_operation(&repair_lock)?;
-            }
-            // Another client may have sent or completed this operation since we loaded it.
-            // Never recreate a stale entry or trust a cached pre-execution refusal.
-            let path = self.existing_pending_path(directory, key)?;
-            if path
-                .with_extension("quarantine")
-                .try_exists()
-                .map_err(journal_error)?
-            {
-                return Err(local(
-                    "outcome_unknown",
-                    "pending operation is quarantined; original bytes retained; reconcile its outcome before using a new key",
-                ));
-            }
-            match std::fs::symlink_metadata(&path) {
-                Ok(metadata) => {
-                    private_file(&metadata)?;
-                    let mut options = StateOpenOptions::new();
-                    options.read(true);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        options.custom_flags(libc::O_NOFOLLOW);
-                    }
-                    let file = options.open(path).map_err(journal_error)?;
-                    private_file(&file.metadata().map_err(journal_error)?)?;
-                    let operation: PendingWrite =
-                        serde_json::from_reader(file).map_err(journal_error)?;
-                    if operation.key != key
-                        || operation.origin != self.base_url
-                        || operation.credential_scope != crate::credential_fingerprint(&self.token)
-                    {
-                        return Err(journal_error("pending operation changed scope"));
-                    }
-                    self.protocol_state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .pending
-                        .insert(key.to_owned(), operation);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if self.settled_response_key_exists(key)? {
-                        return Ok(guard);
-                    }
-                    if let Some(pending) = observed.or_else(|| self.pending_operation(key)) {
-                        // Another client finished this key. Its row is gone, so never write it
-                        // back; the caller resends these exact bytes and the server answers
-                        // from its Idempotency-Key receipt (LOCAL-0148).
-                        self.protocol_state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .pending
-                            .remove(key);
-                        contention.seen = true;
-                        contention.sibling.get_or_insert(pending);
-                    }
-                }
-                Err(error) => return Err(journal_error(error)),
-            }
-        }
-        Ok(guard)
-    }
-
-    pub(super) fn existing_pending_path(
-        &self,
-        directory: &Path,
-        key: &str,
-    ) -> Result<PathBuf, ClientError> {
-        let path = journal_path(directory, key);
-        let unknown = path.with_extension("unknown");
-        if unknown.try_exists().map_err(journal_error)? {
-            Ok(unknown)
-        } else {
-            Ok(path)
-        }
+        }))
     }
 
     pub(super) fn attach_pending_journal(&mut self, directory: &Path) -> Result<(), ClientError> {
-        let scope = crate::credential_fingerprint(&format!("{}\0{}", self.base_url, self.token));
-        let directory = directory.join(scope);
-        private_directory(&directory)?;
-        self.pending_journal = Some(directory);
+        self.pending_journal = Some(PendingJournal::open(self, directory)?);
         Ok(())
     }
 
@@ -1168,7 +806,6 @@ impl Client {
         directory: impl AsRef<Path>,
     ) -> Result<Self, ClientError> {
         self.attach_pending_journal(directory.as_ref())?;
-        self.reload_pending(false)?;
         Ok(self)
     }
 
@@ -1187,14 +824,7 @@ impl Client {
 
     /// Reconcile restored operations after opening the client and configuring encryption.
     pub fn reconcile_pending_on_startup(self) -> Result<Self, ClientError> {
-        match self.maintain_pending_journal() {
-            Ok(_) => {}
-            // A live sender owns its record. Load without waiting for its HTTP exchange.
-            Err(error) if journal_busy(&error) => {
-                self.reload_pending(false)?;
-            }
-            Err(error) => return Err(error),
-        }
+        self.maintain_pending_journal()?;
         Ok(self)
     }
 
@@ -1244,7 +874,7 @@ impl Client {
                 "expected a registry task create".into(),
             ));
         }
-        let mut operations = self.pending_operations();
+        let mut operations = self.try_pending_operations()?;
         operations.extend(self.unconsumed_settled_operations()?);
         for pending in operations {
             if pending.method != call.method
@@ -1306,317 +936,232 @@ impl Client {
 
     /// Retrieve exact bytes for receipt reconciliation; do not log this value.
     pub fn pending_operation(&self, key: &str) -> Option<PendingWrite> {
-        self.protocol_state
+        self.try_pending_operation(key).ok().flatten()
+    }
+
+    pub(crate) fn try_pending_operation(
+        &self,
+        key: &str,
+    ) -> Result<Option<PendingWrite>, ClientError> {
+        if let Some(journal) = &self.pending_journal {
+            return journal.pending(key);
+        }
+        Ok(self
+            .protocol_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pending
             .get(key)
-            .cloned()
+            .cloned())
     }
 
     pub fn pending_operations(&self) -> Vec<PendingWrite> {
-        self.protocol_state
+        self.try_pending_operations().unwrap_or_default()
+    }
+
+    pub fn try_pending_operations(&self) -> Result<Vec<PendingWrite>, ClientError> {
+        if let Some(journal) = &self.pending_journal {
+            return journal.pending_rows();
+        }
+        Ok(self
+            .protocol_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pending
             .values()
             .cloned()
-            .collect()
+            .collect())
     }
 
-    /// Forget an operation only after its receipt or domain state has been verified.
+    pub(crate) fn pending_for_send(&self, key: &str) -> Result<Option<PendingWrite>, ClientError> {
+        self.pending_for_send_before(key, None)
+    }
+
+    fn pending_for_send_before(
+        &self,
+        key: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Option<PendingWrite>, ClientError> {
+        if let Some(journal) = &self.pending_journal {
+            return journal.for_send(key, deadline);
+        }
+        self.try_pending_operation(key)
+    }
+
+    /// Retire an operation only after its receipt or domain state has been verified.
     pub fn resolve_pending(&self, key: &str) -> Result<(), ClientError> {
-        let resolved = if let Some(directory) = &self.pending_journal {
-            match std::fs::remove_file(self.existing_pending_path(directory, key)?) {
-                Ok(()) => lockyard_core::fsio::sync_dir(directory).map_err(journal_error),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(journal_error(error)),
-            }
-        } else {
-            Ok(())
-        };
-        if let Err(error) = resolved {
-            if let Some(pending) = self.pending_operation(key) {
-                // A cleanup failure cannot turn a possibly-sent write into a preflight refusal.
-                // If deletion succeeded but directory sync failed, try restoring its record.
-                // Storage failure can still prevent that; memory always retains the exact bytes.
-                let cause = pending.cause_code.clone();
-                let status = pending.cause_status;
-                return Err(self.unknown(pending, &cause, status));
-            }
-            return Err(error);
+        if let Some(journal) = &self.pending_journal {
+            return journal.complete(key);
         }
         self.protocol_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pending
             .remove(key);
-        if let Some(directory) = &self.pending_journal
-            && directory
-                .join(LONG_POLL_MAINTENANCE)
-                .try_exists()
-                .map_err(journal_error)?
-        {
-            match std::fs::remove_file(journal_path(directory, key).with_extension("completed")) {
-                Ok(()) => lockyard_core::fsio::sync_dir(directory).map_err(journal_error)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(journal_error(error)),
-            }
-        }
         Ok(())
     }
 
-    /// The per-operation lock protects this terminal marker even while another key owns
-    /// the shared journal. It never edits the pending record without the shared lock.
-    fn complete_pending_later(&self, pending: &PendingWrite) {
-        self.protocol_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .completed_writes
-            .insert(pending.key.clone());
-        if let Some(directory) = &self.pending_journal
-            && let Ok(bytes) = serde_json::to_string(pending)
-        {
-            let marker = json!({"key":pending.key,"digest":crate::credential_fingerprint(&bytes)});
-            let _ = lockyard_core::fsio::replace(
-                &journal_path(directory, &pending.key).with_extension("completed"),
-                marker.to_string().as_bytes(),
-                0o600,
-            );
+    fn finish_pending(&self, pending: &PendingWrite) -> Result<(), ClientError> {
+        if let Some(journal) = &self.pending_journal {
+            journal
+                .complete_verified(pending)
+                .map_err(|_| ClientError::OutcomeUnknown(Box::new(pending.clone())))
+        } else {
+            self.resolve_pending(&pending.key)
         }
     }
 
-    /// Called only with the shared journal lock; survives a short-lived CLI exiting.
-    fn retire_completed_pending(&self, directory: &Path) -> Result<bool, ClientError> {
-        #[cfg(test)]
-        pending_completion_tests::record_maintenance_scan();
-        let mut retry_cleanup = false;
-        let mut keys = self
-            .protocol_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .completed_writes
-            .clone();
-        for entry in std::fs::read_dir(directory).map_err(journal_error)? {
-            let path = entry.map_err(journal_error)?.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("completed") {
-                continue;
+    fn discard_unsent(&self, row: &PendingWrite) -> Result<(), ClientError> {
+        if let Some(journal) = &self.pending_journal {
+            if !journal.discard_unshared(row)? {
+                return Err(ClientError::OutcomeUnknown(Box::new(row.clone())));
             }
-            let validated = (|| {
-                let marker: Value = read_private_json(&path)?;
-                let key = marker["key"]
-                    .as_str()
-                    .filter(|key| !key.is_empty())
-                    .ok_or_else(|| journal_error("invalid completion marker"))?;
-                let marker_digest = marker["digest"]
-                    .as_str()
-                    .filter(|digest| {
-                        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    })
-                    .ok_or_else(|| journal_error("invalid completion marker digest"))?;
-                let pending_path = self.existing_pending_path(directory, key)?;
-                if path != pending_path.with_extension("completed") {
-                    return Err(journal_error("invalid completion marker path"));
-                }
-                if pending_path.try_exists().map_err(journal_error)? {
-                    let pending: PendingWrite = read_private_json(&pending_path)?;
-                    let digest = crate::credential_fingerprint(
-                        &serde_json::to_string(&pending).map_err(journal_error)?,
-                    );
-                    if pending.key != key
-                        || pending.origin != self.base_url
-                        || pending.credential_scope != crate::credential_fingerprint(&self.token)
-                        || marker_digest != digest
-                    {
-                        return Err(journal_error(
-                            "completion marker does not match pending operation",
-                        ));
-                    }
-                }
-                Ok(key.to_owned())
-            })();
-            match validated {
-                Ok(key) => {
-                    keys.insert(key);
-                }
-                Err(_) => {
-                    // A marker is only a cleanup hint. Preserve the pending bytes and
-                    // isolate a bad hint instead of blocking every key/process forever.
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos();
-                    let quarantine = path.with_extension(format!("completed.bad-{timestamp}"));
-                    match lockyard_core::fsio::rename(&path, &quarantine)
-                        .and_then(|()| lockyard_core::fsio::sync_dir(directory))
-                    {
-                        Ok(()) => eprintln!(
-                            "warning: quarantined invalid pending completion marker: {}",
-                            quarantine.display()
-                        ),
-                        Err(error) => {
-                            retry_cleanup = true;
-                            eprintln!(
-                                "warning: cannot quarantine invalid pending completion marker {}: {error}",
-                                path.display()
-                            );
-                        }
-                    }
-                }
-            }
+            return Ok(());
         }
-        self.retire_completed_keys(keys)?;
-        Ok(retry_cleanup)
-    }
-
-    fn retire_completed_keys(&self, keys: BTreeSet<String>) -> Result<(), ClientError> {
-        for key in keys {
-            self.resolve_pending(&key)?;
-            self.protocol_state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .completed_writes
-                .remove(&key);
-        }
-        Ok(())
-    }
-
-    fn pending_capacity_exceeded(state: &ProtocolState, extra_bytes: usize) -> bool {
-        let mut count = 0;
-        let mut bytes = extra_bytes;
-        for entry in state
-            .pending
-            .values()
-            .filter(|row| maintenance::uses_replay_budget(row))
-        {
-            count += 1;
-            bytes = bytes.saturating_add(entry.body.as_ref().map_or(0, String::len));
-        }
-        count >= MAX_PENDING || bytes > MAX_PENDING_BYTES as usize
+        self.resolve_pending(&row.key)
     }
 
     pub(crate) fn repair_before_admission(
         &self,
-        guard: &mut PendingSendGuard<'_>,
         new_bytes: usize,
         budget: Duration,
     ) -> Result<(), ClientError> {
-        let full = || {
-            Self::pending_capacity_exceeded(
-                &self
-                    .protocol_state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-                new_bytes,
-            )
-        };
-        if self.pending_journal.is_none() || !full() {
-            return Ok(());
+        let deadline = Instant::now() + budget.min(Duration::from_secs(2));
+        if let Some(journal) = &self.pending_journal
+            && journal.full(new_bytes, deadline)?
+        {
+            self.repair_pending_for_capacity(deadline)?;
         }
-        let started = Instant::now();
-        let left = || budget.saturating_sub(started.elapsed());
-        loop {
-            guard.release_journal()?;
-            let repair = self
-                .repair_pending_for_capacity(Instant::now() + left().min(Duration::from_secs(2)));
-            if matches!(repair, Err(ClientError::JournalBusy)) {
-                std::thread::sleep(left().min(Duration::from_millis(25)));
-            }
-            guard.reacquire_journal(left(), |delay| {
-                std::thread::sleep(delay);
-                Ok(())
-            })?;
-            self.reload_pending(true)?;
-            match repair {
-                Err(ClientError::JournalBusy) if !full() => return Ok(()),
-                Err(ClientError::JournalBusy) if !left().is_zero() => {}
-                result => return result.map(|_| ()),
-            }
-        }
+        Ok(())
     }
 
-    pub(crate) fn retain_pending(&self, operation: PendingWrite) -> Result<(), ClientError> {
+    pub(crate) fn admit_pending(
+        &self,
+        operation: &PendingWrite,
+    ) -> Result<Option<PendingWrite>, ClientError> {
+        self.admit_pending_before(operation, None)
+    }
+
+    fn admit_pending_before(
+        &self,
+        operation: &PendingWrite,
+        deadline: Option<Instant>,
+    ) -> Result<Option<PendingWrite>, ClientError> {
+        let encoded = serde_json::to_vec(operation).map_err(journal_error)?;
+        if encoded.len() > MAX_PENDING_BYTES as usize {
+            return Err(journal_error("pending record exceeds budget"));
+        }
+        if let Some(journal) = &self.pending_journal {
+            return match journal.admit(operation, &encoded, deadline)? {
+                Admission::Inserted => Ok(None),
+                Admission::Existing(existing) => Ok(Some(*existing)),
+                Admission::Full => Err(Self::capacity_error()),
+            };
+        }
         let mut state = self
             .protocol_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.pending.contains_key(&operation.key) {
-            return Err(ClientError::OutcomeUnknown(Box::new(
-                state.pending[&operation.key].clone(),
-            )));
+        if let Some(previous) = state.pending.get(&operation.key) {
+            return Ok(Some(previous.clone()));
         }
-        let encoded = serde_json::to_vec(&operation).map_err(journal_error)?;
-        if encoded.len() > MAX_PENDING_BYTES as usize {
-            return Err(journal_error("pending record exceeds budget"));
-        }
-        if maintenance::uses_replay_budget(&operation)
-            && Self::pending_capacity_exceeded(&state, encoded.len())
-        {
-            return Err(journal_error(
-                "pending operation budget exceeded; run `lockyard doctor --repair-pending`; нужна сеть для сверки (network required); no pending operations were discarded",
-            ));
-        }
-        if let Some(directory) = &self.pending_journal {
-            private_directory(directory)?;
-            use std::io::Write;
-            let mut options = StateOpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
+        if maintenance::uses_replay_budget(operation) {
+            let mut count = 0;
+            let mut bytes = encoded.len();
+            for entry in state
+                .pending
+                .values()
+                .filter(|row| maintenance::uses_replay_budget(row))
             {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+                count += 1;
+                bytes =
+                    bytes.saturating_add(serde_json::to_vec(entry).map_err(journal_error)?.len());
             }
-            let mut file = options
-                .open(journal_path(directory, &operation.key))
-                .map_err(journal_error)?;
-            // An incomplete pre-send journal is deliberately retained and fails closed on load.
-            file.write_all(&encoded)
-                .and_then(|()| file.sync_all())
-                .map_err(journal_error)?;
-            lockyard_core::fsio::sync_dir(directory).map_err(journal_error)?;
+            if count >= MAX_PENDING || bytes > MAX_PENDING_BYTES as usize {
+                return Err(Self::capacity_error());
+            }
         }
-        state.pending.insert(operation.key.clone(), operation);
-        Ok(())
+        state
+            .pending
+            .insert(operation.key.clone(), operation.clone());
+        Ok(None)
+    }
+
+    fn capacity_error() -> ClientError {
+        journal_error(
+            "pending operation budget exceeded; run `lockyard doctor --repair-pending`; нужна сеть для сверки (network required); no pending operations were discarded",
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_pending(&self, operation: PendingWrite) -> Result<(), ClientError> {
+        match self.admit_pending(&operation)? {
+            None => Ok(()),
+            Some(existing) => Err(ClientError::OutcomeUnknown(Box::new(existing))),
+        }
     }
 
     pub(crate) fn update_pending(
         &self,
         previous: &PendingWrite,
         operation: PendingWrite,
-    ) -> Result<(), ClientError> {
+    ) -> Result<bool, ClientError> {
+        self.update_pending_before(previous, operation, None)
+    }
+
+    fn update_pending_before(
+        &self,
+        previous: &PendingWrite,
+        operation: PendingWrite,
+        deadline: Option<Instant>,
+    ) -> Result<bool, ClientError> {
+        if let Some(journal) = &self.pending_journal {
+            return journal.update(previous, &operation, deadline);
+        }
         let mut state = self
             .protocol_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.pending.get(&previous.key) != Some(previous) {
-            return Err(journal_error("pending operation changed during retry"));
-        }
-        if let Some(directory) = &self.pending_journal {
-            private_directory(directory)?;
-            let bytes = serde_json::to_vec(&operation).map_err(journal_error)?;
-            let path = self.existing_pending_path(directory, &operation.key)?;
-            lockyard_core::fsio::replace(&path, &bytes, 0o600).map_err(journal_error)?;
-            if operation.replay_paused && path.extension().is_some_and(|ext| ext == "json") {
-                lockyard_core::fsio::rename(&path, path.with_extension("unknown"))
-                    .map_err(journal_error)?;
-                lockyard_core::fsio::sync_dir(directory).map_err(journal_error)?;
-            }
+            return Ok(false);
         }
         state.pending.insert(operation.key.clone(), operation);
-        Ok(())
+        Ok(true)
+    }
+
+    pub(crate) fn begin_pending_replay(
+        &self,
+        previous: &PendingWrite,
+        row: &PendingWrite,
+    ) -> Result<bool, ClientError> {
+        self.begin_pending_replay_before(previous, row, None)
+    }
+
+    pub(super) fn begin_pending_replay_before(
+        &self,
+        previous: &PendingWrite,
+        row: &PendingWrite,
+        deadline: Option<Instant>,
+    ) -> Result<bool, ClientError> {
+        if let Some(journal) = &self.pending_journal {
+            return journal.begin_replay_before(previous, row, deadline);
+        }
+        self.update_pending(previous, row.clone())
     }
 
     fn retain_refusal(
         &self,
         mut pending: PendingWrite,
         error: &ClientError,
-    ) -> Result<PendingWrite, ClientError> {
+        deadline: Option<Instant>,
+    ) -> Result<Option<PendingWrite>, ClientError> {
         let previous = pending.clone();
         pending.pre_execution_rejected = true;
         pending.cause_code = error.code().unwrap_or("outcome_unknown").to_owned();
         pending.cause_status = error.status();
-        self.update_pending(&previous, pending.clone())?;
-        Ok(pending)
+        Ok(self
+            .update_pending_before(&previous, pending.clone(), deadline)?
+            .then_some(pending))
     }
 
     /// Resolve the current generation without performing any write or changing origin.
@@ -1944,13 +1489,10 @@ impl Client {
             // (a fresh encryption differs). The server applied that sibling's write at most once;
             // this caller reconciles by key instead of reading a conflict (LOCAL-0148).
             Err(error) if resent_after_contention && idempotency_key_reused(&error) => {
-                let key = call.key.clone().unwrap_or_default();
-                Err(ClientError::Protocol(Problem {
-                    status: None,
-                    code: "outcome_unknown".into(),
-                    detail: format!("Reconcile the mutation outcome using Idempotency-Key {key}"),
-                    details: json!({"idempotency_key": key}),
-                }))
+                Err(reconcile_by_key(
+                    call.key.as_deref().expect("validated write key"),
+                    "the server refused this key as already used",
+                ))
             }
             other => other,
         }
@@ -1971,38 +1513,30 @@ impl Client {
         // One clock for journal-busy waits, Retry-After pauses, and remaining()/wait_fits_deadline.
         // Without an explicit call deadline the journal wait budget is MAX_RETRY_WAIT (5 s).
         let started = Instant::now();
+        let deadline = call
+            .deadline_ms
+            .and_then(|ms| started.checked_add(Duration::from_millis(ms)));
         let remaining = || {
             call.deadline_ms
                 .map(|limit| Duration::from_millis(limit).saturating_sub(started.elapsed()))
         };
-        // A maintenance pass can refresh the cache while this call waits for a
-        // sibling sender. Keep this invocation's original uncertainty as well.
-        let observed_pending = call
-            .key
-            .as_deref()
-            .and_then(|key| self.pending_operation(key));
-        let mut contention = SameKeyContention::default();
-        let mut send_guard = if call.is_write() {
-            let key = call.key.as_deref().expect("validated write key");
-            // The flock is local and pre-send: wait inside the call deadline without starting a
-            // second create. Creating calls keep one idempotency key for the whole wait.
+        let _send_guard = if call.is_write() {
             let budget = call
                 .deadline_ms
                 .map(Duration::from_millis)
                 .unwrap_or(crate::MAX_RETRY_WAIT);
-            let mut delay = Duration::from_millis(25);
+            let key = call.key.as_deref().expect("validated write key");
             loop {
                 call.check_cancelled()?;
-                match self.claim_pending_send_observing(key, &mut contention) {
-                    Ok(guard) => break Some(guard),
-                    Err(error) if journal_busy(&error) => {
-                        let left = budget.saturating_sub(started.elapsed());
-                        if left.is_zero() {
-                            return Err(error);
-                        }
-                        let wait = delay.min(left).min(Duration::from_millis(250));
-                        call.wait(wait)?;
-                        delay = delay.saturating_mul(2).min(Duration::from_millis(250));
+                match self.reserve_memory_send(key) {
+                    Ok(guard) => break guard,
+                    Err(ClientError::JournalBusy) if started.elapsed() < budget => {
+                        *resent_after_contention = true;
+                        call.wait(
+                            budget
+                                .saturating_sub(started.elapsed())
+                                .min(Duration::from_millis(25)),
+                        )?;
                     }
                     Err(error) => return Err(error),
                 }
@@ -2010,34 +1544,15 @@ impl Client {
         } else {
             None
         };
-        if let Some(guard) = send_guard.as_mut()
-            && let Some(value) = self.settled_response(call, guard, &remaining)?
-        {
+        if let Some(value) = self.settled_response(call, &remaining, deadline)? {
             return Ok(value);
         }
-        if let Some(key) = &call.key
-            && let Some(pending) = self.pending_operation(key)
-            && let Some(guard) = send_guard.as_mut()
+        if call.is_write()
+            && let Some(pending) =
+                self.pending_for_send_before(call.key.as_deref().unwrap(), deadline)?
         {
-            return self.replay_pending(call, pending, guard, &remaining);
+            return self.replay_pending(call, pending, started);
         }
-        if let Some(pending) = observed_pending {
-            if send_guard.is_none() {
-                return Err(ClientError::OutcomeUnknown(Box::new(pending)));
-            }
-            contention.seen = true;
-            contention.sibling.get_or_insert(pending);
-        }
-        if let Some(sibling) = contention.sibling.take()
-            && let Some(guard) = send_guard.as_mut()
-        {
-            // Its row is gone: the same-key sender finished. Resend its exact bytes; the
-            // server returns the stored receipt for this Idempotency-Key (LOCAL-0148).
-            return self.replay_sibling_receipt(call, sibling, guard, &remaining);
-        }
-        // Same-key contention without visible bytes: a new send is safe because the server
-        // replays a matching receipt or refuses a different body for the same key.
-        *resent_after_contention = contention.seen;
         let route = call.path.split('?').next().unwrap_or(&call.path);
         if !route.starts_with('/')
             || route.starts_with("//")
@@ -2060,11 +1575,6 @@ impl Client {
         if self.expected_e2ee_workspace.is_some() {
             crate::crypto::validate_required_route(&call.method, &call.path)
                 .map_err(ClientError::Invalid)?;
-        }
-        // Initial discovery and policy lookup may block. Reserve the operation key,
-        // then give other writers access to the journal until this call has wire bytes.
-        if let Some(guard) = send_guard.as_mut() {
-            guard.release_journal()?;
         }
         let request_digest = crate::request_identity(call);
         let mut protocol = match self.discover(
@@ -2241,40 +1751,40 @@ impl Client {
                 result_retry_at: None,
             });
             if let Some(pending) = &pending {
-                let guard = send_guard.as_mut().expect("write guard");
-                guard.reacquire_journal(remaining().unwrap_or(crate::MAX_RETRY_WAIT), |pause| {
-                    call.wait(pause)
-                })?;
                 if let Some(previous) = refused_pending.take() {
                     self.verify_pending_replay_encryption(
                         &previous,
-                        guard,
                         remaining(),
                         call.cancellation.as_ref(),
                     )?;
-                    self.update_pending(&previous, pending.clone())?;
+                    if !self.begin_pending_replay_before(&previous, pending, deadline)? {
+                        return Err(ClientError::OutcomeUnknown(Box::new(previous)));
+                    }
                 } else {
                     if maintenance::uses_replay_budget(pending) {
                         self.repair_before_admission(
-                            guard,
                             serde_json::to_vec(pending).map_err(journal_error)?.len(),
                             remaining().unwrap_or(crate::MAX_RETRY_WAIT),
                         )?;
                     }
+                    call.check_cancelled()?;
                     if remaining().is_some_and(|limit| limit.is_zero()) {
                         return Err(ClientError::Transport("call deadline elapsed".into()));
                     }
-                    self.retain_pending(pending.clone())?;
+                    if let Some(existing) = self.admit_pending_before(pending, deadline)? {
+                        if let Some(receipt) = self.settled_response(call, &remaining, deadline)? {
+                            return Ok(receipt);
+                        }
+                        return self.replay_pending(call, existing, started);
+                    }
                     if attempt > 1 {
                         self.verify_pending_replay_encryption(
                             pending,
-                            guard,
                             remaining(),
                             call.cancellation.as_ref(),
                         )?;
                     }
                 }
-                guard.release_journal()?;
             }
             let result = match &pending {
                 Some(pending) if live_write || attempt > 1 => self.attempt_frozen(
@@ -2297,21 +1807,6 @@ impl Client {
             };
             let failure = match result {
                 Ok(mut value) => {
-                    let journal_owned = match &mut send_guard {
-                        Some(guard) => match guard.reacquire_journal(
-                            remaining().unwrap_or(crate::MAX_RETRY_WAIT),
-                            |pause| call.wait(pause),
-                        ) {
-                            Ok(()) => true,
-                            Err(error) if call.long_poll || journal_busy(&error) => false,
-                            Err(_) => {
-                                return Err(ClientError::OutcomeUnknown(Box::new(
-                                    pending.expect("write pending record"),
-                                )));
-                            }
-                        },
-                        None => true,
-                    };
                     // Authenticate/decrypt the response before releasing its recovery record.
                     let event_page = call.method == "GET"
                         && call.path.split('?').next() == Some("/api/v1/events");
@@ -2331,9 +1826,6 @@ impl Client {
                         )
                     {
                         if let Some(pending) = pending {
-                            if !journal_owned {
-                                return Err(ClientError::OutcomeUnknown(Box::new(pending)));
-                            }
                             let cause = if message.starts_with("catalog_") {
                                 message.as_str()
                             } else {
@@ -2356,9 +1848,6 @@ impl Client {
                         encryption_enabled,
                     ) {
                         if let Some(pending) = pending {
-                            if !journal_owned {
-                                return Err(ClientError::OutcomeUnknown(Box::new(pending)));
-                            }
                             let cause = error
                                 .code()
                                 .unwrap_or("catalog_authentication_failed")
@@ -2370,33 +1859,11 @@ impl Client {
                     if let Some(pending) = pending
                         && !call.defer_pending_ack
                     {
-                        if !journal_owned {
-                            self.complete_pending_later(&pending);
-                            return Ok(value);
-                        }
-                        if let Err(error) = self.resolve_pending(&pending.key) {
-                            if !call.long_poll {
-                                return Err(error);
-                            }
-                            self.complete_pending_later(&pending);
-                        }
+                        self.finish_pending(&pending)?;
                     }
                     return Ok(value);
                 }
-                Err(failure) => {
-                    if let Some(guard) = send_guard.as_mut() {
-                        let budget = remaining().unwrap_or(crate::MAX_RETRY_WAIT);
-                        if guard
-                            .reacquire_journal(budget, |pause| call.wait(pause))
-                            .is_err()
-                        {
-                            return Err(ClientError::OutcomeUnknown(Box::new(
-                                pending.expect("write pending record"),
-                            )));
-                        }
-                    }
-                    failure
-                }
+                Err(failure) => failure,
             };
             let (error, may_retry) = match failure {
                 Failure::BeforeSend(error) => {
@@ -2404,7 +1871,7 @@ impl Client {
                     let changed = error.code() == Some(maintenance::ENCRYPTION_MISMATCH);
                     if attempt == 1 {
                         // The policy check stopped this body before its first HTTP send.
-                        self.resolve_pending(&pending.key)?;
+                        self.discard_unsent(&pending)?;
                         return Err(if changed {
                             ClientError::Transport(
                                 "workspace encryption policy changed before send".into(),
@@ -2414,7 +1881,7 @@ impl Client {
                         });
                     }
                     return Err(if changed {
-                        self.park_incompatible_pending(&pending)?
+                        self.park_incompatible_pending(&pending, None)?
                     } else {
                         ClientError::OutcomeUnknown(Box::new(pending))
                     });
@@ -2458,9 +1925,13 @@ impl Client {
                     );
                 }
                 if pre_execution_refusal(&error) {
-                    refused_pending = Some(self.retain_refusal(pending, &error)?);
+                    let original = pending.clone();
+                    refused_pending = self.retain_refusal(pending, &error, None)?;
+                    if refused_pending.is_none() {
+                        return Err(ClientError::OutcomeUnknown(Box::new(original)));
+                    }
                 } else {
-                    self.resolve_pending(&pending.key)?;
+                    self.discard_unsent(&pending)?;
                 }
             }
             if call.path.contains("&assignee_session=")
@@ -2477,9 +1948,6 @@ impl Client {
             {
                 replica_changed = true;
                 self.invalidate_status_protocol_hint();
-                if let Some(guard) = send_guard.as_mut() {
-                    guard.release_journal()?;
-                }
                 protocol =
                     self.discover(&call.session, remaining(), call.cancellation.as_ref(), true)?;
                 if call.path.contains("&assignee_session=")
@@ -2518,13 +1986,7 @@ impl Client {
             {
                 return Err(error);
             }
-            let wait = crate::retry_wait(&error, delay);
-            if let Some(guard) = send_guard.as_mut() {
-                // The refusal or removal is durable. The next iteration retakes the
-                // journal under the same deadline to update or insert the pending row.
-                guard.release_journal()?;
-            }
-            call.wait(wait)?;
+            call.wait(crate::retry_wait(&error, delay))?;
             delay *= 2;
         }
         Err(local(
@@ -2539,8 +2001,7 @@ impl Client {
         &self,
         call: &Call,
         mut pending: PendingWrite,
-        guard: &mut PendingSendGuard<'_>,
-        remaining: &dyn Fn() -> Option<Duration>,
+        started: Instant,
     ) -> Result<Value, ClientError> {
         let refused = pending.pre_execution_rejected;
         if !maintenance::eligible_for_recovery(&pending)
@@ -2558,15 +2019,18 @@ impl Client {
         wire.session = pending.session.clone();
         wire.repository = pending.repository.clone();
         wire.key = Some(pending.key.clone());
+        let remaining = || {
+            call.deadline_ms
+                .map(|ms| Duration::from_millis(ms).saturating_sub(started.elapsed()))
+        };
         if remaining().is_some_and(|limit| limit.is_zero()) {
             return Err(ClientError::OutcomeUnknown(Box::new(pending)));
         }
-        if !self.can_replay_pending(&pending, guard, remaining(), call.cancellation.as_ref())? {
+        if !self.can_replay_pending(&pending, remaining(), call.cancellation.as_ref())? {
             return Err(ClientError::OutcomeUnknown(Box::new(pending)));
         }
         let encryption = self.verify_pending_replay_encryption(
             &pending,
-            guard,
             remaining(),
             call.cancellation.as_ref(),
         )?;
@@ -2579,59 +2043,78 @@ impl Client {
         {
             return Err(ClientError::OutcomeUnknown(Box::new(pending)));
         }
-        if remaining().is_some_and(|limit| limit.is_zero()) {
-            return Err(ClientError::OutcomeUnknown(Box::new(pending)));
-        }
+        let previous = pending.clone();
         if refused {
-            let previous = pending.clone();
             pending.pre_execution_rejected = false;
             pending.cause_code = "outcome_unknown".into();
             pending.cause_status = None;
-            // A crash after this point must never restore permission to replay an unknown write.
-            self.update_pending(&previous, pending.clone())?;
         }
-        // No discovery, route preparation or encryption: those would mutate the operation.
-        // A refusal after an originally unknown attempt cannot prove that earlier write failed.
-        let result = guard.exchange_with_budget(remaining(), call.cancellation.as_ref(), || {
-            let start = Instant::now();
-            self.reconcile_wire(&wire, &pending, || {
-                remaining().unwrap_or_else(|| crate::MAX_RETRY_WAIT.saturating_sub(start.elapsed()))
-            })
-        })?;
-        let mut value = match result {
+        let deadline = call
+            .deadline_ms
+            .and_then(|ms| started.checked_add(Duration::from_millis(ms)));
+        if !self.begin_pending_replay_before(&previous, &pending, deadline)? {
+            if let Some(receipt) = self.settled_response(call, &remaining, deadline)? {
+                return Ok(receipt);
+            }
+            return Err(ClientError::OutcomeUnknown(Box::new(previous)));
+        }
+        // The SQLite transaction ends before HTTP. Concurrent callers use the
+        // same wire bytes, and a completed row is never changed back to pending.
+        let replay_started = Instant::now();
+        let mut value = match self.reconcile_wire(&wire, &pending, || {
+            remaining()
+                .unwrap_or_else(|| crate::MAX_RETRY_WAIT.saturating_sub(replay_started.elapsed()))
+        }) {
             Ok(value) => value,
             Err(error) => {
+                if idempotency_key_reused(&error) {
+                    return Err(reconcile_by_key(
+                        &pending.key,
+                        "the server refused this key as already used",
+                    ));
+                }
                 if error.code() == Some(maintenance::ENCRYPTION_MISMATCH) {
-                    return Err(self.park_incompatible_pending(&pending)?);
+                    return Err(self.park_incompatible_pending(&pending, None)?);
                 }
                 if error.code() == Some("drain_instance_mismatch") {
                     let result =
                         self.unknown(pending.clone(), "drain_instance_mismatch", error.status());
                     if let Some(updated) = self.pending_operation(&pending.key) {
-                        self.park_pending(&updated, false)?;
+                        self.park_pending(&updated, false, None)?;
                     }
                     return Err(result);
                 }
                 if refused && replay_refusal(&error) {
-                    self.retain_refusal(pending, &error)?;
-                    return Err(error);
+                    return if self
+                        .retain_refusal(pending.clone(), &error, None)?
+                        .is_some()
+                    {
+                        Err(error)
+                    } else {
+                        Err(ClientError::OutcomeUnknown(Box::new(pending)))
+                    };
                 }
-                if self.explicit_expiry(&pending, &error)? {
+                if self.explicit_expiry(&pending, &error, None)? {
                     return Err(ClientError::OutcomeUnknown(Box::new(pending)));
                 }
                 if refused
                     && error.api_error().is_some_and(|api| api.status < 500)
                     && !maintenance::outcome_unproven(&error)
                 {
-                    // Retire safe-retry permission, while retaining the original bytes/key.
-                    // A later call must reconcile rather than encrypt a new body for this key.
-                    return Err(error);
+                    // The per-attempt failure proves refusal only while this is
+                    // still the sole possible execution.
+                    return if self
+                        .retain_refusal(pending.clone(), &error, None)?
+                        .is_some()
+                    {
+                        Err(error)
+                    } else {
+                        Err(ClientError::OutcomeUnknown(Box::new(pending)))
+                    };
                 }
                 let cause = error.code().unwrap_or("outcome_unknown").to_owned();
-                if cause == "protocol_response_invalid" {
-                    pending.diagnostic = Some(error.to_string());
-                }
-                return Err(self.unknown(pending, &cause, error.status()));
+                let diagnostic = (cause == "protocol_response_invalid").then(|| error.to_string());
+                return Err(self.record_unknown(pending, &cause, error.status(), diagnostic, None));
             }
         };
         self.decode_pending_response(
@@ -2639,84 +2122,11 @@ impl Client {
             &pending,
             &mut value,
             live_write.then_some(&encryption),
-            true,
         )?;
         if !call.defer_pending_ack {
-            self.resolve_pending(&pending.key)?;
+            self.finish_pending(&pending)?;
         }
         // The agent acknowledges only after its outbox completion marker is durable.
-        Ok(value)
-    }
-
-    /// A same-key sender finished and retired its journal row. Resend its exact bytes under
-    /// this call's key guard; the server answers from its Idempotency-Key receipt. The row is
-    /// never recreated: every failure is an unknown outcome reconciled by key (LOCAL-0148).
-    fn replay_sibling_receipt(
-        &self,
-        call: &Call,
-        mut pending: PendingWrite,
-        guard: &mut PendingSendGuard<'_>,
-        remaining: &dyn Fn() -> Option<Duration>,
-    ) -> Result<Value, ClientError> {
-        let unknown = |mut pending: PendingWrite, cause: &str, status: Option<u16>| {
-            pending.cause_code = cause.into();
-            pending.cause_status = status;
-            ClientError::OutcomeUnknown(Box::new(pending))
-        };
-        if !maintenance::eligible_for_recovery(&pending)
-            || pending.request_digest.as_deref() != Some(crate::request_identity(call).as_str())
-            || pending.method != call.method
-            || pending.request_path != call.path
-            || pending.origin != self.base_url
-            || pending.credential_scope != crate::credential_fingerprint(&self.token)
-            || remaining().is_some_and(|limit| limit.is_zero())
-        {
-            return Err(ClientError::OutcomeUnknown(Box::new(pending)));
-        }
-        let live_write = self.check_live_write_encryption_policy;
-        if pending.encryption_context.is_none()
-            || (!live_write
-                && (!self.pending_encryption_context_ready()
-                    || pending.encryption_context.as_deref()
-                        != Some(self.encryption_context().as_str())))
-        {
-            return Err(ClientError::OutcomeUnknown(Box::new(pending)));
-        }
-        let encryption = self.verify_sibling_replay_encryption(
-            &pending,
-            guard,
-            remaining(),
-            call.cancellation.as_ref(),
-        )?;
-        let mut wire = call.clone();
-        wire.method = pending.method.clone();
-        wire.path = pending.path.clone();
-        wire.session = pending.session.clone();
-        wire.repository = pending.repository.clone();
-        wire.key = Some(pending.key.clone());
-        let result = guard.exchange_with_budget(remaining(), call.cancellation.as_ref(), || {
-            let start = Instant::now();
-            self.reconcile_wire(&wire, &pending, || {
-                remaining().unwrap_or_else(|| crate::MAX_RETRY_WAIT.saturating_sub(start.elapsed()))
-            })
-        })?;
-        let mut value = match result {
-            Ok(value) => value,
-            Err(error) => {
-                let cause = error.code().unwrap_or("outcome_unknown").to_owned();
-                if cause == "protocol_response_invalid" {
-                    pending.diagnostic = Some(error.to_string());
-                }
-                return Err(unknown(pending, &cause, error.status()));
-            }
-        };
-        self.decode_pending_response(
-            call,
-            &pending,
-            &mut value,
-            live_write.then_some(&encryption),
-            false,
-        )?;
         Ok(value)
     }
 
@@ -2736,19 +2146,10 @@ impl Client {
         pending: &PendingWrite,
         value: &mut Value,
         encryption: Option<&ContentEncryption>,
-        journaled: bool,
     ) -> Result<(), ClientError> {
-        // A retired sibling row is never written back: report the unknown outcome only.
-        let unknown = |cause: &str, status: Option<u16>| {
-            if journaled {
-                self.unknown(pending.clone(), cause, status)
-            } else {
-                let mut pending = pending.clone();
-                pending.cause_code = cause.into();
-                pending.cause_status = status;
-                ClientError::OutcomeUnknown(Box::new(pending))
-            }
-        };
+        // Snapshot-checked updates cannot reinsert completed or retired rows.
+        let unknown =
+            |cause: &str, status: Option<u16>| self.unknown(pending.clone(), cause, status);
         let (workspace, held, enabled) = match encryption {
             Some(encryption) => (
                 encryption.workspace.as_deref(),
@@ -2793,43 +2194,57 @@ impl Client {
 
     pub(crate) fn unknown(
         &self,
+        pending: PendingWrite,
+        cause: &str,
+        status: Option<u16>,
+    ) -> ClientError {
+        self.record_unknown(pending, cause, status, None, None)
+    }
+
+    fn record_unknown(
+        &self,
         mut pending: PendingWrite,
         cause: &str,
         status: Option<u16>,
+        diagnostic: Option<String>,
+        deadline: Option<Instant>,
     ) -> ClientError {
         let previous = pending.clone();
         pending.pre_execution_rejected = false;
         pending.cause_code = cause.into();
         pending.cause_status = status;
-        if !maintenance::uses_replay_budget(&pending) {
+        if diagnostic.is_some() {
+            pending.diagnostic = diagnostic;
+        }
+        if !maintenance::uses_replay_budget(&pending)
+            || maintenance::ambiguous_refusal_needs_operator(&pending)
+        {
             pending.replay_paused = true;
         }
         // A storage failure leaves the already-synced pre-send record intact.
-        if self.update_pending(&previous, pending.clone()).is_err()
-            && let Some(current) = self.pending_operation(&pending.key)
-        {
-            let _ = self.update_pending(&current, pending.clone());
-        }
+        let _ = self.update_pending_before(&previous, pending.clone(), deadline);
         ClientError::OutcomeUnknown(Box::new(pending))
     }
 }
 
-/// What one call learned about another call holding its Idempotency-Key (LOCAL-0148).
-#[derive(Default)]
-struct SameKeyContention {
-    /// Another call or client held this key while this call waited.
-    seen: bool,
-    /// Its exact journaled wire bytes, when they were visible.
-    sibling: Option<PendingWrite>,
-}
-
 /// The server refused this body because the key already belongs to another request.
 /// Coordination answers `conflict` and the registry its own code with the same text.
+fn reconcile_by_key(key: &str, reason: &str) -> ClientError {
+    ClientError::Protocol(Problem {
+        status: None,
+        code: "outcome_unknown".into(),
+        detail: format!("Reconcile the mutation outcome using Idempotency-Key {key}: {reason}"),
+        details: json!({"idempotency_key": key}),
+    })
+}
+
 fn idempotency_key_reused(error: &ClientError) -> bool {
     const TEXT: &str = "Idempotency-Key was used for another request";
     error.status() == Some(409)
         && (error.code() == Some("idempotency_conflict")
-            || error.api_error().is_some_and(|api| api.message.contains(TEXT)))
+            || error
+                .api_error()
+                .is_some_and(|api| api.message.contains(TEXT)))
 }
 
 fn failure_error(failure: Failure) -> ClientError {
@@ -2937,6 +2352,14 @@ pub(crate) fn journal_error(error: impl std::fmt::Display) -> ClientError {
     ClientError::Invalid(format!("pending journal unavailable: {error}"))
 }
 
+fn journal_decode_error(error: serde_json::Error) -> ClientError {
+    journal_error(format!(
+        "invalid pending record at line {}, column {}",
+        error.line(),
+        error.column()
+    ))
+}
+
 fn journal_path(directory: &Path, key: &str) -> PathBuf {
     directory.join(format!("{}.json", crate::credential_fingerprint(key)))
 }
@@ -2956,7 +2379,7 @@ fn read_private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, C
     if metadata.len() > MAX_PENDING_BYTES {
         return Err(journal_error("pending record exceeds budget"));
     }
-    serde_json::from_reader(file).map_err(journal_error)
+    serde_json::from_reader(std::io::BufReader::new(file)).map_err(journal_decode_error)
 }
 
 #[cfg(unix)]
@@ -3108,25 +2531,8 @@ fn private_directory(path: &Path) -> Result<(), ClientError> {
 }
 
 #[cfg(test)]
-mod pending_completion_tests {
+pub(super) mod pending_completion_tests {
     use super::*;
-
-    std::thread_local! {
-        static MAINTENANCE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-
-    pub(super) fn record_maintenance_scan() {
-        MAINTENANCE_SCANS.set(MAINTENANCE_SCANS.get() + 1);
-    }
-
-    fn journal_files(directory: &Path) -> Vec<PathBuf> {
-        std::fs::read_dir(directory)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            // Windows already used this global journal lock in 0.3.12.
-            .filter(|path| path.file_name().unwrap() != ".journal.lock")
-            .collect()
-    }
 
     #[test]
     fn task_pending_create_reuses_keys_after_restart_only_for_same_arguments_at_any_age() {
@@ -3187,11 +2593,10 @@ mod pending_completion_tests {
         // Simulate encrypted content in the journal: identity is still caller plaintext.
         operation.body = Some(json!({"client_key":"original-logical-key", "title":{"ciphertext":"opaque"}, "evidence":[{"observed_at":"old timestamp"}]}).to_string());
         client
-            .protocol_state
-            .lock()
+            .pending_journal
+            .as_ref()
             .unwrap()
-            .pending
-            .insert(operation.key.clone(), operation.clone());
+            .seed_pending(&operation);
         assert_eq!(
             client.pending_task_create(&repeat, false).unwrap(),
             original
@@ -3204,276 +2609,17 @@ mod pending_completion_tests {
                 .saturating_sub(30 * 24 * 60 * 60),
         );
         client
-            .protocol_state
-            .lock()
+            .pending_journal
+            .as_ref()
             .unwrap()
-            .pending
-            .insert(operation.key.clone(), operation);
+            .seed_pending(&operation);
         assert_eq!(
             client.pending_task_create(&repeat, false).unwrap(),
             original
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn send_locks_release_while_inherited_descriptors_remain_open() {
-        let root = tempfile::tempdir().unwrap();
-        let client = Client::new("http://127.0.0.1:1", "fixture".into())
-            .unwrap()
-            .with_pending_journal(root.path().canonicalize().unwrap())
-            .unwrap();
-        let mut guard = client.claim_pending_send("short").unwrap();
-        // dup and fork share the same open file description. CLOEXEC only closes it at exec,
-        // so a concurrently spawned child can retain ownership after the parent closes it.
-        let Some(PendingFileLock::Directory(journal)) = &guard.journal else {
-            panic!("expected a directory lock");
-        };
-        let inherited_journal = journal.try_clone().unwrap();
-        guard.release_journal().unwrap();
-        let Some(PendingFileLock::File(operation)) = &guard.operation else {
-            panic!("expected an operation file lock");
-        };
-        let inherited_operation = operation.try_clone().unwrap();
-        drop(client.claim_pending_send("other").unwrap());
-        drop(guard);
-        drop(client.claim_pending_send("short").unwrap());
-        drop(inherited_operation);
-        drop(inherited_journal);
-    }
-
-    #[test]
-    fn operation_file_try_lock_succeeds_after_guard_drop() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("operation.inflight");
-        let guard = PendingSendGuard::lock_operation(&path).unwrap();
-        let contender = StateOpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        assert!(matches!(
-            contender.try_lock(),
-            Err(std::fs::TryLockError::WouldBlock)
-        ));
-        drop(guard);
-        contender.try_lock().unwrap();
-    }
-
-    #[test]
-    fn survey_r6_short_sends_do_not_create_long_poll_files() {
-        let root = tempfile::tempdir().unwrap();
-        let root = root.path().canonicalize().unwrap();
-        let client = Client::new("http://127.0.0.1:1", "fixture".into())
-            .unwrap()
-            .with_pending_journal(&root)
-            .unwrap();
-        let directory = client.pending_journal.as_ref().unwrap();
-        let scans = MAINTENANCE_SCANS.get();
-        for _ in 0..3 {
-            let guard = client.claim_pending_send("short").unwrap();
-            assert!(journal_files(directory).is_empty());
-            client.retain_pending(pending(&client, "short")).unwrap();
-            let paths = journal_files(directory);
-            assert_eq!(paths, vec![journal_path(directory, "short")]);
-            client.resolve_pending("short").unwrap();
-            drop(guard);
-            assert!(journal_files(directory).is_empty());
-        }
-        assert_eq!(MAINTENANCE_SCANS.get(), scans);
-    }
-
-    #[test]
-    fn ly0019_legacy_long_poll_hint_creation_and_cleanup_require_journal_lock() {
-        for extension in ["inflight", "completed"] {
-            let root = tempfile::tempdir().unwrap();
-            let root = root.path().canonicalize().unwrap();
-            let new_client = || {
-                Client::new("http://127.0.0.1:1", "fixture".into())
-                    .unwrap()
-                    .with_pending_journal(&root)
-            };
-            let sender = new_client().unwrap();
-            let directory = sender.pending_journal.as_ref().unwrap();
-            let hint = directory.join(LONG_POLL_MAINTENANCE);
-            let sidecar = journal_path(directory, "poll").with_extension(extension);
-            let holder = PendingSendGuard::lock_journal(directory).unwrap();
-            let record = pending(&sender, "poll");
-            sender.retain_pending(record.clone()).unwrap();
-            // Model an older journal with sidecars but no maintenance hint.
-            if extension == "inflight" {
-                drop(PendingSendGuard::lock_operation(&sidecar).unwrap());
-            } else {
-                sender.complete_pending_later(&record);
-            }
-            assert!(sidecar.exists());
-            assert!(!hint.exists());
-            // A busy journal never fails the load; the hint waits for the flock.
-            drop(new_client().expect("a busy journal must not fail the load"));
-            assert!(!hint.exists(), "{extension}: creation bypassed the flock");
-            drop(holder);
-
-            let restored = new_client().unwrap();
-            assert!(
-                hint.exists(),
-                "{extension}: restoration must publish the hint"
-            );
-            // Restoration releases the flock immediately; another owner can take it.
-            let holder = PendingSendGuard::lock_journal(directory).unwrap();
-            let error = restored.claim_pending_send("unrelated").err().unwrap();
-            assert!(journal_busy(&error), "{extension}: {error}");
-            assert!(hint.exists(), "{extension}: removal bypassed the flock");
-            assert!(sidecar.exists());
-            drop(holder);
-
-            // A published hint means loads skip the flock even while it is busy.
-            let holder = PendingSendGuard::lock_journal(directory).unwrap();
-            drop(new_client().expect("an existing hint must not need the flock"));
-            assert!(hint.exists());
-            drop(holder);
-
-            drop(restored.claim_pending_send("unrelated").unwrap());
-            assert!(!hint.exists(), "{extension}: cleanup must remove the hint");
-            assert!(!sidecar.exists());
-            assert_eq!(
-                restored.pending_operation("poll").is_some(),
-                extension == "inflight"
-            );
-        }
-    }
-
-    #[test]
-    fn survey_r6_existing_client_sees_released_ownership_and_durable_completion() {
-        let root = tempfile::tempdir().unwrap();
-        let root = root.path().canonicalize().unwrap();
-        let new_client = || {
-            Client::new("http://127.0.0.1:1", "fixture".into())
-                .unwrap()
-                .with_pending_journal(&root)
-                .unwrap()
-        };
-        let sender = new_client();
-        // Created before any hint exists: an in-memory-only flag would miss it.
-        let sibling = new_client();
-        let directory = sibling.pending_journal.as_ref().unwrap();
-        let record = pending(&sender, "poll");
-        let mut guard = sender.claim_pending_send("poll").unwrap();
-        sender.retain_pending(record.clone()).unwrap();
-        guard.release_journal().unwrap();
-        assert!(journal_busy(
-            &sibling.claim_pending_send("poll").err().unwrap()
-        ));
-        drop(sibling.claim_pending_send("unrelated").unwrap());
-        sender.complete_pending_later(&record);
-        let marker = journal_path(directory, "poll").with_extension("completed");
-        assert!(marker.exists());
-        drop(guard);
-        drop(sender);
-        drop(sibling.claim_pending_send("unrelated").unwrap());
-        assert!(!journal_path(directory, "poll").exists());
-        assert!(!marker.exists());
-        assert!(!directory.join(LONG_POLL_MAINTENANCE).exists());
-        let scans = MAINTENANCE_SCANS.get();
-        for _ in 0..3 {
-            drop(sibling.claim_pending_send("short").unwrap());
-        }
-        assert_eq!(MAINTENANCE_SCANS.get(), scans);
-    }
-
-    #[test]
-    fn survey_r6_sender_retires_local_completion_after_sibling_removes_hint() {
-        for marker_persisted in [true, false] {
-            let root = tempfile::tempdir().unwrap();
-            let root = root.path().canonicalize().unwrap();
-            let new_client = || {
-                Client::new("http://127.0.0.1:1", "fixture".into())
-                    .unwrap()
-                    .with_pending_journal(&root)
-                    .unwrap()
-            };
-            let sender = new_client();
-            let sibling = new_client();
-            let directory = sender.pending_journal.as_ref().unwrap();
-            let record = pending(&sender, "poll");
-            let mut guard = sender.claim_pending_send("poll").unwrap();
-            sender.retain_pending(record.clone()).unwrap();
-            guard.release_journal().unwrap();
-            sender.complete_pending_later(&record);
-            if !marker_persisted {
-                // Model a failed marker publication: the verified success is still
-                // known in this client, while other clients cannot retire its JSON.
-                std::fs::remove_file(journal_path(directory, "poll").with_extension("completed"))
-                    .unwrap();
-            }
-            drop(guard);
-            drop(sibling.claim_pending_send("unrelated").unwrap());
-            assert!(!directory.join(LONG_POLL_MAINTENANCE).exists());
-            assert_eq!(journal_path(directory, "poll").exists(), !marker_persisted);
-            let scans = MAINTENANCE_SCANS.get();
-            drop(sender.claim_pending_send("poll").unwrap());
-            assert!(sender.pending_operation("poll").is_none());
-            assert!(!journal_path(directory, "poll").exists());
-            assert_eq!(MAINTENANCE_SCANS.get(), scans);
-        }
-    }
-
-    #[test]
-    fn task_receipt_ack_waits_for_journal_owner_without_resending() {
-        use crate::Transport;
-        let root = tempfile::tempdir().unwrap();
-        let root = root.path().canonicalize().unwrap();
-        let client = std::sync::Arc::new(
-            Client::new("http://127.0.0.1:1", "fixture".into())
-                .unwrap()
-                .with_pending_journal(&root)
-                .unwrap(),
-        );
-        let mut call = Call::write(
-            "fixture",
-            "POST",
-            "/api/v1/registry/items".into(),
-            json!({"title":"same"}),
-        );
-        call.deadline_ms = Some(2_000);
-        let key = call.key.as_deref().unwrap();
-        let mut record = pending(&client, key);
-        record.path = call.path.clone();
-        record.request_path = call.path.clone();
-        record.request_digest = Some(crate::request_identity(&call));
-        client.retain_pending(record).unwrap();
-        let owner =
-            PendingSendGuard::lock_journal(client.pending_journal.as_ref().unwrap()).unwrap();
-        let mut short = call.clone();
-        short.deadline_ms = Some(50);
-        assert!(matches!(
-            client.acknowledge_write(&short),
-            Err(ClientError::JournalBusy)
-        ));
-        assert!(client.pending_operation(key).is_some());
-        let (send, done) = std::sync::mpsc::channel();
-        let worker_client = std::sync::Arc::clone(&client);
-        let worker_call = call.clone();
-        let worker = std::thread::spawn(move || {
-            send.send(worker_client.acknowledge_write(&worker_call))
-                .unwrap();
-        });
-        assert!(matches!(
-            done.recv_timeout(Duration::from_millis(100)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ));
-        assert!(client.pending_operation(key).is_some());
-        drop(owner);
-        done.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
-        worker.join().unwrap();
-        assert!(client.pending_operations().is_empty());
-        let restored = Client::new("http://127.0.0.1:1", "fixture".into())
-            .unwrap()
-            .with_pending_journal(&root)
-            .unwrap();
-        assert!(restored.pending_operations().is_empty());
-    }
-
-    fn pending(client: &Client, key: &str) -> PendingWrite {
+    pub(super) fn pending(client: &Client, key: &str) -> PendingWrite {
         PendingWrite {
             code: "outcome_unknown".into(),
             cause_code: "outcome_unknown".into(),
@@ -3499,130 +2645,6 @@ mod pending_completion_tests {
             result_expires_at: None,
             result_retry_at: None,
         }
-    }
-
-    #[test]
-    fn bad_completion_markers_preserve_pending_and_do_not_block_other_keys_or_clients() {
-        for fault in [
-            "json",
-            "key",
-            "path",
-            "digest",
-            "mismatch",
-            "changed_record",
-        ] {
-            let root = tempfile::tempdir().unwrap();
-            let root = root.path().canonicalize().unwrap();
-            let new_client = || {
-                Client::new("http://127.0.0.1:1", "fixture".into())
-                    .unwrap()
-                    .with_pending_journal(&root)
-                    .unwrap()
-            };
-            let client = new_client();
-            let bad = pending(&client, "bad");
-            let good = pending(&client, "good");
-            client.retain_pending(bad.clone()).unwrap();
-            client.retain_pending(good.clone()).unwrap();
-            client.complete_pending_later(&bad);
-            client.complete_pending_later(&good);
-            let directory = client.pending_journal.as_ref().unwrap();
-            let path = journal_path(directory, "bad").with_extension("completed");
-            let mut marker: Value = read_private_json(&path).unwrap();
-            match fault {
-                "json" => {}
-                "key" => marker["key"] = Value::Null,
-                "path" => marker["key"] = json!("another-key"),
-                "digest" => marker["digest"] = json!("wrong-digest"),
-                "mismatch" => marker["digest"] = json!("a".repeat(64)),
-                "changed_record" => {
-                    let mut changed = bad.clone();
-                    changed.body = Some("{\"new\":true}".into());
-                    lockyard_core::fsio::replace(
-                        &journal_path(directory, "bad"),
-                        &serde_json::to_vec(&changed).unwrap(),
-                        0o600,
-                    )
-                    .unwrap();
-                }
-                _ => unreachable!(),
-            }
-            let bytes = if fault == "json" {
-                b"broken-json".to_vec()
-            } else {
-                serde_json::to_vec(&marker).unwrap()
-            };
-            lockyard_core::fsio::replace(&path, &bytes, 0o600).unwrap();
-            let original = std::fs::read(journal_path(directory, "bad")).unwrap();
-            // Fresh clients have no in-memory completion hints. The same durable
-            // files must permit progress after the original process has exited.
-            let next = new_client();
-            drop(next.claim_pending_send("unrelated").unwrap());
-            assert!(!path.exists(), "{fault}");
-            assert_eq!(
-                std::fs::read(journal_path(directory, "bad")).unwrap(),
-                original
-            );
-            assert!(!journal_path(directory, "good").exists(), "{fault}");
-            let quarantines: Vec<_> = std::fs::read_dir(directory)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| path.to_string_lossy().contains(".completed.bad-"))
-                .collect();
-            assert_eq!(quarantines.len(), 1, "{fault}");
-            assert_eq!(std::fs::read(&quarantines[0]).unwrap(), bytes, "{fault}");
-            assert!(!directory.join(LONG_POLL_MAINTENANCE).exists());
-            let scans = MAINTENANCE_SCANS.get();
-            let restored = new_client();
-            drop(restored.claim_pending_send("another-unrelated").unwrap());
-            assert_eq!(MAINTENANCE_SCANS.get(), scans);
-            assert!(restored.pending_operation("bad").is_some(), "{fault}");
-            assert!(restored.pending_operation("good").is_none(), "{fault}");
-        }
-    }
-
-    #[test]
-    fn dropping_send_guard_cleans_operation_lock_and_releases_both_owners() {
-        let root = tempfile::tempdir().unwrap();
-        let root = root.path().canonicalize().unwrap();
-        let client = Client::new("http://127.0.0.1:1", "fixture".into())
-            .unwrap()
-            .with_pending_journal(root)
-            .unwrap();
-        let directory = client.pending_journal.as_ref().unwrap();
-        let path = journal_path(directory, "key").with_extension("inflight");
-        let mut guard = client.claim_pending_send("key").unwrap();
-        assert!(journal_busy(
-            &PendingSendGuard::lock_journal(directory).unwrap_err()
-        ));
-        assert!(!path.exists(), "short sends own only the shared journal");
-        guard.release_journal().unwrap();
-        drop(PendingSendGuard::lock_journal(directory).unwrap());
-        assert!(journal_busy(
-            &PendingSendGuard::lock_operation(&path).unwrap_err()
-        ));
-        guard.reacquire_journal(Duration::ZERO, |_| Ok(())).unwrap();
-        drop(guard);
-        assert!(!path.exists());
-        drop(client.claim_pending_send("key").unwrap());
-        assert!(!path.exists());
-
-        let mut guard = client.claim_pending_send("key").unwrap();
-        guard.release_journal().unwrap();
-        drop(guard);
-        assert!(
-            path.exists(),
-            "cleanup without the shared journal is deferred"
-        );
-        drop(client.claim_pending_send("other-key").unwrap());
-        assert!(
-            !path.exists(),
-            "next owner cleans the closed operation inode"
-        );
-        assert!(!directory.join(LONG_POLL_MAINTENANCE).exists());
-        let scans = MAINTENANCE_SCANS.get();
-        drop(client.claim_pending_send("short").unwrap());
-        assert_eq!(MAINTENANCE_SCANS.get(), scans);
     }
 }
 
@@ -3876,9 +2898,7 @@ mod status_protocol_cache_tests {
         let directory = directory.canonicalize().unwrap();
         Client::new(url, "fixture".into())
             .unwrap()
-            .with_pending_journal(&directory)
-            .unwrap()
-            .with_status_protocol_cache()
+            .with_status_protocol_cache_at(directory)
     }
 
     #[test]

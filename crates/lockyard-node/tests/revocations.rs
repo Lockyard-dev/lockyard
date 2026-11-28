@@ -1,9 +1,12 @@
 // Copyright 2026 The Lockyard Authors. Licensed under the Apache License, Version 2.0.
 use base64::{Engine, engine::general_purpose::STANDARD};
+use lockyard_cloud_client::WorkspaceKey;
 use lockyard_cloud_client::revocations::{RevocationPage, RevocationTrust, SignedDocument};
 use lockyard_node::{
+    crypto::PayloadCodec,
     quic::{DirectClient, DirectServer, Identity, PeerPin, PeerPolicy},
     revocations::{RevocationConfig, RevocationManager},
+    wire::{FrameKind, Operation, RpcFrame, new_id},
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::{
@@ -315,6 +318,15 @@ async fn revoked_pin_is_denied_during_handshake_and_cached_reuse_race() {
 }
 #[tokio::test]
 async fn local_identity_revocation_closes_outgoing_and_incoming_without_peer_binding() {
+    check_local_identity_revocation(true).await;
+}
+
+#[tokio::test]
+async fn local_identity_revocation_also_closes_before_the_first_application_frame() {
+    check_local_identity_revocation(false).await;
+}
+
+async fn check_local_identity_revocation(exchange_application_frame: bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
         let tmp = private_temp();
         let state = RevocationManager::open(config(), tmp.path()).unwrap();
@@ -324,12 +336,14 @@ async fn local_identity_revocation_closes_outgoing_and_incoming_without_peer_bin
         let a = pair();
         let b = pair();
         let own_pin = PeerPin::certificate(&b.0).to_hex();
+        let mut controller = peer("controller", &b);
+        controller.allowed_operations.push(Operation::NodePing);
         let server = DirectServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             "worker".into(),
             identity(&a),
             vec![b.0.clone()],
-            vec![peer("controller", &b)],
+            vec![controller],
         )
         .unwrap();
         let client = DirectClient::bind_with_revocations(
@@ -351,10 +365,44 @@ async fn local_identity_revocation_closes_outgoing_and_incoming_without_peer_bin
         );
         let out = out.unwrap();
         let inc = inc.unwrap();
+        if exchange_application_frame {
+            let mut ping = RpcFrame {
+                v: 1,
+                kind: FrameKind::Request,
+                id: new_id().unwrap(),
+                source: "controller".into(),
+                target: "worker".into(),
+                operation: Operation::NodePing,
+                in_reply_to: None,
+                source_certificate_sha256: None,
+                target_certificate_sha256: None,
+                retention: None,
+                payload: String::new(),
+            };
+            PayloadCodec::new(
+                config().trust.workspace_id,
+                WorkspaceKey::from_entropy([7; 32]),
+            )
+            .unwrap()
+            .encode(&mut ping, &serde_json::json!({}))
+            .unwrap();
+            let mut sending = out.open().await.unwrap();
+            sending.send(&ping).await.unwrap();
+            let mut receiving = inc.accept().await.unwrap();
+            assert_eq!(receiving.recv().await.unwrap(), ping);
+        }
+
         state.apply_additive(&doc(1, "", &[own_pin])).unwrap();
         assert_eq!(out.open().await.err().unwrap().to_string(), "revoked");
         assert_eq!(out.closed().await, "revoked");
-        assert_eq!(inc.closed().await, "revoked");
+        let peer_close = inc.closed().await;
+        // The just-handshaken peer can observe a transport reset before an
+        // application close arrives. A peer that exchanged frames must see the code.
+        assert!(
+            peer_close == "revoked"
+                || (!exchange_application_frame && peer_close == "reset by peer"),
+            "remote close was {peer_close}"
+        );
         assert_eq!(
             client
                 .connect(server.local_addr().unwrap(), "lockyard-node", policy)

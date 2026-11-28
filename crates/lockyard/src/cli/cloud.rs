@@ -212,15 +212,30 @@ pub(super) fn run_cloud_login(cwd: &Path, url: Option<String>, no_browser: bool)
 }
 
 pub(super) fn run_cloud_logout(cwd: &Path, url: Option<String>) -> Result<Output> {
+    use lockyard_core::credentials::{self, Logout};
+
     let (url, _) = cloud_server(cwd, url)?;
-    let path = lockyard_core::credentials::path()?;
-    let had = lockyard_core::credentials::forget_in(&path, &url)?;
-    let text = if had {
-        format!("signed out of {url}")
-    } else {
-        format!("no token was stored for {url}")
-    };
-    output(&json!({"server": url, "removed": had}), text)
+    match credentials::logout_in(&credentials::path()?, &url)? {
+        Logout::NoToken => output(
+            &json!({"server": url, "removed": false}),
+            format!("no token was stored for {url}"),
+        ),
+        Logout::Removed => output(
+            &json!({"server": url, "removed": true}),
+            format!("signed out of {url}"),
+        ),
+        Logout::MovedAside(backup) => output(
+            &json!({
+                "server": url,
+                "removed": null,
+                "credentials_backup": backup.to_string_lossy(),
+            }),
+            format!(
+                "moved the entire unreadable credentials file to {}; log in again to each server you use",
+                backup.display()
+            ),
+        ),
+    }
 }
 
 /// What the panel calls this machine in the token list. Only a label.

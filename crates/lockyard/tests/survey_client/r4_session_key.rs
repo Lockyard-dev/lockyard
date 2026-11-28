@@ -204,19 +204,15 @@ fn survey1118_r5_auto_claude_uses_fresh_zone_cache_and_retains_offline_mail() {
         "{}\0claude-test-token",
         server.url
     ));
-    let journal = runtime
-        .path()
-        .join("state/lockyard/pending-writes")
-        .join(scope);
-    assert!(
-        !std::fs::read_dir(journal)
-            .unwrap()
-            .map(Result::unwrap)
-            .map(|entry| entry.path())
-            .any(|path| path
-                .extension()
-                .is_some_and(|ext| ext == "json" || ext == "unknown"))
-    );
+    let journal = runtime.path().join("state/lockyard/pending-writes");
+    let count: i64 = pending_db(&journal)
+        .query_row(
+            "SELECT count(*) FROM pending_writes WHERE scope = ?1 AND state = 'pending'",
+            [&scope],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
     daemon.stop();
 }
 

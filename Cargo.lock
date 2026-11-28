@@ -1087,6 +1087,7 @@ dependencies = [
  "lockyard-core",
  "reqwest",
  "ring",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

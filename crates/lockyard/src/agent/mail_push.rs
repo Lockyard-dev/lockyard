@@ -3468,7 +3468,8 @@ mod tests {
             "fence": 7, "case_insensitive_paths": true
         }))
         .unwrap();
-        let backend = lockyard_cloud_client::CloudBackend::new(NewerStatusDuringRead(shared), "alice");
+        let backend =
+            lockyard_cloud_client::CloudBackend::new(NewerStatusDuringRead(shared), "alice");
         shared.observe_status_claims(
             Instant::now(),
             "alice",

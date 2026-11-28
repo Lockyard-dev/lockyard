@@ -107,7 +107,8 @@ struct State {
 }
 
 struct MailRepair {
-    cursor: PathBuf,
+    journal: PathBuf,
+    scope: String,
     deliveries: std::collections::HashMap<String, Value>,
 }
 
@@ -410,7 +411,9 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
                 };
                 // Lose the first receipt after commit. Withhold it from daemon retries
                 // until doctor has reserved the operation and recorded its repair cursor.
-                if (first_mail && just_committed) || (!just_committed && !repair.cursor.is_file()) {
+                if (first_mail && just_committed)
+                    || (!just_committed && pending_cursor(&repair.journal, &repair.scope).is_none())
+                {
                     return;
                 }
                 (200, receipt.clone())
@@ -2757,6 +2760,47 @@ fn cloud_status_direct_reads_claims_first_then_each_section_in_turn_on_one_conne
         order[0].contains("/registry/") && order[1].contains("/registry/"),
         "both task chains precede optional mail and work: {events:?}"
     );
+}
+
+#[test]
+fn cloud_status_reads_while_a_pending_migration_holds_the_write_lock() {
+    let server = Server::start();
+    let dir = cloud_project(&server);
+    let runtime = tempfile::tempdir().unwrap();
+    let state = runtime.path().canonicalize().unwrap();
+    let journal = state.join("lockyard/pending-writes");
+    let database = journal.join(".sqlite/pending.db");
+    let token = "test-token";
+    let client = lockyard_cloud_client::Client::new(&server.url, token.into())
+        .unwrap()
+        .load_pending_journal(&journal)
+        .unwrap();
+    let scope = lockyard_cloud_client::credential_fingerprint(&format!("{}\0{token}", server.url));
+    let legacy = journal.join(scope);
+    std::fs::create_dir(&legacy).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    // Hold the write slot until the short-lived CLI has exited. A journal open
+    // now needs this slot to claim the recreated legacy directory.
+    let mut writer = rusqlite::Connection::open(database).unwrap();
+    let _migration = writer
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let output = binary(dir.path(), runtime.path())
+        .args(["--json", "status"])
+        .env("LOCKYARD_AGENT", "alice")
+        .env("LOCKYARD_TOKEN", token)
+        .env("XDG_STATE_HOME", &state)
+        .env("LOCKYARD_STATUS_DEADLINE_MS", "1800")
+        .output()
+        .unwrap();
+    let status = json_of(&output);
+    assert_eq!(status["freshness"]["via"], "direct");
+    assert!(legacy.is_dir());
+    drop(client);
 }
 
 #[test]
@@ -5677,7 +5721,8 @@ fn task_add_cli_and_mcp_reconcile_two_lost_create_responses_without_duplicates()
         assert_eq!(writes[0].body, writes[1].body);
         assert_eq!(writes[0].key, writes[1].key);
         let lookups = server.seen("GET", "/api/v1/registry/items");
-        assert_eq!(lookups.len(), 1);
+        assert_eq!(lookups.len(), 1 + usize::from(use_agent));
+        assert!(lookups.iter().all(|lookup| lookup.path == lookups[0].path));
         assert!(lookups[0].path.contains("client_key="));
         assert_eq!(server.state.lock().unwrap().registry_items.len(), 251);
         // All create/receipt assertions above run against the live agent. Only then join
@@ -5976,9 +6021,71 @@ fn running_agent_uses_live_encryption_for_the_first_outbox_send() {
     assert_eq!(key.decrypt(WORKSPACE, "body", ciphertext).unwrap(), BODY);
 }
 
+fn pending_db(root: &Path) -> rusqlite::Connection {
+    let db = rusqlite::Connection::open(root.join(".sqlite/pending.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    db
+}
+
+fn pending_record(root: &Path, key: &str, column: &str) -> Option<Value> {
+    use rusqlite::OptionalExtension;
+    let bytes: Option<Vec<u8>> = pending_db(root)
+        .query_row(
+            &format!("SELECT {column} FROM pending_writes WHERE key = ?1 AND {column} IS NOT NULL"),
+            [key],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    bytes.map(|bytes| serde_json::from_slice(&bytes).unwrap())
+}
+
+fn pending_state(root: &Path, key: &str) -> (String, Option<i64>, Option<i64>) {
+    pending_db(root)
+        .query_row(
+            "SELECT state, budget_bytes, archived_at FROM pending_writes WHERE key = ?1",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+}
+
+fn pending_cursor(root: &Path, scope: &str) -> Option<String> {
+    pending_db(root)
+        .query_row(
+            "SELECT repair_cursor FROM pending_scopes WHERE scope = ?1",
+            [scope],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn write_legacy_pending(root: &Path, origin: &str, key: &str, value: &Value) {
+    use lockyard_cloud_client::credential_fingerprint;
+    use std::os::unix::fs::DirBuilderExt;
+    let scope = root.join(credential_fingerprint(&format!("{origin}\0test-token")));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&scope)
+        .unwrap();
+    let path = scope.join(format!("{}.json", credential_fingerprint(key)));
+    lockyard_core::fsio::replace(&path, &serde_json::to_vec(value).unwrap(), 0o600).unwrap();
+}
+
+fn pending_row_count(root: &Path) -> i64 {
+    pending_db(root)
+        .query_row(
+            "SELECT count(*) FROM pending_writes WHERE state = 'pending'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 #[test]
 fn running_agent_attests_live_encryption_before_replaying_mail() {
-    use lockyard_cloud_client::{PendingWrite, WorkspaceKey, credential_fingerprint};
+    use lockyard_cloud_client::{PendingWrite, WorkspaceKey};
     const MAIL: &str = "/api/v1/bus/messages";
     const BODY: &str = "plaintext before policy change";
     let server = Server::start();
@@ -5998,12 +6105,7 @@ fn running_agent_attests_live_encryption_before_replaying_mail() {
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].body["body"], BODY);
     let key = writes[0].key.as_deref().unwrap();
-    let scope = credential_fingerprint(&format!("{}\0test-token", server.url));
-    let path = runtime
-        .path()
-        .join("state/lockyard/pending-writes")
-        .join(scope)
-        .join(format!("{}.unknown", credential_fingerprint(key)));
+    let journal = runtime.path().join("state/lockyard/pending-writes");
     let end = Instant::now() + Duration::from_secs(10);
     loop {
         let status = json_of(&cli(
@@ -6011,7 +6113,9 @@ fn running_agent_attests_live_encryption_before_replaying_mail() {
             runtime.path(),
             &["--json", "agent", "status"],
         ));
-        if path.is_file() && status["status"]["outbox"] == 0 {
+        if pending_record(&journal, key, "payload").is_some_and(|row| row["replay_paused"] == true)
+            && status["status"]["outbox"] == 0
+        {
             break;
         }
         assert!(
@@ -6020,7 +6124,8 @@ fn running_agent_attests_live_encryption_before_replaying_mail() {
         );
         thread::sleep(Duration::from_millis(20));
     }
-    let parked: PendingWrite = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let parked: PendingWrite =
+        serde_json::from_value(pending_record(&journal, key, "payload").unwrap()).unwrap();
     assert_eq!(parked.cause_code, "pending_encryption_mismatch");
     assert!(parked.first_sent_server_secs.is_some());
     assert!(parked.replay_paused && !parked.replay_stopped);
@@ -6076,12 +6181,10 @@ fn agent_finishes_mail_from_doctor(initial_required: bool, after_repair: Option<
     key.copy_to_private(&keys.join(format!("{WORKSPACE}.key")))
         .unwrap();
     let scope = credential_fingerprint(&format!("{}\0test-token", server.url));
-    let journal = runtime
-        .path()
-        .join("state/lockyard/pending-writes")
-        .join(scope);
+    let journal = runtime.path().join("state/lockyard/pending-writes");
     server.state.lock().unwrap().mail_repair = Some(MailRepair {
-        cursor: journal.join(".repair-cursor"),
+        journal: journal.clone(),
+        scope,
         deliveries: Default::default(),
     });
     let set_policy = |required: bool| {
@@ -6109,7 +6212,7 @@ fn agent_finishes_mail_from_doctor(initial_required: bool, after_repair: Option<
     );
     let first = server.seen("POST", MAIL).into_iter().next().unwrap();
     let first_key = first.key.as_deref().unwrap();
-    let record = journal.join(format!("{}.settled", credential_fingerprint(first_key)));
+    let receipt = || pending_record(&journal, first_key, "receipt").unwrap();
 
     if after_repair.is_some() {
         // Keep the outbox stopped across repair and the policy change so it cannot
@@ -6133,7 +6236,7 @@ fn agent_finishes_mail_from_doctor(initial_required: bool, after_repair: Option<
         );
         thread::sleep(Duration::from_millis(20));
     }
-    assert!(record.is_file());
+    assert_eq!(pending_state(&journal, first_key).0, "settled");
     let posts_before_next = server.seen("POST", MAIL);
     assert!(
         posts_before_next.len() >= 2,
@@ -6145,7 +6248,7 @@ fn agent_finishes_mail_from_doctor(initial_required: bool, after_repair: Option<
             .all(|post| post.key == first.key && post.body == first.body)
     );
     let _resumed_agent = after_repair.map(|required| {
-        let settled: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        let settled = receipt();
         assert_eq!(settled["consumed"], false);
         set_policy(required);
         start_agent(dir.path(), runtime.path())
@@ -6155,7 +6258,7 @@ fn agent_finishes_mail_from_doctor(initial_required: bool, after_repair: Option<
     assert!(second.status.success(), "{second:?}");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let settled: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        let settled = receipt();
         let status = json_of(&cli(
             dir.path(),
             runtime.path(),
@@ -6229,15 +6332,13 @@ fn r14_plaintext_pending_is_never_sent_by_cli_agent_or_doctor_under_e2ee() {
         };
         let mut pending = *pending;
         pending.first_sent_unix_secs = pending.first_sent_unix_secs.map(|time| time - 120);
-        let scope = journal.join(lockyard_cloud_client::credential_fingerprint(&format!(
-            "{}\0test-token",
-            server.url
-        )));
-        let record = scope.join(format!(
-            "{}.json",
-            lockyard_cloud_client::credential_fingerprint(&pending.key)
-        ));
-        lockyard_core::fsio::replace(&record, &serde_json::to_vec(&pending).unwrap(), 0o600)
+        let scope =
+            lockyard_cloud_client::credential_fingerprint(&format!("{}\0test-token", server.url));
+        pending_db(&journal)
+            .execute(
+                "UPDATE pending_writes SET payload = ?1 WHERE key = ?2",
+                rusqlite::params![serde_json::to_vec(&pending).unwrap(), pending.key],
+            )
             .unwrap();
         {
             let mut state = server.state.lock().unwrap();
@@ -6288,10 +6389,9 @@ fn r14_plaintext_pending_is_never_sent_by_cli_agent_or_doctor_under_e2ee() {
             None
         };
 
-        let cursor: String =
-            serde_json::from_slice(&std::fs::read(scope.join(".repair-cursor")).unwrap()).unwrap();
         assert_eq!(
-            cursor, pending.key,
+            pending_cursor(&journal, &scope).as_deref(),
+            Some(pending.key.as_str()),
             "{entry} did not examine the frozen write"
         );
         assert!(
@@ -6304,10 +6404,14 @@ fn r14_plaintext_pending_is_never_sent_by_cli_agent_or_doctor_under_e2ee() {
             server.seen("POST", PATH).is_empty(),
             "{entry} sent the frozen plaintext"
         );
-        assert!(!record.exists(), "{entry} kept the row active");
-        let unknown = record.with_extension("unknown");
-        let bytes = std::fs::read(&unknown).unwrap();
-        let parked: lockyard_cloud_client::PendingWrite = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            pending_state(&journal, &pending.key).1,
+            None,
+            "{entry} kept the row active"
+        );
+        let bytes = pending_record(&journal, &pending.key, "payload").unwrap();
+        let parked: lockyard_cloud_client::PendingWrite =
+            serde_json::from_value(bytes.clone()).unwrap();
         assert_eq!(parked.cause_code, "pending_encryption_mismatch");
         assert_eq!(parked.body, pending.body);
         assert!(parked.replay_paused && !parked.replay_stopped);
@@ -6325,9 +6429,11 @@ fn r14_plaintext_pending_is_never_sent_by_cli_agent_or_doctor_under_e2ee() {
                 .output()
                 .unwrap();
             assert_eq!(json_of(&forgotten)["forgotten_unknown"], 1);
-            assert!(!unknown.exists());
+            let (state, charge, archived) = pending_state(&journal, &pending.key);
+            assert_eq!((state.as_str(), charge), ("archived", None));
+            assert!(archived.is_some());
             assert_eq!(
-                std::fs::read(record.with_extension("quarantine")).unwrap(),
+                pending_record(&journal, &pending.key, "payload").unwrap(),
                 bytes
             );
         }
@@ -6345,13 +6451,6 @@ fn survey1118_ly0030_doctor_reconciles_pending_online() {
         .canonicalize()
         .unwrap()
         .join("state/lockyard/pending-writes");
-    let _client = lockyard_cloud_client::Client::new(&server.url, "test-token".into())
-        .unwrap()
-        .with_pending_journal(&root)
-        .unwrap();
-    let scope =
-        lockyard_cloud_client::credential_fingerprint(&format!("{}\0test-token", server.url));
-    let scoped = root.join(scope);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -6366,11 +6465,7 @@ fn survey1118_ly0030_doctor_reconciles_pending_online() {
             "key":key,"repository":null,"session":"alice","origin":server.url,
             "credential_scope":lockyard_cloud_client::credential_fingerprint("test-token"),
             "first_sent_unix_secs":if i == 139 { now } else { now - 31 * 24 * 3600 }});
-        let path = scoped.join(format!(
-            "{}.json",
-            lockyard_cloud_client::credential_fingerprint(&key)
-        ));
-        lockyard_core::fsio::replace(&path, &serde_json::to_vec(&record).unwrap(), 0o600).unwrap();
+        write_legacy_pending(&root, &server.url, &key, &record);
     }
     let out = binary(dir.path(), runtime.path())
         .env_remove("LOCKYARD_AGENT")
@@ -6385,18 +6480,7 @@ fn survey1118_ly0030_doctor_reconciles_pending_online() {
     assert_eq!(result["pending_repair"]["applied"], 1, "{result}");
     assert_eq!(result["network"], true);
     assert!(!server.state.lock().unwrap().seen.is_empty());
-    assert!(!scoped.join("quarantine.log").exists());
-    assert_eq!(
-        std::fs::read_dir(&scoped)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| entry
-                .path()
-                .extension()
-                .is_some_and(|ext| ext == "json" || ext == "unknown"))
-            .count(),
-        139,
-    );
+    assert_eq!(pending_row_count(&root), 139);
 }
 
 #[test]
@@ -6409,13 +6493,6 @@ fn survey1118_ly0030_doctor_offline_requires_network_and_preserves_all_records()
         .canonicalize()
         .unwrap()
         .join("state/lockyard/pending-writes");
-    let _client = lockyard_cloud_client::Client::new(&server.url, "test-token".into())
-        .unwrap()
-        .with_pending_journal(&root)
-        .unwrap();
-    let scope =
-        lockyard_cloud_client::credential_fingerprint(&format!("{}\0test-token", server.url));
-    let scoped = root.join(scope);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -6430,11 +6507,7 @@ fn survey1118_ly0030_doctor_offline_requires_network_and_preserves_all_records()
             "key":key,"repository":null,"session":"alice","origin":server.url,
             "credential_scope":lockyard_cloud_client::credential_fingerprint("test-token"),
             "first_sent_unix_secs":if i == 139 { now } else { now - 31 * 24 * 3600 }});
-        let path = scoped.join(format!(
-            "{}.json",
-            lockyard_cloud_client::credential_fingerprint(&key)
-        ));
-        lockyard_core::fsio::replace(&path, &serde_json::to_vec(&record).unwrap(), 0o600).unwrap();
+        write_legacy_pending(&root, &server.url, &key, &record);
     }
     server.state.lock().unwrap().api_offline = true;
     let out = binary(dir.path(), runtime.path())
@@ -6452,18 +6525,7 @@ fn survey1118_ly0030_doctor_offline_requires_network_and_preserves_all_records()
         "{result}"
     );
     assert_eq!(result["network"], false);
-    assert!(!scoped.join("quarantine.log").exists());
-    assert_eq!(
-        std::fs::read_dir(&scoped)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "json" || extension == "unknown"))
-            .count(),
-        140
-    );
+    assert_eq!(pending_row_count(&root), 140);
 }
 
 #[test]
@@ -6476,20 +6538,6 @@ fn survey1118_r13_doctor_forgets_only_selected_unknown_operations_with_confirmat
         .canonicalize()
         .unwrap()
         .join("state/lockyard/pending-writes");
-    let _client = lockyard_cloud_client::Client::new(&server.url, "test-token".into())
-        .unwrap()
-        .with_pending_journal(&root)
-        .unwrap();
-    let scoped = root.join(lockyard_cloud_client::credential_fingerprint(&format!(
-        "{}\0test-token",
-        server.url
-    )));
-    let record_path = |key: &str| {
-        scoped.join(format!(
-            "{}.json",
-            lockyard_cloud_client::credential_fingerprint(key)
-        ))
-    };
     for (key, path) in [
         ("first", "/api/v1/presence"),
         ("second", "/api/v1/presence"),
@@ -6499,12 +6547,7 @@ fn survey1118_r13_doctor_forgets_only_selected_unknown_operations_with_confirmat
             "protocol":{"selected":2,"capabilities":[]},"method":"POST","path":path,
             "request_path":path,"body":"{}","key":key,"repository":null,"session":"alice","origin":server.url,
             "credential_scope":lockyard_cloud_client::credential_fingerprint("test-token")});
-        lockyard_core::fsio::replace(
-            &record_path(key),
-            &serde_json::to_vec(&record).unwrap(),
-            0o600,
-        )
-        .unwrap();
+        write_legacy_pending(&root, &server.url, key, &record);
     }
     let run = |args: &[&str]| cli(dir.path(), runtime.path(), args);
     assert!(
@@ -6512,8 +6555,7 @@ fn survey1118_r13_doctor_forgets_only_selected_unknown_operations_with_confirmat
             .status
             .success()
     );
-    assert!(record_path("first").exists());
-    assert!(!scoped.join("quarantine.log").exists());
+    // The invalid invocation is refused before it can archive a row.
     assert_eq!(
         json_of(&run(&[
             "--json",
@@ -6524,8 +6566,8 @@ fn survey1118_r13_doctor_forgets_only_selected_unknown_operations_with_confirmat
         ]))["forgotten_unknown"],
         1
     );
-    assert!(record_path("first").with_extension("quarantine").exists());
-    assert!(record_path("second").exists());
+    assert_eq!(pending_state(&root, "first").0, "archived");
+    assert_eq!(pending_state(&root, "second").0, "pending");
     assert_eq!(
         json_of(&run(&[
             "--json",
@@ -6536,15 +6578,10 @@ fn survey1118_r13_doctor_forgets_only_selected_unknown_operations_with_confirmat
         ]))["forgotten_unknown"],
         1
     );
-    assert!(record_path("second").with_extension("quarantine").exists());
-    assert!(record_path("active").exists());
-    let log = std::fs::read_to_string(scoped.join("quarantine.log")).unwrap();
-    assert_eq!(
-        log.lines()
-            .filter(|line| line.contains("operator_forgot_unknown"))
-            .count(),
-        2
-    );
+    assert_eq!(pending_state(&root, "second").0, "archived");
+    assert_eq!(pending_state(&root, "active").0, "pending");
+    assert!(pending_state(&root, "first").2.is_some());
+    assert!(pending_state(&root, "second").2.is_some());
     assert!(server.state.lock().unwrap().seen.is_empty());
 }
 
@@ -6579,18 +6616,14 @@ fn survey1118_ly0030_lost_token_issue_is_never_replayed_by_load_service_or_docto
     };
     assert_eq!(server.state.lock().unwrap().tokens_created, 1);
     let key = issue.key.as_deref().unwrap();
-    let scope = journal.join(lockyard_cloud_client::credential_fingerprint(&format!(
-        "{}\0test-token",
-        server.url
-    )));
+    let scope =
+        lockyard_cloud_client::credential_fingerprint(&format!("{}\0test-token", server.url));
     let write_pending = |operation: &lockyard_cloud_client::PendingWrite| {
-        let name = lockyard_cloud_client::credential_fingerprint(&operation.key);
-        lockyard_core::fsio::replace(
-            &scope.join(format!("{name}.json")),
-            &serde_json::to_vec(operation).unwrap(),
-            0o600,
-        )
-        .unwrap();
+        pending_db(&journal).execute(
+            "INSERT INTO pending_writes(scope, key, state, payload) VALUES (?1, ?2, 'pending', ?3)
+             ON CONFLICT(scope, key) DO UPDATE SET payload = excluded.payload",
+            rusqlite::params![scope, operation.key, serde_json::to_vec(operation).unwrap()],
+        ).unwrap();
     };
     let mut pending = *pending;
     pending.first_sent_unix_secs = pending.first_sent_unix_secs.map(|time| time - 120);
@@ -6638,14 +6671,7 @@ fn survey1118_ly0030_lost_token_issue_is_never_replayed_by_load_service_or_docto
     let report = json_of(&out);
     assert_eq!(report["pending_repair"]["outcome_unknown"], 1);
     assert_eq!(report["pending_repair"]["remaining"], 0);
-    assert!(
-        scope
-            .join(format!(
-                "{}.json",
-                lockyard_cloud_client::credential_fingerprint(key)
-            ))
-            .is_file()
-    );
+    assert_eq!(pending_state(&journal, key).0, "pending");
     assert_eq!(server.state.lock().unwrap().tokens_created, 1);
     assert!(!String::from_utf8_lossy(&out.stdout).contains("new-secret-key"));
     assert!(!String::from_utf8_lossy(&out.stderr).contains("new-secret-key"));
@@ -6686,11 +6712,8 @@ fn survey1118_r12_doctor_repair_respects_revoked_url_trust() {
         client.call(&call),
         Err(ClientError::OutcomeUnknown(_))
     ));
-    let scope =
-        lockyard_cloud_client::credential_fingerprint(&format!("{}\0test-token", server.url));
-    let record = lockyard_cloud_client::credential_fingerprint(call.key.as_deref().unwrap());
-    let path = journal.join(scope).join(format!("{record}.json"));
-    let before = std::fs::read(&path).unwrap();
+    let key = call.key.as_deref().unwrap();
+    let before = pending_record(&journal, key, "payload").unwrap();
 
     std::fs::remove_file(runtime.path().join("config/lockyard/trusted-servers")).unwrap();
     server.state.lock().unwrap().refuse_registry_create = None;
@@ -6704,5 +6727,5 @@ fn survey1118_r12_doctor_repair_respects_revoked_url_trust() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("is not trusted"));
     assert_eq!(server.state.lock().unwrap().seen.len(), count);
-    assert_eq!(std::fs::read(path).unwrap(), before);
+    assert_eq!(pending_record(&journal, key, "payload").unwrap(), before);
 }

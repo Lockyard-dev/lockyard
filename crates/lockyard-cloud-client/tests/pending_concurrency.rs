@@ -38,9 +38,13 @@ fn survey_prime(server: &Server, journal: &Journal) {
 #[test]
 fn survey_r3_same_key_in_process_waits_until_deadline_without_resending() {
     let server = Server::start();
-    let journal = Journal::new();
-    survey_prime(&server, &journal);
-    let client = Arc::new(server.client(&journal));
+    let client = Arc::new(Client::new(&server.url, "fixture-token".into()).unwrap());
+    let mut prime = Call::write("me", "POST", "/api/v1/presence".into(), json!({}));
+    prime.deadline_ms = Some(500);
+    assert_eq!(
+        client.call(&prime).unwrap_err().code(),
+        Some("rate_limited")
+    );
     let done = start_call(Arc::clone(&client), survey_wait_call(5_000));
     let first = server.requests.recv_timeout(WAIT).unwrap();
     let original = client.pending_operation("survey-wait-key").unwrap();
@@ -60,93 +64,103 @@ fn survey_r3_same_key_in_process_waits_until_deadline_without_resending() {
 }
 
 #[test]
-fn survey_r2_same_key_process_waits_during_unlocked_long_poll() {
+fn a_second_process_replays_the_exact_long_poll_while_the_first_response_is_open() {
     let server = Server::start();
     let journal = Journal::new();
     survey_prime(&server, &journal);
     let client = Arc::new(server.client(&journal));
-    let done = start_call(Arc::clone(&client), survey_wait_call(5_000));
+    let done = start_call(Arc::clone(&client), survey_wait_call(10_000));
     let first = server.requests.recv_timeout(WAIT).unwrap();
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "survey_r2_same_key_child", "--nocapture"])
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "same_key_child", "--nocapture"])
         .env("LY_R2_URL", &server.url)
         .env("LY_R2_JOURNAL", &journal.0)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(150));
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "same key returned before its journal deadline"
-    );
+    let second = server.requests.recv_timeout(WAIT).unwrap();
+    assert_eq!(second.key, first.key);
+    assert_eq!(second.body, first.body);
+    assert_eq!(second.path, first.path);
+    let second_key = second.key.clone();
+    let second_body = second.body.clone();
+    second.reply(200, None);
     let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        server.requests.try_recv().is_err(),
-        "same key was transmitted concurrently"
-    );
+    assert!(output.status.success(), "{output:?}");
     first.reply(200, None);
-    assert!(done.recv_timeout(WAIT).unwrap().is_ok());
-    let restored = server.client(&journal);
+    assert_eq!(done.recv_timeout(WAIT).unwrap().unwrap()["id"], "A-1");
+    let restored = Arc::new(server.client(&journal));
     assert!(restored.pending_operation("survey-wait-key").is_none());
+    let done = start_call(restored, survey_wait_call(10_000));
+    let after_completion = server.requests.recv_timeout(WAIT).unwrap();
+    assert_eq!(after_completion.key, second_key);
+    assert_eq!(after_completion.body, second_body);
+    after_completion.reply(200, None);
+    assert_eq!(done.recv_timeout(WAIT).unwrap().unwrap()["id"], "A-1");
+    let db = rusqlite::Connection::open(journal.0.join(".sqlite/pending.db")).unwrap();
+    let count: i64 = db
+        .query_row(
+            "SELECT count(*) FROM pending_writes WHERE key = 'survey-wait-key'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
     server.finish();
 }
 
 #[test]
-fn survey_r2_same_key_child() {
+fn same_key_child() {
     let Ok(url) = std::env::var("LY_R2_URL") else {
         return;
     };
     let journal = PathBuf::from(std::env::var_os("LY_R2_JOURNAL").unwrap());
     let client = Client::new(&url, "fixture-token".into())
         .unwrap()
-        .with_pending_journal(journal)
+        .load_pending_journal(journal)
         .unwrap()
         .with_content_encryption(
             "fixture-workspace",
             Some(WorkspaceKey::from_entropy([73; 32])),
             true,
         );
-    let started = Instant::now();
-    let error = client.call(&survey_wait_call(450)).unwrap_err();
-    assert_eq!(error.code(), Some("journal_busy"));
-    assert!(started.elapsed() >= Duration::from_millis(400));
+    assert_eq!(client.call(&survey_wait_call(8_000)).unwrap()["id"], "A-1");
 }
 
 #[test]
-fn survey_r2_success_survives_failed_journal_reacquisition_and_later_cleans_up() {
+fn long_poll_completion_is_durable_while_an_unrelated_write_is_in_flight() {
     let server = Server::start();
     let journal = Journal::new();
     survey_prime(&server, &journal);
     let waiter = Arc::new(server.client(&journal));
     let done = start_call(Arc::clone(&waiter), survey_wait_call(700));
     let first = server.requests.recv_timeout(WAIT).unwrap();
-    let held = journal.lock();
+    let sibling = Arc::new(server.client(&journal));
+    let call = Call::write("me", "POST", "/api/v1/presence".into(), json!({}));
+    let sibling_result = start_call(sibling, call);
+    let other = server.requests.recv_timeout(WAIT).unwrap();
+    assert_ne!(first.key, other.key);
+    let first_body = first.body.clone();
+    let owner = journal.begin_write();
     first.reply(200, None);
+    assert!(matches!(
+        done.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    drop(owner);
     let success = done.recv_timeout(WAIT).unwrap();
-    drop(held);
     assert!(
         success.is_ok(),
         "a verified successful response was lost: {success:?}"
     );
     drop(waiter);
-    // A fresh process/client's next journal acquisition must retire the completed record.
-    let next = Arc::new(server.client(&journal));
-    let call = Call::write("me", "POST", "/api/v1/presence".into(), json!({}));
-    let done = start_call(Arc::clone(&next), call);
-    server.requests.recv_timeout(WAIT).unwrap().reply(200, None);
-    assert!(done.recv_timeout(WAIT).unwrap().is_ok());
-    assert!(
-        server
-            .client(&journal)
-            .pending_operation("survey-wait-key")
-            .is_none()
-    );
+    let restored = server.client(&journal);
+    assert!(restored.pending_operation("survey-wait-key").is_none());
+    assert_eq!(journal.stored_body("survey-wait-key"), first_body);
+    assert!(restored.pending_operation(&other.key).is_some());
+    other.reply(200, None);
+    assert!(sibling_result.recv_timeout(WAIT).unwrap().is_ok());
     server.finish();
 }
 
@@ -160,32 +174,25 @@ impl Journal {
         )))
     }
 
-    fn lock(&self) -> std::fs::File {
-        let scope = std::fs::read_dir(&self.0)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        // Mirror the production journal lock directory on Unix and file on Windows.
-        #[cfg(unix)]
-        let held = std::fs::File::open(scope).unwrap();
-        #[cfg(not(unix))]
-        let held = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(scope.join(".journal.lock"))
+    fn begin_write(&self) -> rusqlite::Connection {
+        let db = rusqlite::Connection::open(self.0.join(".sqlite/pending.db")).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        db
+    }
+
+    fn stored_body(&self, key: &str) -> String {
+        let db = rusqlite::Connection::open(self.0.join(".sqlite/pending.db")).unwrap();
+        let payload: Vec<u8> = db
+            .query_row(
+                "SELECT payload FROM pending_writes WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
             .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
-        }
-        #[cfg(not(unix))]
-        held.lock().unwrap();
-        held
+        serde_json::from_slice::<Value>(&payload).unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 }
 
@@ -262,7 +269,7 @@ impl Server {
                         200,
                         json!({
                             "selected_protocol":2,"min_protocol":1,"max_protocol":2,
-                            "capabilities":[]
+                            "capabilities":["signed_results_v1"]
                         }),
                     );
                 } else if first_write {
@@ -300,6 +307,18 @@ impl Server {
         Client::new(&self.url, "fixture-token".into())
             .unwrap()
             .with_pending_journal(&journal.0)
+            .unwrap()
+            .with_content_encryption(
+                "fixture-workspace",
+                Some(WorkspaceKey::from_entropy([73; 32])),
+                true,
+            )
+    }
+
+    fn load_client(&self, journal: &Journal) -> Client {
+        Client::new(&self.url, "fixture-token".into())
+            .unwrap()
+            .load_pending_journal(&journal.0)
             .unwrap()
             .with_content_encryption(
                 "fixture-workspace",
@@ -425,30 +444,35 @@ fn same_key_waiter_gets_the_first_reply(same_client: bool) {
     let sent = start_call(sender, call.clone());
     let first = server.requests.recv_timeout(WAIT).unwrap();
     let waiting = start_call(waiter, call.clone());
-    assert!(
-        server
-            .requests
-            .recv_timeout(Duration::from_millis(200))
-            .is_err(),
-        "same key was transmitted concurrently"
-    );
-    assert!(waiting.try_recv().is_err());
-    let (first_key, first_body) = (first.key.clone(), first.body.clone());
-    first.reply(200, None);
-    assert_eq!(sent.recv_timeout(WAIT).unwrap().unwrap(), json!({"id":"A-1"}));
-
-    // LOCAL-0148: the waiter reconciles through the server's Idempotency-Key receipt. It
-    // resends the first call's exact bytes, so an encrypted body still matches the receipt.
     let resent = server.requests.recv_timeout(WAIT).unwrap();
-    assert_eq!(resent.key, first_key);
+    assert!(waiting.try_recv().is_err());
+    assert_eq!(resent.key, first.key);
     assert_eq!(resent.path, call.path);
-    assert_eq!(resent.body, first_body, "the resend must reuse the journaled wire bytes");
+    assert_eq!(
+        resent.body, first.body,
+        "the resend must reuse the journaled wire bytes"
+    );
+    assert_eq!(resent.body, journal.stored_body(&key));
+    assert!(
+        first.body.contains("lyenc1."),
+        "fixture must exercise encrypted wire bytes"
+    );
+    first.reply(200, None);
+    assert_eq!(
+        sent.recv_timeout(WAIT).unwrap().unwrap(),
+        json!({"id":"A-1"})
+    );
     resent.reply(200, None);
     assert_eq!(
         waiting.recv_timeout(WAIT).unwrap().unwrap(),
         json!({"id":"A-1"})
     );
-    assert!(server.requests.recv_timeout(Duration::from_millis(300)).is_err());
+    assert!(
+        server
+            .requests
+            .recv_timeout(Duration::from_millis(300))
+            .is_err()
+    );
     assert!(server.client(&journal).pending_operation(&key).is_none());
     server.finish();
 }
@@ -481,10 +505,10 @@ fn same_key_resend_refused_as_reused_reconciles_by_key() {
     let sent = start_call(sender, call.clone());
     let first = server.requests.recv_timeout(WAIT).unwrap();
     let waiting = start_call(waiter, call);
-    std::thread::sleep(Duration::from_millis(100));
+    let resent = server.requests.recv_timeout(WAIT).unwrap();
+    assert_eq!(resent.body, first.body);
     first.reply(200, None);
     assert!(sent.recv_timeout(WAIT).unwrap().is_ok());
-    let resent = server.requests.recv_timeout(WAIT).unwrap();
     let mut stream = resent.stream;
     write_reply(
         &mut stream,
@@ -500,7 +524,12 @@ fn same_key_resend_refused_as_reused_reconciles_by_key() {
         other => other.to_string(),
     };
     assert!(reported.contains(&key), "{reported}");
-    assert!(server.requests.recv_timeout(Duration::from_millis(300)).is_err());
+    assert!(
+        server
+            .requests
+            .recv_timeout(Duration::from_millis(300))
+            .is_err()
+    );
     // The finished sender's row is never written back by the waiter.
     assert!(server.client(&journal).pending_operation(&key).is_none());
     server.finish();
@@ -526,7 +555,7 @@ fn pending_replay_http_uses_the_time_left_after_journal_wait() {
             .pre_execution_rejected
     );
 
-    let held = journal.lock();
+    let held = journal.begin_write();
     let done = start_call(Arc::clone(&client), call.clone());
     std::thread::sleep(Duration::from_millis(800));
     assert!(server.requests.try_recv().is_err());
@@ -677,7 +706,7 @@ fn long_poll_retry_after_allows_a_sibling_zone_release() {
     server.finish();
 }
 
-fn concurrent_retry(same_client: bool) {
+fn concurrent_retry(same_client: bool, success_first: bool) {
     let journal = Journal::new();
     let server = Server::start();
     let mut call = if same_client {
@@ -706,18 +735,12 @@ fn concurrent_retry(same_client: bool) {
     let key = call.key.as_deref().unwrap();
     let original = seed.pending_operation(key).unwrap();
     assert!(original.pre_execution_rejected);
-    // Attach both contenders while the journal is owned, so the test starts with
-    // a pending refusal rather than letting startup reconcile it first.
-    let held = journal.lock();
-    drop(seed);
-
-    let first_client = Arc::new(server.client(&journal));
+    let first_client = Arc::new(server.load_client(&journal));
     let second_client = if same_client {
         Arc::clone(&first_client)
     } else {
-        Arc::new(server.client(&journal))
+        Arc::new(server.load_client(&journal))
     };
-    drop(held);
     // The first network operation stays held while the second caller starts. This puts the
     // durable marker in its unknown/in-flight state before the contender inspects it.
     call.deadline_ms = Some(10_000);
@@ -726,42 +749,36 @@ fn concurrent_retry(same_client: bool) {
     let first_body = first.body.clone();
     assert_eq!(first_body, original.body.as_deref().unwrap());
     let second_done = start_call(Arc::clone(&second_client), call.clone());
-    let overlapping = server.requests.recv_timeout(Duration::from_secs(1));
-    let did_overlap = overlapping.is_ok();
-    if let Ok(second) = overlapping {
-        assert_eq!(second.body, first_body);
-        assert_eq!(second.key, key);
-        // Make the other operation succeed first. A stale refusal must never recreate safe
-        // replay permission after that success, including in a separately restored Client.
+    let second = server.requests.recv_timeout(WAIT).unwrap();
+    assert_eq!(second.body, first_body);
+    assert_eq!(second.key, key);
+    assert_eq!(second.path, first.path);
+    // A refusal cannot restore safe-retry permission while an overlapping send
+    // can still succeed or after its success became durable.
+    let succeed = || {
         second.reply(200, None);
-        assert!(second_done.recv_timeout(WAIT).unwrap().is_ok());
+        assert_eq!(
+            second_done.recv_timeout(WAIT).unwrap().unwrap()["id"],
+            "A-1"
+        );
+    };
+    let refuse = || {
         first.reply(503, Some("server_draining"));
-        assert!(first_done.recv_timeout(WAIT).unwrap().is_err());
+        assert!(matches!(
+            first_done.recv_timeout(WAIT).unwrap(),
+            Err(ClientError::OutcomeUnknown(_))
+        ));
+        assert!(
+            seed.pending_operation(key)
+                .is_none_or(|row| !row.pre_execution_rejected)
+        );
+    };
+    if success_first {
+        succeed();
+        refuse();
     } else {
-        first.reply(200, None);
-        assert!(first_done.recv_timeout(WAIT).unwrap().is_ok());
-        let until = Instant::now() + WAIT;
-        loop {
-            match second_done.try_recv() {
-                Ok(_) => break,
-                Err(mpsc::TryRecvError::Disconnected) => panic!("second caller vanished"),
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-            if let Ok(later) = server.requests.try_recv() {
-                assert_eq!(later.path, call.path);
-                assert_eq!(later.key, key);
-                assert_eq!(
-                    later.body, first_body,
-                    "serialization must not reencrypt a stale call"
-                );
-                later.reply(200, None);
-            }
-            assert!(
-                Instant::now() < until,
-                "serialized contender did not finish"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        refuse();
+        succeed();
     }
 
     let restored = server.client(&journal);
@@ -771,21 +788,138 @@ fn concurrent_retry(same_client: bool) {
             .is_none_or(|pending| !pending.pre_execution_rejected),
         "a successful overlapping operation must not be restored as a safe refusal"
     );
-    assert!(
-        !did_overlap,
-        "two retries transmitted concurrently for one pending operation"
-    );
     server.finish();
 }
 
 #[test]
-fn restored_clients_cannot_overlap_or_recreate_safe_refusal() {
-    concurrent_retry(false);
+fn restored_clients_replay_same_bytes_and_cannot_recreate_safe_refusal() {
+    for success_first in [true, false] {
+        concurrent_retry(false, success_first);
+    }
 }
 
 #[test]
-fn deferred_retries_share_one_in_flight_send() {
-    concurrent_retry(true);
+fn deferred_retries_replay_same_bytes_and_cannot_recreate_safe_refusal() {
+    for success_first in [true, false] {
+        concurrent_retry(true, success_first);
+    }
+}
+
+#[test]
+fn concurrent_signed_result_refusals_keep_the_longest_retry_after() {
+    let server = Server::start();
+    let journal = Journal::new();
+    survey_prime(&server, &journal);
+    let open = || {
+        server.client(&journal).with_content_encryption(
+            "00000000-0000-4000-8000-000000000001",
+            Some(WorkspaceKey::from_entropy([73; 32])),
+            true,
+        )
+    };
+    let first = open();
+    let second = open();
+    let job = lockyard_cloud_client::ulid();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let expiry =
+        Client::signed_result_expiry("worker", &job, now.as_millis() as u64 + 60_000).unwrap();
+    let earliest_retry = now.as_secs() + 3600;
+
+    let send = |client: &Client| {
+        client.put_signed_result("worker", "worker", &job, b"synthetic result", expiry)
+    };
+    std::thread::scope(|scope| {
+        let original = scope.spawn(|| send(&first));
+        let request = server.requests.recv_timeout(WAIT).unwrap();
+        let replay = scope.spawn(|| send(&second));
+        let repeated = server.requests.recv_timeout(WAIT).unwrap();
+        assert_eq!(request.path, repeated.path);
+        assert_eq!(request.body, repeated.body);
+        request.reply(408, Some("request_timeout"));
+        assert_eq!(
+            original.join().unwrap().unwrap_err().code(),
+            Some("outcome_unknown")
+        );
+        repeated.rate_limit(3600);
+        assert_eq!(
+            replay.join().unwrap().unwrap_err().code(),
+            Some("outcome_unknown")
+        );
+    });
+
+    let reopened = server.load_client(&journal);
+    let row = reopened.signed_result_pending("worker", &job).unwrap();
+    assert!(
+        row.result_retry_at.unwrap() >= earliest_retry,
+        "{:?}",
+        row.result_retry_at
+    );
+    assert!(!row.pre_execution_rejected);
+    assert!(!Client::result_retry_ready(&row));
+    server.finish();
+}
+
+#[test]
+fn full_byte_budget_keeps_a_signed_result_quota_suspension() {
+    let server = Server::start();
+    let journal = Journal::new();
+    survey_prime(&server, &journal);
+    let client = server.client(&journal).with_content_encryption(
+        "00000000-0000-4000-8000-000000000001",
+        Some(WorkspaceKey::from_entropy([73; 32])),
+        true,
+    );
+    let job = lockyard_cloud_client::ulid();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let expiry =
+        Client::signed_result_expiry("worker", &job, now.as_millis() as u64 + 60_000).unwrap();
+    let (original, error) = std::thread::scope(|scope| {
+        let send = scope.spawn(|| {
+            client.put_signed_result("worker", "worker", &job, b"synthetic result", expiry)
+        });
+        let mut put = server.requests.recv_timeout(WAIT).unwrap();
+        let original = client.signed_result_pending("worker", &job).unwrap();
+        let db = journal.begin_write();
+        let mut filler = original.clone();
+        filler.key = "fixture-filler".into();
+        filler.body = Some(String::new());
+        let extra = 16 * 1024 * 1024
+            - serde_json::to_vec(&original).unwrap().len()
+            - serde_json::to_vec(&filler).unwrap().len();
+        filler.body = Some("x".repeat(extra));
+        db.execute(
+            "INSERT INTO pending_writes (scope, key, state, payload, budget_bytes)
+             SELECT scope, ?2, 'pending', ?3, length(?3) FROM pending_writes WHERE key = ?1",
+            rusqlite::params![
+                original.key,
+                filler.key,
+                serde_json::to_vec(&filler).unwrap()
+            ],
+        )
+        .unwrap();
+        db.execute_batch("COMMIT").unwrap();
+        write_reply_with_retry_after(
+            &mut put.stream,
+            429,
+            json!({"status":429,"code":"relay_budget_exceeded","detail":"fixture","details":{}}),
+            3600,
+        );
+        (original, send.join().unwrap().unwrap_err())
+    });
+    let reopened = server.load_client(&journal);
+    let suspended = reopened.signed_result_pending("worker", &job).unwrap();
+    assert_eq!(suspended.body, original.body);
+    assert!(suspended.result_retry_at.unwrap() >= now.as_secs() + 3600);
+    assert_eq!(suspended.cause_status, Some(429));
+    assert_eq!(suspended.cause_code, "relay_budget_exceeded");
+    assert!(suspended.pre_execution_rejected);
+    assert!(!Client::result_retry_ready(&suspended));
+    assert_eq!(error.code(), Some("relay_budget_exceeded"));
+    server.finish();
 }
 
 #[test]
@@ -823,14 +957,13 @@ fn fixture_cleanup_preserves_failure_instead_of_aborting() {
     assert!(!stderr.contains("panic in a destructor"), "{stderr}");
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn write_waits_out_a_busy_pending_journal_within_the_deadline() {
     let server = Server::start();
     let journal = Journal::new();
     survey_prime(&server, &journal);
     let waiter = Arc::new(server.client(&journal));
-    let held = journal.lock();
+    let held = journal.begin_write();
     let mut call = Call::write("me", "POST", "/api/v1/presence".into(), json!({}));
     call.key = Some("wait-key".into());
     call.deadline_ms = Some(2_000);
@@ -860,8 +993,27 @@ fn write_waits_out_a_busy_pending_journal_within_the_deadline() {
     ));
 }
 
-/// LY-0010: a long-poll claim (zone wait) must not hold the pending-journal flock while the
-/// server keeps the HTTP response open — otherwise a sibling process cannot release/finish.
+#[test]
+fn unrelated_short_writes_can_reach_the_server_concurrently() {
+    let server = Server::start();
+    let journal = Journal::new();
+    survey_prime(&server, &journal);
+    let first_client = Arc::new(server.client(&journal));
+    let second_client = Arc::new(server.client(&journal));
+    let call = || Call::write("me", "POST", "/api/v1/presence".into(), json!({}));
+    let first_result = start_call(first_client, call());
+    let first = server.requests.recv_timeout(WAIT).unwrap();
+    let second_result = start_call(second_client, call());
+    let second = server.requests.recv_timeout(WAIT).unwrap();
+    assert_ne!(first.key, second.key);
+    second.reply(200, None);
+    assert!(second_result.recv_timeout(WAIT).unwrap().is_ok());
+    first.reply(200, None);
+    assert!(first_result.recv_timeout(WAIT).unwrap().is_ok());
+    server.finish();
+}
+
+/// A sibling release can reach the server while a long-poll claim is still open.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn long_poll_releases_the_pending_journal_while_waiting() {
@@ -919,7 +1071,6 @@ fn long_poll_releases_the_pending_journal_while_waiting() {
         .recv_timeout(WAIT)
         .expect("long-poll claim reached the server");
 
-    let started = Instant::now();
     let mut release = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "long_poll_sibling_process", "--nocapture"])
         .env("LY_SURVEY_URL", &url)
@@ -930,11 +1081,6 @@ fn long_poll_releases_the_pending_journal_while_waiting() {
     let release_stream = ready_rx
         .recv_timeout(WAIT)
         .expect("sibling release must reach the server while wait still holds its HTTP response");
-    assert!(
-        started.elapsed() < Duration::from_millis(1_500),
-        "sibling was blocked on the journal flock for {:?}",
-        started.elapsed()
-    );
     write_reply(&mut { release_stream }, 200, json!({"released": 1}));
     assert!(release.wait().unwrap().success());
 

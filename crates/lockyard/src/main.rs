@@ -463,7 +463,7 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
         } => {
             if repair_pending || forget_unknown.is_some() {
                 if forget_unknown.is_some() && !confirm {
-                    return Err(Error::Invalid("repeat `lockyard doctor --forget-unknown <id|--all>` with --confirm to move the selected operations to the quarantine log".into()));
+                    return Err(Error::Invalid("repeat `lockyard doctor --forget-unknown <id|--all>` with --confirm to archive the selected operations in the pending journal".into()));
                 }
                 let root = lockyard_core::paths::find_root(cwd)
                     .ok_or_else(|| Error::Invalid("no Lockyard project found".into()))?;
@@ -483,7 +483,7 @@ fn run(cli: Cli, cwd: &Path) -> Result<Output> {
                         client.forget_unknown_journal(open::pending_journal_root()?, &selection)?;
                     return output(
                         &serde_json::json!({"forgotten_unknown":count}),
-                        format!("Archived {count} unknown operations in quarantine.log."),
+                        format!("Archived {count} unknown operations in the pending journal."),
                     );
                 }
                 let report = client

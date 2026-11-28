@@ -9,6 +9,7 @@ use std::{
 
 const MAX_BYTES: u64 = 262_144;
 const YEAR_MS: u64 = 365 * 24 * 60 * 60 * 1000;
+const AMBIGUOUS_REFUSAL_RETRY_SECS: u64 = 60;
 
 pub(crate) fn is_result_path(path: &str) -> bool {
     let parts = path.split('/').collect::<Vec<_>>();
@@ -236,25 +237,12 @@ impl Client {
         }
         let call = Self::result_call(session, node, job, document, expires_at_ms)?;
         let key = call.key.as_deref().unwrap();
-        let mut guard = self.claim_pending_send(key)?;
+        let _guard = self.reserve_memory_send(key)?;
         let (workspace, content_key) = self.result_context()?;
         let (_, job_time) = route(node, job)?;
         let now = now_ms();
         let expiry = lockyard_core::proto::rfc3339(expires_at_ms as i64);
-        let (pending, replay) = if let Some(pending) = self.pending_operation(key) {
-            if pending.method != "PUT"
-                || pending.path != call.path
-                || pending.request_path != call.path
-                || pending.session != session
-                || pending.origin != self.base_url
-                || pending.credential_scope != crate::credential_fingerprint(&self.token)
-                || pending.encryption_context.as_deref() != Some(self.encryption_context().as_str())
-                || pending.result_expires_at.as_deref() != Some(expiry.as_str())
-                || pending.request_digest.as_deref()
-                    != Some(crate::request_identity(&call).as_str())
-            {
-                return Err(ClientError::OutcomeUnknown(Box::new(pending)));
-            }
+        let (pending, replay) = if let Some(pending) = self.pending_for_send(key)? {
             (pending, true)
         } else {
             if expires_at_ms <= now
@@ -264,7 +252,7 @@ impl Client {
             {
                 return Err(protocol::local("invalid_request", "invalid result expiry"));
             }
-            let protocol = guard.exchange(|| self.result_protocol(session))??;
+            let protocol = self.result_protocol(session)?;
             let body = content_key
                 .encrypt(
                     workspace,
@@ -299,35 +287,53 @@ impl Client {
                 replay_paused: false,
                 pre_execution_rejected: false,
                 encryption_context: Some(self.encryption_context()),
-                result_expires_at: Some(expiry),
+                result_expires_at: Some(expiry.clone()),
                 result_retry_at: None,
             };
             if pending.first_sent_server_secs.is_some() {
                 self.repair_before_admission(
-                    &mut guard,
                     serde_json::to_vec(&pending)
                         .map_err(protocol::journal_error)?
                         .len(),
                     std::time::Duration::from_secs(5),
                 )?;
             }
-            self.retain_pending(pending.clone())?;
-            (pending, false)
+            match self.admit_pending(&pending)? {
+                Some(existing) => (existing, true),
+                None => (pending, false),
+            }
         };
-        self.send_signed_result(pending, replay, &mut guard)
+        if replay
+            && (pending.method != "PUT"
+                || pending.path != call.path
+                || pending.request_path != call.path
+                || pending.session != session
+                || pending.origin != self.base_url
+                || pending.credential_scope != crate::credential_fingerprint(&self.token)
+                || pending.encryption_context.as_deref()
+                    != Some(self.encryption_context().as_str())
+                || pending.result_expires_at.as_deref() != Some(expiry.as_str())
+                || pending.request_digest.as_deref()
+                    != Some(crate::request_identity(&call).as_str()))
+        {
+            return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+        }
+        self.send_signed_result(pending, replay)
     }
     fn send_signed_result(
         &self,
         mut pending: PendingWrite,
         replay: bool,
-        guard: &mut protocol::PendingSendGuard<'_>,
     ) -> Result<(), ClientError> {
         if pending.replay_stopped && !Self::result_permanently_refused(&pending) {
             return Err(ClientError::OutcomeUnknown(Box::new(pending)));
         }
         if !Self::result_retry_ready(&pending) {
+            let Some(status) = pending.cause_status else {
+                return Err(ClientError::OutcomeUnknown(Box::new(pending)));
+            };
             return Err(ClientError::from_api(crate::ApiError {
-                status: pending.cause_status.unwrap_or(503),
+                status,
                 code: pending.cause_code.clone(),
                 message: "signed result publication is suspended".into(),
                 ..Default::default()
@@ -340,17 +346,25 @@ impl Client {
             // A proven refusal permits fresh discovery at the configured origin.
             // Only the protocol header changes; ciphertext, key, path and expiry stay frozen.
             let previous = pending.clone();
-            pending.protocol = guard.exchange(|| {
-                self.refresh_protocol(&pending.session)?;
-                self.result_protocol(&pending.session)
-            })??;
-            self.update_pending(&previous, pending.clone())?;
+            self.refresh_protocol(&pending.session)?;
+            pending.protocol = self.result_protocol(&pending.session)?;
+            if !self.update_pending(&previous, pending.clone())? {
+                return Err(ClientError::OutcomeUnknown(Box::new(previous)));
+            }
         }
+        let may_prove_refusal = !replay || pending.pre_execution_rejected;
         if replay {
-            if !self.can_replay_pending(&pending, guard, None, None)? {
+            if !self.can_replay_pending(&pending, None, None)? {
                 return Err(ClientError::OutcomeUnknown(Box::new(pending)));
             }
-            self.verify_pending_replay_encryption(&pending, guard, None, None)?;
+            self.verify_pending_replay_encryption(&pending, None, None)?;
+            let previous = pending.clone();
+            pending.pre_execution_rejected = false;
+            // A crash after this transition leaves the new attempt unknown.
+            pending.cause_status = None;
+            if !self.begin_pending_replay(&previous, &pending)? {
+                return Err(ClientError::OutcomeUnknown(Box::new(previous)));
+            }
         }
         let request = self
             .result_request("PUT", &pending.path, &pending.session, &pending.protocol)
@@ -359,52 +373,66 @@ impl Client {
                 "Lockyard-Result-Expires-At",
                 pending.result_expires_at.as_deref().unwrap(),
             );
-        let response = guard.exchange(|| {
-            self.result_response(
-                request.send_bytes(pending.body.as_ref().unwrap().as_bytes()),
-                &pending.protocol,
-            )
-            .map(|response| {
-                if response.status() == 204 {
-                    read_bounded(response).map(|body| body.is_empty())
-                } else {
-                    Ok(false)
-                }
-            })
-        })?;
+        let response = self.result_response(
+            request.send_bytes(pending.body.as_ref().unwrap().as_bytes()),
+            &pending.protocol,
+        );
         match response {
-            Ok(empty) => {
-                if empty? {
-                    Ok(())
-                } else {
-                    Err(self.unknown(pending, "protocol_response_invalid", None))
+            Ok(response) if response.status() == 204 => {
+                if !read_bounded(response).is_ok_and(|body| body.is_empty()) {
+                    return Err(self.unknown(pending, "protocol_response_invalid", None));
                 }
+                Ok(())
             }
+            Ok(_) => Err(self.unknown(pending, "protocol_response_invalid", None)),
             Err(error) => {
-                if self.explicit_expiry(&pending, &error)? {
+                if self.explicit_expiry(&pending, &error, None)? {
                     return Err(ClientError::OutcomeUnknown(Box::new(pending)));
                 }
-                let previous = pending.clone();
-                let mut pending = pending;
-                pending.cause_code = error.code().unwrap_or("outcome_unknown").to_owned();
-                pending.cause_status = error.status();
-                pending.result_retry_at = error
-                    .retry_after()
-                    .map(|seconds| (now_ms().saturating_add(999) / 1000).saturating_add(seconds));
-                self.update_pending(&previous, pending.clone())?;
-                if error.status().is_some_and(|status| {
-                    status < 500
-                        || (status == 503
-                            && matches!(
-                                error.code(),
-                                Some("server_draining" | "frozen" | "temporarily_unavailable")
-                            ))
-                }) {
-                    Err(error)
+                let status = error.status();
+                let definitive = may_prove_refusal
+                    && status.is_some_and(|status| {
+                        (status < 500 && status != 408)
+                            || (status == 503
+                                && matches!(
+                                    error.code(),
+                                    Some("server_draining" | "frozen" | "temporarily_unavailable")
+                                ))
+                    });
+                let retry_at = |seconds: u64| now_ms().div_ceil(1000).saturating_add(seconds);
+                let mut unknown = pending.clone();
+                unknown.cause_code = error.code().unwrap_or("outcome_unknown").to_owned();
+                unknown.cause_status = None;
+                unknown.pre_execution_rejected = false;
+                let ambiguity_delay = status
+                    .is_some_and(|status| (400..500).contains(&status))
+                    .then_some(AMBIGUOUS_REFUSAL_RETRY_SECS);
+                unknown.result_retry_at = error
+                    .api_error()
+                    .and_then(|api| api.retry_after)
+                    .max(ambiguity_delay)
+                    .map(retry_at);
+                let refusal = definitive.then(|| {
+                    let mut refusal = unknown.clone();
+                    refusal.cause_status = status;
+                    refusal.pre_execution_rejected = true;
+                    refusal.result_retry_at = error.retry_after().map(retry_at);
+                    refusal
+                });
+                let proved = if let Some(journal) = &self.pending_journal {
+                    journal.record_result_failure(&pending, refusal.as_ref(), &unknown)?
+                } else if let Some(refusal) = refusal {
+                    self.update_pending(&pending, refusal)?
                 } else {
-                    let cause = pending.cause_code.clone();
-                    Err(self.unknown(pending, &cause, error.status()))
+                    self.update_pending(&pending, unknown.clone())?;
+                    false
+                };
+                if proved {
+                    return Err(error);
                 }
+                // A refusal from this request cannot disprove execution by a
+                // prior attempt. Do not publish its status as a terminal result.
+                Err(ClientError::OutcomeUnknown(Box::new(unknown)))
             }
         }
     }
@@ -441,14 +469,14 @@ impl Client {
     /// document serialization, encryption or expiry generation occurs here. Discovery changes
     /// only after a proven replica refusal.
     pub fn replay_signed_result(&self, key: &str) -> Result<(), ClientError> {
-        let mut guard = self.claim_pending_send(key)?;
-        self.send_signed_result(self.result_for_replay(key)?, true, &mut guard)
+        let _guard = self.reserve_memory_send(key)?;
+        self.send_signed_result(self.result_for_replay(key)?, true)
     }
     /// Explicitly resume a quota-refused operation after budget relief. This only schedules
     /// exact replay: the saved Retry-After still applies, and a durable receipt is still needed
     /// before acknowledgement. Automatic workers never make this decision themselves.
     pub fn resume_signed_result(&self, key: &str) -> Result<(), ClientError> {
-        let _guard = self.claim_pending_send(key)?;
+        let _guard = self.reserve_memory_send(key)?;
         let mut pending = self.result_for_replay(key)?;
         if pending.cause_status != Some(429) || pending.cause_code != "relay_budget_exceeded" {
             return Err(protocol::local(
@@ -459,12 +487,15 @@ impl Client {
         let previous = pending.clone();
         pending.cause_code = "outcome_unknown".into();
         pending.cause_status = None;
-        self.update_pending(&previous, pending)
+        if self.update_pending(&previous, pending)? {
+            return Ok(());
+        }
+        Err(ClientError::OutcomeUnknown(Box::new(previous)))
     }
     fn result_for_replay(&self, key: &str) -> Result<PendingWrite, ClientError> {
         self.result_context()?;
         let pending = self
-            .pending_operation(key)
+            .try_pending_operation(key)?
             .ok_or_else(|| protocol::local("invalid_request", "pending result missing"))?;
         let parts = pending.path.split('/').collect::<Vec<_>>();
         let valid = match parts.as_slice() {

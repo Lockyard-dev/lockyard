@@ -165,7 +165,7 @@ pub enum ClientError {
     Http(ApiError),
     /// The server did not answer.
     Transport(String),
-    /// The local pending-write journal flock is held by another process.
+    /// An in-memory send or a local journal transaction is already active.
     JournalBusy,
     /// The server answered with something unreadable.
     Decode(String),
@@ -785,7 +785,7 @@ pub struct Client {
     protocol_discovery: Mutex<()>,
     registry_auto_area_observed: AtomicBool,
     mail_open_v1_observed: AtomicBool,
-    pending_journal: Option<std::path::PathBuf>,
+    pending_journal: Option<protocol::PendingJournal>,
     check_pending_encryption_policy: bool,
     check_live_write_encryption_policy: bool,
     status_protocol_cache: Option<std::path::PathBuf>,
@@ -1856,10 +1856,7 @@ impl Transport for Client {
     }
 
     fn prepare_task_create(&self, call: &Call, explicit_key: bool) -> Result<Call, ClientError> {
-        match self.maintain_pending_journal() {
-            Ok(_) | Err(ClientError::JournalBusy) => {}
-            Err(error) => return Err(error),
-        }
+        self.maintain_pending_journal()?;
         self.pending_task_create(call, explicit_key)
     }
     fn mail_push_v1(&self, session: &str) -> Result<bool, ClientError> {
@@ -1973,7 +1970,7 @@ impl Transport for Client {
             .unwrap_or(MAX_RETRY_WAIT);
         let _send = loop {
             call.check_cancelled()?;
-            match self.claim_pending_send(key) {
+            match self.reserve_memory_send(key) {
                 Ok(guard) => break guard,
                 Err(error) if protocol::journal_busy(&error) => {
                     let left = budget.saturating_sub(started.elapsed());
@@ -1985,26 +1982,36 @@ impl Transport for Client {
                 Err(error) => return Err(error),
             }
         };
-        let Some(pending) = self.pending_operation(key) else {
-            return self.consume_settled(call);
-        };
-        let Some(request_digest) = pending.request_digest.as_deref() else {
-            // Older journals have only encrypted wire bytes. They cannot establish that an
-            // acknowledgement of a plaintext caller operation describes the same write.
-            return Err(ClientError::OutcomeUnknown(Box::new(pending)));
-        };
-        if pending.method != call.method
-            || pending.request_path != call.path
-            || request_digest != request_identity(call)
-        {
-            return Err(protocol::local(
-                "idempotency_conflict",
-                "acknowledgement does not match the pending operation",
-            ));
+        if let Some(journal) = &self.pending_journal {
+            return if journal.acknowledge(call, key, started + budget)? {
+                Ok(())
+            } else {
+                self.consume_settled(call)
+            };
         }
-        self.resolve_pending(key)?;
+        if let Some(pending) = self.try_pending_operation(key)? {
+            verify_pending_ack(&pending, call)?;
+            self.resolve_pending(key)?;
+        }
         Ok(())
     }
+}
+
+fn verify_pending_ack(pending: &PendingWrite, call: &Call) -> Result<(), ClientError> {
+    let Some(request_digest) = pending.request_digest.as_deref() else {
+        // The legacy wire bytes alone cannot identify the original plaintext call.
+        return Err(ClientError::OutcomeUnknown(Box::new(pending.clone())));
+    };
+    if pending.method != call.method
+        || pending.request_path != call.path
+        || request_digest != request_identity(call)
+    {
+        return Err(protocol::local(
+            "idempotency_conflict",
+            "acknowledgement does not match the pending operation",
+        ));
+    }
+    Ok(())
 }
 
 /// Bind the caller's operation before content encryption or legacy wire adaptation. Operational

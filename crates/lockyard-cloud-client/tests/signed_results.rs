@@ -3,6 +3,7 @@
 use lockyard_cloud_client::{Client, WorkspaceKey};
 use serde_json::json;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const WORKSPACE: &str = "00000000-0000-4000-8000-000000000001";
@@ -17,6 +18,7 @@ struct State {
     tamper: bool,
     puts: usize,
     discoveries: usize,
+    date: Option<&'static str>,
 }
 
 fn fixture() -> (String, Arc<Mutex<State>>, std::thread::JoinHandle<()>) {
@@ -103,7 +105,8 @@ fn fixture() -> (String, Arc<Mutex<State>>, std::thread::JoinHandle<()>) {
                     )
                 }
             };
-            write!(stream, "HTTP/1.1 {status} Reply\r\nLockyard-Protocol: 2\r\nDate: Thu, 12 Nov 2026 10:21:00 GMT\r\nContent-Type: {content_type}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+            let date = state.date.unwrap_or("Thu, 12 Nov 2026 10:21:00 GMT");
+            write!(stream, "HTTP/1.1 {status} Reply\r\nLockyard-Protocol: 2\r\nDate: {date}\r\nContent-Type: {content_type}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
             stream.write_all(&response).unwrap();
         }
     });
@@ -408,6 +411,129 @@ fn frozen_result_replays_after_content_expiry_without_original_document() {
     assert_eq!(restored.pending_operations()[0].body, original);
     restored.resolve_pending(&pending.key).unwrap();
     assert!(restored.pending_operations().is_empty());
+    assert_eq!(state.lock().unwrap().puts, 2);
+    stop(&url, server);
+}
+
+#[test]
+fn a_refusal_after_the_server_stored_the_result_is_still_unknown() {
+    let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let (url, state, server) = fixture();
+    let job = lockyard_cloud_client::ulid();
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 60_000;
+    state.lock().unwrap().drop_ack = true;
+    let first = client(&url, directory.path());
+    let error = first
+        .put_signed_result("worker", "worker", &job, DOCUMENT, expiry)
+        .unwrap_err();
+    assert_eq!(error.code(), Some("outcome_unknown"));
+    let original = first.pending_operations().pop().unwrap();
+    assert!(state.lock().unwrap().stored.is_some());
+
+    state.lock().unwrap().put_error = Some((403, "revoked", 0));
+    let sibling = client(&url, directory.path());
+    assert_eq!(
+        sibling
+            .replay_signed_result(&original.key)
+            .unwrap_err()
+            .code(),
+        Some("outcome_unknown")
+    );
+    let pending = sibling.pending_operations().pop().unwrap();
+    assert_eq!(pending.body, original.body);
+    assert!(!Client::result_permanently_refused(&pending));
+    assert!(!Client::result_retry_ready(&pending));
+    assert_eq!(state.lock().unwrap().puts, 2);
+    state.lock().unwrap().put_error = None;
+    drop(sibling);
+    let restarted = client(&url, directory.path());
+    assert_eq!(
+        restarted
+            .replay_signed_result(&original.key)
+            .unwrap_err()
+            .code(),
+        Some("outcome_unknown")
+    );
+    assert_eq!(state.lock().unwrap().puts, 2);
+    advance_past_retry(directory.path(), &original.key);
+    restarted.replay_signed_result(&original.key).unwrap();
+    restarted
+        .acknowledge_signed_result("worker", "worker", &job, DOCUMENT, expiry)
+        .unwrap();
+    assert!(restarted.pending_operations().is_empty());
+    assert_eq!(state.lock().unwrap().puts, 3);
+    stop(&url, server);
+}
+
+fn advance_past_retry(directory: &Path, key: &str) {
+    let db = rusqlite::Connection::open(directory.join(".sqlite/pending.db")).unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE pending_writes SET
+                payload = CAST(json_set(CAST(payload AS TEXT), '$.result_retry_at', 0) AS BLOB),
+                budget_bytes = length(CAST(json_set(CAST(payload AS TEXT), '$.result_retry_at', 0) AS BLOB))
+             WHERE key = ?1 AND state = 'pending'",
+            [key],
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn put_timeout_is_unknown_and_the_server_window_stops_automatic_replay() {
+    let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let (url, state, server) = fixture();
+    let job = lockyard_cloud_client::ulid();
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 60_000;
+    state.lock().unwrap().put_error = Some((408, "request_timeout", 0));
+    let first = client(&url, directory.path());
+    assert_eq!(
+        first
+            .put_signed_result("worker", "worker", &job, DOCUMENT, expiry)
+            .unwrap_err()
+            .code(),
+        Some("outcome_unknown")
+    );
+    let pending = first.pending_operations().pop().unwrap();
+    assert!(!pending.pre_execution_rejected);
+    assert!(!Client::result_permanently_refused(&pending));
+    assert!(!Client::result_retry_ready(&pending));
+    advance_past_retry(directory.path(), &pending.key);
+    state.lock().unwrap().put_error = Some((403, "revoked", 0));
+    assert_eq!(
+        first.replay_signed_result(&pending.key).unwrap_err().code(),
+        Some("outcome_unknown")
+    );
+    let denied = first.pending_operation(&pending.key).unwrap();
+    assert_eq!(denied.cause_status, None);
+    assert_eq!(denied.cause_code, "revoked");
+    assert!(!Client::result_retry_ready(&denied));
+    advance_past_retry(directory.path(), &pending.key);
+    state.lock().unwrap().date = Some("Sun, 12 Nov 2028 10:21:00 GMT");
+    let reopened = client(&url, directory.path());
+    for _ in 0..2 {
+        assert_eq!(
+            reopened
+                .replay_signed_result(&pending.key)
+                .unwrap_err()
+                .code(),
+            Some("outcome_unknown")
+        );
+    }
+    let stopped = reopened.pending_operations().pop().unwrap();
+    assert!(stopped.replay_stopped);
+    assert!(stopped.replay_paused);
+    assert_eq!(stopped.cause_code, "revoked");
+    assert_eq!(stopped.body, pending.body);
     assert_eq!(state.lock().unwrap().puts, 2);
     stop(&url, server);
 }

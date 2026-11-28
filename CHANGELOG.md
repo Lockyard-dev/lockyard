@@ -7,10 +7,13 @@ All notable changes to Lockyard are recorded here. The format follows
 
 ## [0.3.20] - 2026-11-26
 
-- Keep pending HTTP replay and admission-time reconciliation within the original call deadline. If a writer waits on the same idempotency key and the pending record disappears, require reconciliation by key (LY-0057).
-- Return a verified write response to callers already waiting on the same idempotency key, including concurrent calls on one HTTP client (LOCAL-0146).
+- Keep pending HTTP replay and admission-time reconciliation, including SQLite contention, within the original call deadline (LY-0057).
+- Retry a shared Idempotency-Key with the exact journaled HTTP request and obtain the server's original receipt. Report key reuse after contention as an unknown outcome that can be reconciled by key (LOCAL-0148).
+- Store pending writes in a private SQLite WAL journal. Migrate legacy records by generation, retain the original wire request for safe replay, and reserve keys even after their completed payloads are evicted (LY-0069).
+- Keep the longest applicable Retry-After for overlapping signed-result uploads. Preserve an unknown outcome when an imported file-journal refusal cannot establish whether an earlier upload succeeded.
+- Serialize credentials changes with `File::lock`, report malformed credentials by location, and let logout preserve a private backup without overwriting an earlier copy (LY-0039, LY-0041, LY-0044).
 - Let an offline-started agent read and publish encrypted catalogs using live workspace settings and a newly created or imported key (LY-0058).
-- Release the shared write journal during HTTP requests, protocol discovery and retry backoff while keeping the operation key reserved (LY-0059).
+- Keep journal transactions local to durable state changes so HTTP, protocol discovery and retry backoff leave the journal available (LY-0059).
 - Reject incorrect MCP TTL field names, publish and enforce per-tool minute limits for leases, queues, board entries and mail notices, and forward the requested TTL to task and zone claims in `start_work` (LY-0060).
 
 - Use Unicode D145 canonical caseless matching via `caseless` for case-insensitive zone and gitlink
@@ -53,6 +56,9 @@ All notable changes to Lockyard are recorded here. The format follows
   coverage returns, and report listing errors even at the entry budget limit (LOCAL-0143).
 - Retry recovered dirty paths until the report succeeds, match recovered writes to hook
   announcements at file modification time, and bound each session's cached loss history (LOCAL-0143).
+- Mark incomplete monitor rescans and warn on unreadable entries. A loss learned by another
+  status request fences older snapshots, and evicted alert versions discard stale waits
+  (LOCAL-0144, LOCAL-0145, LOCAL-0147).
 
 ## [0.3.19] - 2026-11-26
 

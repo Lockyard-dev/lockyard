@@ -164,6 +164,8 @@ struct MailFixture {
 
 pub struct FakeServer {
     address: String,
+    #[cfg(test)]
+    listener: std::sync::Weak<TcpListener>,
     bindings: Arc<Mutex<HashMap<String, String>>>,
     routes: Arc<Mutex<HashMap<String, VecDeque<Reply>>>>,
     seen: Arc<Mutex<Vec<Seen>>>,
@@ -253,6 +255,12 @@ impl FakeServer {
         });
         let (stop, stopped) = mpsc::channel();
         let (ready, started) = mpsc::sync_channel(0);
+        #[cfg(test)]
+        let (listener, listener_weak) = {
+            let listener = Arc::new(listener);
+            let weak = Arc::downgrade(&listener);
+            (listener, weak)
+        };
         let worker = thread::spawn(move || {
             let mut workers: Vec<(TcpStream, thread::JoinHandle<()>)> = Vec::new();
             ready.send(()).unwrap();
@@ -322,6 +330,8 @@ impl FakeServer {
         started.recv().unwrap();
         Self {
             address,
+            #[cfg(test)]
+            listener: listener_weak,
             bindings,
             routes,
             seen,
@@ -378,24 +388,45 @@ fn discovery_and_business_requests_reuse_one_connection() {
 #[cfg(test)]
 #[test]
 fn dropping_server_closes_listener_and_joins_request_workers() {
+    use std::io::{BufRead, BufReader};
+
     let server = FakeServer::start(vec![Reply::json(200, serde_json::json!({"ok": true}))]);
-    let address = server.address.clone();
+    let listener = server.listener.clone();
     let log = Arc::clone(&server.seen);
-    let response: Value = ureq::get(&server.url())
-        .call()
-        .unwrap()
-        .into_json()
+    let mut stream = TcpStream::connect(&server.address).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .unwrap();
-    assert_eq!(response, serde_json::json!({"ok": true}));
+    stream
+        .write_all(b"GET /fixture HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut response = BufReader::new(stream);
+    let mut line = String::new();
+    response.read_line(&mut line).unwrap();
+    assert!(line.starts_with("HTTP/1.1 200 "));
+    loop {
+        line.clear();
+        assert_ne!(response.read_line(&mut line).unwrap(), 0);
+        if line == "\r\n" {
+            break;
+        }
+    }
+    let mut body = [0; b"{\"ok\":true}".len()];
+    response.read_exact(&mut body).unwrap();
+    assert_eq!(body, *b"{\"ok\":true}");
+
     drop(server);
+    // Check this listener's lifetime. Its old port can already belong to a different fixture.
+    assert!(listener.upgrade().is_none(), "listener must be closed");
     assert_eq!(
         Arc::strong_count(&log),
         1,
         "all server workers must have exited"
     );
-    assert!(
-        TcpStream::connect(&address).is_err(),
-        "listener must be closed"
+    assert_eq!(
+        response.read(&mut [0]).unwrap(),
+        0,
+        "idle connection must close"
     );
 }
 

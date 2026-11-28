@@ -410,7 +410,9 @@ fn cloud_status_with_registry(
         [
             "/api/v1/registry/items?status=active&limit=200",
             "/api/v1/registry/items?status=review&limit=200",
-        ]
+        ],
+        "MCP mode: {mcp}; response: {}",
+        String::from_utf8_lossy(&result.stdout)
     );
     String::from_utf8(result.stdout).unwrap()
 }
@@ -1374,6 +1376,89 @@ fn logout_forgets_one_server_and_login_refuses_a_plain_http_one() {
     // guessing a server.
     let guessing = run(&["cloud", "login"]);
     assert!(!guessing.status.success());
+}
+
+#[test]
+fn corrupt_credentials_are_redacted_on_stderr_and_logout_moves_them_aside() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let credentials = root.join("credentials.toml");
+    let url = "https://cloud.test";
+    let token = "lk_fake_cli_parse_error_token";
+    let broken = format!("[servers.'{url}']\ntoken = [{token}]\n");
+    lockyard_core::fsio::replace(&credentials, broken.as_bytes(), 0o600).unwrap();
+    let project = root.join(".lockyard");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(
+        project.join("config.toml"),
+        format!("mode = 'cloud'\nurl = '{url}'\nworkspace = 'team'\n"),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_lockyard"))
+            .args(args)
+            .current_dir(root)
+            .env_clear()
+            .env("HOME", root)
+            .env("USERPROFILE", root)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_RUNTIME_DIR", root)
+            .env("LOCKYARD_CREDENTIALS", &credentials)
+            .env("LOCKYARD_URL", url)
+            .env("LOCKYARD_AGENT", "credential-test")
+            .output()
+            .unwrap()
+    };
+
+    let plain = run(&["cloud", "protocol"]);
+    let json = run(&["--json", "cloud", "protocol"]);
+    for output in [&plain, &json] {
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains(token));
+        assert!(stderr.contains("(line 2, column 10)"), "{stderr}");
+        assert!(stderr.contains("lockyard cloud logout --url"), "{stderr}");
+    }
+    let error: Value = serde_json::from_slice(&json.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "invalid");
+
+    let logout = run(&["cloud", "logout", "--url", url]);
+    assert!(logout.status.success(), "{:?}", logout.stderr);
+    assert!(logout.stderr.is_empty());
+    let notice = String::from_utf8_lossy(&logout.stdout);
+    assert!(!notice.contains(token));
+    assert!(notice.contains("credentials.toml.corrupt"), "{notice}");
+    assert!(notice.contains("log in again to each server"), "{notice}");
+    assert!(!credentials.exists());
+    let backup = root.join("credentials.toml.corrupt");
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), broken);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            backup.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    // A second recovery also handles invalid UTF-8 and preserves the first backup.
+    let second_broken = b"token = 'fake_second_parse_error_token\xff'\n";
+    lockyard_core::fsio::replace(&credentials, second_broken, 0o600).unwrap();
+    let logout = run(&["--json", "cloud", "logout", "--url", url]);
+    assert!(logout.status.success(), "{:?}", logout.stderr);
+    assert!(logout.stderr.is_empty());
+    let result: Value = serde_json::from_slice(&logout.stdout).unwrap();
+    let second_backup = root.join("credentials.toml.corrupt.1");
+    assert_eq!(
+        result["credentials_backup"],
+        json!(second_backup.to_string_lossy())
+    );
+    assert!(result["removed"].is_null());
+    assert!(!credentials.exists());
+    assert_eq!(std::fs::read_to_string(backup).unwrap(), broken);
+    assert_eq!(std::fs::read(second_backup).unwrap(), second_broken);
 }
 
 #[test]

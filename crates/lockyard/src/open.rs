@@ -320,9 +320,11 @@ pub(crate) fn status_read(
         ));
     }
     trusted_url(&url)?;
-    let client = journal_client(Client::for_session(&url, session, Some(left()))?)?
-        .with_status_protocol_cache()
-        .configure_content_encryption_with_deadline(session, left())?;
+    let mut client = Client::for_session(&url, session, Some(left()))?;
+    if let Ok(root) = pending_journal_root() {
+        client = client.with_status_protocol_cache_at(root);
+    }
+    let client = client.configure_content_encryption_with_deadline(session, left())?;
     let backend = CloudBackend::new(
         RepositoryTransport::new(client, config.repository.as_deref())?,
         session,

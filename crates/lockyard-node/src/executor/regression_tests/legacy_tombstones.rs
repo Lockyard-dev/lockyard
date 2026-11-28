@@ -442,6 +442,15 @@ fn cloud_reconciliation_is_one_per_tick_and_local_reads_preserve_diagnostics() {
 
 #[test]
 fn completed_result_publication_uses_saved_bytes_and_durable_receipt() {
+    check_completed_result_publication(false);
+}
+
+#[test]
+fn legacy_suspension_marker_does_not_block_an_unknown_signed_result() {
+    check_completed_result_publication(true);
+}
+
+fn check_completed_result_publication(import_legacy_refusal: bool) {
     let (root, _config, mut executor, signer) = legacy_fixture();
     let mut record = retained_fixture_record(&executor, JobState::Succeeded, now_ms() + 60_000);
     let old_id = record.spec.id.clone();
@@ -548,13 +557,21 @@ fn completed_result_publication_uses_saved_bytes_and_durable_receipt() {
             }
         }
     });
-    let client = Arc::new(
-        lockyard_cloud_client::Client::new(&url, "fixture".into())
-            .unwrap()
-            .with_content_encryption("00000000-0000-4000-8000-000000000001", Some(key), true)
-            .with_pending_journal(root.path().canonicalize().unwrap().join("pending"))
-            .unwrap(),
-    );
+    let journal_root = root.path().canonicalize().unwrap().join("pending");
+    let open_client = || {
+        Arc::new(
+            lockyard_cloud_client::Client::new(&url, "fixture".into())
+                .unwrap()
+                .with_content_encryption(
+                    "00000000-0000-4000-8000-000000000001",
+                    Some(key.clone()),
+                    true,
+                )
+                .with_pending_journal(&journal_root)
+                .unwrap(),
+        )
+    };
+    let mut client = open_client();
     Arc::get_mut(&mut executor.inner)
         .unwrap()
         .config
@@ -591,7 +608,36 @@ fn completed_result_publication_uses_saved_bytes_and_durable_receipt() {
     assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
     assert_eq!(client.pending_operations()[0].body, pending.body);
     quota.store(false, Ordering::SeqCst);
-    client.resume_signed_result(&pending.key).unwrap();
+    if import_legacy_refusal {
+        use lockyard_cloud_client::credential_fingerprint;
+        let legacy = journal_root.join(credential_fingerprint(&format!("{url}\0fixture")));
+        private_dir_new(&legacy).unwrap();
+        let name = format!("{}.unknown", credential_fingerprint(&pending.key));
+        let mut legacy_pending = pending.clone();
+        legacy_pending.cause_status = Some(403);
+        legacy_pending.cause_code = "revoked".into();
+        legacy_pending.pre_execution_rejected = false;
+        legacy_pending.replay_paused = true;
+        legacy_pending.replay_stopped = true;
+        lockyard_core::fsio::replace(
+            &legacy.join(name),
+            &serde_json::to_vec(&legacy_pending).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        lockyard_core::fsio::replace(&job_dir.join("signed-result.suspended"), b"revoked", 0o600)
+            .unwrap();
+        client = open_client();
+        let imported = client.pending_operations().pop().unwrap();
+        assert_eq!(imported.cause_status, None);
+        assert!(lockyard_cloud_client::Client::result_retry_ready(&imported));
+        Arc::get_mut(&mut executor.inner)
+            .unwrap()
+            .config
+            .signed_results = Some(client.clone());
+    } else {
+        client.resume_signed_result(&pending.key).unwrap();
+    }
     for _ in 0..2 {
         executor.publish_signed_results();
     }
@@ -705,20 +751,6 @@ fn expired_result_replay_persists_receipt_before_ack_and_survives_crash() {
         .unwrap();
     received.recv_timeout(Duration::from_secs(2)).unwrap();
     let pending = client.pending_operations().pop().unwrap();
-    let scoped_journal = fs::read_dir(&journal)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.is_dir())
-        .unwrap();
-    let journal_path = fs::read_dir(&scoped_journal)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .unwrap();
-    let saved_pending = fs::read(&journal_path).unwrap();
     Arc::get_mut(&mut executor.inner)
         .unwrap()
         .config
@@ -737,7 +769,6 @@ fn expired_result_replay_persists_receipt_before_ack_and_survives_crash() {
         vec![pending.clone()],
         "a 204 without a durable local receipt must retain W4 bytes"
     );
-    assert_eq!(fs::read(&journal_path).unwrap(), saved_pending);
 
     drop(executor);
     drop(client);
@@ -762,7 +793,20 @@ fn expired_result_replay_persists_receipt_before_ack_and_survives_crash() {
     );
 
     // Restore exactly the durable state at a crash between receipt publication and W4 cleanup.
-    lockyard_core::fsio::replace(&journal_path, &saved_pending, 0o600).unwrap();
+    let database =
+        lockyard_core::open_private_state_database(&journal.join(".sqlite"), "pending.db").unwrap();
+    assert_eq!(
+        database
+            .execute(
+                "UPDATE pending_writes SET state = 'pending',
+            budget_bytes = length(payload)
+         WHERE key = ?1 AND state = 'done'",
+                [&pending.key],
+            )
+            .unwrap(),
+        1
+    );
+    drop(database);
     drop(executor);
     config.signed_results = None;
     drop(client);
@@ -774,7 +818,6 @@ fn expired_result_replay_persists_receipt_before_ack_and_survives_crash() {
     executor.publish_signed_results();
     received.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(client.pending_operations().is_empty());
-    assert!(!journal_path.exists());
     executor.purge_expired().unwrap();
     assert_eq!(fs::read(&receipt).unwrap(), saved_receipt);
     assert!(!job_dir.exists());

@@ -128,11 +128,12 @@ impl Executor {
             }
             if let Some(record) = record {
                 let directory = self.inner.config.state_dir.join("jobs").join(&id);
-                if directory.join("signed-result.published").exists() && pending.is_none() {
-                    continue;
-                }
-                if directory.join("signed-result.suspended").exists()
-                    || !directory.join("signed-result.json").exists()
+                // A pending row eligible for replay supersedes a suspension
+                // marker written by an older client after an ambiguous PUT.
+                if !directory.join("signed-result.json").exists()
+                    || (pending.is_none()
+                        && (directory.join("signed-result.published").exists()
+                            || directory.join("signed-result.suspended").exists()))
                 {
                     continue;
                 }
@@ -149,17 +150,21 @@ impl Executor {
                         .as_ref()
                         .map(|p| p.cause_code.clone())
                         .unwrap_or_else(|| error.0.into());
-                    eprintln!(
-                        "lockyard node: result_publication_pending code={} job_id={}",
-                        code, id
-                    );
-                    if let Some(pending) = pending
-                        && lockyard_cloud_client::Client::result_permanently_refused(&pending)
-                    {
+                    let refused = pending
+                        .as_ref()
+                        .is_some_and(lockyard_cloud_client::Client::result_permanently_refused);
+                    if refused {
                         let _ = lockyard_core::fsio::replace(
                             &directory.join("signed-result.suspended"),
                             code.as_bytes(),
                             0o600,
+                        );
+                        eprintln!(
+                            "lockyard node: result_publication_refused code={code} job_id={id}"
+                        );
+                    } else {
+                        eprintln!(
+                            "lockyard node: result_publication_pending cause_code={code} job_id={id}"
                         );
                     }
                 }

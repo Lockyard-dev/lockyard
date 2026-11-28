@@ -15,6 +15,7 @@ fn deferred_ack_keeps_frozen_operation_until_outbox_completion_is_durable() {
     // This acknowledges the caller's already-durable outbox completion after restart.
     restored.acknowledge_write(&call).unwrap();
     assert!(restored.pending_operation(&key).is_none());
+    drop(restored);
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -60,6 +61,7 @@ fn deferred_ack_rejects_changed_operation_and_keeps_persisted_pending() {
     same_operation.defer_pending_ack = false;
     restored.acknowledge_write(&same_operation).unwrap();
     assert!(restored.pending_operation(&key).is_none());
+    drop(restored);
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -90,39 +92,46 @@ fn deferred_ack_matches_original_request_after_encryption_and_restart() {
     assert!(restored.pending_operation(&key).is_some());
     restored.acknowledge_write(&call).unwrap();
     assert!(restored.pending_operation(&key).is_none());
+    drop(restored);
     std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn deferred_ack_quarantines_legacy_journal_without_original_digest() {
     let (directory, url, call) = deferred_operation(false);
-    let scope = std::fs::read_dir(&directory)
+    let initial = Client::new(&url, "fixture-token".into())
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let journals: Vec<_> = std::fs::read_dir(scope)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .collect();
-    assert_eq!(
-        journals.len(),
-        1,
-        "exactly one pending operation is persisted"
-    );
-    let journal = &journals[0];
-    let mut legacy: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(journal).unwrap()).unwrap();
-    legacy.as_object_mut().unwrap().remove("request_digest");
-    std::fs::write(journal, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        .load_pending_journal(&directory)
+        .unwrap();
+    let row = initial
+        .pending_operation(call.key.as_deref().unwrap())
+        .unwrap();
+    drop(initial);
+    let legacy = tempfile::tempdir().unwrap();
+    let root = legacy.path().canonicalize().unwrap();
+    let scope = root.join(lockyard_cloud_client::credential_fingerprint(&format!(
+        "{url}\0fixture-token"
+    )));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&scope)
+            .unwrap();
+    }
+    #[cfg(windows)]
+    lockyard_core::windows::private_dir(&scope).unwrap();
+    let journal = scope.join(format!(
+        "{}.json",
+        lockyard_cloud_client::credential_fingerprint(&row.key)
+    ));
+    let mut record = serde_json::to_value(row).unwrap();
+    record.as_object_mut().unwrap().remove("request_digest");
+    lockyard_core::fsio::replace(&journal, &serde_json::to_vec(&record).unwrap(), 0o600).unwrap();
     let restored = Client::new(&url, "fixture-token".into())
         .unwrap()
-        .with_pending_journal(&directory)
+        .load_pending_journal(&root)
         .unwrap();
     assert_eq!(
         restored.acknowledge_write(&call).unwrap_err().code(),

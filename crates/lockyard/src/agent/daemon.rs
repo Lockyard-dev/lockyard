@@ -2024,10 +2024,16 @@ impl<T: Transport + 'static> Shared<T> {
                     Err(error) => Reply::failed(error),
                 }
             }
-            Request::AcknowledgeWrite { call } => match self.transport.acknowledge_write(&call) {
-                Ok(()) => Reply::default(),
-                Err(error) => Reply::failed(error),
-            },
+            Request::AcknowledgeWrite { call } => {
+                let backend = CloudBackend::new(Arc::clone(&self.transport), &call.session);
+                match backend
+                    .confirm_task_create_ack(&call)
+                    .and_then(|()| self.transport.acknowledge_write(&call))
+                {
+                    Ok(()) => Reply::default(),
+                    Err(error) => Reply::failed(error),
+                }
+            }
             Request::Call { call } => self.forward(call),
         }
     }

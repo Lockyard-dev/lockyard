@@ -36,7 +36,9 @@ pub use backend::{
 };
 pub use error::{Error, Result};
 pub use paths::ZonePath;
-pub use store::{Agent, DIR_NAME, Store, validate_agent};
+pub use store::{
+    Agent, DIR_NAME, PrivateStateDatabase, Store, open_private_state_database, validate_agent,
+};
 
 /// Version of this build.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

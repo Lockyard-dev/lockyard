@@ -170,18 +170,17 @@ fn age_pending_journal(root: &std::path::Path, days: u64) {
         .unwrap()
         .as_secs()
         - days * 24 * 60 * 60;
-    for scope in std::fs::read_dir(root).unwrap() {
-        for record in std::fs::read_dir(scope.unwrap().path()).unwrap() {
-            let path = record.unwrap().path();
-            if path.extension().is_some_and(|ext| ext == "json") {
-                let mut pending: Value =
-                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-                pending["first_sent_unix_secs"] = json!(first);
-                lockyard_core::fsio::replace(&path, &serde_json::to_vec(&pending).unwrap(), 0o600)
-                    .unwrap();
-            }
-        }
-    }
+    journal_db(root).execute(
+        "UPDATE pending_writes SET payload = CAST(json_set(payload, '$.first_sent_unix_secs', ?1) AS BLOB)
+         WHERE state = 'pending'",
+        [first as i64],
+    ).unwrap();
+}
+
+fn journal_db(root: &std::path::Path) -> rusqlite::Connection {
+    let db = rusqlite::Connection::open(root.join(".sqlite/pending.db")).unwrap();
+    db.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+    db
 }
 
 #[test]
@@ -216,6 +215,7 @@ fn survey_r9_frozen_operation_replays_after_31_days_without_quarantine() {
         requests[1].header("idempotency-key"),
         requests[2].header("idempotency-key")
     );
+    drop(restored);
     std::fs::remove_dir_all(directory).unwrap();
 }
 use std::io::{Read, Write};
@@ -1045,6 +1045,7 @@ fn pending_journal_survives_restart_with_original_wire_bytes() {
     );
     restored.resolve_pending(&key).unwrap();
     assert!(restored.pending_operation(&key).is_none());
+    drop(restored);
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -1162,29 +1163,21 @@ fn journal_preflight_failure_never_marks_an_unsent_mutation_unknown() {
     ));
     let server = Server::start(vec![discovery(2, 1, 2, &[])]);
     let client = server.client().with_pending_journal(&directory).unwrap();
-    let scope = std::fs::read_dir(&directory)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    // Exclusive journal ownership is checked before discovery as well as mutation send.
-    // Replacing a still-empty journal directory with a file must cause no network requests.
-    std::fs::remove_dir(&scope).unwrap();
-    std::fs::write(&scope, "not a directory").unwrap();
+    journal_db(&directory)
+        .execute("DROP TABLE pending_writes", [])
+        .unwrap();
     let call = write();
     let error = client.call(&call).unwrap_err();
     assert!(matches!(error, ClientError::Invalid(_)), "{error:?}");
     assert_eq!(error.code(), None);
     assert!(client.pending_operations().is_empty());
     assert!(server.requests().is_empty());
+    drop(client);
     std::fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(unix)]
 #[test]
 fn post_send_journal_cleanup_failure_keeps_original_pending_operation() {
-    use std::os::unix::fs::PermissionsExt;
     let directory = std::env::temp_dir().canonicalize().unwrap().join(format!(
         "ly-protocol-cleanup-{}",
         lockyard_cloud_client::ulid()
@@ -1198,37 +1191,28 @@ fn post_send_journal_cleanup_failure_keeps_original_pending_operation() {
         ],
         move |request| {
             if request.method == "POST" {
-                // The request has been received and its pre-send file is already durable.
-                let scope = writer_journal.lock().unwrap().clone().unwrap();
-                assert_eq!(
-                    std::fs::read_dir(&scope)
-                        .unwrap()
-                        .filter(|entry| entry
-                            .as_ref()
-                            .unwrap()
-                            .path()
-                            .extension()
-                            .is_some_and(|extension| extension == "json"))
-                        .count(),
-                    1
-                );
-                std::fs::set_permissions(scope, std::fs::Permissions::from_mode(0o500)).unwrap();
+                let root = writer_journal.lock().unwrap().clone().unwrap();
+                let db = journal_db(&root);
+                let count: i64 = db
+                    .query_row(
+                        "SELECT count(*) FROM pending_writes WHERE state = 'pending'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 1, "the pre-send operation must already be committed");
+                db.execute_batch(
+                    "CREATE TRIGGER IF NOT EXISTS fixture_cleanup_failure BEFORE UPDATE OF state ON pending_writes
+                     BEGIN SELECT raise(ABORT, 'fixture cleanup failure'); END;",
+                ).unwrap();
             }
         },
     );
     let client = server.client().with_pending_journal(&directory).unwrap();
-    let scope = std::fs::read_dir(&directory)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    *journal.lock().unwrap() = Some(scope.clone());
+    *journal.lock().unwrap() = Some(directory.clone());
     let call = write();
     let key = call.key.as_deref().unwrap();
     let error = client.call(&call).unwrap_err();
-    // Restore permissions before assertions so a failing regression leaves no inaccessible tempdir.
-    std::fs::set_permissions(&scope, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(matches!(error, ClientError::OutcomeUnknown(_)), "{error:?}");
     let pending = client
         .pending_operation(key)
@@ -1250,10 +1234,11 @@ fn post_send_journal_cleanup_failure_keeps_original_pending_operation() {
         requests[1].header("idempotency-key"),
         requests[2].header("idempotency-key")
     );
-    std::fs::set_permissions(&scope, std::fs::Permissions::from_mode(0o700)).unwrap();
     let restored = server.client().with_pending_journal(&directory).unwrap();
     assert_eq!(restored.pending_operation(key).unwrap().body, pending.body);
     assert_eq!(restored.pending_operation(key).unwrap().key, pending.key);
+    drop(restored);
+    drop(client);
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -1302,6 +1287,7 @@ fn server_catalog_invalid_is_a_definite_refusal_and_clears_pending() {
             .is_empty()
     );
     assert_eq!(server.requests().len(), 2);
+    drop(client);
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -1446,29 +1432,25 @@ fn durable_outbox_without_trusted_age_or_identity_stays_pending_when_offline() {
         let client = server.client().with_pending_journal(&directory).unwrap();
         assert!(client.call(&call).is_err());
         drop(client);
-        let scoped = std::fs::read_dir(&directory)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let journals: Vec<_> = std::fs::read_dir(scoped)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "json" || extension == "unknown")
-            })
-            .collect();
-        assert_eq!(
-            journals.len(),
-            1,
-            "exactly one pending operation is persisted"
-        );
-        let file = &journals[0];
-        let mut record: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        let db = journal_db(&directory);
+        let bytes: Vec<u8> = db
+            .query_row(
+                "SELECT payload FROM pending_writes WHERE state = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut record: Value = serde_json::from_slice(&bytes).unwrap();
         record[field] = value;
-        std::fs::write(file, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(
+            db.execute(
+                "UPDATE pending_writes SET payload = ?1 WHERE state = 'pending'",
+                [serde_json::to_vec(&record).unwrap()],
+            )
+            .unwrap(),
+            1
+        );
+        drop(db);
         let restored = server.client().with_pending_journal(&directory).unwrap();
         assert_eq!(
             restored.call(&call).unwrap_err().code(),
@@ -1484,8 +1466,8 @@ fn durable_outbox_without_trusted_age_or_identity_stays_pending_when_offline() {
             .unwrap();
         assert_eq!(saved.body.as_deref(), record["body"].as_str());
         assert!(saved.replay_stopped);
-        assert!(file.with_extension("unknown").exists());
-        assert!(!file.with_extension("quarantine").exists());
+        assert!(saved.replay_paused);
+        drop(restored);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
@@ -1616,6 +1598,7 @@ fn durable_outbox_pending_without_required_encryption_context_stays_unknown() {
             ..pending
         }
     );
+    drop(restored);
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -1742,6 +1725,7 @@ fn pre_execution_retry_survives_restart_and_keeps_ack_boundary() {
                 restored.acknowledge_write(&call).unwrap();
             }
             assert!(restored.pending_operations().is_empty());
+            drop(restored);
             std::fs::remove_dir_all(directory).unwrap();
         }
     }
@@ -1772,6 +1756,7 @@ fn pre_execution_retry_rejects_changed_request_identity_without_sending() {
         );
     }
     assert_eq!(server.requests().len(), 2);
+    drop(client);
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -1783,17 +1768,20 @@ fn pre_execution_retry_must_sync_unknown_marker_before_sending() {
             .pending_operation(call.key.as_deref().unwrap())
             .is_some()
     );
-    let moved = directory.with_extension("moved");
-    std::fs::rename(&directory, &moved).unwrap();
-    std::fs::write(&directory, "not a journal directory").unwrap();
+    journal_db(&directory)
+        .execute_batch(
+            "CREATE TRIGGER fixture_retry_failure BEFORE UPDATE OF payload ON pending_writes
+         BEGIN SELECT raise(ABORT, 'fixture retry failure'); END;",
+        )
+        .unwrap();
     assert!(client.call(&call).is_err());
     assert_eq!(
         server.requests().len(),
         2,
         "failed journal transition must precede network"
     );
-    std::fs::remove_file(directory).unwrap();
-    std::fs::remove_dir_all(moved).unwrap();
+    drop(client);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -1823,25 +1811,19 @@ fn pre_execution_retry_seeded_restart_and_uncertainty_sequences() {
         }
         // The last send may have committed: an invalid echo must revoke safe-retry permission.
         replies.push(Reply::json(200, json!({"id":"A-1"}), None));
-        let server = Server::start_with_hook(replies, move |request| {
-            if request.method == "POST" {
-                let journal = std::fs::read_dir(&journal_directory)
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path();
-                let journal = std::fs::read_dir(journal)
-                    .unwrap()
-                    .map(Result::unwrap)
-                    .map(|entry| entry.path())
-                    .find(|path| path.extension().is_some_and(|ext| ext == "json"))
-                    .unwrap();
-                let pending: lockyard_cloud_client::PendingWrite =
-                    serde_json::from_slice(&std::fs::read(journal).unwrap()).unwrap();
-                markers.lock().unwrap().push(pending.pre_execution_rejected);
-            }
-        });
+        let server =
+            Server::start_with_hook(replies, move |request| {
+                if request.method == "POST" {
+                    let journal = journal_db(&journal_directory);
+                    let bytes: Vec<u8> = journal.query_row(
+                    "SELECT payload FROM pending_writes WHERE key = ?1 AND state = 'pending'",
+                    [request.header("idempotency-key").unwrap()], |row| row.get(0),
+                ).unwrap();
+                    let pending: lockyard_cloud_client::PendingWrite =
+                        serde_json::from_slice(&bytes).unwrap();
+                    markers.lock().unwrap().push(pending.pre_execution_rejected);
+                }
+            });
         let client = || {
             server
                 .client()
@@ -1988,6 +1970,7 @@ fn pre_execution_plaintext_journal_cannot_bypass_new_encryption_policy() {
             assert_eq!(pending.key, original.key);
             assert_eq!(pending.cause_code, "pending_encryption_mismatch");
             assert!(pending.replay_paused && !pending.replay_stopped);
+            drop(restored);
             std::fs::remove_dir_all(directory).unwrap();
         }
     }
